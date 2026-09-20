@@ -173,11 +173,19 @@ func buildOrLoadPlan(
 				return err
 			}
 			scanID = latest.ID
+		} else if _, err := tx.Scan(ctx, scanID); err != nil {
+			// Entries of an unknown scan come back as an empty slice, which
+			// would silently produce a plan bound to a scan that does not
+			// exist.
+			return err
 		}
 		var err error
 		entries, err = tx.Entries(ctx, scanID)
 		return err
 	})
+	if errors.Is(err, store.ErrNotFound) && opts.scanID != "" {
+		return plan.Result{}, nil, fmt.Errorf("no scan %s is stored", opts.scanID)
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		return plan.Result{}, nil, fmt.Errorf("no completed scan is stored: run \"janitor scan\" first")
 	}

@@ -107,6 +107,16 @@ func proposals(entry core.Entry, class Classification, policy config.Policy, ver
 			Specificity: len(canonical),
 			Reason:      fmt.Sprintf("%s already lives in the canonical root %s for %s", entry.Path, canonical, class.Class),
 		})
+	case hasCanonical && class.Class == core.ClassPrimaryProject && core.PathWithin(canonical, entry.Path):
+		// The canonical root lives inside this entry, so relocating would
+		// move the entry into itself. That cannot succeed, and attempting
+		// it would be destructive.
+		out = append(out, Proposal{
+			Rule: "policy.canonical_root", Tier: TierProtected, Kind: core.ActionInvestigate,
+			Specificity: len(canonical),
+			Reason: fmt.Sprintf("the canonical root %s is inside %s, so relocating would move the entry into itself",
+				canonical, entry.Path),
+		})
 	case hasCanonical && class.Class == core.ClassPrimaryProject:
 		out = append(out, Proposal{
 			Rule: "policy.canonical_root", Tier: TierProtected, Kind: core.ActionRelocate,
@@ -242,7 +252,11 @@ func Evaluate(entry core.Entry, policy config.Policy, verdict core.Verdict) Deci
 				Conflict: true,
 			})
 		default:
+			// Same tier, same action: both rules agree, so both are
+			// credited. Rules and reasons stay index-aligned, which is
+			// what lets an explanation pair them.
 			decision.Rules = append(decision.Rules, candidate.Rule)
+			decision.Reasons = append(decision.Reasons, candidate.Reason)
 		}
 	}
 

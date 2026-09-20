@@ -845,3 +845,36 @@ func TestReferencesAttachUnderARootOfSlash(t *testing.T) {
 		}
 	}
 }
+
+// The planner classifies primary projects from project-marker evidence, so
+// the collector has to actually produce it.
+func TestFilesystemCollectorRecordsProjectMarkers(t *testing.T) {
+	root := t.TempDir()
+	project := mustMkdir(t, filepath.Join(root, "module"))
+	mustWrite(t, filepath.Join(project, "go.mod"), "module fixture\n")
+	mustMkdir(t, filepath.Join(root, "plain"))
+
+	opts := fixtureOptions(root)
+	opts.ProjectMarkers = []string{"go.mod", "package.json"}
+	result := run(t, opts)
+
+	entry := entryFor(t, result, project)
+	found := ""
+	for _, evidence := range entry.Evidence {
+		if evidence.Signal == "project_marker" {
+			found = evidence.Detail
+		}
+	}
+	if found != "go.mod" {
+		t.Errorf("evidence = %+v, want a project_marker for go.mod", entry.Evidence)
+	}
+	if hasSignal(entryFor(t, result, filepath.Join(root, "plain")), "project_marker") {
+		t.Error("a directory with no marker must not report one")
+	}
+
+	// Marker detection is bounded by the configured list, not by reading
+	// the directory: a default scan stays a top-level metadata pass.
+	if report := reportFor(t, result, CollectorFilesystem); report.Visited != 2 {
+		t.Errorf("visited = %d, want only the two top-level entries", report.Visited)
+	}
+}

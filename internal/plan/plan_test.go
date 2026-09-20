@@ -479,3 +479,117 @@ func containsString(values []string, want string) bool {
 	}
 	return false
 }
+
+// A directory with a project marker but no Git metadata is still a
+// primary project. The marker list is configuration, so it has to be
+// backed by evidence a collector actually produces.
+func TestProjectMarkerEvidenceClassifiesAPrimaryProject(t *testing.T) {
+	policy := fixturePolicy()
+	entry := entryAt("/home/fixture/repos/module")
+	entry.Evidence = append(entry.Evidence, core.Evidence{
+		Source: core.SourceFilesystem, Signal: "project_marker",
+		Detail: "go.mod", ObservedAt: plannedAt,
+	})
+
+	action := actionFor(t, buildPlan(t, []core.Entry{entry}, policy, nil), "/home/fixture/repos/module")
+	if action.Class != core.ClassPrimaryProject {
+		t.Errorf("class = %q, want primary_project from the marker evidence (rules %v)", action.Class, action.Rules)
+	}
+	if action.Kind != core.ActionKeep {
+		t.Errorf("action = %q, want keep", action.Kind)
+	}
+}
+
+// A canonical root inside the entry would make relocation a move into
+// itself, which cannot succeed and would be destructive to attempt.
+func TestRelocateIsRefusedWhenTheDestinationIsInsideTheEntry(t *testing.T) {
+	policy := fixturePolicy()
+	policy.CanonicalRoots = []config.CanonicalRoot{
+		{Class: core.ClassPrimaryProject, Path: "/home/fixture/project/repos"},
+	}
+	entry := entryAt("/home/fixture/project", withGit(&core.GitState{
+		RepoRoot: "/home/fixture/project", UpstreamKnown: true,
+	}))
+
+	action := actionFor(t, buildPlan(t, []core.Entry{entry}, policy, nil), "/home/fixture/project")
+	if action.Kind == core.ActionRelocate {
+		t.Fatalf("a self-relocation was proposed: %s -> %s", action.Path, action.Destination)
+	}
+	if action.Kind != core.ActionInvestigate {
+		t.Errorf("action = %q, want investigate", action.Kind)
+	}
+	if action.Destination != "" {
+		t.Errorf("destination = %q, want none", action.Destination)
+	}
+}
+
+// Two projects that would relocate onto the same destination collide, so
+// neither is proposed and the collision is reported.
+func TestCollidingRelocationsAreDowngradedAndReported(t *testing.T) {
+	policy := fixturePolicy()
+	first := entryAt("/home/fixture/a/dup", withGit(&core.GitState{
+		RepoRoot: "/home/fixture/a/dup", UpstreamKnown: true,
+	}))
+	second := entryAt("/home/fixture/b/dup", withGit(&core.GitState{
+		RepoRoot: "/home/fixture/b/dup", UpstreamKnown: true,
+	}))
+	unique := entryAt("/home/fixture/c/solo", withGit(&core.GitState{
+		RepoRoot: "/home/fixture/c/solo", UpstreamKnown: true,
+	}))
+
+	result := buildPlan(t, []core.Entry{first, second, unique}, policy, nil)
+	for _, path := range []string{"/home/fixture/a/dup", "/home/fixture/b/dup"} {
+		action := actionFor(t, result, path)
+		if action.Kind != core.ActionInvestigate {
+			t.Errorf("%s: action = %q, want investigate after a destination collision", path, action.Kind)
+		}
+		if action.Destination != "" {
+			t.Errorf("%s: destination = %q, want it cleared", path, action.Destination)
+		}
+		reported := false
+		for _, rejected := range action.Rejected {
+			if rejected.Conflict && strings.Contains(rejected.Reason, "collide") {
+				reported = true
+			}
+		}
+		if !reported {
+			t.Errorf("%s: the collision was not reported: %+v", path, action.Rejected)
+		}
+	}
+
+	solo := actionFor(t, result, "/home/fixture/c/solo")
+	if solo.Kind != core.ActionRelocate || solo.Destination != "/home/fixture/repos/solo" {
+		t.Errorf("an uncontested relocation was disturbed: %+v", solo)
+	}
+}
+
+// Rules and reasons are paired by index in every explanation, so they must
+// stay the same length however a decision was reached.
+func TestRulesAndReasonsStayAligned(t *testing.T) {
+	policy := fixturePolicy()
+	policy.Caches = []config.CacheRule{
+		{Name: "aaa-first", Path: "/home/fixture/.cache", Action: core.ActionQuarantine, Retention: core.Retention30Days},
+		{Name: "zzz-second", Path: "/home/fixture/.cache", Action: core.ActionQuarantine, Retention: core.Retention30Days},
+	}
+	advisor := &stubAdvisor{name: "jev", answers: map[string]core.Recommendation{
+		"/home/fixture/mystery": {
+			Action: core.ActionKeep, Class: core.ClassOperationalTool, Confidence: 0.8,
+			Origin: core.OriginModel, DecidedAt: plannedAt,
+			Reasons: []string{"first reason", "second reason"},
+		},
+	}}
+
+	entries := []core.Entry{
+		entryAt("/home/fixture/.cache"),
+		entryAt("/home/fixture/mystery"),
+		entryAt("/home/fixture/repos/app", withGit(&core.GitState{
+			RepoRoot: "/home/fixture/repos/app", UpstreamKnown: true,
+		})),
+	}
+	for _, action := range buildPlan(t, entries, policy, advisor).Plan.Actions {
+		if len(action.Rules) != len(action.Reasons) {
+			t.Errorf("%s: %d rules but %d reasons, so an explanation would misattribute them:\n rules: %v\n reasons: %v",
+				action.Path, len(action.Rules), len(action.Reasons), action.Rules, action.Reasons)
+		}
+	}
+}

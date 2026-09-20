@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
@@ -169,6 +170,8 @@ func Build(ctx context.Context, in Input) (Result, error) {
 		result.Traces = append(result.Traces, trace)
 	}
 
+	resolveDestinationCollisions(&plan, result.Traces)
+
 	plan.Normalize()
 	if err := plan.Validate(); err != nil {
 		return Result{}, fmt.Errorf("plan: built an invalid plan: %w", err)
@@ -213,11 +216,26 @@ func applyAdvice(
 	decision.Retention = clamped.Retention
 	decision.Class = clamped.Class
 	decision.Rules = append(decision.Rules, "advisor:"+advisor)
-	decision.Reasons = append(decision.Reasons, clamped.Reasons...)
+	// One reason per rule: an explanation pairs them by index, so an
+	// advisor with several reasons contributes one joined entry.
+	decision.Reasons = append(decision.Reasons, joinReasons(clamped.Reasons))
 	decision.Rejected = trace.Rejected
 	trace.Rules = decision.Rules
 	trace.Reasons = decision.Reasons
 	return decision, trace
+}
+
+// joinReasons collapses several reasons into the single entry that pairs
+// with one rule.
+func joinReasons(reasons []string) string {
+	switch len(reasons) {
+	case 0:
+		return "the advisor gave no reason"
+	case 1:
+		return reasons[0]
+	default:
+		return strings.Join(reasons, "; ")
+	}
 }
 
 // confidenceFor reports how firm a decision is. A conflict or an ambiguous
@@ -231,6 +249,77 @@ func confidenceFor(decision Decision) float64 {
 	default:
 		return 0.9
 	}
+}
+
+// resolveDestinationCollisions downgrades relocations that would land on
+// the same destination.
+//
+// Two projects with the same base name outside the canonical root both want
+// canonical/<name>. Applying the second would collide with the first, so
+// neither is proposed: the collision is reported and both go to
+// investigate.
+func resolveDestinationCollisions(built *core.Plan, traces []Trace) {
+	byDestination := map[string][]int{}
+	for i, action := range built.Actions {
+		if action.Kind != core.ActionRelocate || action.Destination == "" {
+			continue
+		}
+		byDestination[action.Destination] = append(byDestination[action.Destination], i)
+	}
+
+	traceIndex := map[string]int{}
+	for i, trace := range traces {
+		traceIndex[trace.Path] = i
+	}
+
+	destinations := make([]string, 0, len(byDestination))
+	for destination := range byDestination {
+		destinations = append(destinations, destination)
+	}
+	sort.Strings(destinations)
+
+	for _, destination := range destinations {
+		indexes := byDestination[destination]
+		if len(indexes) < 2 {
+			continue
+		}
+		others := make([]string, 0, len(indexes))
+		for _, i := range indexes {
+			others = append(others, built.Actions[i].Path)
+		}
+		for _, i := range indexes {
+			action := &built.Actions[i]
+			reason := fmt.Sprintf("%s is also proposed for %s, so relocating either would collide",
+				strings.Join(without(others, action.Path), ", "), destination)
+			action.Rejected = append(action.Rejected, core.RejectedAction{
+				Kind:     core.ActionRelocate,
+				Rule:     "policy.canonical_root",
+				Reason:   reason,
+				Conflict: true,
+			})
+			action.Kind = core.ActionInvestigate
+			action.Destination = ""
+			action.Retention = core.RetentionNone
+			action.Rules = append(action.Rules, "plan.destination_collision")
+			action.Reasons = append(action.Reasons, reason)
+			if t, ok := traceIndex[action.Path]; ok {
+				traces[t].Action = core.ActionInvestigate
+				traces[t].Rules = action.Rules
+				traces[t].Reasons = action.Reasons
+				traces[t].Rejected = action.Rejected
+			}
+		}
+	}
+}
+
+func without(values []string, exclude string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != exclude {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 // EvidenceDigest hashes the fingerprints of an inventory.

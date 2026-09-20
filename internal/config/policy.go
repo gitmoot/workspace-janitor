@@ -155,8 +155,10 @@ type Ownership struct {
 	// InvestigateForeignOwner sends entries owned by another user to
 	// investigate rather than proposing any mutation.
 	InvestigateForeignOwner bool `yaml:"investigate_foreign_owner" json:"investigate_foreign_owner"`
-	// ExpectedUID is the owner the planner expects. Zero means "the user
-	// running the scan".
+	// ExpectedUID is the owner the planner expects. Zero disables the
+	// check: root owns uid 0, so treating it as "unset" and as "expect
+	// root" cannot both be true, and disabling is the honest reading of an
+	// absent field.
 	ExpectedUID uint32 `yaml:"expected_uid" json:"expected_uid"`
 }
 

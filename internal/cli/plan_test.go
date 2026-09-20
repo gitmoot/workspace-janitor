@@ -429,3 +429,62 @@ func TestExplainUsageErrors(t *testing.T) {
 		t.Errorf("stderr = %q", stderr)
 	}
 }
+
+// Planning against a scan that does not exist must fail clearly rather
+// than produce an empty plan bound to nothing.
+func TestPlanWithUnknownScanFailsClearly(t *testing.T) {
+	f := newPlanFixture(t)
+	f.scan(t)
+
+	stdout, stderr, code := f.run(t, "plan", "--scan", "scan-does-not-exist")
+	if code != ExitError {
+		t.Fatalf("exit = %d, want %d", code, ExitError)
+	}
+	if stdout != "" {
+		t.Errorf("wrote a plan for an unknown scan: %q", stdout)
+	}
+	if !strings.Contains(stderr, "scan-does-not-exist") {
+		t.Errorf("stderr = %q, want it to name the missing scan", stderr)
+	}
+}
+
+// explain pairs each rule with its own reason.
+func TestExplainPairsRulesWithTheirOwnReasons(t *testing.T) {
+	f := newPlanFixture(t)
+	target := filepath.Join(f.root, ".cache")
+	f.writePolicy(t, strings.Join([]string{
+		"roots:",
+		"  - path: " + f.root,
+		"    max_depth: 1",
+		"collectors:",
+		"  git: false",
+		"  processes: false",
+		"  services: false",
+		"caches:",
+		"  - name: aaa-first",
+		"    path: " + target,
+		"    action: quarantine",
+		"    retention: 30d",
+		"  - name: zzz-second",
+		"    path: " + target,
+		"    action: quarantine",
+		"    retention: 30d",
+		"",
+	}, "\n"))
+	f.scan(t)
+	doc := f.planJSON(t)
+	action := f.action(t, doc, target)
+
+	if len(action.Rules) != len(action.Reasons) {
+		t.Fatalf("%d rules but %d reasons: an explanation would misattribute them\n rules: %v\n reasons: %v",
+			len(action.Rules), len(action.Reasons), action.Rules, action.Reasons)
+	}
+	for i, rule := range action.Rules {
+		if strings.HasPrefix(rule, "policy.cache:") {
+			name := strings.TrimPrefix(rule, "policy.cache:")
+			if !strings.Contains(action.Reasons[i], name) {
+				t.Errorf("rule %q is paired with %q, which describes a different rule", rule, action.Reasons[i])
+			}
+		}
+	}
+}

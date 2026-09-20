@@ -211,6 +211,7 @@ func (w *metadataWalk) entryFor(path string, dirBounded bool) (core.Entry, bool)
 	if !info.IsDir() {
 		return entry, false
 	}
+	w.recordProjectMarkers(&entry)
 
 	// Mount boundary: a different device means a different filesystem, which
 	// the walk does not enter unless the root allows it.
@@ -237,6 +238,29 @@ func (w *metadataWalk) entryFor(path string, dirBounded bool) (core.Entry, bool)
 		w.seen[entry.FilesystemID] = struct{}{}
 	}
 	return entry, true
+}
+
+// recordProjectMarkers notes which project markers a directory contains.
+//
+// This is one lstat per configured marker, not a directory read: the cost
+// is bounded by the marker list, and a default scan stays metadata-only.
+// The planner classifies from this evidence rather than touching the disk
+// itself.
+func (w *metadataWalk) recordProjectMarkers(entry *core.Entry) {
+	for _, marker := range w.opts.ProjectMarkers {
+		if marker == "" {
+			continue
+		}
+		if _, err := os.Lstat(filepath.Join(entry.Path, marker)); err != nil {
+			continue
+		}
+		addEvidence(entry, core.Evidence{
+			Source:     core.SourceFilesystem,
+			Signal:     "project_marker",
+			Detail:     marker,
+			ObservedAt: w.now,
+		})
+	}
 }
 
 // resolveSymlink records the link target and, per the safety contract, treats

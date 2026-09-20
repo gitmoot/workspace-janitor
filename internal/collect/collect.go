@@ -97,6 +97,10 @@ type Options struct {
 	AgentSources []AgentSource
 	// GitBinary is the git executable to run. Empty means "git" on PATH.
 	GitBinary string
+	// ProjectMarkers are file names whose presence inside a directory
+	// marks it as a real project, for example "go.mod". Each is checked
+	// with a single lstat, so the cost is bounded by the list length.
+	ProjectMarkers []string
 
 	// Prior is the inventory of the previous scan, used for fingerprint
 	// comparison. PriorScanID names it in evidence.
