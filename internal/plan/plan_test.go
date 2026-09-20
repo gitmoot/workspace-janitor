@@ -593,3 +593,41 @@ func TestRulesAndReasonsStayAligned(t *testing.T) {
 		}
 	}
 }
+
+// A destination that already exists cannot be relocated onto, even when no
+// other action wants it.
+func TestRelocationOntoAnExistingPathIsReported(t *testing.T) {
+	policy := fixturePolicy()
+	existing := entryAt("/home/fixture/repos/dup")
+	candidate := entryAt("/home/fixture/a/dup", withGit(&core.GitState{
+		RepoRoot: "/home/fixture/a/dup", UpstreamKnown: true,
+	}))
+
+	result := buildPlan(t, []core.Entry{existing, candidate}, policy, nil)
+	action := actionFor(t, result, "/home/fixture/a/dup")
+	if action.Kind != core.ActionInvestigate {
+		t.Fatalf("action = %q, want investigate: the destination is occupied", action.Kind)
+	}
+	if action.Destination != "" {
+		t.Errorf("destination = %q, want it cleared", action.Destination)
+	}
+	reported := false
+	for _, rejected := range action.Rejected {
+		if rejected.Conflict && strings.Contains(rejected.Reason, "already exists") {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Errorf("the occupied destination was not reported: %+v", action.Rejected)
+	}
+
+	// A free destination still relocates, or the guard would block
+	// everything and teach operators to ignore it.
+	free := entryAt("/home/fixture/b/solo", withGit(&core.GitState{
+		RepoRoot: "/home/fixture/b/solo", UpstreamKnown: true,
+	}))
+	solo := actionFor(t, buildPlan(t, []core.Entry{free}, policy, nil), "/home/fixture/b/solo")
+	if solo.Kind != core.ActionRelocate || solo.Destination != "/home/fixture/repos/solo" {
+		t.Errorf("an uncontested relocation was blocked: %+v", solo)
+	}
+}

@@ -170,7 +170,11 @@ func Build(ctx context.Context, in Input) (Result, error) {
 		result.Traces = append(result.Traces, trace)
 	}
 
-	resolveDestinationCollisions(&plan, result.Traces)
+	occupied := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		occupied[entry.Path] = struct{}{}
+	}
+	resolveDestinationCollisions(&plan, result.Traces, occupied)
 
 	plan.Normalize()
 	if err := plan.Validate(); err != nil {
@@ -251,14 +255,19 @@ func confidenceFor(decision Decision) float64 {
 	}
 }
 
-// resolveDestinationCollisions downgrades relocations that would land on
-// the same destination.
+// resolveDestinationCollisions downgrades relocations whose destination is
+// not free.
 //
-// Two projects with the same base name outside the canonical root both want
-// canonical/<name>. Applying the second would collide with the first, so
-// neither is proposed: the collision is reported and both go to
-// investigate.
-func resolveDestinationCollisions(built *core.Plan, traces []Trace) {
+// A destination collides in two ways: two projects with the same base name
+// both want canonical/<name>, or the destination is already occupied by
+// something the scan observed. Either way the relocation cannot be applied
+// as written, so it is downgraded to investigate and the collision is
+// reported rather than left for apply to discover.
+//
+// The occupancy check sees what the inventory saw. A destination outside
+// every scanned root is unknown to the planner, and apply revalidates the
+// destination before mutating regardless.
+func resolveDestinationCollisions(built *core.Plan, traces []Trace, occupied map[string]struct{}) {
 	byDestination := map[string][]int{}
 	for i, action := range built.Actions {
 		if action.Kind != core.ActionRelocate || action.Destination == "" {
@@ -280,7 +289,8 @@ func resolveDestinationCollisions(built *core.Plan, traces []Trace) {
 
 	for _, destination := range destinations {
 		indexes := byDestination[destination]
-		if len(indexes) < 2 {
+		_, taken := occupied[destination]
+		if len(indexes) < 2 && !taken {
 			continue
 		}
 		others := make([]string, 0, len(indexes))
@@ -289,8 +299,17 @@ func resolveDestinationCollisions(built *core.Plan, traces []Trace) {
 		}
 		for _, i := range indexes {
 			action := &built.Actions[i]
-			reason := fmt.Sprintf("%s is also proposed for %s, so relocating either would collide",
-				strings.Join(without(others, action.Path), ", "), destination)
+			var reason string
+			switch {
+			case taken && len(indexes) > 1:
+				reason = fmt.Sprintf("%s already exists, and %s is also proposed for it",
+					destination, strings.Join(without(others, action.Path), ", "))
+			case taken:
+				reason = fmt.Sprintf("%s already exists, so relocating there would collide with it", destination)
+			default:
+				reason = fmt.Sprintf("%s is also proposed for %s, so relocating either would collide",
+					strings.Join(without(others, action.Path), ", "), destination)
+			}
 			action.Rejected = append(action.Rejected, core.RejectedAction{
 				Kind:     core.ActionRelocate,
 				Rule:     "policy.canonical_root",

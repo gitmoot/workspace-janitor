@@ -134,6 +134,11 @@ type CanonicalRoot struct {
 type Classification struct {
 	// ProjectMarkers are entries that mark a directory as a real project,
 	// for example "go.mod" or ".git".
+	//
+	// Unlike every other list here these are literal file names, not
+	// patterns: the collector detects them with one lstat each, which is
+	// what keeps a default scan a metadata-only pass. A glob is rejected
+	// rather than accepted and silently ignored.
 	ProjectMarkers []string `yaml:"project_markers" json:"project_markers"`
 	// WorktreeMarkers name directories that are task worktrees rather than
 	// primary checkouts.
@@ -515,11 +520,22 @@ func (p *Policy) Validate() core.FieldErrors {
 			errs.Add(field+".path", "must be an absolute path, got %q", root.Path)
 		}
 	}
+	for i, marker := range p.Classification.ProjectMarkers {
+		field := fmt.Sprintf("classification.project_markers[%d]", i)
+		switch {
+		case marker == "":
+			errs.Add(field, "must not be empty")
+		case strings.ContainsAny(marker, "*?["):
+			errs.Add(field, "must be a literal file name, got the pattern %q: "+
+				"markers are detected with a single lstat, so a glob would never match", marker)
+		case strings.ContainsRune(marker, filepath.Separator):
+			errs.Add(field, "must be a file name inside the directory, not a path, got %q", marker)
+		}
+	}
 	for _, group := range []struct {
 		field    string
 		patterns []string
 	}{
-		{"classification.project_markers", p.Classification.ProjectMarkers},
 		{"classification.worktree_markers", p.Classification.WorktreeMarkers},
 		{"classification.generated_names", p.Classification.GeneratedNames},
 		{"classification.cache_names", p.Classification.CacheNames},

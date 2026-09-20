@@ -350,3 +350,41 @@ func TestEnsureDirsCreatesQuarantine(t *testing.T) {
 		}
 	}
 }
+
+// Project markers are detected with one lstat each, so a glob could never
+// match. Accepting one and silently ignoring it would be worse than an
+// error: the operator would believe a classification rule is in force.
+func TestProjectMarkerGlobsAreRejected(t *testing.T) {
+	paths := fixturePaths(t)
+	_, err := parse(t, paths, strings.Join([]string{
+		"roots:",
+		"  - path: /repos",
+		"classification:",
+		"  project_markers:",
+		"    - \"*.csproj\"",
+		"    - go.mod",
+		"    - sub/dir.mod",
+		"",
+	}, "\n"))
+	if err == nil {
+		t.Fatal("expected a glob in project_markers to be rejected")
+	}
+	message := err.Error()
+	for _, want := range []string{"project_markers[0]", "literal file name", "project_markers[2]"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("error %q does not mention %q", message, want)
+		}
+	}
+
+	// Literal markers remain valid, and the other lists still take globs.
+	if _, err := parse(t, paths, strings.Join([]string{
+		"roots:",
+		"  - path: /repos",
+		"classification:",
+		"  project_markers: [go.mod, .git]",
+		"  cache_names: [\"*-cache\"]",
+		"",
+	}, "\n")); err != nil {
+		t.Errorf("literal markers and glob cache names must be accepted: %v", err)
+	}
+}
