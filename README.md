@@ -10,7 +10,8 @@ deletion is always preceded by quarantine.
 ## Status
 
 This repository contains the **foundation** (issue #2), the **inventory
-collectors** (issue #6), and the **safety engine** (issue #3): the command
+collectors** (issue #6), the **safety engine** (issue #3), and the **policy
+and planner** (issue #7): the command
 tree, configuration and policy loading, the versioned domain contracts, the
 local SQLite store, the output contracts, a bounded fail-closed `scan`, and
 the deterministic protections that decide whether a path may ever be
@@ -23,8 +24,8 @@ mutated.
 | `janitor policy check` | implemented |
 | `janitor doctor` | implemented |
 | `janitor version` | implemented |
-| `janitor plan` | not implemented (issue #7) |
-| `janitor explain` | not implemented (issue #7) |
+| `janitor plan` | implemented |
+| `janitor explain` | implemented |
 | `janitor apply` | not implemented (issue #4) |
 | `janitor restore` | not implemented (issue #4) |
 
@@ -163,6 +164,51 @@ janitor --format json scan     # machine-readable inventory and collector report
 | `1` | the command ran and failed |
 | `2` | the invocation or configuration was rejected before any work |
 | `3` | the command exists in the contract but is not implemented in this build |
+
+## Planning
+
+`janitor plan` turns one scan into typed actions: `keep`, `relocate`,
+`quarantine`, `investigate`, and — only where an operator wrote a rule
+saying so — `delete_candidate`. The built-in policy never recommends a
+direct deletion.
+
+Rules run in precedence order, and the first tier that has an opinion
+decides:
+
+| Tier | Source |
+| --- | --- |
+| `safety` | a refusal from the safety engine; nothing overrides it |
+| `protected` | protected paths and canonical roots |
+| `explicit` | rules the operator wrote, such as cache rules |
+| `builtin` | the built-in classification defaults |
+| `fallback` | investigate, when nothing else applied |
+
+Within a tier, the **safer** action wins and the losing rule is reported as
+a conflict. File order is never consulted: rules sort by tier, then
+specificity, then name, so reordering a policy file cannot change a
+decision.
+
+A plan is bound to the scan, the evidence digest, and the policy digest it
+was built from, and is immutable once stored. Re-planning unchanged inputs
+produces the same plan id and reuses the stored plan; using a plan whose
+evidence or policy has changed is refused. Approval is recorded beside the
+plan:
+
+```sh
+janitor plan                              # build and store a plan
+janitor plan --approve <action-id|path>   # approve one mutating action
+janitor plan --approve-all                # approve every mutating action
+janitor explain /path/to/thing            # trace one decision
+```
+
+`explain` prints the winning rules and their reasons, the alternatives that
+were rejected and why, the collected evidence, the safety verdict, and
+whether the action is approved.
+
+A model classifier is not part of this: when one is added (issue #9) it is
+consulted only after the deterministic rules have run, only for entries they
+left ambiguous, and its answer is accepted only if it is safer than what the
+rules decided.
 
 ## Configuration
 

@@ -200,20 +200,31 @@ func (t *Tx) SavePlan(ctx context.Context, plan core.Plan) error {
 	if err := plan.Validate(); err != nil {
 		return fmt.Errorf("store: invalid plan: %w", err)
 	}
+	// A plan is immutable once written. Re-saving the identical document is
+	// harmless, but changing one behind its id would invalidate every
+	// review, approval, and apply decision already made against it.
+	existing, err := t.Plan(ctx, plan.ID)
+	switch {
+	case err == nil:
+		same, compareErr := plansEqual(existing, plan)
+		if compareErr != nil {
+			return compareErr
+		}
+		if !same {
+			return fmt.Errorf("%w: plan %s already exists with different contents", ErrImmutable, plan.ID)
+		}
+		return nil
+	case !errors.Is(err, ErrNotFound):
+		return err
+	}
+
 	if _, err := t.tx.ExecContext(ctx,
-		`INSERT INTO plans (id, scan_id, contract_version, status, created_at)
-		 VALUES (?, ?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET
-		   scan_id = excluded.scan_id,
-		   contract_version = excluded.contract_version,
-		   status = excluded.status,
-		   created_at = excluded.created_at`,
+		`INSERT INTO plans (id, scan_id, contract_version, status, created_at, evidence_digest, policy_digest)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		plan.ID, plan.ScanID, plan.ContractVersion, string(plan.Status), formatTime(plan.CreatedAt),
+		plan.EvidenceDigest, plan.PolicyDigest,
 	); err != nil {
 		return fmt.Errorf("store: save plan %s: %w", plan.ID, err)
-	}
-	if _, err := t.tx.ExecContext(ctx, `DELETE FROM actions WHERE plan_id = ?`, plan.ID); err != nil {
-		return fmt.Errorf("store: clear actions of plan %s: %w", plan.ID, err)
 	}
 	for _, action := range plan.Actions {
 		reasons, err := core.MarshalJSON(stringsOrEmpty(action.Reasons))
@@ -224,14 +235,24 @@ func (t *Tx) SavePlan(ctx context.Context, plan core.Plan) error {
 		if err != nil {
 			return fmt.Errorf("store: encode guards of action %s: %w", action.ID, err)
 		}
+		rules, err := core.MarshalJSON(stringsOrEmpty(action.Rules))
+		if err != nil {
+			return fmt.Errorf("store: encode rules of action %s: %w", action.ID, err)
+		}
+		rejected, err := core.MarshalJSON(rejectedOrEmpty(action.Rejected))
+		if err != nil {
+			return fmt.Errorf("store: encode rejected alternatives of action %s: %w", action.ID, err)
+		}
 		if _, err := t.tx.ExecContext(ctx,
 			`INSERT INTO actions
-			   (id, plan_id, path, kind, retention, confidence, status, destination, device, inode, reasons, guards, created_at, applied_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			action.ID, plan.ID, action.Path, string(action.Kind), string(action.Retention),
+			   (id, plan_id, path, kind, class, retention, confidence, status, destination, device, inode,
+			    fingerprint, reasons, rules, rejected, guards, created_at, applied_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			action.ID, plan.ID, action.Path, string(action.Kind), string(action.Class), string(action.Retention),
 			action.Confidence, string(action.Status), action.Destination,
-			int64(action.FilesystemID.Device), int64(action.FilesystemID.Inode),
-			string(reasons), string(guards), formatTime(action.CreatedAt), nullableTime(action.AppliedAt),
+			int64(action.FilesystemID.Device), int64(action.FilesystemID.Inode), action.Fingerprint,
+			string(reasons), string(rules), string(rejected), string(guards),
+			formatTime(action.CreatedAt), nullableTime(action.AppliedAt),
 		); err != nil {
 			return fmt.Errorf("store: insert action %s: %w", action.ID, err)
 		}
@@ -247,8 +268,10 @@ func (t *Tx) Plan(ctx context.Context, id string) (core.Plan, error) {
 		createdAt string
 	)
 	err := t.tx.QueryRowContext(ctx,
-		`SELECT id, scan_id, contract_version, status, created_at FROM plans WHERE id = ?`, id).
-		Scan(&plan.ID, &plan.ScanID, &plan.ContractVersion, &status, &createdAt)
+		`SELECT id, scan_id, contract_version, status, created_at, evidence_digest, policy_digest
+		 FROM plans WHERE id = ?`, id).
+		Scan(&plan.ID, &plan.ScanID, &plan.ContractVersion, &status, &createdAt,
+			&plan.EvidenceDigest, &plan.PolicyDigest)
 	if errors.Is(err, sql.ErrNoRows) {
 		return core.Plan{}, fmt.Errorf("%w: plan %s", ErrNotFound, id)
 	}
@@ -271,7 +294,8 @@ func (t *Tx) Plan(ctx context.Context, id string) (core.Plan, error) {
 
 func (t *Tx) planActions(ctx context.Context, planID string) ([]core.Action, error) {
 	rows, err := t.tx.QueryContext(ctx,
-		`SELECT id, plan_id, path, kind, retention, confidence, status, destination, device, inode, reasons, guards, created_at, applied_at
+		`SELECT id, plan_id, path, kind, class, retention, confidence, status, destination, device, inode,
+		        fingerprint, reasons, rules, rejected, guards, created_at, applied_at
 		 FROM actions WHERE plan_id = ? ORDER BY path, id`, planID)
 	if err != nil {
 		return nil, fmt.Errorf("store: list actions of plan %s: %w", planID, err)
@@ -281,17 +305,29 @@ func (t *Tx) planActions(ctx context.Context, planID string) ([]core.Action, err
 	for rows.Next() {
 		var (
 			action              core.Action
-			kind, retention     string
+			kind, class         string
+			retention           string
 			status, reasonsJSON string
+			rulesJSON           string
+			rejectedJSON        string
 			guardsJSON          string
 			createdAt           string
 			appliedAt           sql.NullString
 			device, inode       int64
 		)
-		if err := rows.Scan(&action.ID, &action.PlanID, &action.Path, &kind, &retention,
-			&action.Confidence, &status, &action.Destination, &device, &inode,
-			&reasonsJSON, &guardsJSON, &createdAt, &appliedAt); err != nil {
+		if err := rows.Scan(&action.ID, &action.PlanID, &action.Path, &kind, &class, &retention,
+			&action.Confidence, &status, &action.Destination, &device, &inode, &action.Fingerprint,
+			&reasonsJSON, &rulesJSON, &rejectedJSON, &guardsJSON, &createdAt, &appliedAt); err != nil {
 			return nil, fmt.Errorf("store: scan action row: %w", err)
+		}
+		if action.Class, err = core.ParseArtifactClass(class); err != nil {
+			return nil, fmt.Errorf("store: action %s: %w", action.ID, err)
+		}
+		if err := json.Unmarshal([]byte(rulesJSON), &action.Rules); err != nil {
+			return nil, fmt.Errorf("store: decode rules of action %s: %w", action.ID, err)
+		}
+		if err := json.Unmarshal([]byte(rejectedJSON), &action.Rejected); err != nil {
+			return nil, fmt.Errorf("store: decode rejected alternatives of action %s: %w", action.ID, err)
 		}
 		if action.Kind, err = core.ParseActionKind(kind); err != nil {
 			return nil, fmt.Errorf("store: action %s: %w", action.ID, err)
@@ -531,4 +567,118 @@ func encodeScanColumns(scan core.Scan) (roots string, collectors string, err err
 		return "", "", fmt.Errorf("store: encode collector reports of scan %s: %w", scan.ID, err)
 	}
 	return string(rootsJSON), string(collectorsJSON), nil
+}
+
+// ErrImmutable reports an attempt to change a record that may not change.
+var ErrImmutable = errors.New("store: record is immutable")
+
+// plansEqual compares the content of two plan documents.
+//
+// Creation timestamps are excluded: re-running the planner over the same
+// scan, evidence, and policy must produce the same plan, and it would be
+// absurd for replaying a deterministic computation to be rejected as a
+// mutation merely because the clock moved.
+func plansEqual(a, b core.Plan) (bool, error) {
+	a = withoutTimestamps(a)
+	b = withoutTimestamps(b)
+	a.Normalize()
+	b.Normalize()
+	first, err := core.MarshalJSON(a)
+	if err != nil {
+		return false, fmt.Errorf("store: encode stored plan %s: %w", a.ID, err)
+	}
+	second, err := core.MarshalJSON(b)
+	if err != nil {
+		return false, fmt.Errorf("store: encode plan %s: %w", b.ID, err)
+	}
+	return string(first) == string(second), nil
+}
+
+// withoutTimestamps copies a plan with its creation times cleared.
+func withoutTimestamps(plan core.Plan) core.Plan {
+	out := plan
+	out.CreatedAt = time.Time{}
+	out.Actions = append([]core.Action(nil), plan.Actions...)
+	for i := range out.Actions {
+		out.Actions[i].CreatedAt = time.Time{}
+	}
+	return out
+}
+
+func rejectedOrEmpty(v []core.RejectedAction) []core.RejectedAction {
+	if v == nil {
+		return []core.RejectedAction{}
+	}
+	return v
+}
+
+// Approve records a human approval for one action of a plan.
+//
+// Approvals are stored separately from the plan, which is immutable, and
+// are idempotent: approving twice is not an error, and does not rewrite the
+// first approval's timestamp.
+func (t *Tx) Approve(ctx context.Context, approval core.Approval) error {
+	approval.Normalize()
+	if err := approval.Validate(); err != nil {
+		return fmt.Errorf("store: invalid approval: %w", err)
+	}
+	_, err := t.tx.ExecContext(ctx,
+		`INSERT INTO approvals (plan_id, action_id, approver, approved_at, note)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(plan_id, action_id) DO NOTHING`,
+		approval.PlanID, approval.ActionID, approval.Approver,
+		formatTime(approval.ApprovedAt), approval.Note)
+	if err != nil {
+		return fmt.Errorf("store: approve action %s: %w", approval.ActionID, err)
+	}
+	return nil
+}
+
+// Approvals lists the approvals recorded for a plan, ordered by action id.
+func (t *Tx) Approvals(ctx context.Context, planID string) ([]core.Approval, error) {
+	rows, err := t.tx.QueryContext(ctx,
+		`SELECT plan_id, action_id, approver, approved_at, note
+		 FROM approvals WHERE plan_id = ? ORDER BY action_id`, planID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list approvals of plan %s: %w", planID, err)
+	}
+	defer rows.Close()
+	out := []core.Approval{}
+	for rows.Next() {
+		var (
+			approval   core.Approval
+			approvedAt string
+		)
+		if err := rows.Scan(&approval.PlanID, &approval.ActionID, &approval.Approver,
+			&approvedAt, &approval.Note); err != nil {
+			return nil, fmt.Errorf("store: scan approval row: %w", err)
+		}
+		if approval.ApprovedAt, err = parseTime(approvedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, approval)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list approvals of plan %s: %w", planID, err)
+	}
+	return out, nil
+}
+
+// LatestPlan returns the most recent plan for a scan, or every scan when
+// scanID is empty.
+func (t *Tx) LatestPlan(ctx context.Context, scanID string) (core.Plan, error) {
+	query := `SELECT id FROM plans ORDER BY created_at DESC, id DESC LIMIT 1`
+	args := []any{}
+	if scanID != "" {
+		query = `SELECT id FROM plans WHERE scan_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`
+		args = append(args, scanID)
+	}
+	var id string
+	switch err := t.tx.QueryRowContext(ctx, query, args...).Scan(&id); {
+	case errors.Is(err, sql.ErrNoRows):
+		return core.Plan{}, fmt.Errorf("%w: no plan has been created yet", ErrNotFound)
+	case err != nil:
+		return core.Plan{}, fmt.Errorf("store: latest plan: %w", err)
+	}
+	return t.Plan(ctx, id)
 }

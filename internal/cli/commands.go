@@ -74,28 +74,48 @@ func scanCommand() *command {
 }
 
 func planCommand() *command {
-	return planned(&command{
-		name:     "plan",
-		usage:    "janitor plan [flags]",
-		summary:  "Turn the latest scan into a reviewable, reversible plan",
-		tracking: "issue #7",
-		long:     "Applies deterministic safety rules to a scan and emits proposed actions.",
-	}, func(fs *flag.FlagSet) {
-		fs.String("scan", "", "scan id to plan from (default: the most recent scan)")
-		fs.Bool("jev", false, "allow the model classifier for ambiguous entries")
-	})
+	return &command{
+		name:    "plan",
+		usage:   "janitor plan [flags]",
+		summary: "Turn the latest scan into a reviewable plan",
+		long: "Applies deterministic rules to a scan and emits typed actions: keep,\n" +
+			"relocate, quarantine, or investigate. Rules run in precedence order and\n" +
+			"a disagreement between them always resolves to the safer action.\n\n" +
+			"A plan is bound to the scan, the evidence, and the policy it was built\n" +
+			"from, and is immutable once stored. Approving selects actions by id or\n" +
+			"path; it never edits the plan.",
+		register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
+			opts := planOptions{approver: "operator"}
+			fs.StringVar(&opts.scanID, "scan", "", "scan id to plan from (default: the most recent completed scan)")
+			fs.StringVar(&opts.planID, "plan", "", "load a stored plan instead of building one")
+			fs.StringVar(&opts.approve, "approve", "", "comma-separated action ids or paths to approve")
+			fs.BoolVar(&opts.approveAll, "approve-all", false, "approve every mutating action in the plan")
+			fs.StringVar(&opts.approver, "approver", "operator", "who is recorded as approving")
+			fs.StringVar(&opts.note, "note", "", "note stored with the approval")
+			fs.BoolVar(&opts.noPersist, "no-store", false, "report the plan without writing it to the database")
+			return func(ctx context.Context, e *env, args []string) error {
+				return runPlan(ctx, e, args, opts)
+			}
+		},
+	}
 }
 
 func explainCommand() *command {
-	return planned(&command{
-		name:     "explain",
-		usage:    "janitor explain [flags] <path>",
-		summary:  "Show the evidence and rules behind a decision for one path",
-		tracking: "issue #7",
-		long:     "Prints every collected signal, protection, and rule that produced the recommendation.",
-	}, func(fs *flag.FlagSet) {
-		fs.String("plan", "", "plan id to explain against (default: the most recent plan)")
-	})
+	return &command{
+		name:    "explain",
+		usage:   "janitor explain [flags] <path>",
+		summary: "Show the evidence and rules behind a decision for one path",
+		long: "Traces one action: the rules that won, the alternatives that were\n" +
+			"rejected and why, the collected evidence, the safety verdict, and\n" +
+			"whether the action has been approved.",
+		register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
+			opts := explainOptions{}
+			fs.StringVar(&opts.planID, "plan", "", "plan id to explain against (default: the most recent plan)")
+			return func(ctx context.Context, e *env, args []string) error {
+				return runExplain(ctx, e, args, opts)
+			}
+		},
+	}
 }
 
 func applyCommand() *command {

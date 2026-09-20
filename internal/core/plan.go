@@ -262,19 +262,40 @@ func ParseActionStatus(s string) (ActionStatus, error) {
 
 // Action is one planned operation on one path.
 type Action struct {
-	ID           string       `json:"id"`
-	PlanID       string       `json:"plan_id"`
-	Path         string       `json:"path"`
-	Kind         ActionKind   `json:"kind"`
-	Retention    Retention    `json:"retention"`
-	Confidence   float64      `json:"confidence"`
-	Status       ActionStatus `json:"status"`
-	Destination  string       `json:"destination,omitempty"`
-	FilesystemID FilesystemID `json:"filesystem_id"`
-	Reasons      []string     `json:"reasons,omitempty"`
-	Guards       []string     `json:"guards,omitempty"`
-	CreatedAt    time.Time    `json:"created_at"`
-	AppliedAt    *time.Time   `json:"applied_at,omitempty"`
+	ID           string        `json:"id"`
+	PlanID       string        `json:"plan_id"`
+	Path         string        `json:"path"`
+	Kind         ActionKind    `json:"kind"`
+	Class        ArtifactClass `json:"class"`
+	Retention    Retention     `json:"retention"`
+	Confidence   float64       `json:"confidence"`
+	Status       ActionStatus  `json:"status"`
+	Destination  string        `json:"destination,omitempty"`
+	FilesystemID FilesystemID  `json:"filesystem_id"`
+	// Fingerprint is the entry fingerprint this action was planned
+	// against. Apply revalidates it before mutating anything.
+	Fingerprint string   `json:"fingerprint,omitempty"`
+	Reasons     []string `json:"reasons,omitempty"`
+	// Rules names every deterministic rule that contributed, in
+	// precedence order, so a recommendation can be traced to its source.
+	Rules []string `json:"rules,omitempty"`
+	// Rejected records the alternatives that lost, and why. Without it an
+	// explanation can only justify the winner, not the choice.
+	Rejected  []RejectedAction `json:"rejected,omitempty"`
+	Guards    []string         `json:"guards,omitempty"`
+	CreatedAt time.Time        `json:"created_at"`
+	AppliedAt *time.Time       `json:"applied_at,omitempty"`
+}
+
+// RejectedAction is an alternative the planner considered and did not take.
+type RejectedAction struct {
+	Kind   ActionKind `json:"kind"`
+	Rule   string     `json:"rule"`
+	Reason string     `json:"reason"`
+	// Conflict marks a genuine disagreement between rules of the same
+	// precedence, as opposed to an opinion a higher-precedence tier simply
+	// pre-empted. Only the former is worth an operator's attention.
+	Conflict bool `json:"conflict,omitempty"`
 }
 
 // Normalize applies defaults and normalizes timestamps to UTC.
@@ -284,6 +305,9 @@ func (a *Action) Normalize() {
 	}
 	if a.Retention == "" {
 		a.Retention = RetentionNone
+	}
+	if a.Class == "" {
+		a.Class = ClassUnknown
 	}
 	a.CreatedAt = a.CreatedAt.UTC()
 	if a.AppliedAt != nil {
@@ -348,7 +372,14 @@ type Plan struct {
 	ScanID          string     `json:"scan_id"`
 	Status          PlanStatus `json:"status"`
 	CreatedAt       time.Time  `json:"created_at"`
-	Actions         []Action   `json:"actions"`
+	// EvidenceDigest binds the plan to the exact inventory it was built
+	// from. Applying against a scan whose evidence has changed is refused:
+	// the plan describes paths that no longer look the way it assumed.
+	EvidenceDigest string `json:"evidence_digest"`
+	// PolicyDigest binds the plan to the policy that produced it, so a
+	// changed rule set is visible rather than silently applied.
+	PolicyDigest string   `json:"policy_digest"`
+	Actions      []Action `json:"actions"`
 }
 
 // Normalize applies defaults, stamps the plan id on every action, and sorts
@@ -479,6 +510,74 @@ func (u *ModelUsage) Validate() error {
 	}
 	if u.CreatedAt.IsZero() {
 		errs.Add("created_at", "must be set")
+	}
+	return errs.ErrorOrNil()
+}
+
+// riskRank orders action kinds from least to most destructive. Conflict
+// resolution always takes the lower rank, so a disagreement between rules
+// can only ever move a decision toward caution.
+var riskRank = map[ActionKind]int{
+	ActionKeep:            0,
+	ActionInvestigate:     1,
+	ActionRelocate:        2,
+	ActionQuarantine:      3,
+	ActionDeleteCandidate: 4,
+}
+
+// RiskRank returns the relative risk of an action kind. A higher rank means
+// a less recoverable outcome.
+func (k ActionKind) RiskRank() int {
+	if rank, ok := riskRank[k]; ok {
+		return rank
+	}
+	// An unrecognised kind is treated as the most dangerous thing it could
+	// be, so an unmapped addition cannot win a conflict by default.
+	return len(riskRank)
+}
+
+// Safer returns whichever kind is less destructive. Ties keep the receiver.
+func (k ActionKind) Safer(other ActionKind) ActionKind {
+	if other.RiskRank() < k.RiskRank() {
+		return other
+	}
+	return k
+}
+
+// Approval records a human decision to allow one action of a plan.
+//
+// Approvals live beside the plan rather than inside it: a plan is immutable
+// once written, and approving must not require editing its internals.
+type Approval struct {
+	PlanID     string    `json:"plan_id"`
+	ActionID   string    `json:"action_id"`
+	Approver   string    `json:"approver"`
+	ApprovedAt time.Time `json:"approved_at"`
+	Note       string    `json:"note,omitempty"`
+}
+
+// Normalize applies defaults and normalizes the timestamp to UTC.
+func (a *Approval) Normalize() {
+	if a.Approver == "" {
+		a.Approver = "operator"
+	}
+	a.ApprovedAt = a.ApprovedAt.UTC()
+}
+
+// Validate reports every field-level problem with the approval.
+func (a *Approval) Validate() error {
+	var errs FieldErrors
+	if strings.TrimSpace(a.PlanID) == "" {
+		errs.Add("plan_id", "must not be empty")
+	}
+	if strings.TrimSpace(a.ActionID) == "" {
+		errs.Add("action_id", "must not be empty")
+	}
+	if strings.TrimSpace(a.Approver) == "" {
+		errs.Add("approver", "must not be empty")
+	}
+	if a.ApprovedAt.IsZero() {
+		errs.Add("approved_at", "must be set")
 	}
 	return errs.ErrorOrNil()
 }

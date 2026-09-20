@@ -38,6 +38,31 @@ retention:
   # protect.paths automatically: the janitor never acts on its own staging area.
   quarantine_dir: ~/.local/state/workspace-janitor/quarantine
 
+# Where entries of a class are supposed to live. A primary project found
+# outside its canonical root is a relocation candidate, never a deletion
+# candidate.
+canonical_roots:
+  - class: primary_project
+    path: ~/repos
+
+# Name-based signals for the built-in classifications. Each list is matched
+# against the base name.
+classification:
+  project_markers: [".git", "go.mod", "package.json", "Cargo.toml", "pyproject.toml"]
+  worktree_markers: ["*-wt-*", "*.worktree", "worktrees"]
+  generated_names: ["node_modules", "dist", "build", "target", ".venv", "__pycache__", ".next"]
+  cache_names: [".cache", "*-cache", ".uv-cache", ".gradle", ".pytest_cache"]
+  backup_names: ["*.bak", "*-backup", "backup", "backups", "*.tar.gz", "*.zip"]
+  operational_names: [".gitmoot", "fleet-tools", ".ssh", ".config"]
+  evidence_names: ["evidence", "receipts", "incidents", "*-evidence"]
+
+ownership:
+  # Entries owned by another user go to investigate rather than to any
+  # mutating action.
+  investigate_foreign_owner: true
+  # 0 means "do not check ownership".
+  expected_uid: 0
+
 # Known regenerable caches. action is one of keep, quarantine,
 # delete_candidate, or investigate (the default when omitted).
 caches:
