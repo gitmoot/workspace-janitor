@@ -593,3 +593,65 @@ func TestRulesAndReasonsStayAligned(t *testing.T) {
 		}
 	}
 }
+
+// A destination that already exists cannot be relocated onto, even when no
+// other action wants it.
+func TestRelocationOntoAnExistingPathIsReported(t *testing.T) {
+	policy := fixturePolicy()
+	existing := entryAt("/home/fixture/repos/dup")
+	candidate := entryAt("/home/fixture/a/dup", withGit(&core.GitState{
+		RepoRoot: "/home/fixture/a/dup", UpstreamKnown: true,
+	}))
+
+	result := buildPlan(t, []core.Entry{existing, candidate}, policy, nil)
+	action := actionFor(t, result, "/home/fixture/a/dup")
+	if action.Kind != core.ActionInvestigate {
+		t.Fatalf("action = %q, want investigate: the destination is occupied", action.Kind)
+	}
+	if action.Destination != "" {
+		t.Errorf("destination = %q, want it cleared", action.Destination)
+	}
+	reported := false
+	for _, rejected := range action.Rejected {
+		if rejected.Conflict && strings.Contains(rejected.Reason, "already exists") {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Errorf("the occupied destination was not reported: %+v", action.Rejected)
+	}
+
+	// A free destination still relocates, or the guard would block
+	// everything and teach operators to ignore it.
+	free := entryAt("/home/fixture/b/solo", withGit(&core.GitState{
+		RepoRoot: "/home/fixture/b/solo", UpstreamKnown: true,
+	}))
+	solo := actionFor(t, buildPlan(t, []core.Entry{free}, policy, nil), "/home/fixture/b/solo")
+	if solo.Kind != core.ActionRelocate || solo.Destination != "/home/fixture/repos/solo" {
+		t.Errorf("an uncontested relocation was blocked: %+v", solo)
+	}
+}
+
+// A downgraded relocation is a conflict resolution, not an unopposed rule,
+// so its confidence must say so.
+func TestCollisionDowngradeLowersConfidence(t *testing.T) {
+	policy := fixturePolicy()
+	occupied := entryAt("/home/fixture/repos/dup")
+	candidate := entryAt("/home/fixture/a/dup", withGit(&core.GitState{
+		RepoRoot: "/home/fixture/a/dup", UpstreamKnown: true,
+	}))
+	free := entryAt("/home/fixture/b/solo", withGit(&core.GitState{
+		RepoRoot: "/home/fixture/b/solo", UpstreamKnown: true,
+	}))
+
+	result := buildPlan(t, []core.Entry{occupied, candidate, free}, policy, nil)
+	downgraded := actionFor(t, result, "/home/fixture/a/dup")
+	if downgraded.Confidence != conflictConfidence {
+		t.Errorf("confidence = %v, want %v for a collision-downgraded action",
+			downgraded.Confidence, conflictConfidence)
+	}
+	if uncontested := actionFor(t, result, "/home/fixture/b/solo"); uncontested.Confidence != settledConfidence {
+		t.Errorf("confidence = %v, want %v for an unopposed relocation",
+			uncontested.Confidence, settledConfidence)
+	}
+}

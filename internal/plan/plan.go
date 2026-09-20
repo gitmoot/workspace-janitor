@@ -170,7 +170,11 @@ func Build(ctx context.Context, in Input) (Result, error) {
 		result.Traces = append(result.Traces, trace)
 	}
 
-	resolveDestinationCollisions(&plan, result.Traces)
+	occupied := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		occupied[entry.Path] = struct{}{}
+	}
+	resolveDestinationCollisions(&plan, result.Traces, occupied)
 
 	plan.Normalize()
 	if err := plan.Validate(); err != nil {
@@ -238,27 +242,39 @@ func joinReasons(reasons []string) string {
 	}
 }
 
-// confidenceFor reports how firm a decision is. A conflict or an ambiguous
-// classification is less certain than an unopposed rule.
+// Confidence levels. A decision reached over a disagreement, or with no
+// classification at all, is less certain than an unopposed rule.
+const (
+	ambiguousConfidence = 0.3
+	conflictConfidence  = 0.6
+	settledConfidence   = 0.9
+)
+
+// confidenceFor reports how firm a decision is.
 func confidenceFor(decision Decision) float64 {
 	switch {
 	case decision.Ambiguous:
-		return 0.3
+		return ambiguousConfidence
 	case len(decision.Conflicts) > 0:
-		return 0.6
+		return conflictConfidence
 	default:
-		return 0.9
+		return settledConfidence
 	}
 }
 
-// resolveDestinationCollisions downgrades relocations that would land on
-// the same destination.
+// resolveDestinationCollisions downgrades relocations whose destination is
+// not free.
 //
-// Two projects with the same base name outside the canonical root both want
-// canonical/<name>. Applying the second would collide with the first, so
-// neither is proposed: the collision is reported and both go to
-// investigate.
-func resolveDestinationCollisions(built *core.Plan, traces []Trace) {
+// A destination collides in two ways: two projects with the same base name
+// both want canonical/<name>, or the destination is already occupied by
+// something the scan observed. Either way the relocation cannot be applied
+// as written, so it is downgraded to investigate and the collision is
+// reported rather than left for apply to discover.
+//
+// The occupancy check sees what the inventory saw. A destination outside
+// every scanned root is unknown to the planner, and apply revalidates the
+// destination before mutating regardless.
+func resolveDestinationCollisions(built *core.Plan, traces []Trace, occupied map[string]struct{}) {
 	byDestination := map[string][]int{}
 	for i, action := range built.Actions {
 		if action.Kind != core.ActionRelocate || action.Destination == "" {
@@ -280,7 +296,8 @@ func resolveDestinationCollisions(built *core.Plan, traces []Trace) {
 
 	for _, destination := range destinations {
 		indexes := byDestination[destination]
-		if len(indexes) < 2 {
+		_, taken := occupied[destination]
+		if len(indexes) < 2 && !taken {
 			continue
 		}
 		others := make([]string, 0, len(indexes))
@@ -289,8 +306,17 @@ func resolveDestinationCollisions(built *core.Plan, traces []Trace) {
 		}
 		for _, i := range indexes {
 			action := &built.Actions[i]
-			reason := fmt.Sprintf("%s is also proposed for %s, so relocating either would collide",
-				strings.Join(without(others, action.Path), ", "), destination)
+			var reason string
+			switch {
+			case taken && len(indexes) > 1:
+				reason = fmt.Sprintf("%s already exists, and %s is also proposed for it",
+					destination, strings.Join(without(others, action.Path), ", "))
+			case taken:
+				reason = fmt.Sprintf("%s already exists, so relocating there would collide with it", destination)
+			default:
+				reason = fmt.Sprintf("%s is also proposed for %s, so relocating either would collide",
+					strings.Join(without(others, action.Path), ", "), destination)
+			}
 			action.Rejected = append(action.Rejected, core.RejectedAction{
 				Kind:     core.ActionRelocate,
 				Rule:     "policy.canonical_root",
@@ -300,6 +326,9 @@ func resolveDestinationCollisions(built *core.Plan, traces []Trace) {
 			action.Kind = core.ActionInvestigate
 			action.Destination = ""
 			action.Retention = core.RetentionNone
+			// The decision is now a conflict resolution, not an unopposed
+			// rule, and the confidence has to say so.
+			action.Confidence = conflictConfidence
 			action.Rules = append(action.Rules, "plan.destination_collision")
 			action.Reasons = append(action.Reasons, reason)
 			if t, ok := traceIndex[action.Path]; ok {

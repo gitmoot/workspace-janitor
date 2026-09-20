@@ -134,6 +134,11 @@ type CanonicalRoot struct {
 type Classification struct {
 	// ProjectMarkers are entries that mark a directory as a real project,
 	// for example "go.mod" or ".git".
+	//
+	// Unlike every other list here these are literal file names, not
+	// patterns: the collector detects them with one lstat each, which is
+	// what keeps a default scan a metadata-only pass. A glob is rejected
+	// rather than accepted and silently ignored.
 	ProjectMarkers []string `yaml:"project_markers" json:"project_markers"`
 	// WorktreeMarkers name directories that are task worktrees rather than
 	// primary checkouts.
@@ -515,11 +520,30 @@ func (p *Policy) Validate() core.FieldErrors {
 			errs.Add(field+".path", "must be an absolute path, got %q", root.Path)
 		}
 	}
+	for i, marker := range p.Classification.ProjectMarkers {
+		field := fmt.Sprintf("classification.project_markers[%d]", i)
+		switch {
+		case marker == "":
+			errs.Add(field, "must not be empty")
+		case strings.ContainsAny(marker, "*?["):
+			errs.Add(field, "must be a literal file name, got the pattern %q: "+
+				"markers are detected with a single lstat, so a glob would never match", marker)
+		case marker == "." || marker == ".." || marker == "/":
+			// These resolve to the directory itself, its parent, or the
+			// filesystem root, so one such entry would mark every scanned
+			// directory as a project.
+			errs.Add(field, "must be a plain file name inside the directory, got %q, which would match every directory", marker)
+		case !validMarkerName(marker):
+			// A nested path does not match everything; it simply is not a
+			// marker. Markers are detected with one lstat of a name inside
+			// the directory.
+			errs.Add(field, "must be a plain file name inside the directory, got %q", marker)
+		}
+	}
 	for _, group := range []struct {
 		field    string
 		patterns []string
 	}{
-		{"classification.project_markers", p.Classification.ProjectMarkers},
 		{"classification.worktree_markers", p.Classification.WorktreeMarkers},
 		{"classification.generated_names", p.Classification.GeneratedNames},
 		{"classification.cache_names", p.Classification.CacheNames},
@@ -567,6 +591,24 @@ func joinRetentions() string {
 		out[i] = string(v)
 	}
 	return strings.Join(out, ", ")
+}
+
+// validMarkerName reports whether a project marker names a single file
+// inside a directory.
+//
+// Rejected: "", "." and ".." (always resolve), anything containing a path
+// separator, and anything filepath.Base does not return unchanged. Callers
+// distinguish the always-matching values from merely nested ones so the
+// diagnostic does not overclaim.
+func validMarkerName(marker string) bool {
+	switch marker {
+	case "", ".", "..":
+		return false
+	}
+	if strings.ContainsRune(marker, '/') || strings.ContainsRune(marker, filepath.Separator) {
+		return false
+	}
+	return filepath.Base(marker) == marker
 }
 
 // clone deep-copies every pattern list.

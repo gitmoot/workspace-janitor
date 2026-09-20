@@ -48,6 +48,9 @@ canonical_roots:
 # Name-based signals for the built-in classifications. Each list is matched
 # against the base name.
 classification:
+  # project_markers are literal file names, not patterns: each is checked
+  # with a single lstat so a default scan stays metadata-only. A glob here
+  # is rejected rather than silently ignored.
   project_markers: [".git", "go.mod", "package.json", "Cargo.toml", "pyproject.toml"]
   worktree_markers: ["*-wt-*", "*.worktree", "worktrees"]
   generated_names: ["node_modules", "dist", "build", "target", ".venv", "__pycache__", ".next"]

@@ -350,3 +350,62 @@ func TestEnsureDirsCreatesQuarantine(t *testing.T) {
 		}
 	}
 }
+
+// Project markers are detected with one lstat each, so a glob could never
+// match. Accepting one and silently ignoring it would be worse than an
+// error: the operator would believe a classification rule is in force.
+func TestProjectMarkerGlobsAreRejected(t *testing.T) {
+	paths := fixturePaths(t)
+	_, err := parse(t, paths, strings.Join([]string{
+		"roots:",
+		"  - path: /repos",
+		"classification:",
+		"  project_markers:",
+		"    - \"*.csproj\"",
+		"    - go.mod",
+		"    - sub/dir.mod",
+		"    - \".\"",
+		"    - \"..\"",
+		"    - \"/\"",
+		"",
+	}, "\n"))
+	if err == nil {
+		t.Fatal("expected a glob in project_markers to be rejected")
+	}
+	message := err.Error()
+	// "." lstats the directory itself, ".." its parent, and "/" the root,
+	// so any of them would mark every scanned directory as a project. A
+	// nested path is merely not a marker, and the message must not claim
+	// otherwise.
+	for _, want := range []string{
+		"project_markers[0]", "literal file name",
+		"project_markers[2]", "project_markers[3]", "project_markers[4]", "project_markers[5]",
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("error %q does not mention %q", message, want)
+		}
+	}
+	for _, line := range strings.Split(message, "\n") {
+		if !strings.Contains(line, "sub/dir.mod") {
+			continue
+		}
+		if strings.Contains(line, "match every directory") {
+			t.Errorf("the message for a nested path overclaims: %q", line)
+		}
+	}
+	if !strings.Contains(message, "\"/\", which would match every directory") {
+		t.Errorf("the message for %q must say it matches everything: %q", "/", message)
+	}
+
+	// Literal markers remain valid, and the other lists still take globs.
+	if _, err := parse(t, paths, strings.Join([]string{
+		"roots:",
+		"  - path: /repos",
+		"classification:",
+		"  project_markers: [go.mod, .git]",
+		"  cache_names: [\"*-cache\"]",
+		"",
+	}, "\n")); err != nil {
+		t.Errorf("literal markers and glob cache names must be accepted: %v", err)
+	}
+}
