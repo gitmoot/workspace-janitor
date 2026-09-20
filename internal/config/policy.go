@@ -120,6 +120,46 @@ type Collectors struct {
 	PM2Dumps    []string `yaml:"pm2_dumps" json:"pm2_dumps"`
 }
 
+// CanonicalRoot declares where entries of a class are supposed to live.
+// An entry of that class found elsewhere is a relocation candidate, never a
+// deletion candidate.
+type CanonicalRoot struct {
+	Class core.ArtifactClass `yaml:"class" json:"class"`
+	Path  string             `yaml:"path" json:"path"`
+}
+
+// Classification supplies the name-based signals the planner uses to sort
+// paths into the built-in classes. Every list is matched against the base
+// name with filepath.Match semantics.
+type Classification struct {
+	// ProjectMarkers are entries that mark a directory as a real project,
+	// for example "go.mod" or ".git".
+	ProjectMarkers []string `yaml:"project_markers" json:"project_markers"`
+	// WorktreeMarkers name directories that are task worktrees rather than
+	// primary checkouts.
+	WorktreeMarkers []string `yaml:"worktree_markers" json:"worktree_markers"`
+	// GeneratedNames are regenerable build outputs.
+	GeneratedNames []string `yaml:"generated_names" json:"generated_names"`
+	// CacheNames are tool caches.
+	CacheNames []string `yaml:"cache_names" json:"cache_names"`
+	// BackupNames are archives and backups, which are kept by default.
+	BackupNames []string `yaml:"backup_names" json:"backup_names"`
+	// OperationalNames are the operator's own tooling, which is kept.
+	OperationalNames []string `yaml:"operational_names" json:"operational_names"`
+	// EvidenceNames are durable records that must never be cleaned up.
+	EvidenceNames []string `yaml:"evidence_names" json:"evidence_names"`
+}
+
+// Ownership configures how foreign-owned entries are treated.
+type Ownership struct {
+	// InvestigateForeignOwner sends entries owned by another user to
+	// investigate rather than proposing any mutation.
+	InvestigateForeignOwner bool `yaml:"investigate_foreign_owner" json:"investigate_foreign_owner"`
+	// ExpectedUID is the owner the planner expects. Zero means "the user
+	// running the scan".
+	ExpectedUID uint32 `yaml:"expected_uid" json:"expected_uid"`
+}
+
 // Safety configures the destination checks of the safety engine.
 //
 // Nothing here can disable a core invariant: the engine's protections are
@@ -143,8 +183,12 @@ type Policy struct {
 	Caches     []CacheRule     `yaml:"caches" json:"caches"`
 	Collectors Collectors      `yaml:"collectors" json:"collectors"`
 	Safety     Safety          `yaml:"safety" json:"safety"`
-	Jev        JevPolicy       `yaml:"jev" json:"jev"`
-	Limits     Limits          `yaml:"limits" json:"limits"`
+
+	CanonicalRoots []CanonicalRoot `yaml:"canonical_roots" json:"canonical_roots"`
+	Classification Classification  `yaml:"classification" json:"classification"`
+	Ownership      Ownership       `yaml:"ownership" json:"ownership"`
+	Jev            JevPolicy       `yaml:"jev" json:"jev"`
+	Limits         Limits          `yaml:"limits" json:"limits"`
 
 	// Source is where the policy came from: a file path, or "built-in
 	// defaults". It is never settable from YAML.
@@ -190,6 +234,16 @@ func DefaultPolicy(p Paths) Policy {
 			CronPaths: []string{"/etc/crontab", "/etc/cron.d"},
 			PM2Dumps:  []string{},
 		},
+		Classification: Classification{
+			ProjectMarkers:   []string{".git", "go.mod", "package.json", "Cargo.toml", "pyproject.toml"},
+			WorktreeMarkers:  []string{"*-wt-*", "*.worktree", "worktrees"},
+			GeneratedNames:   []string{"node_modules", "dist", "build", "target", ".venv", "__pycache__", ".next"},
+			CacheNames:       []string{".cache", "*-cache", ".uv-cache", ".gradle", ".pytest_cache"},
+			BackupNames:      []string{"*.bak", "*-backup", "backup", "backups", "*.tar.gz", "*.zip"},
+			OperationalNames: []string{".gitmoot", "fleet-tools", ".ssh", ".config"},
+			EvidenceNames:    []string{"evidence", "receipts", "incidents", "*-evidence"},
+		},
+		Ownership: Ownership{InvestigateForeignOwner: true},
 		Safety: Safety{
 			// One gibibyte of headroom: enough that a quarantine cannot be
 			// the thing that fills the disk it is protecting.
@@ -240,6 +294,8 @@ func (p Policy) clone() Policy {
 	out.Collectors.SystemdDirs = append([]string(nil), p.Collectors.SystemdDirs...)
 	out.Collectors.CronPaths = append([]string(nil), p.Collectors.CronPaths...)
 	out.Collectors.PM2Dumps = append([]string(nil), p.Collectors.PM2Dumps...)
+	out.CanonicalRoots = append([]CanonicalRoot(nil), p.CanonicalRoots...)
+	out.Classification = p.Classification.clone()
 	return out
 }
 
@@ -318,6 +374,13 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	if p.Collectors.PM2Dumps == nil {
 		p.Collectors.PM2Dumps = []string{}
 	}
+	for i := range p.CanonicalRoots {
+		p.CanonicalRoots[i].Path = expand(fmt.Sprintf("canonical_roots[%d].path", i), p.CanonicalRoots[i].Path)
+	}
+	if p.CanonicalRoots == nil {
+		p.CanonicalRoots = []CanonicalRoot{}
+	}
+	p.Classification = p.Classification.normalized()
 	return errs
 }
 
@@ -436,6 +499,42 @@ func (p *Policy) Validate() core.FieldErrors {
 			errs.Add(bound.field, "must be greater than zero, got %d", bound.value)
 		}
 	}
+	seenClass := make(map[core.ArtifactClass]int, len(p.CanonicalRoots))
+	for i, root := range p.CanonicalRoots {
+		field := fmt.Sprintf("canonical_roots[%d]", i)
+		if !root.Class.Valid() {
+			errs.Add(field+".class", "unknown artifact class %q", string(root.Class))
+		} else if first, dup := seenClass[root.Class]; dup {
+			errs.Add(field+".class", "duplicates canonical_roots[%d].class %q", first, string(root.Class))
+		} else {
+			seenClass[root.Class] = i
+		}
+		if !core.IsCanonicalPath(root.Path) {
+			errs.Add(field+".path", "must be an absolute path, got %q", root.Path)
+		}
+	}
+	for _, group := range []struct {
+		field    string
+		patterns []string
+	}{
+		{"classification.project_markers", p.Classification.ProjectMarkers},
+		{"classification.worktree_markers", p.Classification.WorktreeMarkers},
+		{"classification.generated_names", p.Classification.GeneratedNames},
+		{"classification.cache_names", p.Classification.CacheNames},
+		{"classification.backup_names", p.Classification.BackupNames},
+		{"classification.operational_names", p.Classification.OperationalNames},
+		{"classification.evidence_names", p.Classification.EvidenceNames},
+	} {
+		for i, pattern := range group.patterns {
+			if pattern == "" {
+				errs.Add(fmt.Sprintf("%s[%d]", group.field, i), "must not be empty")
+				continue
+			}
+			if _, err := filepath.Match(pattern, "probe"); err != nil {
+				errs.Add(fmt.Sprintf("%s[%d]", group.field, i), "invalid pattern %q: %v", pattern, err)
+			}
+		}
+	}
 	if p.Safety.MinFreeBytes < 0 {
 		errs.Add("safety.min_free_bytes", "must not be negative, got %d", p.Safety.MinFreeBytes)
 	}
@@ -466,4 +565,39 @@ func joinRetentions() string {
 		out[i] = string(v)
 	}
 	return strings.Join(out, ", ")
+}
+
+// clone deep-copies every pattern list.
+func (c Classification) clone() Classification {
+	out := c
+	for _, pair := range []struct {
+		src *[]string
+		dst *[]string
+	}{
+		{&c.ProjectMarkers, &out.ProjectMarkers},
+		{&c.WorktreeMarkers, &out.WorktreeMarkers},
+		{&c.GeneratedNames, &out.GeneratedNames},
+		{&c.CacheNames, &out.CacheNames},
+		{&c.BackupNames, &out.BackupNames},
+		{&c.OperationalNames, &out.OperationalNames},
+		{&c.EvidenceNames, &out.EvidenceNames},
+	} {
+		*pair.dst = append([]string(nil), *pair.src...)
+	}
+	return out
+}
+
+// normalized replaces nil lists with empty ones so the effective policy
+// renders identically however it was written.
+func (c Classification) normalized() Classification {
+	out := c
+	for _, list := range []*[]string{
+		&out.ProjectMarkers, &out.WorktreeMarkers, &out.GeneratedNames,
+		&out.CacheNames, &out.BackupNames, &out.OperationalNames, &out.EvidenceNames,
+	} {
+		if *list == nil {
+			*list = []string{}
+		}
+	}
+	return out
 }

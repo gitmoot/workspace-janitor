@@ -167,14 +167,7 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 	// decisions, but it must report which paths may never be mutated and
 	// why, with the remedy for each refusal.
 	target := safety.ResolveTarget(policy.Retention.QuarantineDir)
-	enginePolicy := safety.Policy{
-		ProtectedPaths:           policy.Protect.Paths,
-		NamePatterns:             policy.Protect.NamePatterns,
-		StateDir:                 paths.StateDir,
-		QuarantineDir:            policy.Retention.QuarantineDir,
-		AllowCrossFilesystemCopy: policy.Safety.AllowCrossFilesystemQuarantine,
-		MinFreeBytes:             policy.Safety.MinFreeBytes,
-	}
+	engine := enginePolicy(paths, policy)
 
 	report := scanReport{
 		Scan:            scan,
@@ -203,7 +196,7 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 		}
 		verdict := safety.Evaluate(safety.Input{
 			Entry:  entry,
-			Policy: enginePolicy,
+			Policy: engine,
 			Target: &target,
 			Now:    now,
 		})

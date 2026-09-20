@@ -12,13 +12,16 @@ import (
 func TestWriteJSONEnvelopeIsStableAndVersioned(t *testing.T) {
 	created := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
 	plan := core.Plan{
-		ID:        "plan-1",
-		ScanID:    "scan-1",
-		CreatedAt: created,
+		ID:             "plan-1",
+		ScanID:         "scan-1",
+		CreatedAt:      created,
+		EvidenceDigest: "evidence-1",
+		PolicyDigest:   "policy-1",
 		Actions: []core.Action{{
 			ID:         "action-1",
 			Path:       "/repos/app/target",
 			Kind:       core.ActionQuarantine,
+			Class:      core.ClassGeneratedArtifact,
 			Retention:  core.Retention30Days,
 			Confidence: 0.75,
 			Reasons:    []string{"regenerable build output"},
@@ -49,12 +52,15 @@ func TestWriteJSONEnvelopeIsStableAndVersioned(t *testing.T) {
     "scan_id": "scan-1",
     "status": "draft",
     "created_at": "2026-02-03T04:05:06Z",
+    "evidence_digest": "evidence-1",
+    "policy_digest": "policy-1",
     "actions": [
       {
         "id": "action-1",
         "plan_id": "plan-1",
         "path": "/repos/app/target",
         "kind": "quarantine",
+        "class": "generated_artifact",
         "retention": "30d",
         "confidence": 0.75,
         "status": "pending",

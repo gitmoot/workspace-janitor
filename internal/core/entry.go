@@ -45,6 +45,13 @@ var artifactClasses = []ArtifactClass{
 // Valid reports whether c is a known artifact class.
 func (c ArtifactClass) Valid() bool { return validEnum(c, artifactClasses) }
 
+// ParseArtifactClass converts s into an ArtifactClass. Stored classes are
+// parsed rather than cast so a corrupt row fails instead of decoding to a
+// class the planner never produced.
+func ParseArtifactClass(s string) (ArtifactClass, error) {
+	return parseEnum(s, artifactClasses, "artifact class")
+}
+
 // EvidenceSource names the collector that produced an observation.
 type EvidenceSource string
 

@@ -105,6 +105,33 @@ var migrations = []migration{
 			`CREATE INDEX inventories_fingerprint_idx ON inventories(fingerprint)`,
 		},
 	},
+	{
+		version: 3,
+		name:    "plan_bindings_and_approvals",
+		statements: []string{
+			// A plan is only meaningful against the evidence and policy it
+			// was built from, so both digests are part of the record.
+			`ALTER TABLE plans ADD COLUMN evidence_digest TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE plans ADD COLUMN policy_digest TEXT NOT NULL DEFAULT ''`,
+			// The rationale is what makes an action reviewable: its class,
+			// the rules that produced it, and the alternatives rejected.
+			`ALTER TABLE actions ADD COLUMN class TEXT NOT NULL DEFAULT 'unknown'`,
+			`ALTER TABLE actions ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE actions ADD COLUMN rules TEXT NOT NULL DEFAULT '[]'`,
+			`ALTER TABLE actions ADD COLUMN rejected TEXT NOT NULL DEFAULT '[]'`,
+			// Approvals live beside the plan: approving must never require
+			// editing an immutable plan.
+			`CREATE TABLE approvals (
+				plan_id     TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+				action_id   TEXT NOT NULL REFERENCES actions(id) ON DELETE CASCADE,
+				approver    TEXT NOT NULL,
+				approved_at TEXT NOT NULL,
+				note        TEXT NOT NULL DEFAULT '',
+				PRIMARY KEY (plan_id, action_id)
+			)`,
+			`CREATE INDEX approvals_plan_idx ON approvals(plan_id)`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.

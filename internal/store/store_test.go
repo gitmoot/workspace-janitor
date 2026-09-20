@@ -362,12 +362,17 @@ func TestUpdateActionStatusUnknownIDIsNotFound(t *testing.T) {
 	}
 }
 
-func TestSavePlanReplacesActionSet(t *testing.T) {
+// A plan is immutable once written: reviews, approvals, and apply
+// decisions are all made against a specific document, so changing one
+// behind its id would invalidate every one of them. Saving the identical
+// document again is allowed and does nothing.
+func TestSavePlanIsImmutable(t *testing.T) {
 	ctx := context.Background()
 	db := openFixture(t)
 	at := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	plan := core.Plan{
 		ID: "plan-1", ScanID: "scan-1", CreatedAt: at,
+		EvidenceDigest: "evidence-1", PolicyDigest: "policy-1",
 		Actions: []core.Action{{ID: "a", Path: "/repos/a", Kind: core.ActionKeep, CreatedAt: at}},
 	}
 	if err := db.Write(ctx, func(tx *Tx) error {
@@ -378,17 +383,30 @@ func TestSavePlanReplacesActionSet(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save plan: %v", err)
 	}
-	plan.Actions = []core.Action{{ID: "b", Path: "/repos/b", Kind: core.ActionInvestigate, CreatedAt: at}}
+
+	// Saving the same document again is a no-op, not an error: replaying a
+	// planning run must not fail.
 	if err := db.Write(ctx, func(tx *Tx) error { return tx.SavePlan(ctx, plan) }); err != nil {
-		t.Fatalf("resave plan: %v", err)
+		t.Fatalf("re-saving an identical plan failed: %v", err)
 	}
+
+	changed := plan
+	changed.Actions = []core.Action{{ID: "b", Path: "/repos/b", Kind: core.ActionQuarantine, CreatedAt: at}}
+	err := db.Write(ctx, func(tx *Tx) error { return tx.SavePlan(ctx, changed) })
+	if !errors.Is(err, ErrImmutable) {
+		t.Fatalf("error = %v, want ErrImmutable", err)
+	}
+
 	if err := db.Read(ctx, func(tx *Tx) error {
 		loaded, err := tx.Plan(ctx, "plan-1")
 		if err != nil {
 			return err
 		}
-		if len(loaded.Actions) != 1 || loaded.Actions[0].ID != "b" {
-			t.Errorf("actions = %+v, want only the new action", loaded.Actions)
+		if len(loaded.Actions) != 1 || loaded.Actions[0].ID != "a" {
+			t.Errorf("actions = %+v, want the original set", loaded.Actions)
+		}
+		if loaded.EvidenceDigest != "evidence-1" || loaded.PolicyDigest != "policy-1" {
+			t.Errorf("plan = %+v, want its bindings preserved", loaded)
 		}
 		return nil
 	}); err != nil {
@@ -396,37 +414,135 @@ func TestSavePlanReplacesActionSet(t *testing.T) {
 	}
 }
 
-// A row whose enum no longer matches the contract is corruption. Reading it
-// must fail loudly rather than hand back a silently wrong action kind.
-func TestPlanRejectsUnknownStoredEnum(t *testing.T) {
+// Approvals live beside the plan so approving never edits it.
+func TestApprovalsAreRecordedBesideTheImmutablePlan(t *testing.T) {
 	ctx := context.Background()
 	db := openFixture(t)
 	at := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	plan := core.Plan{
 		ID: "plan-1", ScanID: "scan-1", CreatedAt: at,
-		Actions: []core.Action{{ID: "a", Path: "/repos/a", Kind: core.ActionKeep, CreatedAt: at}},
+		EvidenceDigest: "evidence-1", PolicyDigest: "policy-1",
+		Actions: []core.Action{
+			{ID: "a", Path: "/repos/a", Kind: core.ActionQuarantine, Retention: core.Retention30Days, CreatedAt: at},
+			{ID: "b", Path: "/repos/b", Kind: core.ActionKeep, CreatedAt: at},
+		},
 	}
 	if err := db.Write(ctx, func(tx *Tx) error {
 		if err := tx.CreateScan(ctx, fixtureScan("scan-1", at)); err != nil {
 			return err
 		}
-		if err := tx.SavePlan(ctx, plan); err != nil {
+		return tx.SavePlan(ctx, plan)
+	}); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	approved := at.Add(time.Hour)
+	if err := db.Write(ctx, func(tx *Tx) error {
+		if err := tx.Approve(ctx, core.Approval{
+			PlanID: "plan-1", ActionID: "a", Approver: "operator",
+			ApprovedAt: approved, Note: "reviewed the diff",
+		}); err != nil {
 			return err
 		}
-		_, err := tx.tx.ExecContext(ctx, `UPDATE actions SET kind = 'delete' WHERE id = 'a'`)
+		// Approving twice must not error or rewrite the first record.
+		return tx.Approve(ctx, core.Approval{
+			PlanID: "plan-1", ActionID: "a", Approver: "someone-else",
+			ApprovedAt: approved.Add(time.Hour),
+		})
+	}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+
+	if err := db.Read(ctx, func(tx *Tx) error {
+		approvals, err := tx.Approvals(ctx, "plan-1")
+		if err != nil {
+			return err
+		}
+		if len(approvals) != 1 {
+			t.Fatalf("approvals = %+v, want exactly one", approvals)
+		}
+		if approvals[0].ActionID != "a" || approvals[0].Approver != "operator" {
+			t.Errorf("approval = %+v, want the first one kept", approvals[0])
+		}
+		if !approvals[0].ApprovedAt.Equal(approved) {
+			t.Errorf("approved_at = %v, want %v", approvals[0].ApprovedAt, approved)
+		}
+		loaded, err := tx.Plan(ctx, "plan-1")
+		if err != nil {
+			return err
+		}
+		if len(loaded.Actions) != 2 {
+			t.Errorf("approving changed the plan: %+v", loaded.Actions)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+}
+
+// A plan must survive a restart unchanged, including its rationale.
+func TestPlanSurvivesReopenWithItsRationale(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state", "janitor.db")
+	at := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+
+	plan := core.Plan{
+		ID: "plan-1", ScanID: "scan-1", Status: core.PlanReady, CreatedAt: at,
+		EvidenceDigest: "evidence-1", PolicyDigest: "policy-1",
+		Actions: []core.Action{{
+			ID: "a", Path: "/repos/app/node_modules", Kind: core.ActionQuarantine,
+			Class: core.ClassGeneratedArtifact, Retention: core.Retention30Days,
+			Confidence: 0.9, Fingerprint: "fingerprint-1", CreatedAt: at,
+			Reasons:  []string{"node_modules matches a generated artifact name"},
+			Rules:    []string{"classify.generated", "builtin.generated_artifact"},
+			Rejected: []core.RejectedAction{{Kind: core.ActionKeep, Rule: "builtin.unknown", Reason: "classified"}},
+			Guards:   []string{"git_state"},
+		}},
+	}
+
+	first, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := first.Write(ctx, func(tx *Tx) error {
+		if err := tx.CreateScan(ctx, fixtureScan("scan-1", at)); err != nil {
+			return err
+		}
+		return tx.SavePlan(ctx, plan)
+	}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	reopened, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	var loaded core.Plan
+	if err := reopened.Read(ctx, func(tx *Tx) error {
+		var err error
+		loaded, err = tx.LatestPlan(ctx, "scan-1")
 		return err
 	}); err != nil {
-		t.Fatalf("seed corrupt row: %v", err)
+		t.Fatalf("read after restart: %v", err)
 	}
-	err := db.Read(ctx, func(tx *Tx) error {
-		_, err := tx.Plan(ctx, "plan-1")
-		return err
-	})
-	if err == nil {
-		t.Fatal("expected an unknown stored action kind to be rejected")
+
+	plan.Normalize()
+	want, err := core.MarshalJSON(plan)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
 	}
-	if !strings.Contains(err.Error(), "unknown action kind") {
-		t.Errorf("error = %v, want an unknown action kind complaint", err)
+	got, err := core.MarshalJSON(loaded)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("plan changed across a restart:\n got: %s\nwant: %s", got, want)
 	}
 }
 

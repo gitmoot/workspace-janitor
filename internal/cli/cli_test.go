@@ -94,8 +94,6 @@ func TestUnimplementedCommandsFailWithoutFakingSuccess(t *testing.T) {
 		args     []string
 		tracking string
 	}{
-		{[]string{"plan"}, "issue #7"},
-		{[]string{"explain", "/repos/app"}, "issue #7"},
 		{[]string{"apply", "--plan", "plan-1", "--confirm"}, "issue #4"},
 		{[]string{"restore", "receipt-1", "--confirm"}, "issue #4"},
 	}
