@@ -1,0 +1,62 @@
+# workspace-janitor policy
+#
+# Copy to $XDG_CONFIG_HOME/workspace-janitor/policy.yaml (by default
+# ~/.config/workspace-janitor/policy.yaml) and validate with:
+#
+#   janitor policy check
+#
+# Unknown fields are rejected, so a typo fails loudly instead of silently
+# disabling a protection. Omitted keys keep their built-in default; a key you
+# write is used exactly as written, including a zero, which then has to pass
+# validation.
+
+version: 1
+
+# Discovery roots. Every scan starts here and never leaves a root's
+# filesystem unless cross_filesystem is set.
+roots:
+  - path: ~/repos
+    max_depth: 2
+    follow_symlinks: false
+    cross_filesystem: false
+    # report_only keeps a root in the inventory but bars any mutating action.
+    report_only: false
+
+# Protections are additive: these entries are added to the built-in ones
+# (credential directories and secret-shaped filenames), never replace them.
+protect:
+  paths:
+    - /srv/data
+  name_patterns:
+    - "*.backup"
+
+retention:
+  # How long quarantined items are kept: none, 7d, 30d, 90d, or permanent.
+  # Expiry alone never deletes anything; a second safety evaluation must pass.
+  default: 30d
+  # Defaults to <state-dir>/quarantine.
+  quarantine_dir: ~/.local/state/workspace-janitor/quarantine
+
+# Known regenerable caches. action is one of keep, quarantine,
+# delete_candidate, or investigate (the default when omitted).
+caches:
+  - name: go-build
+    path: ~/.cache/go-build
+    action: delete_candidate
+    retention: 30d
+
+# The model classifier is optional and disabled by default: the tool must be
+# fully useful with no credentials and no network.
+jev:
+  enabled: false
+  model: ""
+  max_batch: 20
+  # Path segments redacted before anything is sent to a model.
+  redact_segments:
+    - secrets
+    - credentials
+
+limits:
+  git_timeout: 5s
+  command_timeout: 10s
+  max_entries: 20000
