@@ -45,18 +45,32 @@ func planned(cmd *command, flags func(fs *flag.FlagSet)) *command {
 }
 
 func scanCommand() *command {
-	return planned(&command{
-		name:     "scan",
-		usage:    "janitor scan [flags] [root...]",
-		summary:  "Inventory configured roots and collect safety evidence",
-		tracking: "issue #7",
-		long: "Walks each configured root, records filesystem identity, Git state, and\n" +
-			"process or service references, and stores the result as a scan.",
-	}, func(fs *flag.FlagSet) {
-		fs.Int("max-depth", 0, "override the per-root maximum walk depth")
-		fs.Bool("no-git", false, "skip Git collection")
-		fs.Bool("refresh", false, "discard cached collector results")
-	})
+	return &command{
+		name:    "scan",
+		usage:   "janitor scan [flags] [root...]",
+		summary: "Inventory configured roots and collect safety evidence",
+		long: "Walks each root with lstat metadata only, then collects Git state and\n" +
+			"process, registered-agent, and service references. Every collector is\n" +
+			"bounded, and anything it cannot observe is recorded as unknown evidence\n" +
+			"that protects the path rather than as a clean result.\n\n" +
+			"Deep sizing is opt-in: the default scan performs no recursive reads.\n" +
+			"Given root arguments, each inherits the bounds of the policy root that\n" +
+			"contains it.",
+		register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
+			opts := scanOptions{}
+			fs.IntVar(&opts.maxDepth, "max-depth", 0, "override the per-root metadata walk depth")
+			fs.IntVar(&opts.entriesLimit, "max-entries", 0, "override the total recorded entry limit")
+			fs.BoolVar(&opts.deepSize, "deep-size", false, "compute bounded recursive directory sizes")
+			fs.BoolVar(&opts.noGit, "no-git", false, "skip Git collection")
+			fs.BoolVar(&opts.noProcesses, "no-processes", false, "skip process reference collection")
+			fs.BoolVar(&opts.noServices, "no-services", false, "skip service and scheduler reference collection")
+			fs.BoolVar(&opts.noPersist, "no-store", false, "report the inventory without writing it to the database")
+			fs.BoolVar(&opts.noPriorScan, "no-compare", false, "skip fingerprint comparison with the previous scan")
+			return func(ctx context.Context, e *env, args []string) error {
+				return runScan(ctx, e, args, opts)
+			}
+		},
+	}
 }
 
 func planCommand() *command {
@@ -64,7 +78,7 @@ func planCommand() *command {
 		name:     "plan",
 		usage:    "janitor plan [flags]",
 		summary:  "Turn the latest scan into a reviewable, reversible plan",
-		tracking: "issue #4",
+		tracking: "issue #7",
 		long:     "Applies deterministic safety rules to a scan and emits proposed actions.",
 	}, func(fs *flag.FlagSet) {
 		fs.String("scan", "", "scan id to plan from (default: the most recent scan)")
@@ -77,7 +91,7 @@ func explainCommand() *command {
 		name:     "explain",
 		usage:    "janitor explain [flags] <path>",
 		summary:  "Show the evidence and rules behind a decision for one path",
-		tracking: "issue #3",
+		tracking: "issue #7",
 		long:     "Prints every collected signal, protection, and rule that produced the recommendation.",
 	}, func(fs *flag.FlagSet) {
 		fs.String("plan", "", "plan id to explain against (default: the most recent plan)")
@@ -89,7 +103,7 @@ func applyCommand() *command {
 		name:     "apply",
 		usage:    "janitor apply [flags]",
 		summary:  "Execute an approved plan through quarantine",
-		tracking: "issue #5",
+		tracking: "issue #4",
 		long: "Re-validates every guard immediately before mutating, moves items to\n" +
 			"quarantine rather than deleting them, and records a reversible receipt.",
 	}, func(fs *flag.FlagSet) {
@@ -104,7 +118,7 @@ func restoreCommand() *command {
 		name:     "restore",
 		usage:    "janitor restore [flags] <receipt-id>",
 		summary:  "Restore quarantined items from a receipt",
-		tracking: "issue #5",
+		tracking: "issue #4",
 		long:     "Returns quarantined items to their recorded original locations.",
 	}, func(fs *flag.FlagSet) {
 		fs.Bool("confirm", false, "required to perform the restore")

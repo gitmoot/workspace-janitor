@@ -17,15 +17,15 @@ func (t *Tx) CreateScan(ctx context.Context, scan core.Scan) error {
 	if err := scan.Validate(); err != nil {
 		return fmt.Errorf("store: invalid scan: %w", err)
 	}
-	roots, err := core.MarshalJSON(scan.Roots)
+	roots, collectors, err := encodeScanColumns(scan)
 	if err != nil {
-		return fmt.Errorf("store: encode scan roots: %w", err)
+		return err
 	}
 	_, err = t.tx.ExecContext(ctx,
-		`INSERT INTO scans (id, contract_version, roots, status, started_at, finished_at, entry_count, error)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		scan.ID, scan.ContractVersion, string(roots), string(scan.Status),
-		formatTime(scan.StartedAt), nullableTime(scan.FinishedAt), scan.EntryCount, scan.Error,
+		`INSERT INTO scans (id, contract_version, roots, status, started_at, finished_at, entry_count, error, collectors)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		scan.ID, scan.ContractVersion, roots, string(scan.Status),
+		formatTime(scan.StartedAt), nullableTime(scan.FinishedAt), scan.EntryCount, scan.Error, collectors,
 	)
 	if err != nil {
 		return fmt.Errorf("store: insert scan %s: %w", scan.ID, err)
@@ -39,15 +39,15 @@ func (t *Tx) UpdateScan(ctx context.Context, scan core.Scan) error {
 	if err := scan.Validate(); err != nil {
 		return fmt.Errorf("store: invalid scan: %w", err)
 	}
-	roots, err := core.MarshalJSON(scan.Roots)
+	roots, collectors, err := encodeScanColumns(scan)
 	if err != nil {
-		return fmt.Errorf("store: encode scan roots: %w", err)
+		return err
 	}
 	res, err := t.tx.ExecContext(ctx,
-		`UPDATE scans SET roots = ?, status = ?, started_at = ?, finished_at = ?, entry_count = ?, error = ?
+		`UPDATE scans SET roots = ?, status = ?, started_at = ?, finished_at = ?, entry_count = ?, error = ?, collectors = ?
 		 WHERE id = ?`,
-		string(roots), string(scan.Status), formatTime(scan.StartedAt),
-		nullableTime(scan.FinishedAt), scan.EntryCount, scan.Error, scan.ID,
+		roots, string(scan.Status), formatTime(scan.StartedAt),
+		nullableTime(scan.FinishedAt), scan.EntryCount, scan.Error, collectors, scan.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("store: update scan %s: %w", scan.ID, err)
@@ -58,7 +58,7 @@ func (t *Tx) UpdateScan(ctx context.Context, scan core.Scan) error {
 // Scan loads one scan by id.
 func (t *Tx) Scan(ctx context.Context, id string) (core.Scan, error) {
 	row := t.tx.QueryRowContext(ctx,
-		`SELECT id, contract_version, roots, status, started_at, finished_at, entry_count, error
+		`SELECT id, contract_version, roots, status, started_at, finished_at, entry_count, error, collectors
 		 FROM scans WHERE id = ?`, id)
 	scan, err := scanScanRow(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -69,7 +69,7 @@ func (t *Tx) Scan(ctx context.Context, id string) (core.Scan, error) {
 
 // ListScans returns scans newest first, bounded by limit (0 means all).
 func (t *Tx) ListScans(ctx context.Context, limit int) ([]core.Scan, error) {
-	query := `SELECT id, contract_version, roots, status, started_at, finished_at, entry_count, error
+	query := `SELECT id, contract_version, roots, status, started_at, finished_at, entry_count, error, collectors
 	          FROM scans ORDER BY started_at DESC, id DESC`
 	args := []any{}
 	if limit > 0 {
@@ -95,6 +95,22 @@ func (t *Tx) ListScans(ctx context.Context, limit int) ([]core.Scan, error) {
 	return out, nil
 }
 
+// LatestScan returns the most recent scan with the given status. It reports
+// ErrNotFound when no such scan exists.
+func (t *Tx) LatestScan(ctx context.Context, status core.ScanStatus) (core.Scan, error) {
+	if !status.Valid() {
+		return core.Scan{}, fmt.Errorf("store: unknown scan status %q", string(status))
+	}
+	row := t.tx.QueryRowContext(ctx,
+		`SELECT id, contract_version, roots, status, started_at, finished_at, entry_count, error, collectors
+		 FROM scans WHERE status = ? ORDER BY started_at DESC, id DESC LIMIT 1`, string(status))
+	scan, err := scanScanRow(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.Scan{}, fmt.Errorf("%w: no %s scan", ErrNotFound, status)
+	}
+	return scan, err
+}
+
 // PutEntry inserts or replaces one inventory entry for a scan. The full
 // entry document is stored verbatim so later slices can read fields that the
 // indexed columns do not carry.
@@ -112,8 +128,8 @@ func (t *Tx) PutEntry(ctx context.Context, scanID string, entry core.Entry) erro
 	}
 	_, err = t.tx.ExecContext(ctx,
 		`INSERT INTO inventories
-		   (scan_id, path, root, kind, class, device, inode, size_bytes, modified_at, observed_at, protected, document)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		   (scan_id, path, root, kind, class, device, inode, size_bytes, modified_at, observed_at, protected, fingerprint, document)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(scan_id, path) DO UPDATE SET
 		   root = excluded.root,
 		   kind = excluded.kind,
@@ -124,10 +140,12 @@ func (t *Tx) PutEntry(ctx context.Context, scanID string, entry core.Entry) erro
 		   modified_at = excluded.modified_at,
 		   observed_at = excluded.observed_at,
 		   protected = excluded.protected,
+		   fingerprint = excluded.fingerprint,
 		   document = excluded.document`,
 		scanID, entry.Path, entry.Root, string(entry.Kind), string(entry.Class),
 		int64(entry.FilesystemID.Device), int64(entry.FilesystemID.Inode), entry.SizeBytes,
-		formatTime(entry.ModifiedAt), formatTime(entry.ObservedAt), boolToInt(entry.Protected()), string(doc),
+		formatTime(entry.ModifiedAt), formatTime(entry.ObservedAt), boolToInt(entry.Protected()),
+		entry.Fingerprint, string(doc),
 	)
 	if err != nil {
 		return fmt.Errorf("store: put entry %s: %w", entry.Path, err)
@@ -410,14 +428,15 @@ type rowScanner interface {
 
 func scanScanRow(row rowScanner) (core.Scan, error) {
 	var (
-		scan       core.Scan
-		rootsJSON  string
-		status     string
-		startedAt  string
-		finishedAt sql.NullString
+		scan           core.Scan
+		rootsJSON      string
+		collectorsJSON string
+		status         string
+		startedAt      string
+		finishedAt     sql.NullString
 	)
 	if err := row.Scan(&scan.ID, &scan.ContractVersion, &rootsJSON, &status, &startedAt,
-		&finishedAt, &scan.EntryCount, &scan.Error); err != nil {
+		&finishedAt, &scan.EntryCount, &scan.Error, &collectorsJSON); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return core.Scan{}, err
 		}
@@ -425,6 +444,14 @@ func scanScanRow(row rowScanner) (core.Scan, error) {
 	}
 	if err := json.Unmarshal([]byte(rootsJSON), &scan.Roots); err != nil {
 		return core.Scan{}, fmt.Errorf("store: decode roots of scan %s: %w", scan.ID, err)
+	}
+	if err := json.Unmarshal([]byte(collectorsJSON), &scan.Collectors); err != nil {
+		return core.Scan{}, fmt.Errorf("store: decode collector reports of scan %s: %w", scan.ID, err)
+	}
+	for _, report := range scan.Collectors {
+		if _, err := core.ParseCollectorStatus(string(report.Status)); err != nil {
+			return core.Scan{}, fmt.Errorf("store: scan %s collector %s: %w", scan.ID, report.Name, err)
+		}
 	}
 	var err error
 	if scan.Status, err = core.ParseScanStatus(status); err != nil {
@@ -487,4 +514,21 @@ func stringsOrEmpty(v []string) []string {
 		return []string{}
 	}
 	return v
+}
+
+// encodeScanColumns renders the JSON-valued scan columns.
+func encodeScanColumns(scan core.Scan) (roots string, collectors string, err error) {
+	rootsJSON, err := core.MarshalJSON(scan.Roots)
+	if err != nil {
+		return "", "", fmt.Errorf("store: encode roots of scan %s: %w", scan.ID, err)
+	}
+	reports := scan.Collectors
+	if reports == nil {
+		reports = []core.CollectorReport{}
+	}
+	collectorsJSON, err := core.MarshalJSON(reports)
+	if err != nil {
+		return "", "", fmt.Errorf("store: encode collector reports of scan %s: %w", scan.ID, err)
+	}
+	return string(rootsJSON), string(collectorsJSON), nil
 }

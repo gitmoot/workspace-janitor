@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
+	"github.com/gitmoot/workspace-janitor/internal/core"
+	"github.com/gitmoot/workspace-janitor/internal/store"
 )
 
 // fixture is an isolated home for one CLI test. Every run resolves its paths
@@ -68,8 +71,11 @@ func TestHelpExposesIntendedCommandTree(t *testing.T) {
 		}
 	}
 	// Commands this build cannot perform must say so in help.
-	if !strings.Contains(stdout, "not implemented: issue #7") {
-		t.Errorf("help does not mark scan as unimplemented:\n%s", stdout)
+	if !strings.Contains(stdout, "not implemented: issue #4") {
+		t.Errorf("help does not mark apply as unimplemented:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "janitor scan [flags] [root...]  Inventory configured roots and collect safety evidence  (not implemented") {
+		t.Errorf("scan is implemented and must not be marked otherwise:\n%s", stdout)
 	}
 
 	policyHelp, _, code := f.run(t, "help", "policy")
@@ -88,11 +94,10 @@ func TestUnimplementedCommandsFailWithoutFakingSuccess(t *testing.T) {
 		args     []string
 		tracking string
 	}{
-		{[]string{"scan", "/repos"}, "issue #7"},
-		{[]string{"plan"}, "issue #4"},
-		{[]string{"explain", "/repos/app"}, "issue #3"},
-		{[]string{"apply", "--plan", "plan-1", "--confirm"}, "issue #5"},
-		{[]string{"restore", "receipt-1", "--confirm"}, "issue #5"},
+		{[]string{"plan"}, "issue #7"},
+		{[]string{"explain", "/repos/app"}, "issue #7"},
+		{[]string{"apply", "--plan", "plan-1", "--confirm"}, "issue #4"},
+		{[]string{"restore", "receipt-1", "--confirm"}, "issue #4"},
 	}
 	for _, tc := range cases {
 		f := newFixture(t)
@@ -145,7 +150,7 @@ func TestDoctorInitializesStoreAndStatusThenReportsIt(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("status exit = %d", code)
 	}
-	if !strings.Contains(statusOut, "schema 1") {
+	if !strings.Contains(statusOut, fmt.Sprintf("schema %d", store.SchemaVersion())) {
 		t.Errorf("status does not report the schema version:\n%s", statusOut)
 	}
 }
@@ -348,8 +353,9 @@ func TestVersionFlagAndCommandAgree(t *testing.T) {
 	if flagOut != commandOut {
 		t.Errorf("--version = %q, version = %q", flagOut, commandOut)
 	}
-	if !strings.Contains(flagOut, "contract=1") || !strings.Contains(flagOut, "schema=1") {
-		t.Errorf("version output must carry the contract and schema versions: %q", flagOut)
+	wantVersions := fmt.Sprintf("contract=%d schema=%d", core.ContractVersion, store.SchemaVersion())
+	if !strings.Contains(flagOut, wantVersions) {
+		t.Errorf("version output = %q, want it to carry %q", flagOut, wantVersions)
 	}
 }
 

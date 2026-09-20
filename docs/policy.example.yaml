@@ -57,7 +57,32 @@ jev:
     - secrets
     - credentials
 
+# Which collectors run, and where the reference collectors look. Every
+# location is explicit so a scan can be pointed at a fixture tree.
+collectors:
+  # Deep sizing is opt-in: the default scan is a top-level metadata pass.
+  deep_size: false
+  git: true
+  processes: true
+  services: true
+  proc_root: /proc
+  systemd_dirs:
+    - /etc/systemd/system
+    - /usr/lib/systemd/system
+    - ~/.config/systemd/user
+  cron_paths:
+    - /etc/crontab
+    - /etc/cron.d
+  pm2_dumps:
+    - ~/.pm2/dump.pm2
+
+# Bounds that keep one slow repository or one enormous directory from
+# stalling or unbounding a scan. Hitting a bound is reported as partial, not
+# hidden.
 limits:
   git_timeout: 5s
   command_timeout: 10s
   max_entries: 20000
+  max_dir_entries: 5000
+  deep_size_max_entries: 200000
+  deep_size_max_depth: 16

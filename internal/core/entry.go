@@ -213,6 +213,7 @@ type Entry struct {
 	SymlinkTarget   string          `json:"symlink_target,omitempty"`
 	CanonicalPath   string          `json:"canonical_path,omitempty"`
 	Destination     string          `json:"destination,omitempty"`
+	Fingerprint     string          `json:"fingerprint,omitempty"`
 	Class           ArtifactClass   `json:"class"`
 	Git             *GitState       `json:"git,omitempty"`
 	Evidence        []Evidence      `json:"evidence,omitempty"`
