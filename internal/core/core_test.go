@@ -361,3 +361,34 @@ func TestVerdictValidateRejectsAContradictoryDecision(t *testing.T) {
 		t.Fatal("expected a contradictory verdict to be rejected")
 	}
 }
+
+// A protection covering "/" must cover everything under it: prefix matching
+// that appends a separator builds "//" and matches nothing, turning a valid
+// protection into no protection at all.
+func TestPathWithinHandlesTheRootDirectory(t *testing.T) {
+	cases := []struct {
+		path, target string
+		want         bool
+	}{
+		{"/repos/app", "/", true},
+		{"/", "/", true},
+		{"/repos/app/src", "/repos/app", true},
+		{"/repos/app", "/repos/app/", true},
+		{"/repos/application", "/repos/app", false},
+		{"/repos", "/repos/app", false},
+		{"relative/path", "/", false},
+		{"/repos/app", "", false},
+		{"", "/", false},
+	}
+	for _, tc := range cases {
+		if got := PathWithin(tc.path, tc.target); got != tc.want {
+			t.Errorf("PathWithin(%q, %q) = %t, want %t", tc.path, tc.target, got, tc.want)
+		}
+	}
+	if !PathsOverlap("/repos", "/repos/app") || !PathsOverlap("/repos/app", "/repos") {
+		t.Error("overlap must hold in both directions")
+	}
+	if PathsOverlap("/repos", "/other") {
+		t.Error("unrelated paths must not overlap")
+	}
+}

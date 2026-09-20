@@ -93,7 +93,13 @@ clear it.
 | `durable_evidence` | the entry is classified as durable evidence |
 | `job_ownership` | a running, queued, or blocked job claims the path |
 | `quarantine_filesystem` | the destination is on another filesystem with no copy policy, or cannot be inspected |
-| `free_space` | the destination would be left below the configured headroom |
+| `free_space` | a cross-filesystem copy would exceed the destination's headroom, or its size is unmeasured |
+
+Space is only checked where it can be spent: a same-filesystem quarantine
+is a rename and consumes none. A cross-filesystem copy needs a real size, so
+a directory whose size was never measured — the default, since deep sizing
+is opt-in — is refused rather than approved against its four-kilobyte
+directory entry.
 
 Four properties hold:
 

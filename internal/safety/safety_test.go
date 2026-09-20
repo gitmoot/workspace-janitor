@@ -219,10 +219,42 @@ func protectionCases() []protectionCase {
 			},
 		},
 		{
+			// Space only matters for a copy, which only happens across
+			// filesystems, which in turn requires an explicit policy.
 			name: "insufficient free space", guard: "free_space", kind: core.ProtectInsufficientSpace,
 			setup: func(in *Input) {
+				in.Policy.AllowCrossFilesystemCopy = true
+				in.Target.Device = 99
+				in.Entry.Kind = core.EntryKindFile
 				in.Entry.SizeBytes = 10 << 30
 				in.Target.FreeBytes = 2 << 30
+			},
+		},
+		{
+			name: "unmeasured directory copied across filesystems", guard: "free_space", kind: core.ProtectInsufficientSpace,
+			setup: func(in *Input) {
+				in.Policy.AllowCrossFilesystemCopy = true
+				in.Target.Device = 99
+				in.Target.FreeBytes = 100 << 30
+			},
+		},
+		{
+			name: "symlink with no discovery root", guard: "symlink_containment", kind: core.ProtectSymlinkEscape,
+			setup: func(in *Input) {
+				in.Entry.Kind = core.EntryKindSymlink
+				in.Entry.SymlinkTarget = "/repos/app/real"
+				in.Entry.CanonicalPath = "/repos/app/real"
+				in.Entry.Root = ""
+			},
+		},
+		{
+			name: "protected path is the root directory", guard: "protected_paths", kind: core.ProtectPolicyProtected,
+			setup: func(in *Input) { in.Policy.ProtectedPaths = []string{"/"} },
+		},
+		{
+			name: "job owns the root directory", guard: "job_ownership", kind: core.ProtectOwningJob,
+			setup: func(in *Input) {
+				in.Jobs = []JobRef{{ID: "job-root", State: JobRunning, Path: "/", Owner: "gitmoot"}}
 			},
 		},
 	}
@@ -546,4 +578,70 @@ func TestResolveTargetMeasuresANotYetCreatedDestination(t *testing.T) {
 
 func writeFile(path string) error {
 	return os.WriteFile(path, []byte("x"), 0o600)
+}
+
+// A same-filesystem quarantine is a rename and consumes no space, so the
+// space guard must not refuse it however large the item is.
+func TestSameFilesystemQuarantineNeedsNoSpace(t *testing.T) {
+	in := baseInput()
+	in.Entry.Kind = core.EntryKindFile
+	in.Entry.SizeBytes = 500 << 30
+	in.Target.FreeBytes = 1 << 20
+
+	if verdict := Evaluate(in); verdict.Refused() {
+		t.Errorf("a rename on the same filesystem was refused for space: %+v", verdict.Protections)
+	}
+}
+
+// A deep-measured directory has a real size, so a cross-filesystem copy can
+// be judged rather than refused for being unmeasured.
+func TestDeepMeasuredDirectoryCanBeJudgedForSpace(t *testing.T) {
+	in := baseInput()
+	in.Policy.AllowCrossFilesystemCopy = true
+	in.Target.Device = 99
+	in.Target.FreeBytes = 100 << 30
+	in.Entry.SizeIsDeep = true
+	in.Entry.SizeBytes = 1 << 20
+
+	if verdict := Evaluate(in); verdict.Refused() {
+		t.Errorf("a measured directory that fits was refused: %+v", verdict.Protections)
+	}
+
+	in.Entry.SizeBytes = 200 << 30
+	verdict := Evaluate(in)
+	if !hasKind(verdict, core.ProtectInsufficientSpace) {
+		t.Errorf("a measured directory that does not fit was allowed: %+v", verdict.Protections)
+	}
+}
+
+// A protection covering "/" must protect everything under it. Prefix
+// matching that builds "//" silently protects nothing, which is a
+// fail-open.
+func TestRootDirectoryContainmentIsNotFailOpen(t *testing.T) {
+	cases := []struct {
+		path, target string
+		want         bool
+	}{
+		{"/repos/app", "/", true},
+		{"/", "/", true},
+		{"/repos/app", "/repos", true},
+		{"/repos/app", "/repos/", true},
+		{"/repos-other", "/repos", false},
+		{"relative", "/", false},
+	}
+	for _, tc := range cases {
+		if got := pathWithin(tc.path, tc.target); got != tc.want {
+			t.Errorf("pathWithin(%q, %q) = %t, want %t", tc.path, tc.target, got, tc.want)
+		}
+	}
+
+	// And a symlink resolving inside a "/" root is contained, not an escape.
+	in := baseInput()
+	in.Entry.Kind = core.EntryKindSymlink
+	in.Entry.Root = "/"
+	in.Entry.SymlinkTarget = "/etc/hosts"
+	in.Entry.CanonicalPath = "/etc/hosts"
+	if verdict := Evaluate(in); hasKind(verdict, core.ProtectSymlinkEscape) {
+		t.Errorf("a symlink inside a root of \"/\" was reported as escaping: %+v", verdict.Protections)
+	}
 }

@@ -109,7 +109,14 @@ func guardSymlinkContainment(in Input) []core.Protection {
 	case in.Entry.CanonicalPath == "":
 		return []core.Protection{protect(core.ProtectSymlinkEscape, core.SourceFilesystem,
 			fmt.Sprintf("symlink %s was not resolved, so its target is unknown", in.Entry.Path))}
-	case in.Entry.Root != "" && !pathWithin(in.Entry.CanonicalPath, in.Entry.Root):
+	case in.Entry.Root == "":
+		// Containment is judged against a root. Without one there is
+		// nothing to judge against, and an unjudgeable symlink protects the
+		// path like any other unknown.
+		return []core.Protection{protect(core.ProtectSymlinkEscape, core.SourceFilesystem,
+			fmt.Sprintf("symlink %s has no recorded discovery root, so containment of %s cannot be judged",
+				in.Entry.Path, in.Entry.CanonicalPath))}
+	case !pathWithin(in.Entry.CanonicalPath, in.Entry.Root):
 		return []core.Protection{protect(core.ProtectSymlinkEscape, core.SourceFilesystem,
 			fmt.Sprintf("symlink %s resolves to %s, outside root %s", in.Entry.Path, in.Entry.CanonicalPath, in.Entry.Root))}
 	}
@@ -237,6 +244,23 @@ func guardFreeSpace(in Input) []core.Protection {
 	if in.Target == nil || !in.Target.Known {
 		// An unknown destination is already refused by the filesystem guard.
 		return nil
+	}
+	// A same-filesystem quarantine is a rename: it consumes no space, so
+	// there is nothing to measure. Only a cross-device copy does, and that
+	// already requires an explicit policy.
+	sameFilesystem := !in.Entry.FilesystemID.Zero() && in.Target.Device == in.Entry.FilesystemID.Device
+	if sameFilesystem {
+		return nil
+	}
+	// A copy needs the real size. A directory measured by lstat reports
+	// about one block regardless of what it contains, so accepting that
+	// number would approve copying an arbitrarily large tree into a
+	// filesystem that cannot hold it.
+	if in.Entry.Kind == core.EntryKindDirectory && !in.Entry.SizeIsDeep {
+		return []core.Protection{protect(core.ProtectInsufficientSpace, core.SourceFilesystem,
+			fmt.Sprintf("%s would be copied to %s on another filesystem, but its size is unmeasured: "+
+				"the recorded %d byte(s) is directory metadata, not the size of its contents",
+				in.Entry.Path, in.Target.Dir, in.Entry.SizeBytes))}
 	}
 	required := in.Entry.SizeBytes + in.Policy.MinFreeBytes
 	if in.Target.FreeBytes >= required {

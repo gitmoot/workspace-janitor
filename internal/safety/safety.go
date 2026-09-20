@@ -14,8 +14,6 @@
 package safety
 
 import (
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -186,15 +184,8 @@ func protect(kind core.ProtectionKind, source core.EvidenceSource, reason string
 	}
 }
 
-// pathWithin reports whether path is target or lives inside it.
-func pathWithin(path, target string) bool {
-	if path == target {
-		return true
-	}
-	return strings.HasPrefix(path, target+string(filepath.Separator))
-}
+// pathWithin and overlaps delegate to the shared containment rules, which
+// handle the root directory correctly.
+func pathWithin(path, target string) bool { return core.PathWithin(path, target) }
 
-// overlaps reports whether mutating a would affect b, in either direction: a
-// parent directory contains the protected path, and a protected parent
-// contains the entry.
-func overlaps(a, b string) bool { return pathWithin(a, b) || pathWithin(b, a) }
+func overlaps(a, b string) bool { return core.PathsOverlap(a, b) }

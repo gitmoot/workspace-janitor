@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -285,13 +284,10 @@ func attachReferences(entries []core.Entry, refs []Reference, now time.Time) int
 	return matched
 }
 
-// pathWithin reports whether path is entry or lives inside it.
-func pathWithin(path, entry string) bool {
-	if path == entry {
-		return true
-	}
-	return len(path) > len(entry) && path[:len(entry)] == entry && path[len(entry)] == filepath.Separator
-}
+// pathWithin reports whether path is entry or lives inside it. The shared
+// implementation handles the root directory, which naive prefix matching
+// gets wrong.
+func pathWithin(path, entry string) bool { return core.PathWithin(path, entry) }
 
 // addEvidence appends an observation, skipping exact duplicates so repeated
 // collectors do not inflate the record.
