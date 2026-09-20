@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/gitmoot/workspace-janitor/internal/buildinfo"
+	"github.com/gitmoot/workspace-janitor/internal/collect"
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/output"
 )
@@ -46,6 +47,10 @@ type Options struct {
 	// Lookup resolves environment variables. Required: there is no implicit
 	// fallback to the real environment.
 	Lookup config.Lookup
+	// AgentSources are registered-agent adapters consulted during a scan.
+	// The binary ships with none: an agent registry is an integration, and
+	// a scan must work with no registry at all.
+	AgentSources []collect.AgentSource
 }
 
 // globalOpts are the flags accepted before and after the command name.
@@ -71,6 +76,8 @@ type env struct {
 	stdout io.Writer
 	stderr io.Writer
 	lookup config.Lookup
+
+	agentSources []collect.AgentSource
 
 	paths    *config.Paths
 	policy   *config.Policy
@@ -182,7 +189,14 @@ func Run(ctx context.Context, opts Options) ExitCode {
 
 	root := rootCommand()
 	global := &globalOpts{format: string(output.FormatText)}
-	e := &env{opts: global, stdout: stdout, stderr: stderr, lookup: opts.Lookup, buildRef: buildinfo.Get()}
+	e := &env{
+		opts:         global,
+		stdout:       stdout,
+		stderr:       stderr,
+		lookup:       opts.Lookup,
+		agentSources: opts.AgentSources,
+		buildRef:     buildinfo.Get(),
+	}
 
 	fs := newFlagSet(buildinfo.Name)
 	global.register(fs)

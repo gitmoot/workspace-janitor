@@ -112,14 +112,72 @@ func ParseScanStatus(s string) (ScanStatus, error) { return parseEnum(s, scanSta
 
 // Scan is one inventory collection run over a set of roots.
 type Scan struct {
-	ContractVersion int        `json:"contract_version"`
-	ID              string     `json:"id"`
-	Roots           []string   `json:"roots"`
-	Status          ScanStatus `json:"status"`
-	StartedAt       time.Time  `json:"started_at"`
-	FinishedAt      *time.Time `json:"finished_at,omitempty"`
-	EntryCount      int        `json:"entry_count"`
-	Error           string     `json:"error,omitempty"`
+	ContractVersion int               `json:"contract_version"`
+	ID              string            `json:"id"`
+	Roots           []string          `json:"roots"`
+	Status          ScanStatus        `json:"status"`
+	StartedAt       time.Time         `json:"started_at"`
+	FinishedAt      *time.Time        `json:"finished_at,omitempty"`
+	EntryCount      int               `json:"entry_count"`
+	Collectors      []CollectorReport `json:"collectors"`
+	Error           string            `json:"error,omitempty"`
+}
+
+// CollectorStatus is the outcome of one collector during a scan.
+type CollectorStatus string
+
+const (
+	// CollectorRan means the collector completed within its bounds.
+	CollectorRan CollectorStatus = "ran"
+	// CollectorPartial means the collector produced results but hit a bound
+	// or could not observe part of its input. Everything it could not see is
+	// recorded as unknown evidence, never as a clean result.
+	CollectorPartial CollectorStatus = "partial"
+	// CollectorFailed means the collector produced no usable result.
+	CollectorFailed CollectorStatus = "failed"
+	// CollectorSkipped means the collector was disabled or unavailable.
+	CollectorSkipped CollectorStatus = "skipped"
+)
+
+var collectorStatuses = []CollectorStatus{CollectorRan, CollectorPartial, CollectorFailed, CollectorSkipped}
+
+// Valid reports whether s is a known collector status.
+func (s CollectorStatus) Valid() bool { return validEnum(s, collectorStatuses) }
+
+// ParseCollectorStatus converts s into a CollectorStatus.
+func ParseCollectorStatus(s string) (CollectorStatus, error) {
+	return parseEnum(s, collectorStatuses, "collector status")
+}
+
+// CollectorReport records what one collector did during a scan, so a reader
+// can tell a clean result from an unobserved one.
+type CollectorReport struct {
+	Name     string          `json:"name"`
+	Status   CollectorStatus `json:"status"`
+	Detail   string          `json:"detail,omitempty"`
+	Visited  int             `json:"visited"`
+	Recorded int             `json:"recorded"`
+	Unknowns int             `json:"unknowns"`
+}
+
+// Validate reports every field-level problem with the report.
+func (r CollectorReport) Validate(field string) FieldErrors {
+	var errs FieldErrors
+	if strings.TrimSpace(r.Name) == "" {
+		errs.Add(field+".name", "must not be empty")
+	}
+	if !r.Status.Valid() {
+		errs.Add(field+".status", "unknown collector status %q", string(r.Status))
+	}
+	for _, count := range []struct {
+		name  string
+		value int
+	}{{"visited", r.Visited}, {"recorded", r.Recorded}, {"unknowns", r.Unknowns}} {
+		if count.value < 0 {
+			errs.Add(field+"."+count.name, "must not be negative, got %d", count.value)
+		}
+	}
+	return errs
 }
 
 // Normalize fills the contract version and normalizes timestamps to UTC.
@@ -131,6 +189,12 @@ func (s *Scan) Normalize() {
 		s.Status = ScanRunning
 	}
 	s.StartedAt = s.StartedAt.UTC()
+	if s.Collectors == nil {
+		s.Collectors = []CollectorReport{}
+	}
+	// Reports render in a stable order so a scan document is byte-stable for
+	// identical collection results.
+	sort.SliceStable(s.Collectors, func(i, j int) bool { return s.Collectors[i].Name < s.Collectors[j].Name })
 	if s.FinishedAt != nil {
 		finished := s.FinishedAt.UTC()
 		s.FinishedAt = &finished
@@ -162,6 +226,15 @@ func (s *Scan) Validate() error {
 	}
 	if s.EntryCount < 0 {
 		errs.Add("entry_count", "must not be negative, got %d", s.EntryCount)
+	}
+	seen := make(map[string]struct{}, len(s.Collectors))
+	for i, report := range s.Collectors {
+		field := fmt.Sprintf("collectors[%d]", i)
+		errs = append(errs, report.Validate(field)...)
+		if _, dup := seen[report.Name]; dup {
+			errs.Add(field+".name", "duplicate collector report %q", report.Name)
+		}
+		seen[report.Name] = struct{}{}
 	}
 	return errs.ErrorOrNil()
 }

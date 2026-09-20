@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -500,4 +503,299 @@ func TestStatsReportsBothVersions(t *testing.T) {
 	if stats.SchemaVersion != SchemaVersion() {
 		t.Errorf("schema version = %d, want %d", stats.SchemaVersion, SchemaVersion())
 	}
+}
+
+func TestScanCollectorReportsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	db := openFixture(t)
+	at := time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
+
+	scan := fixtureScan("scan-1", at)
+	scan.Collectors = []core.CollectorReport{
+		{Name: "git", Status: core.CollectorPartial, Detail: "one repository timed out", Visited: 3, Recorded: 2, Unknowns: 1},
+		{Name: "filesystem", Status: core.CollectorRan, Visited: 12, Recorded: 12},
+	}
+	if err := db.Write(ctx, func(tx *Tx) error { return tx.CreateScan(ctx, scan) }); err != nil {
+		t.Fatalf("create scan: %v", err)
+	}
+
+	var loaded core.Scan
+	if err := db.Read(ctx, func(tx *Tx) error {
+		var err error
+		loaded, err = tx.Scan(ctx, "scan-1")
+		return err
+	}); err != nil {
+		t.Fatalf("read scan: %v", err)
+	}
+	if len(loaded.Collectors) != 2 {
+		t.Fatalf("collectors = %+v, want 2 reports", loaded.Collectors)
+	}
+	// Normalize sorts reports by name, so the order is part of the contract.
+	if loaded.Collectors[0].Name != "filesystem" || loaded.Collectors[1].Name != "git" {
+		t.Errorf("collector order = %+v, want name order", loaded.Collectors)
+	}
+	git := loaded.Collectors[1]
+	if git.Status != core.CollectorPartial || git.Unknowns != 1 || git.Detail == "" {
+		t.Errorf("git report = %+v", git)
+	}
+
+	// An updated scan must replace the reports rather than keep the old set.
+	scan = loaded
+	scan.Status = core.ScanCompleted
+	scan.Collectors = []core.CollectorReport{{Name: "filesystem", Status: core.CollectorRan, Visited: 12, Recorded: 12}}
+	if err := db.Write(ctx, func(tx *Tx) error { return tx.UpdateScan(ctx, scan) }); err != nil {
+		t.Fatalf("update scan: %v", err)
+	}
+	if err := db.Read(ctx, func(tx *Tx) error {
+		updated, err := tx.Scan(ctx, "scan-1")
+		if err != nil {
+			return err
+		}
+		if len(updated.Collectors) != 1 {
+			t.Errorf("collectors after update = %+v, want only the new report", updated.Collectors)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read scan: %v", err)
+	}
+}
+
+func TestScanRejectsUnknownStoredCollectorStatus(t *testing.T) {
+	ctx := context.Background()
+	db := openFixture(t)
+	at := time.Now().UTC()
+	if err := db.Write(ctx, func(tx *Tx) error {
+		if err := tx.CreateScan(ctx, fixtureScan("scan-1", at)); err != nil {
+			return err
+		}
+		_, err := tx.tx.ExecContext(ctx,
+			`UPDATE scans SET collectors = '[{"name":"git","status":"probably-fine"}]' WHERE id = 'scan-1'`)
+		return err
+	}); err != nil {
+		t.Fatalf("seed corrupt row: %v", err)
+	}
+	err := db.Read(ctx, func(tx *Tx) error {
+		_, err := tx.Scan(ctx, "scan-1")
+		return err
+	})
+	if err == nil || !strings.Contains(err.Error(), "unknown collector status") {
+		t.Fatalf("error = %v, want an unknown collector status complaint", err)
+	}
+}
+
+func TestLatestScanFiltersByStatus(t *testing.T) {
+	ctx := context.Background()
+	db := openFixture(t)
+	base := time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
+
+	older := fixtureScan("scan-old", base)
+	older.Status = core.ScanCompleted
+	newer := fixtureScan("scan-new", base.Add(time.Hour))
+	if err := db.Write(ctx, func(tx *Tx) error {
+		if err := tx.CreateScan(ctx, older); err != nil {
+			return err
+		}
+		return tx.CreateScan(ctx, newer)
+	}); err != nil {
+		t.Fatalf("create scans: %v", err)
+	}
+
+	if err := db.Read(ctx, func(tx *Tx) error {
+		completed, err := tx.LatestScan(ctx, core.ScanCompleted)
+		if err != nil {
+			return err
+		}
+		if completed.ID != "scan-old" {
+			t.Errorf("latest completed = %q, want scan-old", completed.ID)
+		}
+		if _, err := tx.LatestScan(ctx, core.ScanFailed); !errors.Is(err, ErrNotFound) {
+			t.Errorf("error = %v, want ErrNotFound when no scan has that status", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+}
+
+// The indexed fingerprint column exists so a later scan can find unchanged
+// entries without decoding every document; it must actually be populated.
+func TestPutEntryPopulatesFingerprintColumn(t *testing.T) {
+	ctx := context.Background()
+	db := openFixture(t)
+	at := time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
+	entry := fixtureEntry("/repos/app", at)
+	entry.Fingerprint = "abc123"
+
+	if err := db.Write(ctx, func(tx *Tx) error {
+		if err := tx.CreateScan(ctx, fixtureScan("scan-1", at)); err != nil {
+			return err
+		}
+		return tx.PutEntry(ctx, "scan-1", entry)
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := db.Read(ctx, func(tx *Tx) error {
+		var stored string
+		if err := tx.tx.QueryRowContext(ctx,
+			`SELECT fingerprint FROM inventories WHERE scan_id = 'scan-1' AND path = '/repos/app'`).Scan(&stored); err != nil {
+			return err
+		}
+		if stored != "abc123" {
+			t.Errorf("fingerprint column = %q, want the entry fingerprint", stored)
+		}
+		loaded, err := tx.Entry(ctx, "scan-1", "/repos/app")
+		if err != nil {
+			return err
+		}
+		if loaded.Fingerprint != "abc123" {
+			t.Errorf("document fingerprint = %q", loaded.Fingerprint)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+}
+
+// A reporting-only command must leave the database byte-identical: no
+// migration, no journal-mode change, no permission change.
+func TestOpenReadOnlyDoesNotMutateTheDatabase(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "janitor.db")
+	writable, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	at := time.Now().UTC()
+	if err := writable.Write(ctx, func(tx *Tx) error {
+		return tx.CreateScan(ctx, fixtureScan("scan-1", at))
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	before := digestOf(t, path)
+
+	readOnly, err := OpenReadOnly(ctx, path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	if !readOnly.ReadOnly() {
+		t.Error("handle does not report itself read-only")
+	}
+	var scans int
+	if err := readOnly.Read(ctx, func(tx *Tx) error {
+		scan, err := tx.LatestScan(ctx, core.ScanRunning)
+		if err != nil {
+			return err
+		}
+		if scan.ID != "scan-1" {
+			t.Errorf("scan = %q, want scan-1", scan.ID)
+		}
+		scans++
+		return nil
+	}); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if scans != 1 {
+		t.Errorf("read %d scans, want 1", scans)
+	}
+
+	// A write through a read-only handle must be refused, not attempted.
+	if err := readOnly.Write(ctx, func(tx *Tx) error {
+		return tx.CreateScan(ctx, fixtureScan("scan-2", at))
+	}); err == nil {
+		t.Error("a read-only handle accepted a write")
+	}
+	if err := readOnly.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if after := digestOf(t, path); after != before {
+		t.Errorf("database changed during a read-only open:\n before %s\n after  %s", before, after)
+	}
+	// A WAL reader has to map the shared-memory index, so the -shm and -wal
+	// sidecars may appear. They must stay empty: no data was written and no
+	// transaction was committed.
+	if info, err := os.Stat(path + "-wal"); err == nil && info.Size() != 0 {
+		t.Errorf("write-ahead log is %d bytes after a read-only open, want empty", info.Size())
+	}
+	version := userVersionOf(t, path)
+	if version != SchemaVersion() {
+		t.Errorf("schema version = %d after a read-only open, want %d", version, SchemaVersion())
+	}
+}
+
+// userVersionOf reads the schema version through a fresh writable handle.
+func userVersionOf(t *testing.T, path string) int {
+	t.Helper()
+	db, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	version, err := db.userVersion(context.Background())
+	if err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	return version
+}
+
+// An out-of-date database must be reported, never silently migrated, by a
+// read-only open.
+func TestOpenReadOnlyRefusesSchemaMismatchInsteadOfMigrating(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "janitor.db")
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Write(ctx, func(tx *Tx) error {
+		_, err := tx.tx.ExecContext(ctx, "PRAGMA user_version = 1")
+		return err
+	}); err != nil {
+		t.Fatalf("downgrade version: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	_, err = OpenReadOnly(ctx, path)
+	if !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("error = %v, want ErrSchemaMismatch", err)
+	}
+	reopened, err := OpenReadOnly(ctx, path)
+	if reopened != nil {
+		reopened.Close()
+	}
+	if !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("second open error = %v, want ErrSchemaMismatch: the first must not have migrated", err)
+	}
+}
+
+func TestOpenReadOnlyReportsUninitializedState(t *testing.T) {
+	_, err := OpenReadOnly(context.Background(), filepath.Join(t.TempDir(), "janitor.db"))
+	if !errors.Is(err, ErrNotInitialized) {
+		t.Fatalf("error = %v, want ErrNotInitialized", err)
+	}
+}
+
+// digestOf fingerprints the database file and its mode, so any write to the
+// durable database or change of its permissions is visible.
+func digestOf(t *testing.T, path string) string {
+	t.Helper()
+	parts := make([]string, 0, 1)
+	for _, candidate := range []string{path} {
+		info, err := os.Stat(candidate)
+		if err != nil {
+			parts = append(parts, filepath.Base(candidate)+":absent")
+			continue
+		}
+		data, err := os.ReadFile(candidate)
+		if err != nil {
+			t.Fatalf("read %s: %v", candidate, err)
+		}
+		parts = append(parts, fmt.Sprintf("%s:%o:%x", filepath.Base(candidate), info.Mode().Perm(), sha256.Sum256(data)))
+	}
+	return strings.Join(parts, " ")
 }

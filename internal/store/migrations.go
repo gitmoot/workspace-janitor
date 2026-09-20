@@ -91,6 +91,20 @@ var migrations = []migration{
 			`CREATE INDEX model_usage_scan_idx ON model_usage(scan_id)`,
 		},
 	},
+	{
+		version: 2,
+		name:    "collector_reports_and_fingerprints",
+		statements: []string{
+			// Which collectors ran, failed, or were skipped is part of the
+			// scan's meaning: without it a sparse inventory is
+			// indistinguishable from a clean machine.
+			`ALTER TABLE scans ADD COLUMN collectors TEXT NOT NULL DEFAULT '[]'`,
+			// The metadata fingerprint is indexed so a later scan can detect
+			// unchanged entries without decoding every stored document.
+			`ALTER TABLE inventories ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX inventories_fingerprint_idx ON inventories(fingerprint)`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.

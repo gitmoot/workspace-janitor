@@ -95,22 +95,41 @@ type JevPolicy struct {
 	RedactSegments []string `yaml:"redact_segments" json:"redact_segments"`
 }
 
-// Limits bounds collection work so one slow repository cannot stall a scan.
+// Limits bounds collection work so one slow repository, one enormous
+// directory, or one hung command cannot stall or unbound a scan.
 type Limits struct {
-	GitTimeout     Duration `yaml:"git_timeout" json:"git_timeout"`
-	CommandTimeout Duration `yaml:"command_timeout" json:"command_timeout"`
-	MaxEntries     int      `yaml:"max_entries" json:"max_entries"`
+	GitTimeout         Duration `yaml:"git_timeout" json:"git_timeout"`
+	CommandTimeout     Duration `yaml:"command_timeout" json:"command_timeout"`
+	MaxEntries         int      `yaml:"max_entries" json:"max_entries"`
+	MaxDirEntries      int      `yaml:"max_dir_entries" json:"max_dir_entries"`
+	DeepSizeMaxEntries int      `yaml:"deep_size_max_entries" json:"deep_size_max_entries"`
+	DeepSizeMaxDepth   int      `yaml:"deep_size_max_depth" json:"deep_size_max_depth"`
+}
+
+// Collectors selects which evidence collectors run and where the reference
+// collectors look. Every location is explicit so a scan can be pointed at a
+// fixture tree instead of the real system.
+type Collectors struct {
+	DeepSize    bool     `yaml:"deep_size" json:"deep_size"`
+	Git         bool     `yaml:"git" json:"git"`
+	Processes   bool     `yaml:"processes" json:"processes"`
+	Services    bool     `yaml:"services" json:"services"`
+	ProcRoot    string   `yaml:"proc_root" json:"proc_root"`
+	SystemdDirs []string `yaml:"systemd_dirs" json:"systemd_dirs"`
+	CronPaths   []string `yaml:"cron_paths" json:"cron_paths"`
+	PM2Dumps    []string `yaml:"pm2_dumps" json:"pm2_dumps"`
 }
 
 // Policy is the validated policy document.
 type Policy struct {
-	Version   int             `yaml:"version" json:"version"`
-	Roots     []Root          `yaml:"roots" json:"roots"`
-	Protect   Protect         `yaml:"protect" json:"protect"`
-	Retention RetentionPolicy `yaml:"retention" json:"retention"`
-	Caches    []CacheRule     `yaml:"caches" json:"caches"`
-	Jev       JevPolicy       `yaml:"jev" json:"jev"`
-	Limits    Limits          `yaml:"limits" json:"limits"`
+	Version    int             `yaml:"version" json:"version"`
+	Roots      []Root          `yaml:"roots" json:"roots"`
+	Protect    Protect         `yaml:"protect" json:"protect"`
+	Retention  RetentionPolicy `yaml:"retention" json:"retention"`
+	Caches     []CacheRule     `yaml:"caches" json:"caches"`
+	Collectors Collectors      `yaml:"collectors" json:"collectors"`
+	Jev        JevPolicy       `yaml:"jev" json:"jev"`
+	Limits     Limits          `yaml:"limits" json:"limits"`
 
 	// Source is where the policy came from: a file path, or "built-in
 	// defaults". It is never settable from YAML.
@@ -141,10 +160,28 @@ func DefaultPolicy(p Paths) Policy {
 			MaxBatch:       20,
 			RedactSegments: []string{},
 		},
+		Collectors: Collectors{
+			// Deep sizing is opt-in: a default scan must stay a top-level,
+			// metadata-only pass.
+			DeepSize:  false,
+			Git:       true,
+			Processes: true,
+			Services:  true,
+			ProcRoot:  "/proc",
+			SystemdDirs: []string{
+				"/etc/systemd/system",
+				"/usr/lib/systemd/system",
+			},
+			CronPaths: []string{"/etc/crontab", "/etc/cron.d"},
+			PM2Dumps:  []string{},
+		},
 		Limits: Limits{
-			GitTimeout:     Duration(5 * time.Second),
-			CommandTimeout: Duration(10 * time.Second),
-			MaxEntries:     20000,
+			GitTimeout:         Duration(5 * time.Second),
+			CommandTimeout:     Duration(10 * time.Second),
+			MaxEntries:         20000,
+			MaxDirEntries:      5000,
+			DeepSizeMaxEntries: 200000,
+			DeepSizeMaxDepth:   16,
 		},
 		Source:   "built-in defaults",
 		FromFile: false,
@@ -154,6 +191,8 @@ func DefaultPolicy(p Paths) Policy {
 		for _, rel := range []string{".ssh", ".gnupg", ".aws", ".kube", ".config"} {
 			policy.Protect.Paths = append(policy.Protect.Paths, filepath.Join(p.Home, rel))
 		}
+		policy.Collectors.SystemdDirs = append(policy.Collectors.SystemdDirs, filepath.Join(p.Home, ".config", "systemd", "user"))
+		policy.Collectors.PM2Dumps = append(policy.Collectors.PM2Dumps, filepath.Join(p.Home, ".pm2", "dump.pm2"))
 	} else {
 		policy.Roots = []Root{}
 		policy.Protect.Paths = []string{}
@@ -177,6 +216,9 @@ func (p Policy) clone() Policy {
 	out.Protect.NamePatterns = append([]string(nil), p.Protect.NamePatterns...)
 	out.Caches = append([]CacheRule(nil), p.Caches...)
 	out.Jev.RedactSegments = append([]string(nil), p.Jev.RedactSegments...)
+	out.Collectors.SystemdDirs = append([]string(nil), p.Collectors.SystemdDirs...)
+	out.Collectors.CronPaths = append([]string(nil), p.Collectors.CronPaths...)
+	out.Collectors.PM2Dumps = append([]string(nil), p.Collectors.PM2Dumps...)
 	return out
 }
 
@@ -214,6 +256,18 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	if p.Retention.QuarantineDir != "" {
 		p.Retention.QuarantineDir = expand("retention.quarantine_dir", p.Retention.QuarantineDir)
 	}
+	if p.Collectors.ProcRoot != "" {
+		p.Collectors.ProcRoot = expand("collectors.proc_root", p.Collectors.ProcRoot)
+	}
+	for i := range p.Collectors.SystemdDirs {
+		p.Collectors.SystemdDirs[i] = expand(fmt.Sprintf("collectors.systemd_dirs[%d]", i), p.Collectors.SystemdDirs[i])
+	}
+	for i := range p.Collectors.CronPaths {
+		p.Collectors.CronPaths[i] = expand(fmt.Sprintf("collectors.cron_paths[%d]", i), p.Collectors.CronPaths[i])
+	}
+	for i := range p.Collectors.PM2Dumps {
+		p.Collectors.PM2Dumps[i] = expand(fmt.Sprintf("collectors.pm2_dumps[%d]", i), p.Collectors.PM2Dumps[i])
+	}
 	// Built-in protections are additive. A document that lists its own
 	// protected paths must not silently drop the credential locations the
 	// tool protects by default.
@@ -233,6 +287,15 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	}
 	if p.Jev.RedactSegments == nil {
 		p.Jev.RedactSegments = []string{}
+	}
+	if p.Collectors.SystemdDirs == nil {
+		p.Collectors.SystemdDirs = []string{}
+	}
+	if p.Collectors.CronPaths == nil {
+		p.Collectors.CronPaths = []string{}
+	}
+	if p.Collectors.PM2Dumps == nil {
+		p.Collectors.PM2Dumps = []string{}
 	}
 	return errs
 }
@@ -339,8 +402,35 @@ func (p *Policy) Validate() core.FieldErrors {
 	if p.Limits.CommandTimeout.Duration() <= 0 {
 		errs.Add("limits.command_timeout", "must be greater than zero, got %s", p.Limits.CommandTimeout)
 	}
-	if p.Limits.MaxEntries <= 0 {
-		errs.Add("limits.max_entries", "must be greater than zero, got %d", p.Limits.MaxEntries)
+	for _, bound := range []struct {
+		field string
+		value int
+	}{
+		{"limits.max_entries", p.Limits.MaxEntries},
+		{"limits.max_dir_entries", p.Limits.MaxDirEntries},
+		{"limits.deep_size_max_entries", p.Limits.DeepSizeMaxEntries},
+		{"limits.deep_size_max_depth", p.Limits.DeepSizeMaxDepth},
+	} {
+		if bound.value <= 0 {
+			errs.Add(bound.field, "must be greater than zero, got %d", bound.value)
+		}
+	}
+	if p.Collectors.Processes && !core.IsCanonicalPath(p.Collectors.ProcRoot) {
+		errs.Add("collectors.proc_root", "must be an absolute path while collectors.processes is true, got %q", p.Collectors.ProcRoot)
+	}
+	for _, group := range []struct {
+		field  string
+		values []string
+	}{
+		{"collectors.systemd_dirs", p.Collectors.SystemdDirs},
+		{"collectors.cron_paths", p.Collectors.CronPaths},
+		{"collectors.pm2_dumps", p.Collectors.PM2Dumps},
+	} {
+		for i, value := range group.values {
+			if !core.IsCanonicalPath(value) {
+				errs.Add(fmt.Sprintf("%s[%d]", group.field, i), "must be an absolute path, got %q", value)
+			}
+		}
 	}
 	return errs
 }
