@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -652,4 +655,147 @@ func TestPutEntryPopulatesFingerprintColumn(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("read: %v", err)
 	}
+}
+
+// A reporting-only command must leave the database byte-identical: no
+// migration, no journal-mode change, no permission change.
+func TestOpenReadOnlyDoesNotMutateTheDatabase(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "janitor.db")
+	writable, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	at := time.Now().UTC()
+	if err := writable.Write(ctx, func(tx *Tx) error {
+		return tx.CreateScan(ctx, fixtureScan("scan-1", at))
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	before := digestOf(t, path)
+
+	readOnly, err := OpenReadOnly(ctx, path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	if !readOnly.ReadOnly() {
+		t.Error("handle does not report itself read-only")
+	}
+	var scans int
+	if err := readOnly.Read(ctx, func(tx *Tx) error {
+		scan, err := tx.LatestScan(ctx, core.ScanRunning)
+		if err != nil {
+			return err
+		}
+		if scan.ID != "scan-1" {
+			t.Errorf("scan = %q, want scan-1", scan.ID)
+		}
+		scans++
+		return nil
+	}); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if scans != 1 {
+		t.Errorf("read %d scans, want 1", scans)
+	}
+
+	// A write through a read-only handle must be refused, not attempted.
+	if err := readOnly.Write(ctx, func(tx *Tx) error {
+		return tx.CreateScan(ctx, fixtureScan("scan-2", at))
+	}); err == nil {
+		t.Error("a read-only handle accepted a write")
+	}
+	if err := readOnly.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if after := digestOf(t, path); after != before {
+		t.Errorf("database changed during a read-only open:\n before %s\n after  %s", before, after)
+	}
+	// A WAL reader has to map the shared-memory index, so the -shm and -wal
+	// sidecars may appear. They must stay empty: no data was written and no
+	// transaction was committed.
+	if info, err := os.Stat(path + "-wal"); err == nil && info.Size() != 0 {
+		t.Errorf("write-ahead log is %d bytes after a read-only open, want empty", info.Size())
+	}
+	version := userVersionOf(t, path)
+	if version != SchemaVersion() {
+		t.Errorf("schema version = %d after a read-only open, want %d", version, SchemaVersion())
+	}
+}
+
+// userVersionOf reads the schema version through a fresh writable handle.
+func userVersionOf(t *testing.T, path string) int {
+	t.Helper()
+	db, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	version, err := db.userVersion(context.Background())
+	if err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	return version
+}
+
+// An out-of-date database must be reported, never silently migrated, by a
+// read-only open.
+func TestOpenReadOnlyRefusesSchemaMismatchInsteadOfMigrating(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "janitor.db")
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Write(ctx, func(tx *Tx) error {
+		_, err := tx.tx.ExecContext(ctx, "PRAGMA user_version = 1")
+		return err
+	}); err != nil {
+		t.Fatalf("downgrade version: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	_, err = OpenReadOnly(ctx, path)
+	if !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("error = %v, want ErrSchemaMismatch", err)
+	}
+	reopened, err := OpenReadOnly(ctx, path)
+	if reopened != nil {
+		reopened.Close()
+	}
+	if !errors.Is(err, ErrSchemaMismatch) {
+		t.Fatalf("second open error = %v, want ErrSchemaMismatch: the first must not have migrated", err)
+	}
+}
+
+func TestOpenReadOnlyReportsUninitializedState(t *testing.T) {
+	_, err := OpenReadOnly(context.Background(), filepath.Join(t.TempDir(), "janitor.db"))
+	if !errors.Is(err, ErrNotInitialized) {
+		t.Fatalf("error = %v, want ErrNotInitialized", err)
+	}
+}
+
+// digestOf fingerprints the database file and its mode, so any write to the
+// durable database or change of its permissions is visible.
+func digestOf(t *testing.T, path string) string {
+	t.Helper()
+	parts := make([]string, 0, 1)
+	for _, candidate := range []string{path} {
+		info, err := os.Stat(candidate)
+		if err != nil {
+			parts = append(parts, filepath.Base(candidate)+":absent")
+			continue
+		}
+		data, err := os.ReadFile(candidate)
+		if err != nil {
+			t.Fatalf("read %s: %v", candidate, err)
+		}
+		parts = append(parts, fmt.Sprintf("%s:%o:%x", filepath.Base(candidate), info.Mode().Perm(), sha256.Sum256(data)))
+	}
+	return strings.Join(parts, " ")
 }

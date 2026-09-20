@@ -31,14 +31,17 @@ type scanOptions struct {
 
 // scanReport is the `scan` result contract.
 type scanReport struct {
-	Scan       core.Scan     `json:"scan"`
-	Persisted  bool          `json:"persisted"`
-	PriorScan  string        `json:"prior_scan_id,omitempty"`
-	Protected  int           `json:"protected_entries"`
-	Unknowns   int           `json:"unknown_observations"`
-	Entries    []core.Entry  `json:"entries"`
-	EntryLimit int           `json:"entry_limit"`
-	Roots      []scanRootRef `json:"roots"`
+	Scan      core.Scan `json:"scan"`
+	Persisted bool      `json:"persisted"`
+	PriorScan string    `json:"prior_scan_id,omitempty"`
+	// PriorComparison explains why no prior scan was compared, when that
+	// happened for a reason other than "this is the first scan".
+	PriorComparison string        `json:"prior_comparison,omitempty"`
+	Protected       int           `json:"protected_entries"`
+	Unknowns        int           `json:"unknown_observations"`
+	Entries         []core.Entry  `json:"entries"`
+	EntryLimit      int           `json:"entry_limit"`
+	Roots           []scanRootRef `json:"roots"`
 }
 
 // scanRootRef records the bounds a root was scanned with.
@@ -84,15 +87,22 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 			return err
 		}
 		defer db.Close()
-	} else if !opts.noPriorScan {
-		db, err = store.OpenExisting(ctx, paths.DatabaseFile)
+	}
+
+	comparisonNote := ""
+	if opts.noPersist && !opts.noPriorScan {
+		// Read-only: no migration, no journal-mode change, no chmod. The
+		// comparison is an optimisation, so a database this build cannot
+		// read read-only is reported and skipped rather than upgraded.
+		readOnly, err := store.OpenReadOnly(ctx, paths.DatabaseFile)
 		switch {
 		case errors.Is(err, store.ErrNotInitialized):
-			db = nil
+			comparisonNote = "skipped: no previous scan is stored"
 		case err != nil:
-			return err
+			comparisonNote = "skipped: " + err.Error()
 		default:
-			defer db.Close()
+			defer readOnly.Close()
+			db = readOnly
 		}
 	}
 
@@ -138,11 +148,12 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 	scan.Normalize()
 
 	report := scanReport{
-		Scan:       scan,
-		PriorScan:  priorID,
-		Entries:    result.Entries,
-		EntryLimit: policy.Limits.MaxEntries,
-		Roots:      rootRefs(roots),
+		Scan:            scan,
+		PriorScan:       priorID,
+		PriorComparison: comparisonNote,
+		Entries:         result.Entries,
+		EntryLimit:      policy.Limits.MaxEntries,
+		Roots:           rootRefs(roots),
 	}
 	for _, entry := range result.Entries {
 		if entry.Protected() {
@@ -315,6 +326,9 @@ func writeScanText(e *env, report scanReport) error {
 	}
 	if report.PriorScan != "" {
 		fields = append(fields, output.Field{Key: "compared with:", Value: report.PriorScan})
+	}
+	if report.PriorComparison != "" {
+		fields = append(fields, output.Field{Key: "comparison:", Value: report.PriorComparison})
 	}
 	if err := output.WriteFields(e.stdout, fields); err != nil {
 		return err

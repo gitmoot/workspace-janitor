@@ -59,6 +59,17 @@ Three properties hold across all of them:
   and crontab assignments; and no Git command may touch the network — the
   collector runs a fixed allowlist of local read-only subcommands.
 
+`--no-store` makes a scan reporting-only: it creates no database, and when
+one already exists it is opened strictly read-only — no migration, no
+permission change, no journal-mode change. A database this build cannot read
+that way is reported in `prior_comparison` and the comparison is skipped
+rather than upgraded silently.
+
+Every reference collector is bounded by `limits.command_timeout` in wall
+clock, enforced by the scan rather than by the collector's cooperation, so a
+stalled filesystem or an adapter that ignores cancellation cannot hang a
+scan; it becomes a partial report with an unknown.
+
 Each scan stores its inventory, the metadata fingerprint of every entry, and
 a report per collector saying whether it ran, was partial, failed, or was
 skipped. A later scan compares fingerprints with the previous one and marks

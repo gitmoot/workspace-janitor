@@ -428,7 +428,93 @@ func TestAgentSourceIgnoringCancellationIsStillBounded(t *testing.T) {
 	if report.Status != core.CollectorPartial || report.Unknowns == 0 {
 		t.Errorf("agents report = %+v, want partial with an unknown", report)
 	}
-	if !strings.Contains(report.Detail, "did not answer") {
+	if !strings.Contains(report.Detail, "timeout") {
 		t.Errorf("detail = %q, want it to name the timeout", report.Detail)
+	}
+}
+
+// blockingSource simulates a collector stuck in a syscall no cancellation
+// interrupts: it ignores its context entirely.
+type blockingSource struct{ release chan struct{} }
+
+func (blockingSource) Name() string { return "blocking" }
+
+func (b blockingSource) ActiveDirectories(context.Context) ([]AgentRef, error) {
+	<-b.release
+	return nil, nil
+}
+
+// The command timeout is a wall-clock guarantee, enforced by the caller. A
+// collector wedged in an uninterruptible operation must not extend the scan.
+func TestRunBoundedStopsAtTheCommandTimeout(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	opts := fixtureOptions(t.TempDir())
+	opts.Limits.CommandTimeout = 120 * time.Millisecond
+
+	blocked := func(ctx context.Context, _ *Options) ([]Reference, core.CollectorReport) {
+		<-release
+		return nil, core.CollectorReport{Name: CollectorProcesses, Status: core.CollectorRan}
+	}
+
+	start := time.Now()
+	refs, report := runBounded(context.Background(), &opts, CollectorProcesses, blocked)
+	elapsed := time.Since(start)
+
+	if elapsed > 5*time.Second {
+		t.Fatalf("runBounded took %s: the deadline was not enforced by the caller", elapsed)
+	}
+	if len(refs) != 0 {
+		t.Errorf("refs = %+v, want none from a collector that never answered", refs)
+	}
+	if report.Name != CollectorProcesses {
+		t.Errorf("report name = %q, want the collector that overran", report.Name)
+	}
+	if report.Status != core.CollectorPartial || report.Unknowns != 1 {
+		t.Errorf("report = %+v, want partial with one unknown", report)
+	}
+	if !strings.Contains(report.Detail, "command timeout") {
+		t.Errorf("detail = %q, want it to name the timeout", report.Detail)
+	}
+}
+
+// The same guarantee must hold through a full scan, for a collector wedged
+// in an ordinary blocking syscall rather than in cooperative code. A fifo
+// standing in for a stalled procfs read is the reproducible version of
+// "an OS operation that never returns".
+func TestScanFinishesWhenAReferenceCollectorWedges(t *testing.T) {
+	if _, err := exec.LookPath("mkfifo"); err != nil {
+		t.Skipf("mkfifo is unavailable: %v", err)
+	}
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, "project"))
+
+	procRoot := t.TempDir()
+	pidDir := mustMkdir(t, filepath.Join(procRoot, "99"))
+	mustSymlink(t, root, filepath.Join(pidDir, "cwd"))
+	if out, err := exec.Command("mkfifo", filepath.Join(pidDir, "comm")).CombinedOutput(); err != nil {
+		t.Skipf("cannot create a fifo: %v (%s)", err, out)
+	}
+
+	opts := fixtureOptions(root)
+	opts.Limits.CommandTimeout = 120 * time.Millisecond
+	opts.Processes = true
+	opts.ProcRoot = procRoot
+
+	start := time.Now()
+	result := run(t, opts)
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("scan took %s despite a %s command timeout", elapsed, opts.Limits.CommandTimeout)
+	}
+	report := reportFor(t, result, CollectorProcesses)
+	if report.Status != core.CollectorPartial || report.Unknowns == 0 {
+		t.Errorf("processes report = %+v, want partial with an unknown", report)
+	}
+	if !strings.Contains(report.Detail, "timeout") {
+		t.Errorf("detail = %q, want it to name the timeout", report.Detail)
+	}
+	if len(result.Entries) == 0 {
+		t.Error("the scan must still return the entries it did observe")
 	}
 }

@@ -202,23 +202,21 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		})
 	}
 
-	// Each reference collector gets its own deadline. Without one, a stalled
-	// procfs read, an unresponsive service definition, or an adapter that
-	// ignores cancellation would hang the whole scan.
-	for _, gather := range []func(context.Context, *Options) ([]Reference, core.CollectorReport){
-		gatherProcessReferences,
-		gatherAgentReferences,
-		gatherServiceReferences,
+	// Each reference collector runs under its own deadline, enforced by the
+	// caller rather than by the collector's cooperation. A context alone is
+	// not enough: these collectors sit on blocking syscalls — procfs reads,
+	// readlink, open on a stalled filesystem — that no cancellation
+	// interrupts. Enforcing the bound here means the scan finishes on time
+	// and says what it could not observe.
+	for _, collector := range []struct {
+		name   string
+		gather func(context.Context, *Options) ([]Reference, core.CollectorReport)
+	}{
+		{CollectorProcesses, gatherProcessReferences},
+		{CollectorAgents, gatherAgentReferences},
+		{CollectorServices, gatherServiceReferences},
 	} {
-		collectorCtx, cancel := context.WithTimeout(ctx, opts.Limits.CommandTimeout)
-		refs, report := gather(collectorCtx, &opts)
-		if deadlineExceeded(collectorCtx) {
-			report.Status = core.CollectorPartial
-			report.Unknowns++
-			report.Detail = appendDetail(report.Detail,
-				fmt.Sprintf("stopped at the %s command timeout", opts.Limits.CommandTimeout))
-		}
-		cancel()
+		refs, report := runBounded(ctx, &opts, collector.name, collector.gather)
 		report.Recorded = attachReferences(entries, refs, now)
 		result.Reports = append(result.Reports, report)
 	}
@@ -337,6 +335,56 @@ func addUnknown(entry *core.Entry, source core.EvidenceSource, kind core.Protect
 // errBounded marks a bound being reached, which is reported rather than
 // treated as a failure.
 var errBounded = errors.New("collect: bound reached")
+
+// runBounded runs one reference collector and enforces its deadline from the
+// outside.
+//
+// The collector runs on its own goroutine. If it has not returned when the
+// command timeout elapses, the scan continues with a partial report and one
+// unknown; a late answer is discarded. The goroutine stays parked until its
+// blocking syscall returns, which is unavoidable in-process, but it can no
+// longer delay the scan.
+func runBounded(
+	ctx context.Context,
+	opts *Options,
+	name string,
+	gather func(context.Context, *Options) ([]Reference, core.CollectorReport),
+) ([]Reference, core.CollectorReport) {
+	timeout := opts.Limits.CommandTimeout
+	collectorCtx, cancel := context.WithTimeout(ctx, timeout)
+
+	type outcome struct {
+		refs   []Reference
+		report core.CollectorReport
+	}
+	// Buffered so an overrunning collector never blocks on the send.
+	done := make(chan outcome, 1)
+	go func() {
+		defer cancel()
+		refs, report := gather(collectorCtx, opts)
+		done <- outcome{refs: refs, report: report}
+	}()
+
+	select {
+	case result := <-done:
+		report := result.report
+		if deadlineExceeded(collectorCtx) {
+			report.Status = core.CollectorPartial
+			report.Unknowns++
+			report.Detail = appendDetail(report.Detail,
+				fmt.Sprintf("stopped at the %s command timeout", timeout))
+		}
+		return result.refs, report
+	case <-collectorCtx.Done():
+		return nil, core.CollectorReport{
+			Name:     name,
+			Status:   core.CollectorPartial,
+			Unknowns: 1,
+			Detail: fmt.Sprintf("did not finish within the %s command timeout; references from this source are unknown",
+				timeout),
+		}
+	}
+}
 
 // deadlineExceeded reports whether a collector context ran out of time.
 func deadlineExceeded(ctx context.Context) bool {

@@ -35,8 +35,9 @@ const (
 
 // Store is an open database handle with the current schema applied.
 type Store struct {
-	db   *sql.DB
-	path string
+	db       *sql.DB
+	path     string
+	readOnly bool
 }
 
 // Open opens the database at path, creating the file and its parent directory
@@ -88,8 +89,57 @@ func OpenExisting(ctx context.Context, path string) (*Store, error) {
 	return Open(ctx, path)
 }
 
+// ErrSchemaMismatch reports a database whose schema version differs from
+// this build's, encountered on a read-only open that may not migrate it.
+var ErrSchemaMismatch = errors.New("store: database schema version differs from this build")
+
+// OpenReadOnly opens an existing database for reading only.
+//
+// Unlike Open it creates nothing, changes no permissions, sets no journal
+// mode, and applies no migration: a reporting-only command must leave the
+// durable database byte-identical. A schema that does not match this build
+// is reported as ErrSchemaMismatch rather than upgraded behind the
+// operator's back.
+//
+// One caveat is inherent to SQLite: reading a database in WAL mode requires
+// mapping the shared-memory index, so empty "-wal" and "-shm" sidecars may
+// appear. No transaction is committed and the database file itself is
+// unchanged.
+func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrNotInitialized
+		}
+		return nil, fmt.Errorf("store: stat %s: %w", path, err)
+	}
+	db, err := sql.Open("sqlite", readOnlyDSN(path))
+	if err != nil {
+		return nil, fmt.Errorf("store: open %s read-only: %w", path, err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: open %s read-only: %w", path, err)
+	}
+	s := &Store{db: db, path: path, readOnly: true}
+	version, err := s.userVersion(ctx)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if version != SchemaVersion() {
+		db.Close()
+		return nil, fmt.Errorf("%w: database is at %d, this build expects %d", ErrSchemaMismatch, version, SchemaVersion())
+	}
+	return s, nil
+}
+
 // Path returns the database file path.
 func (s *Store) Path() string { return s.path }
+
+// ReadOnly reports whether this handle may not write.
+func (s *Store) ReadOnly() bool { return s.readOnly }
 
 // Close releases the database handle.
 func (s *Store) Close() error { return s.db.Close() }
@@ -100,6 +150,9 @@ type Tx struct{ tx *sql.Tx }
 // Write runs fn inside a transaction, committing on success and rolling back
 // on any error or panic.
 func (s *Store) Write(ctx context.Context, fn func(*Tx) error) error {
+	if s.readOnly {
+		return fmt.Errorf("store: %s is open read-only", s.path)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin transaction: %w", err)
@@ -197,6 +250,18 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 		stats.DatabaseBytes = info.Size()
 	}
 	return stats, nil
+}
+
+// readOnlyDSN opens the database strictly for reading: no journal-mode
+// change, no recovery write, and the connection itself refuses writes.
+func readOnlyDSN(path string) string {
+	u := url.URL{Scheme: "file", Path: path}
+	q := url.Values{}
+	q.Add("mode", "ro")
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "query_only(1)")
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func dsn(path string) string {

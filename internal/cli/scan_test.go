@@ -2,7 +2,10 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +13,7 @@ import (
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
 	"github.com/gitmoot/workspace-janitor/internal/store"
+	_ "modernc.org/sqlite" // the test inspects the database schema directly
 )
 
 // scanFixture is a fixture home plus a scannable workspace root. Process and
@@ -64,12 +68,13 @@ type scanDocument struct {
 	SchemaVersion int    `json:"schema_version"`
 	Kind          string `json:"kind"`
 	Data          struct {
-		Scan      core.Scan    `json:"scan"`
-		Persisted bool         `json:"persisted"`
-		PriorScan string       `json:"prior_scan_id"`
-		Protected int          `json:"protected_entries"`
-		Unknowns  int          `json:"unknown_observations"`
-		Entries   []core.Entry `json:"entries"`
+		Scan            core.Scan    `json:"scan"`
+		Persisted       bool         `json:"persisted"`
+		PriorScan       string       `json:"prior_scan_id"`
+		PriorComparison string       `json:"prior_comparison"`
+		Protected       int          `json:"protected_entries"`
+		Unknowns        int          `json:"unknown_observations"`
+		Entries         []core.Entry `json:"entries"`
 	} `json:"data"`
 }
 
@@ -333,4 +338,102 @@ func TestScanFailsOnInvalidPolicy(t *testing.T) {
 	if !strings.Contains(stderr, "invalid configuration") {
 		t.Errorf("stderr = %q", stderr)
 	}
+}
+
+// A reporting-only run against an existing database must not migrate it,
+// change its permissions, or write to it.
+func TestScanNoStoreLeavesAnExistingDatabaseUnchanged(t *testing.T) {
+	f := newScanFixture(t)
+	if _, _, code := f.run(t, "scan"); code != ExitOK {
+		t.Fatalf("seeding scan failed with exit %d", code)
+	}
+	dbPath := filepath.Join(f.home, ".local", "state", "workspace-janitor", "janitor.db")
+	before := fileDigest(t, dbPath)
+
+	doc := f.scanJSON(t, "--no-store")
+	if doc.Data.Persisted {
+		t.Error("--no-store persisted the scan")
+	}
+	if doc.Data.PriorScan == "" {
+		t.Error("--no-store should still read the prior scan for comparison")
+	}
+	if after := fileDigest(t, dbPath); after != before {
+		t.Errorf("--no-store changed the database:\n before %s\n after  %s", before, after)
+	}
+}
+
+// A database this build cannot read read-only is reported and skipped, not
+// migrated behind the operator's back.
+func TestScanNoStoreReportsWhyComparisonWasSkipped(t *testing.T) {
+	f := newScanFixture(t)
+	doc := f.scanJSON(t, "--no-store")
+	if !strings.Contains(doc.Data.PriorComparison, "no previous scan") {
+		t.Errorf("prior comparison note = %q, want it to explain the skip", doc.Data.PriorComparison)
+	}
+}
+
+func fileDigest(t *testing.T, path string) string {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return fmt.Sprintf("%o:%x", info.Mode().Perm(), sha256.Sum256(data))
+}
+
+// A database from a different schema version must be reported and left
+// alone. Migrating it during a reporting-only run would change durable
+// state the operator asked the command not to touch.
+func TestScanNoStoreDoesNotMigrateAStaleDatabase(t *testing.T) {
+	f := newScanFixture(t)
+	if _, _, code := f.run(t, "scan"); code != ExitOK {
+		t.Fatalf("seeding scan failed with exit %d", code)
+	}
+	dbPath := filepath.Join(f.home, ".local", "state", "workspace-janitor", "janitor.db")
+	setUserVersion(t, dbPath, 1)
+	before := fileDigest(t, dbPath)
+
+	doc := f.scanJSON(t, "--no-store")
+	if doc.Data.PriorScan != "" {
+		t.Errorf("prior scan = %q, want no comparison against an unreadable schema", doc.Data.PriorScan)
+	}
+	if !strings.Contains(doc.Data.PriorComparison, "schema") {
+		t.Errorf("comparison note = %q, want it to name the schema mismatch", doc.Data.PriorComparison)
+	}
+	if got := userVersion(t, dbPath); got != 1 {
+		t.Errorf("schema version = %d, want 1: --no-store migrated the database", got)
+	}
+	if after := fileDigest(t, dbPath); after != before {
+		t.Errorf("--no-store changed a stale database:\n before %s\n after  %s", before, after)
+	}
+}
+
+func setUserVersion(t *testing.T, path string, version int) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		t.Fatalf("set user_version: %v", err)
+	}
+}
+
+func userVersion(t *testing.T, path string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	return version
 }
