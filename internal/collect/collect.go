@@ -344,11 +344,12 @@ var errBounded = errors.New("collect: bound reached")
 // with one unknown. It never waits for a collector, and it never blocks on
 // one that is mid-publication.
 //
-// Lateness is decided by comparing against the deadline, not by which
-// goroutine is scheduled first: the collector publishes only if the context
-// has not expired by the time it finishes, so a result produced after the
-// deadline is discarded at the source rather than accepted by a caller that
-// happened to be delayed.
+// Lateness is decided by comparing the completion time against the recorded
+// deadline, not by which goroutine is scheduled first and not by context
+// cancellation. Context cancellation is asynchronous — collectorCtx.Err()
+// only becomes non-nil once the timer goroutine runs — so a collector that
+// finished after the deadline could still observe a nil error and publish.
+// The wall-clock comparison has no such lag.
 //
 // The residual case is a collector that finished just before the deadline
 // and had not yet published: it is reported as an unknown. That is the
@@ -361,7 +362,8 @@ func runBounded(
 	gather func(context.Context, *Options) ([]Reference, core.CollectorReport),
 ) ([]Reference, core.CollectorReport) {
 	timeout := opts.Limits.CommandTimeout
-	collectorCtx, cancel := context.WithTimeout(ctx, timeout)
+	deadline := nowFunc().Add(timeout)
+	collectorCtx, cancel := context.WithDeadline(ctx, deadline)
 	// Cancelled by the caller, not by the collector goroutine: cancelling
 	// after a publication would make the deadline look expired for a
 	// collector that finished in time.
@@ -376,9 +378,9 @@ func runBounded(
 	done := make(chan outcome, 1)
 	go func() {
 		refs, report := gather(collectorCtx, opts)
-		if collectorCtx.Err() != nil {
-			// Finished after the deadline: the scan has already reported
-			// this source as unknown, so the result is dropped.
+		if !nowFunc().Before(deadline) {
+			// Finished at or after the deadline: the scan reports this
+			// source as unknown, so the result is dropped.
 			return
 		}
 		done <- outcome{refs: refs, report: report}
@@ -413,6 +415,11 @@ func runBounded(
 
 // beforeSettle is nil outside tests. See runBounded.
 var beforeSettle func()
+
+// nowFunc is time.Now outside tests. It exists so a test can place a
+// collector's completion on either side of the deadline without depending
+// on real timing.
+var nowFunc = time.Now
 
 // appendDetail joins report details without losing the earlier one.
 func appendDetail(existing, addition string) string {

@@ -737,3 +737,47 @@ func TestRunBoundedNeverBlocksOnAPublishingCollector(t *testing.T) {
 		t.Errorf("report = %+v, want partial", report)
 	}
 }
+
+// Context cancellation is asynchronous: a collector that finished after the
+// deadline can still observe a nil context error. The decision must use the
+// recorded deadline, so a completion placed past it is dropped even while
+// the context is still live.
+func TestRunBoundedDropsLateResultBeforeContextCancellationLands(t *testing.T) {
+	opts := fixtureOptions(t.TempDir())
+	opts.Limits.CommandTimeout = 200 * time.Millisecond
+
+	start := time.Now()
+	// The collector finishes immediately in real time, but the clock it is
+	// judged against reports a moment past the deadline — the cancellation
+	// lag the context check could not see. The first reading arms the
+	// deadline; every later reading is past it.
+	var armed bool
+	nowFunc = func() time.Time {
+		if !armed {
+			armed = true
+			return start
+		}
+		return start.Add(time.Hour)
+	}
+	t.Cleanup(func() { nowFunc = time.Now })
+
+	gather := func(ctx context.Context, _ *Options) ([]Reference, core.CollectorReport) {
+		if ctx.Err() != nil {
+			t.Error("the context must still be live: this test is about the cancellation lag")
+		}
+		return []Reference{{
+			Path:       "/repos/app",
+			Source:     core.SourceProcess,
+			Protection: core.ProtectActiveProcess,
+			Signal:     "process_cwd",
+		}}, core.CollectorReport{Name: CollectorProcesses, Status: core.CollectorRan, Visited: 4}
+	}
+
+	refs, report := runBounded(context.Background(), &opts, CollectorProcesses, gather)
+	if report.Status != core.CollectorPartial || report.Unknowns != 1 {
+		t.Errorf("report = %+v, want a partial timeout report", report)
+	}
+	if len(refs) != 0 || report.Visited != 0 {
+		t.Errorf("a result completed past the deadline was accepted: report = %+v refs = %+v", report, refs)
+	}
+}
