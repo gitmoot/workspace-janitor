@@ -364,13 +364,20 @@ func TestProjectMarkerGlobsAreRejected(t *testing.T) {
 		"    - \"*.csproj\"",
 		"    - go.mod",
 		"    - sub/dir.mod",
+		"    - \".\"",
+		"    - \"..\"",
 		"",
 	}, "\n"))
 	if err == nil {
 		t.Fatal("expected a glob in project_markers to be rejected")
 	}
 	message := err.Error()
-	for _, want := range []string{"project_markers[0]", "literal file name", "project_markers[2]"} {
+	// "." lstats the directory itself and ".." its parent, so either would
+	// mark every scanned directory as a project.
+	for _, want := range []string{
+		"project_markers[0]", "literal file name",
+		"project_markers[2]", "project_markers[3]", "project_markers[4]",
+	} {
 		if !strings.Contains(message, want) {
 			t.Errorf("error %q does not mention %q", message, want)
 		}

@@ -631,3 +631,27 @@ func TestRelocationOntoAnExistingPathIsReported(t *testing.T) {
 		t.Errorf("an uncontested relocation was blocked: %+v", solo)
 	}
 }
+
+// A downgraded relocation is a conflict resolution, not an unopposed rule,
+// so its confidence must say so.
+func TestCollisionDowngradeLowersConfidence(t *testing.T) {
+	policy := fixturePolicy()
+	occupied := entryAt("/home/fixture/repos/dup")
+	candidate := entryAt("/home/fixture/a/dup", withGit(&core.GitState{
+		RepoRoot: "/home/fixture/a/dup", UpstreamKnown: true,
+	}))
+	free := entryAt("/home/fixture/b/solo", withGit(&core.GitState{
+		RepoRoot: "/home/fixture/b/solo", UpstreamKnown: true,
+	}))
+
+	result := buildPlan(t, []core.Entry{occupied, candidate, free}, policy, nil)
+	downgraded := actionFor(t, result, "/home/fixture/a/dup")
+	if downgraded.Confidence != conflictConfidence {
+		t.Errorf("confidence = %v, want %v for a collision-downgraded action",
+			downgraded.Confidence, conflictConfidence)
+	}
+	if uncontested := actionFor(t, result, "/home/fixture/b/solo"); uncontested.Confidence != settledConfidence {
+		t.Errorf("confidence = %v, want %v for an unopposed relocation",
+			uncontested.Confidence, settledConfidence)
+	}
+}

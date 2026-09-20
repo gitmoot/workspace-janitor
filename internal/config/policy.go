@@ -528,8 +528,15 @@ func (p *Policy) Validate() core.FieldErrors {
 		case strings.ContainsAny(marker, "*?["):
 			errs.Add(field, "must be a literal file name, got the pattern %q: "+
 				"markers are detected with a single lstat, so a glob would never match", marker)
-		case strings.ContainsRune(marker, filepath.Separator):
-			errs.Add(field, "must be a file name inside the directory, not a path, got %q", marker)
+		case marker == "." || marker == "..":
+			// These always resolve: "." lstats the directory itself and
+			// ".." its parent, so either would mark every scanned
+			// directory as a project.
+			errs.Add(field, "must name a file inside the directory, got %q, which matches every directory", marker)
+		case filepath.Base(marker) != marker:
+			// Base() rejects anything with a path separator, on any
+			// platform's rules for this build.
+			errs.Add(field, "must be a plain file name inside the directory, got %q", marker)
 		}
 	}
 	for _, group := range []struct {

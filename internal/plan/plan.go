@@ -242,16 +242,23 @@ func joinReasons(reasons []string) string {
 	}
 }
 
-// confidenceFor reports how firm a decision is. A conflict or an ambiguous
-// classification is less certain than an unopposed rule.
+// Confidence levels. A decision reached over a disagreement, or with no
+// classification at all, is less certain than an unopposed rule.
+const (
+	ambiguousConfidence = 0.3
+	conflictConfidence  = 0.6
+	settledConfidence   = 0.9
+)
+
+// confidenceFor reports how firm a decision is.
 func confidenceFor(decision Decision) float64 {
 	switch {
 	case decision.Ambiguous:
-		return 0.3
+		return ambiguousConfidence
 	case len(decision.Conflicts) > 0:
-		return 0.6
+		return conflictConfidence
 	default:
-		return 0.9
+		return settledConfidence
 	}
 }
 
@@ -319,6 +326,9 @@ func resolveDestinationCollisions(built *core.Plan, traces []Trace, occupied map
 			action.Kind = core.ActionInvestigate
 			action.Destination = ""
 			action.Retention = core.RetentionNone
+			// The decision is now a conflict resolution, not an unopposed
+			// rule, and the confidence has to say so.
+			action.Confidence = conflictConfidence
 			action.Rules = append(action.Rules, "plan.destination_collision")
 			action.Reasons = append(action.Reasons, reason)
 			if t, ok := traceIndex[action.Path]; ok {
