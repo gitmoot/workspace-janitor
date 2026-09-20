@@ -89,6 +89,7 @@ const (
 	ProtectSymlinkEscape      ProtectionKind = "symlink_escape"
 	ProtectIdentityChanged    ProtectionKind = "identity_changed"
 	ProtectInsufficientSpace  ProtectionKind = "insufficient_space"
+	ProtectCrossFilesystem    ProtectionKind = "cross_filesystem"
 	ProtectCollectorFailure   ProtectionKind = "collector_failure"
 	ProtectPolicyProtected    ProtectionKind = "policy_protected"
 )
@@ -97,9 +98,14 @@ var protectionKinds = []ProtectionKind{
 	ProtectActiveProcess, ProtectRegisteredAgent, ProtectOwningJob, ProtectDirtyRepository,
 	ProtectStashedWork, ProtectUnpublishedCommits, ProtectBrokenGitMetadata, ProtectLockHeld,
 	ProtectServiceReference, ProtectSensitiveContent, ProtectLiveDatabase, ProtectDurableEvidence,
-	ProtectSymlinkEscape, ProtectIdentityChanged, ProtectInsufficientSpace, ProtectCollectorFailure,
-	ProtectPolicyProtected,
+	ProtectSymlinkEscape, ProtectIdentityChanged, ProtectInsufficientSpace, ProtectCrossFilesystem,
+	ProtectCollectorFailure, ProtectPolicyProtected,
 }
+
+// ProtectionKinds returns every protection kind in the contract. The safety
+// engine uses it to prove that each kind has remediation text, so a new
+// protection cannot ship as a refusal with no way out.
+func ProtectionKinds() []ProtectionKind { return copyEnum(protectionKinds) }
 
 // Valid reports whether k is a known protection kind.
 func (k ProtectionKind) Valid() bool { return validEnum(k, protectionKinds) }
@@ -177,10 +183,14 @@ func (e Evidence) Validate(field string) FieldErrors {
 
 // Protection is a deterministic reason an entry may not be mutated.
 type Protection struct {
-	Kind     ProtectionKind `json:"kind"`
-	Reason   string         `json:"reason"`
-	Source   EvidenceSource `json:"source"`
-	Blocking bool           `json:"blocking"`
+	Kind   ProtectionKind `json:"kind"`
+	Reason string         `json:"reason"`
+	Source EvidenceSource `json:"source"`
+	// Remediation tells the operator what would clear this protection. A
+	// refusal without it is a dead end, so the safety engine fills it for
+	// every protection it reports.
+	Remediation string `json:"remediation,omitempty"`
+	Blocking    bool   `json:"blocking"`
 }
 
 // Validate checks a single protection record.

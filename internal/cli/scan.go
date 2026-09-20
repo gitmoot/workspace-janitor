@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 	"github.com/gitmoot/workspace-janitor/internal/output"
+	"github.com/gitmoot/workspace-janitor/internal/safety"
 	"github.com/gitmoot/workspace-janitor/internal/store"
 )
 
@@ -36,12 +37,27 @@ type scanReport struct {
 	PriorScan string    `json:"prior_scan_id,omitempty"`
 	// PriorComparison explains why no prior scan was compared, when that
 	// happened for a reason other than "this is the first scan".
-	PriorComparison string        `json:"prior_comparison,omitempty"`
-	Protected       int           `json:"protected_entries"`
-	Unknowns        int           `json:"unknown_observations"`
-	Entries         []core.Entry  `json:"entries"`
-	EntryLimit      int           `json:"entry_limit"`
-	Roots           []scanRootRef `json:"roots"`
+	PriorComparison string       `json:"prior_comparison,omitempty"`
+	Protected       int          `json:"protected_entries"`
+	Refused         int          `json:"refused_entries"`
+	Unknowns        int          `json:"unknown_observations"`
+	Entries         []core.Entry `json:"entries"`
+	// Verdicts is the safety engine's typed answer per entry, ordered by
+	// path. A refusal here cannot be overridden by any later stage.
+	Verdicts   []core.Verdict `json:"verdicts"`
+	Guards     []string       `json:"guards"`
+	Target     safetyTarget   `json:"quarantine_target"`
+	EntryLimit int            `json:"entry_limit"`
+	Roots      []scanRootRef  `json:"roots"`
+}
+
+// safetyTarget reports what the engine learned about the quarantine
+// destination, including that it could not learn anything.
+type safetyTarget struct {
+	Dir       string `json:"dir"`
+	Known     bool   `json:"known"`
+	FreeBytes int64  `json:"free_bytes,omitempty"`
+	Detail    string `json:"detail,omitempty"`
 }
 
 // scanRootRef records the bounds a root was scanned with.
@@ -147,13 +163,34 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 	scan.Collectors = result.Reports
 	scan.Normalize()
 
+	// The safety engine runs over every observed entry. A scan makes no
+	// decisions, but it must report which paths may never be mutated and
+	// why, with the remedy for each refusal.
+	target := safety.ResolveTarget(policy.Retention.QuarantineDir)
+	enginePolicy := safety.Policy{
+		ProtectedPaths:           policy.Protect.Paths,
+		NamePatterns:             policy.Protect.NamePatterns,
+		StateDir:                 paths.StateDir,
+		QuarantineDir:            policy.Retention.QuarantineDir,
+		AllowCrossFilesystemCopy: policy.Safety.AllowCrossFilesystemQuarantine,
+		MinFreeBytes:             policy.Safety.MinFreeBytes,
+	}
+
 	report := scanReport{
 		Scan:            scan,
 		PriorScan:       priorID,
 		PriorComparison: comparisonNote,
 		Entries:         result.Entries,
-		EntryLimit:      policy.Limits.MaxEntries,
-		Roots:           rootRefs(roots),
+		Verdicts:        make([]core.Verdict, 0, len(result.Entries)),
+		Guards:          safety.GuardNames(),
+		Target: safetyTarget{
+			Dir:       target.Dir,
+			Known:     target.Known,
+			FreeBytes: target.FreeBytes,
+			Detail:    target.Detail,
+		},
+		EntryLimit: policy.Limits.MaxEntries,
+		Roots:      rootRefs(roots),
 	}
 	for _, entry := range result.Entries {
 		if entry.Protected() {
@@ -164,6 +201,16 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 				report.Unknowns++
 			}
 		}
+		verdict := safety.Evaluate(safety.Input{
+			Entry:  entry,
+			Policy: enginePolicy,
+			Target: &target,
+			Now:    now,
+		})
+		if verdict.Refused() {
+			report.Refused++
+		}
+		report.Verdicts = append(report.Verdicts, verdict)
 	}
 
 	if !opts.noPersist {
@@ -321,6 +368,7 @@ func writeScanText(e *env, report scanReport) error {
 		{Key: "roots:", Value: strings.Join(report.Scan.Roots, ", ")},
 		{Key: "entries:", Value: strconv.Itoa(report.Scan.EntryCount)},
 		{Key: "protected:", Value: strconv.Itoa(report.Protected)},
+		{Key: "refused:", Value: strconv.Itoa(report.Refused)},
 		{Key: "unknowns:", Value: strconv.Itoa(report.Unknowns)},
 		{Key: "persisted:", Value: strconv.FormatBool(report.Persisted)},
 	}
@@ -353,16 +401,60 @@ func writeScanText(e *env, report scanReport) error {
 	if _, err := fmt.Fprintln(e.stdout, "\nEntries:"); err != nil {
 		return err
 	}
+	verdicts := make(map[string]core.Verdict, len(report.Verdicts))
+	for _, verdict := range report.Verdicts {
+		verdicts[verdict.Path] = verdict
+	}
 	entryRows := make([][]string, 0, len(report.Entries))
 	for _, entry := range report.Entries {
+		verdict := verdicts[entry.Path]
 		entryRows = append(entryRows, []string{
+			string(verdict.Decision),
 			string(entry.Kind),
 			output.HumanBytes(entry.SizeBytes),
 			protectionSummary(entry),
 			entry.Path,
 		})
 	}
-	return output.WriteTable(e.stdout, []string{"KIND", "SIZE", "PROTECTIONS", "PATH"}, entryRows)
+	if err := output.WriteTable(e.stdout, []string{"SAFETY", "KIND", "SIZE", "PROTECTIONS", "PATH"}, entryRows); err != nil {
+		return err
+	}
+	return writeRefusals(e, report)
+}
+
+// writeRefusals prints every refusal with its evidence and its remedy. A
+// refusal the operator cannot act on is not a useful answer.
+func writeRefusals(e *env, report scanReport) error {
+	refused := make([]core.Verdict, 0, len(report.Verdicts))
+	for _, verdict := range report.Verdicts {
+		if verdict.Refused() {
+			refused = append(refused, verdict)
+		}
+	}
+	if len(refused) == 0 {
+		_, err := fmt.Fprintf(e.stdout, "\nNo path is protected against mutation (%d guard(s) ran).\n", len(report.Guards))
+		return err
+	}
+	if _, err := fmt.Fprintf(e.stdout, "\nRefusals (%d of %d entries, %d guard(s) ran):\n",
+		len(refused), len(report.Entries), len(report.Guards)); err != nil {
+		return err
+	}
+	for _, verdict := range refused {
+		if _, err := fmt.Fprintf(e.stdout, "\n  %s\n", verdict.Path); err != nil {
+			return err
+		}
+		rows := make([][]string, 0, len(verdict.Protections))
+		for _, protection := range verdict.Protections {
+			if !protection.Blocking {
+				continue
+			}
+			rows = append(rows, []string{"    " + string(protection.Kind), protection.Reason, "-> " + protection.Remediation})
+		}
+		if err := output.WriteTable(e.stdout, nil, rows); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // protectionSummary lists the blocking protection kinds of an entry.

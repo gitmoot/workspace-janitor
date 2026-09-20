@@ -823,3 +823,25 @@ func TestRunBoundedHonoursAnEarlierCallerDeadline(t *testing.T) {
 		t.Errorf("a result produced after caller cancellation was accepted: report = %+v refs = %+v", report, refs)
 	}
 }
+
+// References under a root of "/" must still attach. A containment check
+// that mishandles the root directory would silently drop every reference.
+func TestReferencesAttachUnderARootOfSlash(t *testing.T) {
+	entries := []core.Entry{{Path: "/", Root: "/"}, {Path: "/repos", Root: "/"}}
+	matched := attachReferences(entries, []Reference{{
+		Path:       "/repos/app",
+		Source:     core.SourceProcess,
+		Protection: core.ProtectActiveProcess,
+		Signal:     "process_cwd",
+		Detail:     "pid 1 (init) working directory",
+	}}, fixedNow)
+
+	if matched != 1 {
+		t.Fatalf("matched = %d, want the reference attached", matched)
+	}
+	for _, entry := range entries {
+		if !hasProtection(entry, core.ProtectActiveProcess) {
+			t.Errorf("%s did not receive the reference: %+v", entry.Path, entry.Protections)
+		}
+	}
+}

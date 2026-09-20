@@ -76,6 +76,16 @@ collectors:
   pm2_dumps:
     - ~/.pm2/dump.pm2
 
+# Destination checks of the safety engine. Nothing here disables a core
+# invariant: the protections themselves are not configurable.
+safety:
+  # Headroom that must remain on the destination filesystem after a
+  # quarantine.
+  min_free_bytes: 1073741824
+  # Allowing a destination on another filesystem turns an atomic rename
+  # into a copy and delete, so it is off by default.
+  allow_cross_filesystem_quarantine: false
+
 # Bounds that keep one slow repository or one enormous directory from
 # stalling or unbounding a scan. Hitting a bound is reported as partial, not
 # hidden.
