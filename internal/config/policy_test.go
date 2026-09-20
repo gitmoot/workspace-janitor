@@ -266,3 +266,87 @@ func TestExamplePolicyDocumentIsValid(t *testing.T) {
 		t.Errorf("example policy lost its roots or cache rules: %+v", policy)
 	}
 }
+
+// The quarantine directory is where apply moves things. Wherever the policy
+// puts it, it must be protected, or a scan root containing it could propose
+// acting on the tool's own staging area.
+func TestParsePolicyProtectsConfiguredQuarantineDir(t *testing.T) {
+	paths := fixturePaths(t)
+	policy, err := parse(t, paths, "roots:\n  - path: /srv\nretention:\n  quarantine_dir: /srv/quarantine\n")
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+	if policy.Retention.QuarantineDir != "/srv/quarantine" {
+		t.Fatalf("quarantine dir = %q", policy.Retention.QuarantineDir)
+	}
+	if !contains(policy.Protect.Paths, "/srv/quarantine") {
+		t.Errorf("configured quarantine directory is unprotected: %v", policy.Protect.Paths)
+	}
+}
+
+func TestDefaultPolicyProtectsStateAndQuarantine(t *testing.T) {
+	paths := fixturePaths(t)
+	policy := DefaultPolicy(paths)
+	for _, want := range []string{paths.StateDir, paths.QuarantineDir} {
+		if !contains(policy.Protect.Paths, want) {
+			t.Errorf("default protections missing %q: %v", want, policy.Protect.Paths)
+		}
+	}
+}
+
+// With no home, the defaults have no root to derive. The failure must say
+// what to do rather than complain about an empty list the operator never
+// wrote.
+func TestLoadPolicyWithoutHomeDemandsAPolicyFile(t *testing.T) {
+	dir := t.TempDir()
+	paths, err := ResolvePaths(MapLookup(map[string]string{}), Overrides{
+		ConfigDir: filepath.Join(dir, "config"),
+		StateDir:  filepath.Join(dir, "state"),
+		CacheDir:  filepath.Join(dir, "cache"),
+	})
+	if err != nil {
+		t.Fatalf("ResolvePaths: %v", err)
+	}
+	_, err = LoadPolicy(paths)
+	if err == nil {
+		t.Fatal("expected a run with no home and no policy file to fail")
+	}
+	message := err.Error()
+	for _, want := range []string{paths.PolicyFile, EnvHome, "at least one root"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("error %q does not mention %q", message, want)
+		}
+	}
+
+	// With a policy file declaring a root, the same no-home run works.
+	if err := EnsureDirs(paths); err != nil {
+		t.Fatalf("EnsureDirs: %v", err)
+	}
+	if err := os.WriteFile(paths.PolicyFile, []byte("roots:\n  - path: /srv/work\n"), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	policy, err := LoadPolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadPolicy with an explicit policy and no home: %v", err)
+	}
+	if len(policy.Roots) != 1 || policy.Roots[0].Path != "/srv/work" {
+		t.Errorf("roots = %+v", policy.Roots)
+	}
+}
+
+func TestEnsureDirsCreatesQuarantine(t *testing.T) {
+	paths := fixturePaths(t)
+	if err := EnsureDirs(paths); err != nil {
+		t.Fatalf("EnsureDirs: %v", err)
+	}
+	for _, dir := range []string{paths.ConfigDir, paths.StateDir, paths.CacheDir, paths.QuarantineDir} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Errorf("stat %s: %v", dir, err)
+			continue
+		}
+		if perm := info.Mode().Perm(); perm != DirMode.Perm() {
+			t.Errorf("%s mode = %o, want %o", dir, perm, DirMode.Perm())
+		}
+	}
+}

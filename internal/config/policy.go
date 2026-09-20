@@ -158,8 +158,12 @@ func DefaultPolicy(p Paths) Policy {
 		policy.Roots = []Root{}
 		policy.Protect.Paths = []string{}
 	}
-	if p.StateDir != "" {
-		policy.Protect.Paths = append(policy.Protect.Paths, p.StateDir)
+	// The tool's own state and quarantine are mutation boundaries: whatever a
+	// scan root turns out to cover, they may never be acted on.
+	for _, path := range []string{p.StateDir, p.QuarantineDir} {
+		if path != "" {
+			policy.Protect.Paths = append(policy.Protect.Paths, path)
+		}
 	}
 	return policy
 }
@@ -215,6 +219,12 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	// tool protects by default.
 	p.Protect.Paths = mergeUnique(p.Protect.Paths, defaults.Protect.Paths)
 	p.Protect.NamePatterns = mergeUnique(p.Protect.NamePatterns, defaults.Protect.NamePatterns)
+	// A relocated quarantine directory is still a mutation boundary. The
+	// default protections only cover the default location, so protect
+	// whatever location the document actually configured.
+	if p.Retention.QuarantineDir != "" {
+		p.Protect.Paths = mergeUnique(p.Protect.Paths, []string{p.Retention.QuarantineDir})
+	}
 	if p.Caches == nil {
 		p.Caches = []CacheRule{}
 	}

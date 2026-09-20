@@ -34,7 +34,8 @@ retention:
   # How long quarantined items are kept: none, 7d, 30d, 90d, or permanent.
   # Expiry alone never deletes anything; a second safety evaluation must pass.
   default: 30d
-  # Defaults to <state-dir>/quarantine.
+  # Defaults to <state-dir>/quarantine. Wherever it points, it is added to
+  # protect.paths automatically: the janitor never acts on its own staging area.
   quarantine_dir: ~/.local/state/workspace-janitor/quarantine
 
 # Known regenerable caches. action is one of keep, quarantine,

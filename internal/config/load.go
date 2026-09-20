@@ -23,27 +23,44 @@ const MaxPolicyBytes = 1 << 20
 // A missing policy file is not an error: the built-in defaults are returned
 // with FromFile false. An existing but invalid file always fails; defaults are
 // never substituted for a broken document.
+//
+// The built-in defaults derive their single discovery root from the home
+// directory. A run with no home — every path supplied by an override — has no
+// default root, so it requires a policy file that declares one.
 func LoadPolicy(paths Paths) (Policy, error) {
 	if paths.PolicyFile == "" {
-		policy := DefaultPolicy(paths)
-		if errs := policy.Validate(); len(errs) > 0 {
-			return Policy{}, &Error{Scope: "built-in defaults", Errors: errs}
-		}
-		return policy, nil
+		return defaultsOnly(paths, "built-in defaults")
 	}
 	data, err := readPolicyFile(paths.PolicyFile)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		policy := DefaultPolicy(paths)
-		policy.Source = fmt.Sprintf("built-in defaults (no policy file at %s)", paths.PolicyFile)
-		if errs := policy.Validate(); len(errs) > 0 {
-			return Policy{}, &Error{Scope: policy.Source, Errors: errs}
-		}
-		return policy, nil
+		return defaultsOnly(paths, fmt.Sprintf("built-in defaults (no policy file at %s)", paths.PolicyFile))
 	case err != nil:
 		return Policy{}, fmt.Errorf("read policy %s: %w", paths.PolicyFile, err)
 	}
 	return ParsePolicy(data, paths, paths.PolicyFile)
+}
+
+func defaultsOnly(paths Paths, source string) (Policy, error) {
+	policy := DefaultPolicy(paths)
+	policy.Source = source
+	if len(policy.Roots) == 0 && paths.Home == "" {
+		var errs core.FieldErrors
+		errs.Add("roots", "cannot be derived without a home directory: write a policy file at %s declaring at least one root, or set %s",
+			policyFileHint(paths), EnvHome)
+		return Policy{}, &Error{Scope: source, Errors: errs}
+	}
+	if errs := policy.Validate(); len(errs) > 0 {
+		return Policy{}, &Error{Scope: source, Errors: errs}
+	}
+	return policy, nil
+}
+
+func policyFileHint(paths Paths) string {
+	if paths.PolicyFile != "" {
+		return paths.PolicyFile
+	}
+	return "the configured policy path"
 }
 
 // ParsePolicy decodes and validates a policy document.

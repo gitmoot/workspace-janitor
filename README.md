@@ -69,12 +69,18 @@ overridden explicitly:
 | cache dir | `$XDG_CACHE_HOME/workspace-janitor` or `~/.cache/workspace-janitor` | `--cache-dir`, `JANITOR_CACHE_DIR`, `XDG_CACHE_HOME` |
 | policy file | `<config dir>/policy.yaml` | `--policy`, `JANITOR_POLICY` |
 
-The state directory holds `janitor.db` and the quarantine directory. Both are
-created with owner-only permissions. `janitor status` reports which source
-each path came from.
+The state directory holds `janitor.db` and the quarantine directory. All of
+them, including the quarantine directory, are created by `janitor doctor`
+with owner-only permissions. `janitor status` reports which source each path
+came from.
 
 If no home directory and no overrides are available, the run fails with
 field-level errors rather than guessing a location.
+
+A run with **every** path overridden needs no home directory, but the
+built-in defaults derive their single discovery root from the home
+directory. Such a run therefore requires a policy file that declares at
+least one root; without one it fails and says so.
 
 ## Policy
 
@@ -88,7 +94,9 @@ example. Three rules govern loading:
 - **A broken policy file never falls back to defaults.** A missing file does.
 
 Protections are additive: paths and name patterns in the document are added
-to the built-in credential protections, never replace them.
+to the built-in credential protections, never replace them. The state
+directory and the effective quarantine directory are always protected,
+wherever `retention.quarantine_dir` puts the latter.
 
 ## Output contracts
 

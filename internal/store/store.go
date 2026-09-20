@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/gitmoot/workspace-janitor/internal/core"
 	_ "modernc.org/sqlite" // pure-Go SQLite driver; no cgo
 )
 
@@ -145,7 +146,7 @@ type Stats struct {
 
 // Stats collects row counts and the most recent scan.
 func (s *Store) Stats(ctx context.Context) (Stats, error) {
-	stats := Stats{}
+	stats := Stats{ContractVersion: core.ContractVersion}
 	err := s.Read(ctx, func(tx *Tx) error {
 		version, err := tx.schemaVersion(ctx)
 		if err != nil {

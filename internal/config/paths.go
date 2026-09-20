@@ -152,10 +152,18 @@ func ResolvePaths(lookup Lookup, overrides Overrides) (Paths, error) {
 	return p, nil
 }
 
-// EnsureDirs creates the config, state, and cache directories with owner-only
-// permissions. It is idempotent.
+// EnsureDirs creates the config, state, cache, and quarantine directories
+// with owner-only permissions. It is idempotent.
+//
+// The quarantine directory is included because it is the mutation boundary:
+// an apply that discovers it missing has already decided to move something.
 func EnsureDirs(p Paths) error {
-	for _, dir := range []string{p.ConfigDir, p.StateDir, p.CacheDir} {
+	return EnsureDir(p.ConfigDir, p.StateDir, p.CacheDir, p.QuarantineDir)
+}
+
+// EnsureDir creates each non-empty directory with owner-only permissions.
+func EnsureDir(dirs ...string) error {
+	for _, dir := range dirs {
 		if dir == "" {
 			continue
 		}

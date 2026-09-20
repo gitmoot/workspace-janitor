@@ -352,3 +352,97 @@ func TestVersionFlagAndCommandAgree(t *testing.T) {
 		t.Errorf("version output must carry the contract and schema versions: %q", flagOut)
 	}
 }
+
+// A run with every path overridden and no home is a supported configuration.
+// It must work end to end when a policy file supplies a root, and fail with
+// actionable guidance when none exists.
+func TestFullyOverriddenRunWithoutHome(t *testing.T) {
+	dir := t.TempDir()
+	configDir := filepath.Join(dir, "config")
+	overrides := []string{
+		"--config-dir", configDir,
+		"--state-dir", filepath.Join(dir, "state"),
+		"--cache-dir", filepath.Join(dir, "cache"),
+	}
+	f := &fixture{env: map[string]string{}}
+
+	_, stderr, code := f.run(t, append(append([]string{}, overrides...), "status")...)
+	if code != ExitUsage {
+		t.Fatalf("exit = %d, want %d", code, ExitUsage)
+	}
+	for _, want := range []string{"roots", "policy.yaml", config.EnvHome} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr %q does not mention %q", stderr, want)
+		}
+	}
+
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "policy.yaml"), []byte("roots:\n  - path: /srv/work\n"), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	stdout, stderr, code := f.run(t, append(append([]string{}, overrides...), "status")...)
+	if code != ExitOK {
+		t.Fatalf("exit = %d, stderr = %q", code, stderr)
+	}
+	if !strings.Contains(stdout, "/srv/work") && !strings.Contains(stdout, "1 root(s)") {
+		t.Errorf("status does not reflect the explicit policy:\n%s", stdout)
+	}
+}
+
+// doctor must prove the mutation boundary is usable, not just the three XDG
+// directories. A healthy verdict with no quarantine directory would be false.
+func TestDoctorPreparesQuarantineDirectory(t *testing.T) {
+	f := newFixture(t)
+	custom := filepath.Join(t.TempDir(), "custom-quarantine")
+	f.writePolicy(t, "roots:\n  - path: /repos\nretention:\n  quarantine_dir: "+custom+"\n")
+
+	stdout, stderr, code := f.run(t, "doctor")
+	if code != ExitOK {
+		t.Fatalf("exit = %d, stdout = %s, stderr = %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "quarantine-dir") || !strings.Contains(stdout, custom) {
+		t.Errorf("doctor does not check the configured quarantine directory:\n%s", stdout)
+	}
+	if _, err := os.Stat(custom); err != nil {
+		t.Errorf("doctor reported healthy without creating %s: %v", custom, err)
+	}
+}
+
+// Version metadata must agree across the envelope and the store statistics:
+// contradictory numbers make a consumer guess which one is real.
+func TestStatusJSONVersionsAgree(t *testing.T) {
+	f := newFixture(t)
+	if _, _, code := f.run(t, "doctor"); code != ExitOK {
+		t.Fatalf("doctor exit = %d", code)
+	}
+	stdout, _, code := f.run(t, "--format", "json", "status")
+	if code != ExitOK {
+		t.Fatalf("status exit = %d", code)
+	}
+	var doc struct {
+		SchemaVersion int `json:"schema_version"`
+		Data          struct {
+			ContractVersion int `json:"contract_version"`
+			Store           struct {
+				ExpectedSchemaVersion int `json:"expected_schema_version"`
+				Stats                 struct {
+					SchemaVersion   int `json:"schema_version"`
+					ContractVersion int `json:"contract_version"`
+				} `json:"stats"`
+			} `json:"store"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
+		t.Fatalf("status JSON is not valid: %v\n%s", err, stdout)
+	}
+	if doc.Data.Store.Stats.ContractVersion != doc.Data.ContractVersion {
+		t.Errorf("store stats contract version = %d, want %d",
+			doc.Data.Store.Stats.ContractVersion, doc.Data.ContractVersion)
+	}
+	if doc.Data.Store.Stats.SchemaVersion != doc.Data.Store.ExpectedSchemaVersion {
+		t.Errorf("store schema version = %d, want %d",
+			doc.Data.Store.Stats.SchemaVersion, doc.Data.Store.ExpectedSchemaVersion)
+	}
+}

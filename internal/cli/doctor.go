@@ -77,6 +77,22 @@ func runDoctor(ctx context.Context, e *env) error {
 	} else {
 		add("policy", checkOK, "%s: version %d, %d root(s), %d cache rule(s), jev=%s",
 			policy.Source, policy.Version, len(policy.Roots), len(policy.Caches), jevSummary(policy))
+		// The quarantine directory the policy actually configures may sit
+		// outside the state directory, so it is checked from the effective
+		// policy rather than from the default layout.
+		quarantine := policy.Retention.QuarantineDir
+		switch {
+		case quarantine == "":
+			add("quarantine-dir", checkFail, "no quarantine directory is configured; apply would have nowhere to move items")
+		default:
+			if err := config.EnsureDir(quarantine); err != nil {
+				add("quarantine-dir", checkFail, "%v", err)
+			} else if err := checkWritable(quarantine); err != nil {
+				add("quarantine-dir", checkFail, "%s is not writable: %v", quarantine, err)
+			} else {
+				add("quarantine-dir", checkOK, "%s is writable", quarantine)
+			}
+		}
 	}
 
 	db, err := store.Open(ctx, paths.DatabaseFile)

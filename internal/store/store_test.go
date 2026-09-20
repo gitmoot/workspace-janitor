@@ -486,3 +486,18 @@ func TestOpenRejectsRelativePath(t *testing.T) {
 		t.Fatal("expected a relative database path to be rejected")
 	}
 }
+
+// Stats carries both versions a consumer needs. Publishing a zero contract
+// version next to a valid schema version would be contradictory metadata.
+func TestStatsReportsBothVersions(t *testing.T) {
+	stats, err := openFixture(t).Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.ContractVersion != core.ContractVersion {
+		t.Errorf("contract version = %d, want %d", stats.ContractVersion, core.ContractVersion)
+	}
+	if stats.SchemaVersion != SchemaVersion() {
+		t.Errorf("schema version = %d, want %d", stats.SchemaVersion, SchemaVersion())
+	}
+}
