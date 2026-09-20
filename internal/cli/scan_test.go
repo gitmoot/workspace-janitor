@@ -68,13 +68,16 @@ type scanDocument struct {
 	SchemaVersion int    `json:"schema_version"`
 	Kind          string `json:"kind"`
 	Data          struct {
-		Scan            core.Scan    `json:"scan"`
-		Persisted       bool         `json:"persisted"`
-		PriorScan       string       `json:"prior_scan_id"`
-		PriorComparison string       `json:"prior_comparison"`
-		Protected       int          `json:"protected_entries"`
-		Unknowns        int          `json:"unknown_observations"`
-		Entries         []core.Entry `json:"entries"`
+		Scan            core.Scan      `json:"scan"`
+		Persisted       bool           `json:"persisted"`
+		PriorScan       string         `json:"prior_scan_id"`
+		PriorComparison string         `json:"prior_comparison"`
+		Protected       int            `json:"protected_entries"`
+		Refused         int            `json:"refused_entries"`
+		Unknowns        int            `json:"unknown_observations"`
+		Entries         []core.Entry   `json:"entries"`
+		Verdicts        []core.Verdict `json:"verdicts"`
+		Guards          []string       `json:"guards"`
 	} `json:"data"`
 }
 
@@ -436,4 +439,128 @@ func userVersion(t *testing.T, path string) int {
 		t.Fatalf("read user_version: %v", err)
 	}
 	return version
+}
+
+// The scan must report the safety verdict for every entry, with evidence
+// and a remedy for each refusal, and the document must be byte-stable.
+func TestScanReportsSafetyVerdicts(t *testing.T) {
+	f := newScanFixture(t)
+	link := filepath.Join(f.root, "escape")
+	if err := os.Symlink("/etc", link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	secret := filepath.Join(f.root, "deploy.pem")
+	if err := os.WriteFile(secret, []byte("not a real key"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	doc := f.scanJSON(t)
+	if len(doc.Data.Verdicts) != len(doc.Data.Entries) {
+		t.Fatalf("%d verdicts for %d entries", len(doc.Data.Verdicts), len(doc.Data.Entries))
+	}
+	if len(doc.Data.Guards) == 0 {
+		t.Error("the scan must name the guards that ran")
+	}
+
+	byPath := map[string]core.Verdict{}
+	for _, verdict := range doc.Data.Verdicts {
+		byPath[verdict.Path] = verdict
+		if err := verdict.Validate(); err != nil {
+			t.Errorf("verdict for %s does not validate: %v", verdict.Path, err)
+		}
+	}
+
+	for path, wantKind := range map[string]core.ProtectionKind{
+		link:   core.ProtectSymlinkEscape,
+		secret: core.ProtectSensitiveContent,
+	} {
+		verdict, ok := byPath[path]
+		if !ok {
+			t.Fatalf("no verdict for %s", path)
+		}
+		if !verdict.Refused() {
+			t.Errorf("%s was allowed, want a refusal", path)
+		}
+		found := false
+		for _, protection := range verdict.Protections {
+			if protection.Kind != wantKind {
+				continue
+			}
+			found = true
+			if protection.Reason == "" || protection.Remediation == "" {
+				t.Errorf("%s protection %q lacks evidence or remedy: %+v", path, wantKind, protection)
+			}
+		}
+		if !found {
+			t.Errorf("%s protections = %+v, want %q", path, verdict.Protections, wantKind)
+		}
+	}
+	if doc.Data.Refused < 2 {
+		t.Errorf("refused entries = %d, want at least the symlink and the key", doc.Data.Refused)
+	}
+
+	// A plain directory with nothing against it must still be allowed, or
+	// the engine would be refusing everything and proving nothing.
+	plain, ok := byPath[filepath.Join(f.root, "project")]
+	if !ok {
+		t.Fatal("no verdict for the plain project directory")
+	}
+	if plain.Refused() {
+		t.Errorf("plain directory was refused: %+v", plain.Protections)
+	}
+}
+
+func TestScanVerdictOutputIsStable(t *testing.T) {
+	f := newScanFixture(t)
+	if err := os.Symlink("/etc", filepath.Join(f.root, "escape")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	first, _, code := f.run(t, "--format", "json", "scan", "--no-store")
+	if code != ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	second, _, _ := f.run(t, "--format", "json", "scan", "--no-store")
+	if verdictsOf(t, first) != verdictsOf(t, second) {
+		t.Errorf("verdict output is not stable:\n%s\n---\n%s", verdictsOf(t, first), verdictsOf(t, second))
+	}
+}
+
+// verdictsOf extracts just the verdict array, which must not vary between
+// runs even though scan ids and timestamps do.
+func verdictsOf(t *testing.T, document string) string {
+	t.Helper()
+	var doc struct {
+		Data struct {
+			Verdicts []struct {
+				Path        string            `json:"path"`
+				Decision    string            `json:"decision"`
+				Protections []core.Protection `json:"protections"`
+				Guards      []string          `json:"guards"`
+			} `json:"verdicts"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(document), &doc); err != nil {
+		t.Fatalf("scan JSON is not valid: %v", err)
+	}
+	encoded, err := core.MarshalIndentJSON(doc.Data.Verdicts)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return string(encoded)
+}
+
+func TestScanTerminalOutputExplainsRefusals(t *testing.T) {
+	f := newScanFixture(t)
+	if err := os.Symlink("/etc", filepath.Join(f.root, "escape")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	stdout, stderr, code := f.run(t, "scan", "--no-store")
+	if code != ExitOK {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr)
+	}
+	for _, want := range []string{"SAFETY", "refuse", "Refusals (", "symlink_escape", "-> resolve the symlink"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("scan output does not contain %q:\n%s", want, stdout)
+		}
+	}
 }

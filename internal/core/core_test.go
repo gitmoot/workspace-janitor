@@ -263,3 +263,101 @@ func TestFieldErrorsSortAndErrorOrNil(t *testing.T) {
 		t.Error("non-empty FieldErrors must yield an error")
 	}
 }
+
+func TestVerdictDecisionFollowsBlockingProtections(t *testing.T) {
+	verdict := Verdict{
+		Path:        "/repos/app",
+		EvaluatedAt: mustTime(t, "2026-06-07T08:09:10Z"),
+		Guards:      []string{"git_state"},
+	}
+	verdict.Normalize()
+	if verdict.Decision != DecisionAllow || verdict.Refused() {
+		t.Fatalf("verdict = %+v, want allow with no protections", verdict)
+	}
+	if err := verdict.Validate(); err != nil {
+		t.Fatalf("clean verdict must validate: %v", err)
+	}
+
+	verdict.Protections = []Protection{
+		{Kind: ProtectDirtyRepository, Reason: "2 changes", Source: SourceGit, Remediation: "commit", Blocking: true},
+		{Kind: ProtectActiveProcess, Reason: "pid 1", Source: SourceProcess, Remediation: "stop it", Blocking: true},
+		{Kind: ProtectActiveProcess, Reason: "pid 0", Source: SourceProcess, Remediation: "stop it", Blocking: true},
+	}
+	verdict.Normalize()
+	if verdict.Decision != DecisionRefuse {
+		t.Errorf("decision = %q, want refuse", verdict.Decision)
+	}
+	// Protections order by kind then reason, so identical evidence always
+	// renders identically.
+	if verdict.Protections[0].Kind != ProtectActiveProcess || verdict.Protections[0].Reason != "pid 0" {
+		t.Errorf("protections are not ordered: %+v", verdict.Protections)
+	}
+	if kinds := verdict.Kinds(); len(kinds) != 2 {
+		t.Errorf("kinds = %v, want the distinct kinds", kinds)
+	}
+	if verdict.Summary() != "refuse: active_process,dirty_repository" {
+		t.Errorf("summary = %q", verdict.Summary())
+	}
+}
+
+// A mutating action needs a clean verdict; a non-mutating one never does.
+func TestVerdictAllowsOnlyNonMutatingActionsWhenRefused(t *testing.T) {
+	refused := Verdict{
+		Path:        "/repos/app",
+		EvaluatedAt: mustTime(t, "2026-06-07T08:09:10Z"),
+		Guards:      []string{"git_state"},
+		Protections: []Protection{{
+			Kind: ProtectDirtyRepository, Reason: "2 changes", Source: SourceGit,
+			Remediation: "commit", Blocking: true,
+		}},
+	}
+	refused.Normalize()
+	for _, kind := range ActionKinds() {
+		allowed := refused.Allows(kind)
+		if kind.Mutating() && allowed {
+			t.Errorf("%s was allowed on a refused path", kind)
+		}
+		if !kind.Mutating() && !allowed {
+			t.Errorf("%s must stay allowed: it mutates nothing", kind)
+		}
+	}
+}
+
+// A refusal without a remedy is a dead end, so validation rejects it.
+func TestVerdictValidateRequiresRemediationForRefusals(t *testing.T) {
+	verdict := Verdict{
+		Path:        "/repos/app",
+		EvaluatedAt: mustTime(t, "2026-06-07T08:09:10Z"),
+		Guards:      []string{"git_state"},
+		Protections: []Protection{{
+			Kind: ProtectDirtyRepository, Reason: "2 changes", Source: SourceGit, Blocking: true,
+		}},
+	}
+	verdict.Normalize()
+	err := verdict.Validate()
+	if err == nil {
+		t.Fatal("expected a refusal without remediation to be rejected")
+	}
+	if !strings.Contains(err.Error(), "remediation") {
+		t.Errorf("error = %v, want it to name the missing remediation", err)
+	}
+}
+
+func TestVerdictValidateRejectsAContradictoryDecision(t *testing.T) {
+	verdict := Verdict{
+		ContractVersion: ContractVersion,
+		Path:            "/repos/app",
+		Decision:        DecisionAllow,
+		EvaluatedAt:     mustTime(t, "2026-06-07T08:09:10Z"),
+		Guards:          []string{"git_state"},
+		Protections: []Protection{{
+			Kind: ProtectDirtyRepository, Reason: "2 changes", Source: SourceGit,
+			Remediation: "commit", Blocking: true,
+		}},
+	}
+	// Deliberately not normalized: a hand-built document must not be able
+	// to claim "allow" while carrying a blocking protection.
+	if err := verdict.Validate(); err == nil {
+		t.Fatal("expected a contradictory verdict to be rejected")
+	}
+}

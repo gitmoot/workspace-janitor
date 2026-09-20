@@ -120,6 +120,20 @@ type Collectors struct {
 	PM2Dumps    []string `yaml:"pm2_dumps" json:"pm2_dumps"`
 }
 
+// Safety configures the destination checks of the safety engine.
+//
+// Nothing here can disable a core invariant: the engine's protections are
+// not configurable, and switching them off would require a separately named
+// unsafe build mode, which this release does not provide.
+type Safety struct {
+	// MinFreeBytes is the headroom that must remain on the destination
+	// filesystem after a quarantine.
+	MinFreeBytes int64 `yaml:"min_free_bytes" json:"min_free_bytes"`
+	// AllowCrossFilesystemQuarantine permits a destination on another
+	// filesystem, which turns an atomic rename into a copy and delete.
+	AllowCrossFilesystemQuarantine bool `yaml:"allow_cross_filesystem_quarantine" json:"allow_cross_filesystem_quarantine"`
+}
+
 // Policy is the validated policy document.
 type Policy struct {
 	Version    int             `yaml:"version" json:"version"`
@@ -128,6 +142,7 @@ type Policy struct {
 	Retention  RetentionPolicy `yaml:"retention" json:"retention"`
 	Caches     []CacheRule     `yaml:"caches" json:"caches"`
 	Collectors Collectors      `yaml:"collectors" json:"collectors"`
+	Safety     Safety          `yaml:"safety" json:"safety"`
 	Jev        JevPolicy       `yaml:"jev" json:"jev"`
 	Limits     Limits          `yaml:"limits" json:"limits"`
 
@@ -174,6 +189,12 @@ func DefaultPolicy(p Paths) Policy {
 			},
 			CronPaths: []string{"/etc/crontab", "/etc/cron.d"},
 			PM2Dumps:  []string{},
+		},
+		Safety: Safety{
+			// One gibibyte of headroom: enough that a quarantine cannot be
+			// the thing that fills the disk it is protecting.
+			MinFreeBytes:                   1 << 30,
+			AllowCrossFilesystemQuarantine: false,
 		},
 		Limits: Limits{
 			GitTimeout:         Duration(5 * time.Second),
@@ -414,6 +435,9 @@ func (p *Policy) Validate() core.FieldErrors {
 		if bound.value <= 0 {
 			errs.Add(bound.field, "must be greater than zero, got %d", bound.value)
 		}
+	}
+	if p.Safety.MinFreeBytes < 0 {
+		errs.Add("safety.min_free_bytes", "must not be negative, got %d", p.Safety.MinFreeBytes)
 	}
 	if p.Collectors.Processes && !core.IsCanonicalPath(p.Collectors.ProcRoot) {
 		errs.Add("collectors.proc_root", "must be an absolute path while collectors.processes is true, got %q", p.Collectors.ProcRoot)

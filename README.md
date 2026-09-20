@@ -9,14 +9,16 @@ deletion is always preceded by quarantine.
 
 ## Status
 
-This repository contains the **foundation** (issue #2) and the **inventory
-collectors** (issue #6): the command tree, configuration and policy loading,
-the versioned domain contracts, the local SQLite store, the output
-contracts, and a bounded, fail-closed `scan`.
+This repository contains the **foundation** (issue #2), the **inventory
+collectors** (issue #6), and the **safety engine** (issue #3): the command
+tree, configuration and policy loading, the versioned domain contracts, the
+local SQLite store, the output contracts, a bounded fail-closed `scan`, and
+the deterministic protections that decide whether a path may ever be
+mutated.
 
 | Command | State |
 | --- | --- |
-| `janitor scan` | implemented |
+| `janitor scan` | implemented (reports safety verdicts) |
 | `janitor status` | implemented |
 | `janitor policy check` | implemented |
 | `janitor doctor` | implemented |
@@ -69,6 +71,54 @@ Every reference collector is bounded by `limits.command_timeout` in wall
 clock, enforced by the scan rather than by the collector's cooperation, so a
 stalled filesystem or an adapter that ignores cancellation cannot hang a
 scan; it becomes a partial report with an unknown.
+
+## Safety
+
+The safety engine is the only authority on whether a path may be mutated.
+Classification, policy, and any model answer are inputs to planning; none of
+them can clear a protection. `janitor scan` reports a typed verdict per
+entry, and every refusal carries its evidence and the remedy that would
+clear it.
+
+| Guard | Refuses when |
+| --- | --- |
+| `collected_protections` | a collector observed an active process, registered agent, or service reference |
+| `unknown_evidence` | any collector left an `unknown:` observation |
+| `filesystem_identity` | device and inode are unknown, so nothing can be revalidated |
+| `git_state` | dirty files, stashes, unpublished or unverifiable commits, broken metadata, or a lock |
+| `symlink_containment` | a symlink is unresolved or resolves outside its root |
+| `protected_paths` | the entry overlaps a protected path, the state directory, or the quarantine directory |
+| `sensitive_names` | the name matches a protected pattern, without ever reading the value |
+| `live_databases` | the file looks like a database that may have an open writer |
+| `durable_evidence` | the entry is classified as durable evidence |
+| `job_ownership` | a running, queued, or blocked job claims the path |
+| `quarantine_filesystem` | the destination is on another filesystem with no copy policy, or cannot be inspected |
+| `free_space` | the destination would be left below the configured headroom |
+
+Four properties hold:
+
+- **Deterministic and typed.** The same evidence always yields the same
+  verdict, with protections in the same order, in JSON and in the terminal.
+- **Fail closed.** Unknown, degraded, or unobserved state protects the path.
+  Absence of a signal is never read as absence of risk.
+- **Model output cannot weaken a protection.** A recommendation for a
+  refused path is clamped to `investigate` with the refusal recorded in its
+  reasons. Policy is the same: it can add protection, never remove it, and
+  there is no switch that disables a core invariant.
+- **Revalidated before mutation.** A verdict describes one moment. Apply
+  must re-run every guard against a fresh observation immediately before
+  mutating, and anything that changed since planning refuses outright.
+
+### Why revalidation uses an open handle
+
+Comparing paths and metadata is not enough to close the time-of-check to
+time-of-use window. Measured on ext4 while building this engine: removing a
+directory and recreating it under the same name reused the inode and
+reported identical device, inode, and all three timestamps, so every
+metadata comparison saw no change. A handle opened with `O_PATH` refers to
+one kernel object and reports it as unlinked, which is how a replacement is
+caught. Apply is expected to open the object, revalidate through the handle,
+and mutate relative to it.
 
 Each scan stores its inventory, the metadata fingerprint of every entry, and
 a report per collector saying whether it ran, was partial, failed, or was
@@ -175,6 +225,8 @@ internal/config      XDG path resolution and strict YAML policy loading
 internal/core        versioned domain types: entries, evidence, protections,
                      recommendations, scans, plans, actions, retention, usage
 internal/collect     bounded, fail-closed collectors and fingerprints
+internal/safety      deterministic protections, remediation, and apply-time
+                     revalidation
 internal/store       SQLite schema, migrations, and transactional persistence
 internal/output      deterministic JSON and terminal rendering
 internal/buildinfo   version and build metadata
