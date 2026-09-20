@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -336,24 +337,19 @@ func addUnknown(entry *core.Entry, source core.EvidenceSource, kind core.Protect
 // treated as a failure.
 var errBounded = errors.New("collect: bound reached")
 
-// graceWindow is how long the deadline branch waits for a collector that
-// may have finished at the same instant. It closes the scheduling gap
-// between a collector returning and its result arriving on the channel.
-const graceWindow = 250 * time.Millisecond
-
 // runBounded runs one reference collector and enforces its deadline from the
 // outside.
 //
-// The collector runs on its own goroutine. If it has not produced a result
-// when the command timeout elapses, the scan continues with a partial report
-// and one unknown; a late answer is discarded. The goroutine stays parked
-// until its blocking syscall returns, which is unavoidable in-process, but
-// it can no longer delay the scan.
+// The collector runs on its own goroutine. The deadline is exact: nothing
+// waits past opts.Limits.CommandTimeout, and a result produced after the
+// caller has already declared the timeout is discarded. The goroutine stays
+// parked until its blocking syscall returns, which is unavoidable
+// in-process, but it can no longer delay the scan.
 //
-// A completed collector is never reported as timed out. Both channels can
-// become ready at once — a select would then pick either — so the result
-// channel is always checked first, and the deadline branch waits a short
-// grace window before declaring a timeout.
+// Completion and timeout are settled by one atomic claim rather than by a
+// select over two ready channels. A select would pick either branch when
+// both became ready at once and could discard a finished collector's
+// references; whichever side claims first now wins, and the loser yields.
 func runBounded(
 	ctx context.Context,
 	opts *Options,
@@ -363,29 +359,42 @@ func runBounded(
 	timeout := opts.Limits.CommandTimeout
 	collectorCtx, cancel := context.WithTimeout(ctx, timeout)
 	// Cancelled by the caller, not by the collector goroutine: cancelling
-	// after the send would make the deadline look expired for a collector
-	// that finished in time.
+	// after a send would make the deadline look expired for a collector that
+	// finished in time.
 	defer cancel()
 
 	type outcome struct {
 		refs   []Reference
 		report core.CollectorReport
 	}
-	// Buffered so an overrunning collector never blocks on the send.
+	var settled atomic.Bool
+	// Buffered so a collector that loses the claim never blocks on the send.
 	done := make(chan outcome, 1)
 	go func() {
 		refs, report := gather(collectorCtx, opts)
-		done <- outcome{refs: refs, report: report}
+		if settled.CompareAndSwap(false, true) {
+			done <- outcome{refs: refs, report: report}
+		}
+		// Otherwise the caller already reported the timeout; the late
+		// result is dropped rather than applied to a finished scan.
 	}()
+
+	// Test seam: lets a test hold the caller here until the collector has
+	// finished and the deadline has passed, so the "both ready" interleaving
+	// this code exists to settle can be exercised deterministically.
+	if beforeSettle != nil {
+		beforeSettle()
+	}
 
 	select {
 	case result := <-done:
 		return result.refs, result.report
 	case <-collectorCtx.Done():
-		select {
-		case result := <-done:
+		if !settled.CompareAndSwap(false, true) {
+			// The collector claimed completion first, so its send is
+			// already on its way to the buffered channel.
+			result := <-done
 			return result.refs, result.report
-		case <-time.After(graceWindow):
 		}
 		return nil, core.CollectorReport{
 			Name:     name,
@@ -396,6 +405,9 @@ func runBounded(
 		}
 	}
 }
+
+// beforeSettle is nil outside tests. See runBounded.
+var beforeSettle func()
 
 // appendDetail joins report details without losing the earlier one.
 func appendDetail(existing, addition string) string {

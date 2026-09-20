@@ -567,11 +567,45 @@ func TestOverlappingRootsProduceOneEntryPerPath(t *testing.T) {
 }
 
 // A collector that finished must never be reported as timed out, even when
-// its result and the deadline become ready at the same moment. The previous
-// wrapper let select pick either branch and discarded real results.
+// its result and the deadline are both ready. The seam forces exactly that
+// interleaving, which a plain select would settle by coin flip.
+func TestRunBoundedKeepsResultWhenDeadlineAlsoFired(t *testing.T) {
+	opts := fixtureOptions(t.TempDir())
+	opts.Limits.CommandTimeout = 40 * time.Millisecond
+
+	finished := make(chan struct{})
+	gather := func(context.Context, *Options) ([]Reference, core.CollectorReport) {
+		defer close(finished)
+		return []Reference{{
+			Path:       "/repos/app",
+			Source:     core.SourceProcess,
+			Protection: core.ProtectActiveProcess,
+			Signal:     "process_cwd",
+		}}, core.CollectorReport{Name: CollectorProcesses, Status: core.CollectorRan, Visited: 5}
+	}
+
+	beforeSettle = func() {
+		// Wait until the collector has produced its result and the deadline
+		// has certainly elapsed: both outcomes are now available.
+		<-finished
+		time.Sleep(80 * time.Millisecond)
+	}
+	t.Cleanup(func() { beforeSettle = nil })
+
+	refs, report := runBounded(context.Background(), &opts, CollectorProcesses, gather)
+	if report.Status != core.CollectorRan || report.Visited != 5 {
+		t.Errorf("report = %+v, want the finished collector's own report", report)
+	}
+	if len(refs) != 1 {
+		t.Errorf("refs = %+v, want the finished collector's references", refs)
+	}
+}
+
+// A collector that finished must never be reported as timed out, even when
+// its result and the deadline become ready at the same moment.
 func TestRunBoundedPrefersACompletedCollectorOverTheDeadline(t *testing.T) {
 	opts := fixtureOptions(t.TempDir())
-	opts.Limits.CommandTimeout = time.Nanosecond // already expired on arrival
+	opts.Limits.CommandTimeout = 2 * time.Second
 
 	want := []Reference{{
 		Path:       "/repos/app",
@@ -603,7 +637,6 @@ func TestScanDoesNotFalselyReportTimeoutsForFastCollectors(t *testing.T) {
 
 	for i := 0; i < 50; i++ {
 		opts := fixtureOptions(root)
-		opts.Limits.CommandTimeout = time.Nanosecond
 		result := run(t, opts)
 		for _, name := range []string{CollectorProcesses, CollectorAgents, CollectorServices} {
 			report := reportFor(t, result, name)
@@ -612,5 +645,36 @@ func TestScanDoesNotFalselyReportTimeoutsForFastCollectors(t *testing.T) {
 					i, name, report)
 			}
 		}
+	}
+}
+
+// The deadline is exact. A collector that answers late must not extend the
+// scan, and its result must be discarded rather than applied.
+func TestRunBoundedDoesNotWaitPastTheDeadline(t *testing.T) {
+	opts := fixtureOptions(t.TempDir())
+	opts.Limits.CommandTimeout = 60 * time.Millisecond
+
+	late := func(context.Context, *Options) ([]Reference, core.CollectorReport) {
+		time.Sleep(400 * time.Millisecond)
+		return []Reference{{
+			Path:       "/repos/app",
+			Source:     core.SourceProcess,
+			Protection: core.ProtectActiveProcess,
+			Signal:     "process_cwd",
+		}}, core.CollectorReport{Name: CollectorProcesses, Status: core.CollectorRan, Visited: 3}
+	}
+
+	start := time.Now()
+	refs, report := runBounded(context.Background(), &opts, CollectorProcesses, late)
+	elapsed := time.Since(start)
+
+	if elapsed > 250*time.Millisecond {
+		t.Errorf("runBounded waited %s for a %s deadline: the bound must not be extended", elapsed, opts.Limits.CommandTimeout)
+	}
+	if report.Status != core.CollectorPartial || report.Unknowns != 1 {
+		t.Errorf("report = %+v, want a partial timeout report", report)
+	}
+	if len(refs) != 0 {
+		t.Errorf("refs = %+v, want the late result discarded", refs)
 	}
 }
