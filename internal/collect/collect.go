@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -340,16 +339,21 @@ var errBounded = errors.New("collect: bound reached")
 // runBounded runs one reference collector and enforces its deadline from the
 // outside.
 //
-// The collector runs on its own goroutine. The deadline is exact: nothing
-// waits past opts.Limits.CommandTimeout, and a result produced after the
-// caller has already declared the timeout is discarded. The goroutine stays
-// parked until its blocking syscall returns, which is unavoidable
-// in-process, but it can no longer delay the scan.
+// The deadline is a wall: when it fires the caller takes whatever the
+// collector has already published and otherwise reports a partial result
+// with one unknown. It never waits for a collector, and it never blocks on
+// one that is mid-publication.
 //
-// Completion and timeout are settled by one atomic claim rather than by a
-// select over two ready channels. A select would pick either branch when
-// both became ready at once and could discard a finished collector's
-// references; whichever side claims first now wins, and the loser yields.
+// Lateness is decided by comparing against the deadline, not by which
+// goroutine is scheduled first: the collector publishes only if the context
+// has not expired by the time it finishes, so a result produced after the
+// deadline is discarded at the source rather than accepted by a caller that
+// happened to be delayed.
+//
+// The residual case is a collector that finished just before the deadline
+// and had not yet published: it is reported as an unknown. That is the
+// fail-closed direction — an unobserved reference is treated as unobserved,
+// never as absence.
 func runBounded(
 	ctx context.Context,
 	opts *Options,
@@ -359,29 +363,29 @@ func runBounded(
 	timeout := opts.Limits.CommandTimeout
 	collectorCtx, cancel := context.WithTimeout(ctx, timeout)
 	// Cancelled by the caller, not by the collector goroutine: cancelling
-	// after a send would make the deadline look expired for a collector that
-	// finished in time.
+	// after a publication would make the deadline look expired for a
+	// collector that finished in time.
 	defer cancel()
 
 	type outcome struct {
 		refs   []Reference
 		report core.CollectorReport
 	}
-	var settled atomic.Bool
-	// Buffered so a collector that loses the claim never blocks on the send.
+	// Buffered so a collector that publishes after the caller has moved on
+	// never blocks on the send and never leaks.
 	done := make(chan outcome, 1)
 	go func() {
 		refs, report := gather(collectorCtx, opts)
-		if settled.CompareAndSwap(false, true) {
-			done <- outcome{refs: refs, report: report}
+		if collectorCtx.Err() != nil {
+			// Finished after the deadline: the scan has already reported
+			// this source as unknown, so the result is dropped.
+			return
 		}
-		// Otherwise the caller already reported the timeout; the late
-		// result is dropped rather than applied to a finished scan.
+		done <- outcome{refs: refs, report: report}
 	}()
 
-	// Test seam: lets a test hold the caller here until the collector has
-	// finished and the deadline has passed, so the "both ready" interleaving
-	// this code exists to settle can be exercised deterministically.
+	// Test seam: lets a test hold the caller here until a chosen
+	// interleaving has occurred. Nil outside tests.
 	if beforeSettle != nil {
 		beforeSettle()
 	}
@@ -390,11 +394,12 @@ func runBounded(
 	case result := <-done:
 		return result.refs, result.report
 	case <-collectorCtx.Done():
-		if !settled.CompareAndSwap(false, true) {
-			// The collector claimed completion first, so its send is
-			// already on its way to the buffered channel.
-			result := <-done
+		select {
+		case result := <-done:
+			// Published before the deadline; both outcomes were ready and a
+			// plain select would have discarded this by coin flip.
 			return result.refs, result.report
+		default:
 		}
 		return nil, core.CollectorReport{
 			Name:     name,

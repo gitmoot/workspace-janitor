@@ -678,3 +678,62 @@ func TestRunBoundedDoesNotWaitPastTheDeadline(t *testing.T) {
 		t.Errorf("refs = %+v, want the late result discarded", refs)
 	}
 }
+
+// Lateness must be decided against the deadline, not against goroutine
+// scheduling. A collector that finishes after the deadline must be
+// discarded even when the caller was delayed long enough to still be
+// waiting for it.
+func TestRunBoundedDiscardsResultFinishedAfterTheDeadline(t *testing.T) {
+	opts := fixtureOptions(t.TempDir())
+	opts.Limits.CommandTimeout = 40 * time.Millisecond
+
+	finished := make(chan struct{})
+	late := func(context.Context, *Options) ([]Reference, core.CollectorReport) {
+		time.Sleep(120 * time.Millisecond) // returns well after the deadline
+		defer close(finished)
+		return []Reference{{
+			Path:       "/repos/app",
+			Source:     core.SourceProcess,
+			Protection: core.ProtectActiveProcess,
+			Signal:     "process_cwd",
+		}}, core.CollectorReport{Name: CollectorProcesses, Status: core.CollectorRan, Visited: 9}
+	}
+
+	// Hold the caller until the late collector has finished, which is the
+	// interleaving where a scheduling-based claim would accept its result.
+	beforeSettle = func() {
+		<-finished
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Cleanup(func() { beforeSettle = nil })
+
+	refs, report := runBounded(context.Background(), &opts, CollectorProcesses, late)
+	if report.Status != core.CollectorPartial || report.Unknowns != 1 {
+		t.Errorf("report = %+v, want a partial timeout report for a late collector", report)
+	}
+	if report.Visited != 0 || len(refs) != 0 {
+		t.Errorf("late result was accepted: report = %+v refs = %+v", report, refs)
+	}
+}
+
+// The deadline branch must never block on a collector that is publishing.
+func TestRunBoundedNeverBlocksOnAPublishingCollector(t *testing.T) {
+	opts := fixtureOptions(t.TempDir())
+	opts.Limits.CommandTimeout = 30 * time.Millisecond
+
+	stall := make(chan struct{})
+	t.Cleanup(func() { close(stall) })
+	blocked := func(context.Context, *Options) ([]Reference, core.CollectorReport) {
+		<-stall
+		return nil, core.CollectorReport{Name: CollectorServices, Status: core.CollectorRan}
+	}
+
+	start := time.Now()
+	_, report := runBounded(context.Background(), &opts, CollectorServices, blocked)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("runBounded waited %s for a %s deadline", elapsed, opts.Limits.CommandTimeout)
+	}
+	if report.Status != core.CollectorPartial {
+		t.Errorf("report = %+v, want partial", report)
+	}
+}
