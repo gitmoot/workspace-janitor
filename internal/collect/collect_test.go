@@ -565,3 +565,52 @@ func TestOverlappingRootsProduceOneEntryPerPath(t *testing.T) {
 		t.Errorf("merged entry lost the report-only protection: %+v", entry.Protections)
 	}
 }
+
+// A collector that finished must never be reported as timed out, even when
+// its result and the deadline become ready at the same moment. The previous
+// wrapper let select pick either branch and discarded real results.
+func TestRunBoundedPrefersACompletedCollectorOverTheDeadline(t *testing.T) {
+	opts := fixtureOptions(t.TempDir())
+	opts.Limits.CommandTimeout = time.Nanosecond // already expired on arrival
+
+	want := []Reference{{
+		Path:       "/repos/app",
+		Source:     core.SourceProcess,
+		Protection: core.ProtectActiveProcess,
+		Signal:     "process_cwd",
+	}}
+	gather := func(context.Context, *Options) ([]Reference, core.CollectorReport) {
+		return want, core.CollectorReport{Name: CollectorProcesses, Status: core.CollectorRan, Visited: 7}
+	}
+
+	for i := 0; i < 200; i++ {
+		refs, report := runBounded(context.Background(), &opts, CollectorProcesses, gather)
+		if report.Status != core.CollectorRan {
+			t.Fatalf("iteration %d: status = %q (%s), want the completed collector's own report",
+				i, report.Status, report.Detail)
+		}
+		if report.Visited != 7 || len(refs) != 1 {
+			t.Fatalf("iteration %d: result was discarded: report = %+v refs = %+v", i, report, refs)
+		}
+	}
+}
+
+// The same guarantee through the full scan: a fast collector must not be
+// reported partial merely because the configured timeout is tiny.
+func TestScanDoesNotFalselyReportTimeoutsForFastCollectors(t *testing.T) {
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, "project"))
+
+	for i := 0; i < 50; i++ {
+		opts := fixtureOptions(root)
+		opts.Limits.CommandTimeout = time.Nanosecond
+		result := run(t, opts)
+		for _, name := range []string{CollectorProcesses, CollectorAgents, CollectorServices} {
+			report := reportFor(t, result, name)
+			if report.Status != core.CollectorSkipped {
+				t.Fatalf("iteration %d: %s report = %+v, want skipped: these collectors are disabled and do no work",
+					i, name, report)
+			}
+		}
+	}
+}

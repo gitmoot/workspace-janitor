@@ -199,6 +199,6 @@ func askAgentSource(ctx context.Context, source AgentSource, timeout time.Durati
 	case result := <-done:
 		return result.dirs, result.err
 	case <-callCtx.Done():
-		return nil, fmt.Errorf("did not answer within %s", timeout)
+		return nil, fmt.Errorf("did not answer within the %s command timeout", timeout)
 	}
 }
