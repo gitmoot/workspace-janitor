@@ -528,12 +528,16 @@ func (p *Policy) Validate() core.FieldErrors {
 		case strings.ContainsAny(marker, "*?["):
 			errs.Add(field, "must be a literal file name, got the pattern %q: "+
 				"markers are detected with a single lstat, so a glob would never match", marker)
-		case !validMarkerName(marker):
-			// A marker is joined onto each directory and lstatted, so
-			// anything that resolves to the directory itself, its parent,
-			// or an absolute path would mark every scanned directory as a
-			// project. Only a plain file name can be checked meaningfully.
+		case marker == "." || marker == ".." || marker == "/":
+			// These resolve to the directory itself, its parent, or the
+			// filesystem root, so one such entry would mark every scanned
+			// directory as a project.
 			errs.Add(field, "must be a plain file name inside the directory, got %q, which would match every directory", marker)
+		case !validMarkerName(marker):
+			// A nested path does not match everything; it simply is not a
+			// marker. Markers are detected with one lstat of a name inside
+			// the directory.
+			errs.Add(field, "must be a plain file name inside the directory, got %q", marker)
 		}
 	}
 	for _, group := range []struct {
@@ -592,10 +596,10 @@ func joinRetentions() string {
 // validMarkerName reports whether a project marker names a single file
 // inside a directory.
 //
-// Rejected: "." and ".." (always resolve), anything containing a path
-// separator, and anything filepath.Base does not return unchanged. "/" is
-// caught by all three, which is the point: each check is a different way
-// of saying "this is not a file name".
+// Rejected: "", "." and ".." (always resolve), anything containing a path
+// separator, and anything filepath.Base does not return unchanged. Callers
+// distinguish the always-matching values from merely nested ones so the
+// diagnostic does not overclaim.
 func validMarkerName(marker string) bool {
 	switch marker {
 	case "", ".", "..":

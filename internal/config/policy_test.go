@@ -373,8 +373,10 @@ func TestProjectMarkerGlobsAreRejected(t *testing.T) {
 		t.Fatal("expected a glob in project_markers to be rejected")
 	}
 	message := err.Error()
-	// "." lstats the directory itself and ".." its parent, so either would
-	// mark every scanned directory as a project.
+	// "." lstats the directory itself, ".." its parent, and "/" the root,
+	// so any of them would mark every scanned directory as a project. A
+	// nested path is merely not a marker, and the message must not claim
+	// otherwise.
 	for _, want := range []string{
 		"project_markers[0]", "literal file name",
 		"project_markers[2]", "project_markers[3]", "project_markers[4]", "project_markers[5]",
@@ -382,6 +384,17 @@ func TestProjectMarkerGlobsAreRejected(t *testing.T) {
 		if !strings.Contains(message, want) {
 			t.Errorf("error %q does not mention %q", message, want)
 		}
+	}
+	for _, line := range strings.Split(message, "\n") {
+		if !strings.Contains(line, "sub/dir.mod") {
+			continue
+		}
+		if strings.Contains(line, "match every directory") {
+			t.Errorf("the message for a nested path overclaims: %q", line)
+		}
+	}
+	if !strings.Contains(message, "\"/\", which would match every directory") {
+		t.Errorf("the message for %q must say it matches everything: %q", "/", message)
 	}
 
 	// Literal markers remain valid, and the other lists still take globs.
