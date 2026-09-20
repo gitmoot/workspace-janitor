@@ -781,3 +781,45 @@ func TestRunBoundedDropsLateResultBeforeContextCancellationLands(t *testing.T) {
 		t.Errorf("a result completed past the deadline was accepted: report = %+v refs = %+v", report, refs)
 	}
 }
+
+// The caller's own deadline or cancellation bounds the collector too. A
+// result produced after the caller gave up must not be accepted, even when
+// this collector's own timeout has not elapsed.
+func TestRunBoundedHonoursAnEarlierCallerDeadline(t *testing.T) {
+	opts := fixtureOptions(t.TempDir())
+	opts.Limits.CommandTimeout = 10 * time.Second // never reached
+
+	callerCtx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	t.Cleanup(cancel)
+
+	finished := make(chan struct{})
+	gather := func(context.Context, *Options) ([]Reference, core.CollectorReport) {
+		time.Sleep(120 * time.Millisecond) // outlives the caller's deadline
+		defer close(finished)
+		return []Reference{{
+			Path:       "/repos/app",
+			Source:     core.SourceProcess,
+			Protection: core.ProtectActiveProcess,
+			Signal:     "process_cwd",
+		}}, core.CollectorReport{Name: CollectorProcesses, Status: core.CollectorRan, Visited: 6}
+	}
+	// Hold the caller until the collector has finished: the interleaving in
+	// which a guard that only knows its own deadline accepts the result.
+	beforeSettle = func() {
+		<-finished
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Cleanup(func() { beforeSettle = nil })
+
+	start := time.Now()
+	refs, report := runBounded(callerCtx, &opts, CollectorProcesses, gather)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("runBounded waited %s past a 40ms caller deadline", elapsed)
+	}
+	if report.Status != core.CollectorPartial || report.Unknowns != 1 {
+		t.Errorf("report = %+v, want a partial report once the caller gave up", report)
+	}
+	if len(refs) != 0 || report.Visited != 0 {
+		t.Errorf("a result produced after caller cancellation was accepted: report = %+v refs = %+v", report, refs)
+	}
+}

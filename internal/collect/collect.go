@@ -344,12 +344,14 @@ var errBounded = errors.New("collect: bound reached")
 // with one unknown. It never waits for a collector, and it never blocks on
 // one that is mid-publication.
 //
-// Lateness is decided by comparing the completion time against the recorded
-// deadline, not by which goroutine is scheduled first and not by context
-// cancellation. Context cancellation is asynchronous — collectorCtx.Err()
-// only becomes non-nil once the timer goroutine runs — so a collector that
-// finished after the deadline could still observe a nil error and publish.
-// The wall-clock comparison has no such lag.
+// Lateness is decided by comparing the completion time against the
+// effective deadline — the earlier of this collector's own and any the
+// caller imposed — and additionally by whether the caller has cancelled.
+// The clock comparison is needed because context cancellation is
+// asynchronous: collectorCtx.Err() only becomes non-nil once the timer
+// goroutine runs, so a late collector could otherwise observe a nil error
+// and publish. The context check is needed because a caller may cancel with
+// no deadline at all.
 //
 // The residual case is a collector that finished just before the deadline
 // and had not yet published: it is reported as an unknown. That is the
@@ -364,6 +366,12 @@ func runBounded(
 	timeout := opts.Limits.CommandTimeout
 	deadline := nowFunc().Add(timeout)
 	collectorCtx, cancel := context.WithDeadline(ctx, deadline)
+	// The caller may impose an earlier deadline than this collector's own.
+	// Honour whichever comes first, so the guard below matches the context
+	// the collector actually runs under.
+	if inherited, ok := collectorCtx.Deadline(); ok && inherited.Before(deadline) {
+		deadline = inherited
+	}
 	// Cancelled by the caller, not by the collector goroutine: cancelling
 	// after a publication would make the deadline look expired for a
 	// collector that finished in time.
@@ -378,9 +386,12 @@ func runBounded(
 	done := make(chan outcome, 1)
 	go func() {
 		refs, report := gather(collectorCtx, opts)
-		if !nowFunc().Before(deadline) {
-			// Finished at or after the deadline: the scan reports this
-			// source as unknown, so the result is dropped.
+		if !nowFunc().Before(deadline) || collectorCtx.Err() != nil {
+			// Finished at or after the deadline, or after the caller gave
+			// up: the scan reports this source as unknown, so the result is
+			// dropped. Both tests are needed — the clock catches the
+			// cancellation lag, and the context catches a caller that
+			// cancelled without a deadline at all.
 			return
 		}
 		done <- outcome{refs: refs, report: report}
