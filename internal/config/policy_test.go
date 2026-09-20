@@ -366,6 +366,7 @@ func TestProjectMarkerGlobsAreRejected(t *testing.T) {
 		"    - sub/dir.mod",
 		"    - \".\"",
 		"    - \"..\"",
+		"    - \"/\"",
 		"",
 	}, "\n"))
 	if err == nil {
@@ -376,7 +377,7 @@ func TestProjectMarkerGlobsAreRejected(t *testing.T) {
 	// mark every scanned directory as a project.
 	for _, want := range []string{
 		"project_markers[0]", "literal file name",
-		"project_markers[2]", "project_markers[3]", "project_markers[4]",
+		"project_markers[2]", "project_markers[3]", "project_markers[4]", "project_markers[5]",
 	} {
 		if !strings.Contains(message, want) {
 			t.Errorf("error %q does not mention %q", message, want)
