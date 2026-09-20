@@ -55,33 +55,42 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		refs = append(refs, gather(ctx, opts, &report)...)
 	}
 
-	if report.Detail == "" {
-		report.Detail = fmt.Sprintf("inspected %d definition(s); %d unreadable", report.Visited, report.Unknowns)
-	}
+	report.Detail = appendDetail(
+		fmt.Sprintf("inspected %d definition(s); %d unreadable", report.Visited, report.Unknowns),
+		report.Detail)
 	return refs, report
 }
 
-func gatherSystemd(_ context.Context, opts *Options, report *core.CollectorReport) []Reference {
+func gatherSystemd(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
 	var refs []Reference
 	for _, dir := range opts.ServiceSources.SystemdDirs {
+		if ctx.Err() != nil {
+			return refs
+		}
 		names, err := readDirNamesBounded(dir, opts.Limits.MaxDirEntries)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
-			report.Unknowns++
-			report.Status = core.CollectorPartial
+			noteUnreadable(report, fmt.Sprintf("could not list %s: %v", dir, err))
 			continue
 		}
+		if names.bounded {
+			// Units past the bound were not read, so their references are
+			// unknown; a truncated listing must not read as "no more units".
+			noteUnreadable(report, fmt.Sprintf("listing of %s was truncated at %d entries", dir, opts.Limits.MaxDirEntries))
+		}
 		for _, name := range names.names {
+			if ctx.Err() != nil {
+				return refs
+			}
 			if !strings.HasSuffix(name, ".service") {
 				continue
 			}
 			path := filepath.Join(dir, name)
 			content, err := readFileBounded(path, maxUnitFileBytes)
 			if err != nil {
-				report.Unknowns++
-				report.Status = core.CollectorPartial
+				noteUnreadable(report, fmt.Sprintf("could not read %s: %v", path, err))
 				continue
 			}
 			report.Visited++
@@ -134,25 +143,29 @@ func systemdUnitReferences(unit, content string) []Reference {
 	return refs
 }
 
-func gatherCron(_ context.Context, opts *Options, report *core.CollectorReport) []Reference {
+func gatherCron(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
 	var refs []Reference
 	for _, target := range opts.ServiceSources.CronPaths {
+		if ctx.Err() != nil {
+			return refs
+		}
 		info, err := os.Stat(target)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
-			report.Unknowns++
-			report.Status = core.CollectorPartial
+			noteUnreadable(report, fmt.Sprintf("could not stat %s: %v", target, err))
 			continue
 		}
 		files := []string{target}
 		if info.IsDir() {
 			names, err := readDirNamesBounded(target, opts.Limits.MaxDirEntries)
 			if err != nil {
-				report.Unknowns++
-				report.Status = core.CollectorPartial
+				noteUnreadable(report, fmt.Sprintf("could not list %s: %v", target, err))
 				continue
+			}
+			if names.bounded {
+				noteUnreadable(report, fmt.Sprintf("listing of %s was truncated at %d entries", target, opts.Limits.MaxDirEntries))
 			}
 			files = files[:0]
 			for _, name := range names.names {
@@ -160,10 +173,12 @@ func gatherCron(_ context.Context, opts *Options, report *core.CollectorReport) 
 			}
 		}
 		for _, file := range files {
+			if ctx.Err() != nil {
+				return refs
+			}
 			content, err := readFileBounded(file, maxCronFileBytes)
 			if err != nil {
-				report.Unknowns++
-				report.Status = core.CollectorPartial
+				noteUnreadable(report, fmt.Sprintf("could not read %s: %v", file, err))
 				continue
 			}
 			report.Visited++
@@ -228,23 +243,24 @@ type pm2Dump []struct {
 	} `json:"pm2_env"`
 }
 
-func gatherPM2(_ context.Context, opts *Options, report *core.CollectorReport) []Reference {
+func gatherPM2(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
 	var refs []Reference
 	for _, dump := range opts.ServiceSources.PM2Dumps {
+		if ctx.Err() != nil {
+			return refs
+		}
 		content, err := readFileBounded(dump, maxPM2DumpBytes)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
-			report.Unknowns++
-			report.Status = core.CollectorPartial
+			noteUnreadable(report, fmt.Sprintf("could not read %s: %v", dump, err))
 			continue
 		}
 		report.Visited++
 		var parsed pm2Dump
 		if err := json.Unmarshal([]byte(content), &parsed); err != nil {
-			report.Unknowns++
-			report.Status = core.CollectorPartial
+			noteUnreadable(report, fmt.Sprintf("could not parse %s: %v", dump, err))
 			continue
 		}
 		for _, process := range parsed {
@@ -287,6 +303,16 @@ func firstAbsolutePath(value string) string {
 // readFileBounded reads at most limit bytes and fails when the file exceeds
 // that bound, rather than truncating silently.
 func readFileBounded(path string, limit int64) (string, error) {
+	// A FIFO, device, or socket would block an ordinary Open indefinitely.
+	// Service definitions are regular files, so anything else is refused
+	// rather than read.
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file (%s)", path, info.Mode().Type())
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -300,4 +326,13 @@ func readFileBounded(path string, limit int64) (string, error) {
 		return "", fmt.Errorf("%s exceeds the %d byte bound", path, limit)
 	}
 	return string(data), nil
+}
+
+// noteUnreadable records something the service collectors could not read.
+// Every such gap makes the report partial: a definition that was not read
+// may reference a workspace path that would otherwise look unreferenced.
+func noteUnreadable(report *core.CollectorReport, detail string) {
+	report.Unknowns++
+	report.Status = core.CollectorPartial
+	report.Detail = appendDetail(report.Detail, detail)
 }

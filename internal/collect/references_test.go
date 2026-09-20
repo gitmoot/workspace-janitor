@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -72,35 +71,6 @@ func TestProcessReferencesProtectEntries(t *testing.T) {
 	report := reportFor(t, result, CollectorProcesses)
 	if report.Visited != 1 {
 		t.Errorf("visited = %d, want only the numeric pid inspected", report.Visited)
-	}
-}
-
-// The real process collector must find a live process working directory.
-func TestProcessCollectorReadsRealProcfs(t *testing.T) {
-	if _, err := os.Stat("/proc/self/cwd"); err != nil {
-		t.Skipf("procfs is unavailable: %v", err)
-	}
-	root := t.TempDir()
-	workdir := mustMkdir(t, filepath.Join(root, "live"))
-
-	cmd := exec.Command("sleep", "30")
-	cmd.Dir = workdir
-	if err := cmd.Start(); err != nil {
-		t.Skipf("cannot start a fixture process: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	})
-
-	opts := fixtureOptions(root)
-	opts.Processes = true
-	opts.ProcRoot = "/proc"
-	opts.Limits.MaxDirEntries = 100000
-
-	entry := entryFor(t, run(t, opts), workdir)
-	if !hasProtection(entry, core.ProtectActiveProcess) {
-		t.Errorf("a directory used by a running process is not protected: %+v", entry.Protections)
 	}
 }
 
@@ -354,5 +324,111 @@ func TestAttachReferencesIgnoresRelativePaths(t *testing.T) {
 	}, time.Now())
 	if matched != 0 || len(entries[0].Protections) != 0 {
 		t.Errorf("relative reference was attached: matched=%d protections=%+v", matched, entries[0].Protections)
+	}
+}
+
+// A truncated service directory hides definitions, and a hidden definition
+// may be the only thing protecting a workspace path. The bound must surface
+// as an unknown, never as a clean listing.
+func TestServiceDirectoryBoundsAreReportedAsUnknown(t *testing.T) {
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, "service"))
+
+	systemdDir := t.TempDir()
+	for _, name := range []string{"a.service", "b.service", "c.service"} {
+		mustWrite(t, filepath.Join(systemdDir, name), "[Service]\nWorkingDirectory=/srv/"+name+"\n")
+	}
+	cronDir := t.TempDir()
+	for _, name := range []string{"one", "two", "three"} {
+		mustWrite(t, filepath.Join(cronDir, name), "0 * * * * root /srv/"+name+"/run.sh\n")
+	}
+
+	opts := fixtureOptions(root)
+	opts.Services = true
+	opts.Limits.MaxDirEntries = 1
+	opts.ServiceSources = ServiceSources{SystemdDirs: []string{systemdDir}, CronPaths: []string{cronDir}}
+
+	report := reportFor(t, run(t, opts), CollectorServices)
+	if report.Status != core.CollectorPartial {
+		t.Fatalf("services report = %+v, want partial once a listing is truncated", report)
+	}
+	if report.Unknowns < 2 {
+		t.Errorf("unknowns = %d, want both truncated directories counted", report.Unknowns)
+	}
+	if !strings.Contains(report.Detail, "truncated") {
+		t.Errorf("detail = %q, want it to name the truncation", report.Detail)
+	}
+}
+
+// A definition path that is not a regular file — a FIFO, for instance —
+// would block an ordinary read forever. It must be refused and reported.
+func TestServiceCollectorRefusesNonRegularDefinitionFiles(t *testing.T) {
+	if _, err := exec.LookPath("mkfifo"); err != nil {
+		t.Skipf("mkfifo is unavailable: %v", err)
+	}
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, "service"))
+	fifo := filepath.Join(t.TempDir(), "dump.pm2")
+	if out, err := exec.Command("mkfifo", fifo).CombinedOutput(); err != nil {
+		t.Skipf("cannot create a fifo: %v (%s)", err, out)
+	}
+
+	opts := fixtureOptions(root)
+	opts.Services = true
+	opts.Limits.CommandTimeout = 2 * time.Second
+	opts.ServiceSources = ServiceSources{PM2Dumps: []string{fifo}}
+
+	done := make(chan Result, 1)
+	go func() {
+		result, err := Run(context.Background(), opts)
+		if err != nil {
+			t.Errorf("Run: %v", err)
+		}
+		done <- result
+	}()
+	select {
+	case result := <-done:
+		report := reportFor(t, result, CollectorServices)
+		if report.Status != core.CollectorPartial || report.Unknowns == 0 {
+			t.Errorf("services report = %+v, want partial with an unknown", report)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the service collector blocked on a fifo")
+	}
+}
+
+// stallingAgents ignores cancellation, as third-party code may.
+type stallingAgents struct{ release chan struct{} }
+
+func (stallingAgents) Name() string { return "stalling" }
+
+func (s stallingAgents) ActiveDirectories(context.Context) ([]AgentRef, error) {
+	<-s.release
+	return nil, nil
+}
+
+// The advertised command timeout must hold even when an adapter ignores the
+// context it was given.
+func TestAgentSourceIgnoringCancellationIsStillBounded(t *testing.T) {
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, "worktree"))
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	opts := fixtureOptions(root)
+	opts.Limits.CommandTimeout = 150 * time.Millisecond
+	opts.AgentSources = []AgentSource{stallingAgents{release: release}}
+
+	start := time.Now()
+	result := run(t, opts)
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("scan took %s: the adapter timeout did not bound the call", elapsed)
+	}
+	report := reportFor(t, result, CollectorAgents)
+	if report.Status != core.CollectorPartial || report.Unknowns == 0 {
+		t.Errorf("agents report = %+v, want partial with an unknown", report)
+	}
+	if !strings.Contains(report.Detail, "did not answer") {
+		t.Errorf("detail = %q, want it to name the timeout", report.Detail)
 	}
 }

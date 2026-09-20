@@ -214,15 +214,42 @@ func TestScanPersistsInventoryAndComparesWithPriorScan(t *testing.T) {
 	}
 }
 
-func TestScanNoStoreLeavesDatabaseUntouched(t *testing.T) {
+// A reporting-only run must leave no trace: not a scan row, and not the
+// database itself, which opening would otherwise create and migrate.
+func TestScanNoStoreCreatesNoDatabase(t *testing.T) {
 	f := newScanFixture(t)
 	doc := f.scanJSON(t, "--no-store")
 	if doc.Data.Persisted {
 		t.Error("--no-store still persisted the scan")
 	}
+	if len(doc.Data.Entries) == 0 {
+		t.Error("--no-store must still report the inventory")
+	}
 
+	dbPath := filepath.Join(f.home, ".local", "state", "workspace-janitor", "janitor.db")
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("--no-store created %s (err = %v)", dbPath, err)
+	}
+
+	// With a database already present, --no-store may read it for the
+	// comparison but must still add nothing.
+	if _, _, code := f.run(t, "scan"); code != ExitOK {
+		t.Fatalf("seeding scan failed with exit %d", code)
+	}
+	before := scanRowCount(t, dbPath)
+	doc = f.scanJSON(t, "--no-store")
+	if doc.Data.PriorScan == "" {
+		t.Error("--no-store should still compare against the stored prior scan")
+	}
+	if after := scanRowCount(t, dbPath); after != before {
+		t.Errorf("scan rows = %d, want %d: --no-store wrote to the database", after, before)
+	}
+}
+
+func scanRowCount(t *testing.T, dbPath string) int64 {
+	t.Helper()
 	ctx := context.Background()
-	db, err := store.OpenExisting(ctx, filepath.Join(f.home, ".local", "state", "workspace-janitor", "janitor.db"))
+	db, err := store.OpenExisting(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -231,9 +258,7 @@ func TestScanNoStoreLeavesDatabaseUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stats: %v", err)
 	}
-	if stats.Scans != 0 || stats.InventoryEntries != 0 {
-		t.Errorf("stats = %+v, want no stored scan", stats)
-	}
+	return stats.Scans
 }
 
 func TestScanRootArgumentsInheritPolicyBounds(t *testing.T) {

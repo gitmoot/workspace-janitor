@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -201,16 +202,33 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		})
 	}
 
+	// Each reference collector gets its own deadline. Without one, a stalled
+	// procfs read, an unresponsive service definition, or an adapter that
+	// ignores cancellation would hang the whole scan.
 	for _, gather := range []func(context.Context, *Options) ([]Reference, core.CollectorReport){
 		gatherProcessReferences,
 		gatherAgentReferences,
 		gatherServiceReferences,
 	} {
-		refs, report := gather(ctx, &opts)
+		collectorCtx, cancel := context.WithTimeout(ctx, opts.Limits.CommandTimeout)
+		refs, report := gather(collectorCtx, &opts)
+		if deadlineExceeded(collectorCtx) {
+			report.Status = core.CollectorPartial
+			report.Unknowns++
+			report.Detail = appendDetail(report.Detail,
+				fmt.Sprintf("stopped at the %s command timeout", opts.Limits.CommandTimeout))
+		}
+		cancel()
 		report.Recorded = attachReferences(entries, refs, now)
 		result.Reports = append(result.Reports, report)
 	}
 
+	// Overlapping roots are valid policy input, so the same path can be
+	// reached twice. Merging keeps one entry per path with the union of its
+	// evidence and protections, which also keeps the reported entry count
+	// equal to the count the store will hold.
+	result.Entries = mergeDuplicatePaths(entries)
+	entries = result.Entries
 	applyFingerprints(entries, opts.Prior, opts.PriorScanID, now)
 
 	sort.SliceStable(result.Entries, func(i, j int) bool {
@@ -319,3 +337,66 @@ func addUnknown(entry *core.Entry, source core.EvidenceSource, kind core.Protect
 // errBounded marks a bound being reached, which is reported rather than
 // treated as a failure.
 var errBounded = errors.New("collect: bound reached")
+
+// deadlineExceeded reports whether a collector context ran out of time.
+func deadlineExceeded(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.DeadlineExceeded)
+}
+
+// appendDetail joins report details without losing the earlier one.
+func appendDetail(existing, addition string) string {
+	if existing == "" {
+		return addition
+	}
+	if strings.Contains(existing, addition) {
+		return existing
+	}
+	return existing + "; " + addition
+}
+
+// mergeDuplicatePaths collapses entries that two overlapping roots both
+// produced.
+//
+// The surviving entry keeps the most specific root — the longest root prefix
+// — so the choice does not depend on traversal order, and it takes the union
+// of evidence and protections so a protection recorded under either root
+// cannot be lost.
+func mergeDuplicatePaths(entries []core.Entry) []core.Entry {
+	index := make(map[string]int, len(entries))
+	merged := make([]core.Entry, 0, len(entries))
+	for _, entry := range entries {
+		position, seen := index[entry.Path]
+		if !seen {
+			index[entry.Path] = len(merged)
+			merged = append(merged, entry)
+			continue
+		}
+		existing := &merged[position]
+		if len(entry.Root) > len(existing.Root) {
+			// Keep the more specific root, but not at the cost of the
+			// evidence already gathered under the broader one.
+			evidence, protections := existing.Evidence, existing.Protections
+			*existing = entry
+			existing.Evidence = evidence
+			existing.Protections = protections
+			for _, e := range entry.Evidence {
+				addEvidence(existing, e)
+			}
+			for _, p := range entry.Protections {
+				addProtection(existing, p)
+			}
+			continue
+		}
+		for _, e := range entry.Evidence {
+			addEvidence(existing, e)
+		}
+		for _, p := range entry.Protections {
+			addProtection(existing, p)
+		}
+		if entry.SizeIsDeep && !existing.SizeIsDeep {
+			existing.SizeBytes = entry.SizeBytes
+			existing.SizeIsDeep = true
+		}
+	}
+	return merged
+}

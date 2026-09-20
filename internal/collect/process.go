@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
@@ -136,9 +137,7 @@ func gatherAgentReferences(ctx context.Context, opts *Options) ([]Reference, cor
 	)
 	for _, source := range opts.AgentSources {
 		report.Visited++
-		callCtx, cancel := context.WithTimeout(ctx, opts.Limits.CommandTimeout)
-		dirs, err := source.ActiveDirectories(callCtx)
-		cancel()
+		dirs, err := askAgentSource(ctx, source, opts.Limits.CommandTimeout)
 		if err != nil {
 			report.Unknowns++
 			report.Status = core.CollectorPartial
@@ -172,4 +171,34 @@ func gatherAgentReferences(ctx context.Context, opts *Options) ([]Reference, cor
 		report.Detail = fmt.Sprintf("%d source(s) reported %d directory reference(s)", report.Visited, len(refs))
 	}
 	return refs, report
+}
+
+// askAgentSource queries one adapter under a deadline.
+//
+// The adapter is third-party code. Passing it a cancellable context is not
+// enough — an adapter that ignores cancellation would still block the scan —
+// so the call runs on its own goroutine and the deadline is enforced here.
+// A late answer is discarded rather than awaited.
+func askAgentSource(ctx context.Context, source AgentSource, timeout time.Duration) ([]AgentRef, error) {
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	type answer struct {
+		dirs []AgentRef
+		err  error
+	}
+	// Buffered so an adapter that answers after the deadline does not leak a
+	// blocked goroutine.
+	done := make(chan answer, 1)
+	go func() {
+		dirs, err := source.ActiveDirectories(callCtx)
+		done <- answer{dirs: dirs, err: err}
+	}()
+
+	select {
+	case result := <-done:
+		return result.dirs, result.err
+	case <-callCtx.Done():
+		return nil, fmt.Errorf("did not answer within %s", timeout)
+	}
 }

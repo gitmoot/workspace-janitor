@@ -499,3 +499,69 @@ func TestPathWithin(t *testing.T) {
 		}
 	}
 }
+
+// Git facts that decide protections must be part of the fingerprint.
+// Gaining an upstream at the same HEAD removes the unknown-publication
+// protection, so it must not compare as unchanged.
+func TestFingerprintCoversGitFactsThatDecideProtections(t *testing.T) {
+	base := core.Entry{
+		Path:       "/repos/app",
+		Kind:       core.EntryKindDirectory,
+		ModifiedAt: fixedNow,
+		Git: &core.GitState{
+			RepoRoot: "/repos/app",
+			Head:     "abcdef",
+			Branch:   "main",
+		},
+	}
+	stable := Fingerprint(base)
+	for name, mutate := range map[string]func(*core.GitState){
+		"upstream became known":  func(g *core.GitState) { g.UpstreamKnown = true },
+		"repository became bare": func(g *core.GitState) { g.Bare = true },
+		"worktree owner changed": func(g *core.GitState) { g.WorktreeOf = "/repos/origin" },
+		"remote changed":         func(g *core.GitState) { g.Remote = "git@example.invalid:app.git" },
+	} {
+		state := *base.Git
+		mutate(&state)
+		changed := base
+		changed.Git = &state
+		if Fingerprint(changed) == stable {
+			t.Errorf("%s did not change the fingerprint", name)
+		}
+	}
+}
+
+// Nested roots are valid policy input. A path both roots cover must appear
+// once, with the protections either root recorded, so the reported count
+// matches what the store will hold.
+func TestOverlappingRootsProduceOneEntryPerPath(t *testing.T) {
+	outer := t.TempDir()
+	inner := mustMkdir(t, filepath.Join(outer, "inner"))
+	shared := mustMkdir(t, filepath.Join(inner, "project"))
+
+	opts := fixtureOptions(outer)
+	opts.Roots = []RootSpec{
+		{Path: outer, MaxDepth: 2},
+		{Path: inner, MaxDepth: 1, ReportOnly: true},
+	}
+	result := run(t, opts)
+
+	seen := map[string]int{}
+	for _, entry := range result.Entries {
+		seen[entry.Path]++
+	}
+	for path, count := range seen {
+		if count != 1 {
+			t.Errorf("%s appears %d times, want once", path, count)
+		}
+	}
+	entry := entryFor(t, result, shared)
+	if entry.Root != inner {
+		t.Errorf("root = %q, want the most specific root %q", entry.Root, inner)
+	}
+	// The report-only protection was recorded under the inner root; merging
+	// must not drop it.
+	if !hasProtection(entry, core.ProtectPolicyProtected) {
+		t.Errorf("merged entry lost the report-only protection: %+v", entry.Protections)
+	}
+}

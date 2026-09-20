@@ -73,11 +73,28 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 		return err
 	}
 
-	db, err := store.Open(ctx, paths.DatabaseFile)
-	if err != nil {
-		return err
+	// A reporting-only run must leave no trace. store.Open would create the
+	// state directory, the database, and its schema, so it is called only
+	// when this scan will actually write; a comparison-only run opens an
+	// existing database and tolerates its absence.
+	var db *store.Store
+	if !opts.noPersist {
+		db, err = store.Open(ctx, paths.DatabaseFile)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+	} else if !opts.noPriorScan {
+		db, err = store.OpenExisting(ctx, paths.DatabaseFile)
+		switch {
+		case errors.Is(err, store.ErrNotInitialized):
+			db = nil
+		case err != nil:
+			return err
+		default:
+			defer db.Close()
+		}
 	}
-	defer db.Close()
 
 	prior, priorID, err := priorInventory(ctx, db, opts)
 	if err != nil {
@@ -219,7 +236,7 @@ func collectLimits(policy config.Policy, opts scanOptions) collect.Limits {
 // priorInventory loads the most recent completed scan for fingerprint
 // comparison.
 func priorInventory(ctx context.Context, db *store.Store, opts scanOptions) ([]core.Entry, string, error) {
-	if opts.noPriorScan {
+	if opts.noPriorScan || db == nil {
 		return nil, "", nil
 	}
 	var (
