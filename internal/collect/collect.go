@@ -228,7 +228,25 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		report.Recorded = attachReferences(entries, refs, now)
 		result.Reports = append(result.Reports, report)
 	}
-	result.Reports = append(result.Reports, collectGitmoot(ctx, &opts, entries, now))
+	// Gitmoot probes a separate snapshot: a timed-out collector may still be
+	// blocked in the kernel, so it must never mutate entries after Run returns.
+	gitmootSnapshot := make([]core.Entry, len(entries))
+	for i := range entries {
+		gitmootSnapshot[i] = core.Entry{Path: entries[i].Path, Kind: entries[i].Kind}
+	}
+	refs, gitmootReport := runBounded(ctx, &opts, CollectorGitmoot, func(ctx context.Context, opts *Options) ([]Reference, core.CollectorReport) {
+		report := collectGitmoot(ctx, opts, gitmootSnapshot, now)
+		var observations []Reference
+		for _, entry := range gitmootSnapshot {
+			for _, evidence := range entry.Evidence {
+				observations = append(observations, Reference{Path: entry.Path, Source: core.SourceJob,
+					Protection: core.ProtectOwningJob, Signal: evidence.Signal, Detail: evidence.Detail})
+			}
+		}
+		return observations, report
+	})
+	attachGitmootObservations(entries, refs, &gitmootReport, opts.GitmootHome, now)
+	result.Reports = append(result.Reports, gitmootReport)
 
 	// Overlapping roots are valid policy input, so the same path can be
 	// reached twice. Merging keeps one entry per path with the union of its
@@ -248,6 +266,32 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		return result.Reports[i].Name < result.Reports[j].Name
 	})
 	return result, nil
+}
+
+// Gitmoot's ledger names exact paths; reference attachment must not widen an
+// external path to its parent. Timeout is unknown for every managed entry.
+func attachGitmootObservations(entries []core.Entry, refs []Reference, report *core.CollectorReport, home string, now time.Time) {
+	observations := make(map[string]Reference, len(refs))
+	for _, ref := range refs {
+		observations[ref.Path] = ref
+	}
+	for i := range entries {
+		entry := &entries[i]
+		if ref, ok := observations[entry.Path]; ok {
+			if ref.Signal == "unknown:gitmoot" {
+				addUnknown(entry, core.SourceJob, core.ProtectOwningJob, "gitmoot", ref.Detail, now)
+			} else {
+				addEvidence(entry, core.Evidence{Source: core.SourceJob, Signal: ref.Signal,
+					Detail: ref.Detail, ObservedAt: now})
+				addProtection(entry, core.Protection{Kind: core.ProtectOwningJob, Source: core.SourceJob,
+					Reason: "Gitmoot-managed worktree; use Gitmoot's own lifecycle cleanup", Blocking: true})
+			}
+		} else if report.Status == core.CollectorPartial && len(refs) == 0 && core.PathWithin(entry.Path, home) {
+			addUnknown(entry, core.SourceJob, core.ProtectOwningJob, "gitmoot", report.Detail, now)
+			report.Recorded++
+			report.Unknowns++
+		}
+	}
 }
 
 // Reference is a path that something outside the filesystem points at.

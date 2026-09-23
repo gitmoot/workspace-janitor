@@ -41,7 +41,7 @@ no decisions and mutates nothing.
 | `git` | common dir, remote, branch, HEAD, dirty count, stashes, upstream, worktree metadata, locks | per-command timeout, read-only verbs only |
 | `processes` | `cwd` and `exe` links plus `comm` from procfs | directory-entry bound |
 | `agents` | registered-agent directories from an adapter | command timeout per adapter |
-| `gitmoot` | read-only Gitmoot job, task, and cleanup-obligation ledger for exact paths | transaction timeout, entry bound; missing or uncertain state fails closed |
+| `gitmoot` | read-only Gitmoot job, task, and cleanup-obligation ledger for exact paths | command timeout, entry bound; missing or uncertain state fails closed |
 | `services` | systemd `WorkingDirectory`/`Exec*`, cron command paths, PM2 `pm_cwd`/`pm_exec_path` | per-file byte bound, per-directory entries |
 
 Three properties hold across all of them:

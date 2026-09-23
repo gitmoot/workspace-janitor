@@ -73,10 +73,14 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	if !opts.dryRun && !opts.confirm {
 		return &usageError{msg: "--confirm is required with --dry-run=false"}
 	}
-	if (opts.expire && (opts.planID != "" || opts.actionID != "")) ||
-		(!opts.expire && opts.cleanupID != "") ||
-		(opts.prune && opts.actionID == "") {
-		return &usageError{msg: "--prune requires --action and a plan; --cleanup applies only to expiry"}
+	if opts.prune && opts.actionID == "" {
+		return &usageError{msg: "--prune requires --action"}
+	}
+	if opts.expire && (opts.planID != "" || opts.actionID != "") {
+		return &usageError{msg: "--plan and --action do not apply to expiry"}
+	}
+	if !opts.expire && opts.cleanupID != "" {
+		return &usageError{msg: "--cleanup applies only to expiry"}
 	}
 	format, err := e.format()
 	if err != nil {

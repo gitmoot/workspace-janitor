@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
@@ -202,5 +204,25 @@ func TestGitmootAbsentHomeLeavesOtherScansUnchanged(t *testing.T) {
 	}
 	if reportFor(t, result, CollectorGitmoot).Status != core.CollectorSkipped {
 		t.Fatal("expected skipped collector")
+	}
+}
+
+func TestGitmootTimeoutProtectsManagedEntry(t *testing.T) {
+	base := t.TempDir()
+	home := mustMkdir(t, filepath.Join(base, ".gitmoot"))
+	managed := mustMkdir(t, filepath.Join(home, "worktree"))
+	opts := fixtureOptions(base)
+	opts.Roots[0].MaxDepth = 2
+	opts.GitmootHome, opts.GitmootDatabase = home, filepath.Join(home, "gitmoot.db")
+	opts.Limits.CommandTimeout = time.Nanosecond
+	result := run(t, opts)
+	entry := entryFor(t, result, managed)
+	if signal := gitmootSignal(entry); signal != "unknown:gitmoot" || !entry.Protected() {
+		t.Fatalf("timed-out ledger did not protect managed path: %q %+v", signal, entry.Protections)
+	}
+	report := reportFor(t, result, CollectorGitmoot)
+	if report.Status != core.CollectorPartial || report.Unknowns == 0 ||
+		!strings.Contains(report.Detail, "command timeout") {
+		t.Fatalf("timed-out ledger reported certainty: %+v", report)
 	}
 }

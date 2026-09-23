@@ -138,15 +138,10 @@ func (e *Engine) Eligible(ctx context.Context, item core.CleanupItem) error {
 	if !original.Allows(core.ActionDeleteCandidate) {
 		return fmt.Errorf("original source safety refused: %s", original.Summary())
 	}
-	// Refuse a mount or incomplete subtree before entering recursive deletion.
-	// The anchored remover checks each child's device again against races.
-	checked := observed
-	checked.Path = item.Destination
-	limit := e.Collect.Limits.DeepSizeMaxEntries
-	if limit <= 0 {
-		limit = 20000
-	}
-	if _, err := EstimateReclaim(ctx, []core.Entry{checked}, limit); err != nil {
+	// Inspect the full tree for mount boundaries before deleting any child.
+	// This streams directory names without the estimator's entry cap or
+	// per-inode accounting: large valid receipts must still be eligible.
+	if err := verifyDeletionTree(ctx, item.Destination, planned.FilesystemID); err != nil {
 		return fmt.Errorf("deletion footprint is unproven: %w", err)
 	}
 	return nil

@@ -581,6 +581,35 @@ func TestExpiredUnchangedItemDeletesOnlyAfterSecondEvaluation(t *testing.T) {
 	}
 }
 
+func TestExpiryOfLargeReceiptDoesNotDependOnEstimateEntryLimit(t *testing.T) {
+	e, root, clock := fixtureEngine(t)
+	source := filepath.Join(root, "candidate")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"one", "two", "three", "four"} {
+		if err := os.WriteFile(filepath.Join(source, name), []byte(name), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	item := prepareFixture(t, e, source, core.Retention30Days)
+	item, err := e.Quarantine(context.Background(), item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Estimates may be unavailable for a large receipt, but the anchored
+	// deletion verifier streams the entire tree and still enforces mounts.
+	e.Collect.Limits.DeepSizeMaxEntries = 2
+	*clock = clock.Add(31 * 24 * time.Hour)
+	deleted, err := e.Delete(context.Background(), item)
+	if err != nil || deleted.State != core.CleanupDeleted {
+		t.Fatalf("valid expired receipt was trapped by estimate limit: %+v %v", deleted, err)
+	}
+	if _, err := os.Lstat(item.Destination); !os.IsNotExist(err) {
+		t.Fatalf("receipt still exists after deletion: %v", err)
+	}
+}
+
 func TestExpiryNeedsTimeAndFreshUnreferencedEvidence(t *testing.T) {
 	e, root, clock := fixtureEngine(t)
 	ctx := context.Background()
