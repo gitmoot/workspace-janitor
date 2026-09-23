@@ -455,6 +455,25 @@ func TestMalformedAdvisorConfidenceLeavesRulesPlan(t *testing.T) {
 	}
 }
 
+// Invalid retention in an external advisor's otherwise safer answer
+// cannot abort plan validation; the rules' action remains reviewable.
+func TestMalformedAdvisorRetentionLeavesRulesPlan(t *testing.T) {
+	entry := entryAt("/home/fixture/mystery")
+	advisor := &stubAdvisor{name: "other", answers: map[string]core.Recommendation{
+		entry.Path: {
+			Action: core.ActionKeep, Class: core.ClassOperationalTool,
+			Retention: core.Retention("bogus"), Confidence: 0.9,
+			Origin: core.OriginModel, Reasons: []string{"bad retention"}, DecidedAt: plannedAt,
+		},
+	}}
+	result := buildPlan(t, []core.Entry{entry}, fixturePolicy(), advisor)
+	action := actionFor(t, result, entry.Path)
+	if action.Kind != core.ActionInvestigate || action.Retention != core.RetentionNone ||
+		containsString(action.Rules, "advisor:other") {
+		t.Errorf("malformed advice changed the rules plan: %+v", action)
+	}
+}
+
 // An advisor that agrees with the rules is still credited, so the trace
 // says why the entry stayed where it was.
 func TestAgreeingAdviceIsCreditedWithoutChangingTheAction(t *testing.T) {

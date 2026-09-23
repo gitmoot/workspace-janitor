@@ -128,12 +128,20 @@ func Build(ctx context.Context, in Input) (Result, error) {
 			// A failed advisor changes nothing: the rules already decided.
 			advice = map[string]core.Recommendation{}
 		} else {
-			// Only finite confidence in [0,1] can become action
-			// confidence. Invalid advisor confidence must not abort a
-			// rules-only plan; the positive comparisons also reject NaN.
+			// The advisor is outside the planner's trust boundary.
+			// Preserve the historic omitted-retention default, but drop
+			// other malformed answers before they enter the plan or its
+			// identity. The positive bounds also reject NaN.
 			for _, entry := range ambiguous {
 				recommendation, ok := answers[entry.Path]
-				if !ok || !(recommendation.Confidence >= 0 && recommendation.Confidence <= 1) {
+				if !ok {
+					continue
+				}
+				if recommendation.Retention == "" {
+					recommendation.Retention = core.RetentionNone
+				}
+				if !(recommendation.Confidence >= 0 && recommendation.Confidence <= 1) ||
+					len(recommendation.Validate("advisor")) != 0 {
 					continue
 				}
 				advice[entry.Path] = recommendation
