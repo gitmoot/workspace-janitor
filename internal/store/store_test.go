@@ -915,3 +915,60 @@ func digestOf(t *testing.T, path string) string {
 	}
 	return strings.Join(parts, " ")
 }
+
+// A cached model answer is served until it expires, and never after: a
+// stale answer must not be reused as if it were fresh.
+func TestModelDecisionIsCachedUntilItExpires(t *testing.T) {
+	db := openFixture(t)
+	ctx := context.Background()
+	at := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	want := core.Recommendation{
+		Action: core.ActionKeep, Class: core.ClassOperationalTool, Retention: core.RetentionNone,
+		Confidence: 0.9, Origin: core.OriginModel, Reasons: []string{"model: keep"}, DecidedAt: at,
+	}
+	decision := ModelDecision{
+		Key: "key-1", Fingerprint: "fp-1", SchemaVersion: 1, Model: "jev-latest",
+		PolicyDigest: "policy-1", ResolvedModel: "jev-1.13.0", Recommendation: want,
+		CreatedAt: at, ExpiresAt: at.Add(24 * time.Hour),
+	}
+	if err := db.Write(ctx, func(tx *Tx) error { return tx.PutModelDecision(ctx, decision) }); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	lookup := func(key string, now time.Time) (core.Recommendation, bool) {
+		t.Helper()
+		var (
+			got   core.Recommendation
+			found bool
+		)
+		if err := db.Read(ctx, func(tx *Tx) error {
+			var err error
+			got, found, err = tx.ModelDecision(ctx, key, now)
+			return err
+		}); err != nil {
+			t.Fatalf("lookup: %v", err)
+		}
+		return got, found
+	}
+
+	got, found := lookup("key-1", at.Add(time.Hour))
+	if !found || got.Action != want.Action || got.Class != want.Class || got.Origin != core.OriginModel {
+		t.Errorf("fresh lookup = %+v, %t; want %+v", got, found, want)
+	}
+	if _, found := lookup("key-1", at.Add(24*time.Hour)); found {
+		t.Error("an expired decision was served")
+	}
+	if _, found := lookup("key-2", at); found {
+		t.Error("an unknown key was served")
+	}
+
+	// A newer answer under the same key replaces the old one.
+	decision.Recommendation.Action = core.ActionInvestigate
+	decision.ExpiresAt = at.Add(48 * time.Hour)
+	if err := db.Write(ctx, func(tx *Tx) error { return tx.PutModelDecision(ctx, decision) }); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	if got, found := lookup("key-1", at.Add(30*time.Hour)); !found || got.Action != core.ActionInvestigate {
+		t.Errorf("replaced lookup = %+v, %t; want the newer investigate", got, found)
+	}
+}

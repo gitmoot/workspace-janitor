@@ -10,12 +10,13 @@ deletion is always preceded by quarantine.
 ## Status
 
 This repository contains the **foundation** (issue #2), the **inventory
-collectors** (issue #6), the **safety engine** (issue #3), and the **policy
-and planner** (issue #7): the command
-tree, configuration and policy loading, the versioned domain contracts, the
-local SQLite store, the output contracts, a bounded fail-closed `scan`, and
-the deterministic protections that decide whether a path may ever be
-mutated.
+collectors** (issue #6), the **safety engine** (issue #3), the **policy
+and planner** (issue #7), and the optional **Jev advisor** (issue #9): the
+command tree, configuration and policy loading, the versioned domain
+contracts, the local SQLite store, the output contracts, a bounded
+fail-closed `scan`, the deterministic protections that decide whether a
+path may ever be mutated, and model advice for entries the rules could not
+classify.
 
 | Command | State |
 | --- | --- |
@@ -188,11 +189,11 @@ a conflict. File order is never consulted: rules sort by tier, then
 specificity, then name, so reordering a policy file cannot change a
 decision.
 
-A plan is bound to the scan, the evidence digest, and the policy digest it
-was built from, and is immutable once stored. Re-planning unchanged inputs
-produces the same plan id and reuses the stored plan; using a plan whose
-evidence or policy has changed is refused. Approval is recorded beside the
-plan:
+A plan is bound to the scan, evidence digest, policy digest, advisor, and
+well-formed advice considered (even if rejected), and is immutable once stored.
+Re-planning unchanged inputs produces the same plan id and reuses the
+stored plan; using a plan whose evidence or policy has changed is refused.
+Approval is recorded beside the plan:
 
 ```sh
 janitor plan                              # build and store a plan
@@ -205,10 +206,49 @@ janitor explain /path/to/thing            # trace one decision
 were rejected and why, the collected evidence, the safety verdict, and
 whether the action is approved.
 
-A model classifier is not part of this: when one is added (issue #9) it is
-consulted only after the deterministic rules have run, only for entries they
-left ambiguous, and its answer is accepted only if it is safer than what the
-rules decided.
+### Jev advice
+
+Rules-only planning is the default and is complete on its own. With
+`jev.enabled: true` and a key in the environment variable named by
+`jev.api_key_env` (`TYPESAFE_API_KEY` by default), `plan` offers the
+entries the rules left **ambiguous** — and only those, after every rule has
+run — to the TypeSafe Jev model. A missing key is not an error: the plan is
+built from rules alone and says so.
+
+What is sent is an allowlisted projection, never the entry itself: a
+`<root>/`-relative path with configured, protected, and secret-looking
+segments redacted; kind, depth, a size bucket, and age in days; Git counts
+and booleans; evidence signal names; and protection kinds. Remotes,
+branches, commit ids, evidence details, symlink targets, owners, and
+absolute paths are never sent.
+
+Each entry gets four typed questions: its class, an action, a retention,
+and the probability that moving it would lose work. The action options are
+only `keep`, `quarantine`, and `investigate`. A missing, malformed, or
+low-confidence answer, or one judged unsafe, becomes `investigate`. Every
+answer then goes through the safety engine and is applied only if it is
+safer than the rules' decision; a rejected proposal is recorded in the
+trace.
+
+```sh
+janitor plan --jev-dry-run   # print the exact requests; send and store nothing
+janitor plan --jev-debug     # also print the requests that were sent
+janitor plan --no-jev        # rules only for this run
+```
+
+Requests are batched within `max_batch` and `max_state_tokens`, paced by
+`min_interval`, bounded by `timeout`, and retried up to `max_retries` times
+on 429, 529, 5xx, and transport errors, honoring `Retry-After`. A rejected
+key or request is not retried. After `breaker_failures` consecutive
+failures the run stops calling the model and plans the rest from rules.
+Well-formed answers are cached by entry fingerprint, request schema,
+model, and policy for `cache_ttl`, so re-planning unchanged entries sends
+nothing; malformed answers are retried on the next plan.
+
+Usage is recorded for every answered request, even with `--no-store`.
+`plan` shows the run's tokens and estimated cost, and `status` shows the
+totals. Cost is an estimate: reported input tokens times
+`price_per_mtok_usd`.
 
 ## Configuration
 

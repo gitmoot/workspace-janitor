@@ -219,10 +219,10 @@ func (t *Tx) SavePlan(ctx context.Context, plan core.Plan) error {
 	}
 
 	if _, err := t.tx.ExecContext(ctx,
-		`INSERT INTO plans (id, scan_id, contract_version, status, created_at, evidence_digest, policy_digest)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO plans (id, scan_id, contract_version, status, created_at, evidence_digest, policy_digest, advisor)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		plan.ID, plan.ScanID, plan.ContractVersion, string(plan.Status), formatTime(plan.CreatedAt),
-		plan.EvidenceDigest, plan.PolicyDigest,
+		plan.EvidenceDigest, plan.PolicyDigest, advisorOrRulesOnly(plan.Advisor),
 	); err != nil {
 		return fmt.Errorf("store: save plan %s: %w", plan.ID, err)
 	}
@@ -268,10 +268,10 @@ func (t *Tx) Plan(ctx context.Context, id string) (core.Plan, error) {
 		createdAt string
 	)
 	err := t.tx.QueryRowContext(ctx,
-		`SELECT id, scan_id, contract_version, status, created_at, evidence_digest, policy_digest
+		`SELECT id, scan_id, contract_version, status, created_at, evidence_digest, policy_digest, advisor
 		 FROM plans WHERE id = ?`, id).
 		Scan(&plan.ID, &plan.ScanID, &plan.ContractVersion, &status, &createdAt,
-			&plan.EvidenceDigest, &plan.PolicyDigest)
+			&plan.EvidenceDigest, &plan.PolicyDigest, &plan.Advisor)
 	if errors.Is(err, sql.ErrNoRows) {
 		return core.Plan{}, fmt.Errorf("%w: plan %s", ErrNotFound, id)
 	}
@@ -681,4 +681,87 @@ func (t *Tx) LatestPlan(ctx context.Context, scanID string) (core.Plan, error) {
 		return core.Plan{}, fmt.Errorf("store: latest plan: %w", err)
 	}
 	return t.Plan(ctx, id)
+}
+
+// advisorOrRulesOnly defaults an unnamed advisor to rules-only, so a plan
+// saved before the field existed still round-trips to the same document.
+func advisorOrRulesOnly(advisor string) string {
+	if advisor == "" {
+		return "rules-only"
+	}
+	return advisor
+}
+
+// ModelDecision is one cached model answer.
+type ModelDecision struct {
+	Key            string
+	Fingerprint    string
+	SchemaVersion  int
+	Model          string
+	PolicyDigest   string
+	ResolvedModel  string
+	Recommendation core.Recommendation
+	CreatedAt      time.Time
+	ExpiresAt      time.Time
+}
+
+// PutModelDecision stores a model answer, replacing an older one under the
+// same key.
+func (t *Tx) PutModelDecision(ctx context.Context, decision ModelDecision) error {
+	if decision.Key == "" {
+		return errors.New("store: a model decision needs a cache key")
+	}
+	if err := decision.Recommendation.Validate("recommendation").ErrorOrNil(); err != nil {
+		return fmt.Errorf("store: invalid cached recommendation: %w", err)
+	}
+	encoded, err := core.MarshalJSON(decision.Recommendation)
+	if err != nil {
+		return fmt.Errorf("store: encode cached recommendation: %w", err)
+	}
+	_, err = t.tx.ExecContext(ctx,
+		`INSERT INTO model_decisions
+		   (cache_key, fingerprint, schema_version, model, policy_digest, resolved_model, recommendation, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(cache_key) DO UPDATE SET
+		   resolved_model = excluded.resolved_model,
+		   recommendation = excluded.recommendation,
+		   created_at = excluded.created_at,
+		   expires_at = excluded.expires_at`,
+		decision.Key, decision.Fingerprint, decision.SchemaVersion, decision.Model, decision.PolicyDigest,
+		decision.ResolvedModel, string(encoded), formatTime(decision.CreatedAt), formatTime(decision.ExpiresAt))
+	if err != nil {
+		return fmt.Errorf("store: put model decision: %w", err)
+	}
+	return nil
+}
+
+// ModelDecision returns a cached answer that has not expired. An expired
+// or undecodable entry is a miss: a stale answer must never be reused as
+// if it were fresh.
+func (t *Tx) ModelDecision(ctx context.Context, key string, now time.Time) (core.Recommendation, bool, error) {
+	var encoded, expiresAt string
+	err := t.tx.QueryRowContext(ctx,
+		`SELECT recommendation, expires_at FROM model_decisions WHERE cache_key = ?`, key).
+		Scan(&encoded, &expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.Recommendation{}, false, nil
+	}
+	if err != nil {
+		return core.Recommendation{}, false, fmt.Errorf("store: look up model decision: %w", err)
+	}
+	expires, err := parseTime(expiresAt)
+	if err != nil {
+		return core.Recommendation{}, false, nil
+	}
+	if !now.Before(expires) {
+		return core.Recommendation{}, false, nil
+	}
+	var recommendation core.Recommendation
+	if err := json.Unmarshal([]byte(encoded), &recommendation); err != nil {
+		return core.Recommendation{}, false, nil
+	}
+	if errs := recommendation.Validate("recommendation"); len(errs) > 0 {
+		return core.Recommendation{}, false, nil
+	}
+	return recommendation, true, nil
 }

@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -88,10 +90,48 @@ type CacheRule struct {
 
 // JevPolicy configures the optional model classifier. It is disabled by
 // default: the tool must be fully useful with no credentials and no network.
+//
+// Credentials are bring-your-own and never live in the policy document: the
+// policy names the environment variable that holds the key, and the key is
+// read at run time. A policy file can therefore be shared, committed, or
+// shown in full without exposing a secret.
 type JevPolicy struct {
-	Enabled        bool     `yaml:"enabled" json:"enabled"`
-	Model          string   `yaml:"model" json:"model"`
-	MaxBatch       int      `yaml:"max_batch" json:"max_batch"`
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Model is sent as the request's model field. An alias such as
+	// "jev-latest" can move to a new version; pin a versioned id to keep
+	// cached decisions and confidence thresholds tied to one model.
+	Model string `yaml:"model" json:"model"`
+	// Endpoint is the TypeSafe evaluation endpoint.
+	Endpoint string `yaml:"endpoint" json:"endpoint"`
+	// APIKeyEnv names the environment variable holding the API key.
+	APIKeyEnv string `yaml:"api_key_env" json:"api_key_env"`
+	// MaxBatch caps how many entries share one request.
+	MaxBatch int `yaml:"max_batch" json:"max_batch"`
+	// MaxStateTokens caps the estimated size of one request's state,
+	// kept below the model's per-request limit with room for questions.
+	MaxStateTokens int `yaml:"max_state_tokens" json:"max_state_tokens"`
+	// Timeout bounds one HTTP attempt.
+	Timeout Duration `yaml:"timeout" json:"timeout"`
+	// MaxRetries bounds retries of a retryable failure (429, 529, 5xx,
+	// timeout). Other failures are not retried.
+	MaxRetries int `yaml:"max_retries" json:"max_retries"`
+	// MinInterval spaces consecutive requests, a client-side rate limit.
+	MinInterval Duration `yaml:"min_interval" json:"min_interval"`
+	// BreakerFailures is how many consecutive failed requests open the
+	// circuit breaker for the rest of the run.
+	BreakerFailures int `yaml:"breaker_failures" json:"breaker_failures"`
+	// MinConfidence is the lowest answer confidence acted on; anything
+	// less becomes investigate.
+	MinConfidence float64 `yaml:"min_confidence" json:"min_confidence"`
+	// MaxUnsafe is the highest unsafe-to-remove probability tolerated;
+	// anything more becomes investigate.
+	MaxUnsafe float64 `yaml:"max_unsafe" json:"max_unsafe"`
+	// PricePerMTokUSD estimates cost from reported input tokens. The API
+	// reports tokens, not money, so cost is always an estimate.
+	PricePerMTokUSD float64 `yaml:"price_per_mtok_usd" json:"price_per_mtok_usd"`
+	// CacheTTL bounds how long a cached decision is reused.
+	CacheTTL Duration `yaml:"cache_ttl" json:"cache_ttl"`
+	// RedactSegments are path segments replaced before anything is sent.
 	RedactSegments []string `yaml:"redact_segments" json:"redact_segments"`
 }
 
@@ -222,9 +262,25 @@ func DefaultPolicy(p Paths) Policy {
 		},
 		Caches: []CacheRule{},
 		Jev: JevPolicy{
-			Enabled:        false,
-			MaxBatch:       20,
-			RedactSegments: []string{},
+			Enabled:   false,
+			Model:     "jev-latest",
+			Endpoint:  "https://api.typesafe.ai/v1/systemone",
+			APIKeyEnv: "TYPESAFE_API_KEY",
+			MaxBatch:  20,
+			// Documented limits: 64k tokens per request, 32k for the state
+			// plus the longest question. 24k leaves room for both.
+			MaxStateTokens:  24000,
+			Timeout:         Duration(20 * time.Second),
+			MaxRetries:      2,
+			MinInterval:     Duration(100 * time.Millisecond),
+			BreakerFailures: 3,
+			MinConfidence:   0.7,
+			MaxUnsafe:       0.2,
+			// Published price for jev-1.13.0: $0.042 per million input
+			// tokens; output tokens are free.
+			PricePerMTokUSD: 0.042,
+			CacheTTL:        Duration(30 * 24 * time.Hour),
+			RedactSegments:  []string{},
 		},
 		Collectors: Collectors{
 			// Deep sizing is opt-in: a default scan must stay a top-level,
@@ -482,6 +538,7 @@ func (p *Policy) Validate() core.FieldErrors {
 	if p.Jev.MaxBatch <= 0 {
 		errs.Add("jev.max_batch", "must be greater than zero, got %d", p.Jev.MaxBatch)
 	}
+	errs = append(errs, validateJev(p.Jev)...)
 	for i, segment := range p.Jev.RedactSegments {
 		if segment == "" {
 			errs.Add(fmt.Sprintf("jev.redact_segments[%d]", i), "must not be empty")
@@ -644,4 +701,86 @@ func (c Classification) normalized() Classification {
 		}
 	}
 	return out
+}
+
+// validateJev checks the provider settings. They are validated whether or
+// not the provider is enabled, so turning it on later cannot expose a
+// configuration nobody checked.
+func validateJev(j JevPolicy) core.FieldErrors {
+	var errs core.FieldErrors
+	if err := validateEndpoint(j.Endpoint); err != nil {
+		errs.Add("jev.endpoint", "%v", err)
+	}
+	if !isEnvName(j.APIKeyEnv) {
+		errs.Add("jev.api_key_env", "must name an environment variable, got %q", j.APIKeyEnv)
+	}
+	if j.MaxStateTokens <= 0 || j.MaxStateTokens > 32000 {
+		errs.Add("jev.max_state_tokens", "must be within (0, 32000], the per-request state limit; got %d", j.MaxStateTokens)
+	}
+	if j.Timeout.Duration() <= 0 {
+		errs.Add("jev.timeout", "must be greater than zero, got %s", j.Timeout)
+	}
+	if j.MaxRetries < 0 || j.MaxRetries > 5 {
+		errs.Add("jev.max_retries", "must be within [0, 5], got %d", j.MaxRetries)
+	}
+	if j.MinInterval.Duration() < 0 {
+		errs.Add("jev.min_interval", "must not be negative, got %s", j.MinInterval)
+	}
+	if j.BreakerFailures <= 0 {
+		errs.Add("jev.breaker_failures", "must be greater than zero, got %d", j.BreakerFailures)
+	}
+	if j.MinConfidence < 0 || j.MinConfidence > 1 {
+		errs.Add("jev.min_confidence", "must be within [0, 1], got %v", j.MinConfidence)
+	}
+	if j.MaxUnsafe < 0 || j.MaxUnsafe > 1 {
+		errs.Add("jev.max_unsafe", "must be within [0, 1], got %v", j.MaxUnsafe)
+	}
+	if j.PricePerMTokUSD < 0 {
+		errs.Add("jev.price_per_mtok_usd", "must not be negative, got %v", j.PricePerMTokUSD)
+	}
+	if j.CacheTTL.Duration() <= 0 {
+		errs.Add("jev.cache_ttl", "must be greater than zero, got %s", j.CacheTTL)
+	}
+	return errs
+}
+
+// validateEndpoint requires HTTPS, allowing plain HTTP only to a loopback
+// address. The API key travels in a header, so sending it in the clear to
+// anything but this machine is refused.
+func validateEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("must be an absolute URL, got %q", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		host := u.Hostname()
+		if host == "localhost" {
+			return nil
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+		return fmt.Errorf("must use https unless it is a loopback address, got %q", raw)
+	default:
+		return fmt.Errorf("must use https, got %q", raw)
+	}
+}
+
+// isEnvName reports whether s is a valid environment variable name.
+func isEnvName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r == '_':
+		case r >= '0' && r <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
 }

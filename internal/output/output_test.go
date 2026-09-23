@@ -54,6 +54,7 @@ func TestWriteJSONEnvelopeIsStableAndVersioned(t *testing.T) {
     "created_at": "2026-02-03T04:05:06Z",
     "evidence_digest": "evidence-1",
     "policy_digest": "policy-1",
+    "advisor": "rules-only",
     "actions": [
       {
         "id": "action-1",

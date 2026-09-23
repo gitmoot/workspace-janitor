@@ -57,6 +57,7 @@ func TestParsePolicyReportsEveryInvalidField(t *testing.T) {
 		"  default: 45d",
 		"jev:",
 		"  enabled: true",
+		"  model: \"\"",
 		"",
 	}, "\n"))
 	if err == nil {
@@ -407,5 +408,50 @@ func TestProjectMarkerGlobsAreRejected(t *testing.T) {
 		"",
 	}, "\n")); err != nil {
 		t.Errorf("literal markers and glob cache names must be accepted: %v", err)
+	}
+}
+
+// The API key travels in a header, so an endpoint that is not HTTPS is
+// refused unless it is this machine. A policy may name the variable that
+// holds the key, never the key itself.
+func TestJevProviderSettingsAreValidated(t *testing.T) {
+	paths := fixturePaths(t)
+	_, err := parse(t, paths, strings.Join([]string{
+		"roots:",
+		"  - path: /repos",
+		"jev:",
+		"  endpoint: http://api.example.invalid/v1/systemone",
+		"  api_key_env: \"not a name\"",
+		"  max_state_tokens: 50000",
+		"  min_confidence: 1.5",
+		"  max_retries: 9",
+		"",
+	}, "\n"))
+	if err == nil {
+		t.Fatal("expected invalid provider settings to be rejected")
+	}
+	for _, want := range []string{
+		"jev.endpoint", "jev.api_key_env", "jev.max_state_tokens", "jev.min_confidence", "jev.max_retries",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+
+	for _, endpoint := range []string{
+		"https://api.typesafe.ai/v1/systemone",
+		"http://127.0.0.1:8080/v1/systemone",
+		"http://localhost:9/v1/systemone",
+	} {
+		if _, err := parse(t, paths, "roots:\n  - path: /repos\njev:\n  endpoint: "+endpoint+"\n"); err != nil {
+			t.Errorf("endpoint %s must be accepted: %v", endpoint, err)
+		}
+	}
+
+	// There is no field for the key itself: a key in the policy file is an
+	// unknown field, not a silently accepted secret.
+	_, err = parse(t, paths, "roots:\n  - path: /repos\njev:\n  api_key: sk-should-never-be-here\n")
+	if err == nil || !strings.Contains(err.Error(), "api_key") {
+		t.Errorf("a key in the policy must be rejected, got %v", err)
 	}
 }

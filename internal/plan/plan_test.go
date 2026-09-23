@@ -3,6 +3,7 @@ package plan
 import (
 	"context"
 	"errors"
+	"math"
 	"math/rand/v2"
 	"strings"
 	"testing"
@@ -401,6 +402,143 @@ func TestAdvisorCanOnlyLowerRisk(t *testing.T) {
 	}
 	if !containsString(action.Rules, "advisor:jev") {
 		t.Errorf("rules = %v, want the advisor credited", action.Rules)
+	}
+}
+
+// A relocation could rank safer than a rule's quarantine, but the
+// advisor has no destination to supply. It must be rejected before
+// becoming an invalid plan action.
+func TestAdvisorCannotProposeRelocation(t *testing.T) {
+	entry := entryAt("/home/fixture/mystery")
+	policy := fixturePolicy()
+	policy.Caches = []config.CacheRule{{
+		Name: "mystery", Path: entry.Path,
+		Action: core.ActionQuarantine, Retention: core.Retention30Days,
+	}}
+	advisor := &stubAdvisor{name: "other", answers: map[string]core.Recommendation{
+		entry.Path: {
+			Action: core.ActionRelocate, Class: core.ClassCache,
+			Retention: core.RetentionNone, Confidence: 0.9,
+			Origin: core.OriginModel, Reasons: []string{"move this"}, DecidedAt: plannedAt,
+		},
+	}}
+	result := buildPlan(t, []core.Entry{entry}, policy, advisor)
+	action := actionFor(t, result, entry.Path)
+	if action.Kind != core.ActionQuarantine {
+		t.Errorf("action = %q, want the rules' quarantine", action.Kind)
+	}
+	found := false
+	for _, rejected := range action.Rejected {
+		if rejected.Kind == core.ActionRelocate && rejected.Rule == "advisor:other" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("unsupported relocation not recorded as rejected: %+v", action.Rejected)
+	}
+}
+
+// A safer accepted answer carries its own confidence and class through
+// both the action and the trace; rules-only ambiguity remains conservative.
+func TestAcceptedAdviceClassAndConfidenceAgreeWithTrace(t *testing.T) {
+	entry := entryAt("/home/fixture/mystery")
+	advisor := &stubAdvisor{name: "jev", answers: map[string]core.Recommendation{
+		entry.Path: {
+			Action: core.ActionKeep, Class: core.ClassOperationalTool,
+			Confidence: 0.95, Origin: core.OriginModel,
+			Reasons: []string{"operator tooling"}, DecidedAt: plannedAt,
+		},
+	}}
+	result := buildPlan(t, []core.Entry{entry}, fixturePolicy(), advisor)
+	action := actionFor(t, result, entry.Path)
+	if action.Kind != core.ActionKeep || action.Confidence != 0.95 || action.Class != core.ClassOperationalTool {
+		t.Fatalf("accepted action = %+v", action)
+	}
+	if len(result.Traces) != 1 || result.Traces[0].Class != action.Class || result.Traces[0].Action != action.Kind {
+		t.Errorf("trace = %+v, action = %+v", result.Traces, action)
+	}
+}
+
+// An advisor can be implemented by something other than Jev. Invalid
+// recommendations must never cause the complete rules plan to fail.
+func TestMalformedAdvisorConfidenceLeavesRulesPlan(t *testing.T) {
+	entry := entryAt("/home/fixture/mystery")
+	for _, tc := range []struct {
+		name       string
+		confidence float64
+	}{
+		{name: "above one", confidence: 1.5},
+		{name: "not a number", confidence: math.NaN()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			advisor := &stubAdvisor{name: "other", answers: map[string]core.Recommendation{
+				entry.Path: {
+					Action: core.ActionKeep, Class: core.ClassOperationalTool,
+					Confidence: tc.confidence, Origin: core.OriginModel,
+					Reasons: []string{"unsafe advisor value"}, DecidedAt: plannedAt,
+				},
+			}}
+			result := buildPlan(t, []core.Entry{entry}, fixturePolicy(), advisor)
+			action := actionFor(t, result, entry.Path)
+			if action.Kind != core.ActionInvestigate || action.Confidence != ambiguousConfidence ||
+				containsString(action.Rules, "advisor:other") {
+				t.Errorf("malformed advice changed the rules plan: %+v", action)
+			}
+		})
+	}
+}
+
+// Invalid retention in an external advisor's otherwise safer answer
+// cannot abort plan validation; the rules' action remains reviewable.
+func TestMalformedAdvisorRetentionLeavesRulesPlan(t *testing.T) {
+	entry := entryAt("/home/fixture/mystery")
+	advisor := &stubAdvisor{name: "other", answers: map[string]core.Recommendation{
+		entry.Path: {
+			Action: core.ActionKeep, Class: core.ClassOperationalTool,
+			Retention: core.Retention("bogus"), Confidence: 0.9,
+			Origin: core.OriginModel, Reasons: []string{"bad retention"}, DecidedAt: plannedAt,
+		},
+	}}
+	result := buildPlan(t, []core.Entry{entry}, fixturePolicy(), advisor)
+	action := actionFor(t, result, entry.Path)
+	if action.Kind != core.ActionInvestigate || action.Retention != core.RetentionNone ||
+		containsString(action.Rules, "advisor:other") {
+		t.Errorf("malformed advice changed the rules plan: %+v", action)
+	}
+}
+
+// An advisor that agrees with the rules is still credited, so the trace
+// says why the entry stayed where it was.
+func TestAgreeingAdviceIsCreditedWithoutChangingTheAction(t *testing.T) {
+	policy := fixturePolicy()
+	unsure := &stubAdvisor{name: "jev", answers: map[string]core.Recommendation{
+		"/home/fixture/mystery": {
+			Action: core.ActionInvestigate, Class: core.ClassCache,
+			Retention: core.RetentionNone, Confidence: 0.4, Origin: core.OriginModel,
+			Reasons: []string{"confidence 0.40 is below the 0.70 threshold"}, DecidedAt: plannedAt,
+		},
+	}}
+	action := actionFor(t, buildPlan(t, []core.Entry{entryAt("/home/fixture/mystery")}, policy, unsure), "/home/fixture/mystery")
+	if action.Kind != core.ActionInvestigate {
+		t.Fatalf("action = %q, want investigate", action.Kind)
+	}
+	if len(action.Rules) != len(action.Reasons) {
+		t.Fatalf("rules %v and reasons %v are not aligned", action.Rules, action.Reasons)
+	}
+	credited := false
+	for i, rule := range action.Rules {
+		if rule == "advisor:jev" && strings.Contains(action.Reasons[i], "below the 0.70 threshold") {
+			credited = true
+		}
+	}
+	if !credited {
+		t.Errorf("rules %v / reasons %v do not credit the advisor with its reason", action.Rules, action.Reasons)
+	}
+	if action.Class != core.ClassCache {
+		t.Errorf("class = %q, want the advisor's label on an unchanged action", action.Class)
+	}
+	if len(action.Rejected) != 0 {
+		t.Errorf("an agreeing advisor was recorded as rejected: %+v", action.Rejected)
 	}
 }
 

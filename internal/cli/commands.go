@@ -83,7 +83,13 @@ func planCommand() *command {
 			"a disagreement between them always resolves to the safer action.\n\n" +
 			"A plan is bound to the scan, the evidence, and the policy it was built\n" +
 			"from, and is immutable once stored. Approving selects actions by id or\n" +
-			"path; it never edits the plan.",
+			"path; it never edits the plan.\n\n" +
+			"Entries the rules leave ambiguous can be offered to the Jev model when\n" +
+			"jev.enabled is true and an API key is in the environment variable named\n" +
+			"by jev.api_key_env. Only a redacted, allowlisted projection is sent. The\n" +
+			"model may only propose keep, quarantine, or investigate, and its advice\n" +
+			"is accepted only when the safety engine allows it and it is safer than\n" +
+			"the rules' choice. Without a key the plan is built from rules alone.",
 		register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
 			opts := planOptions{approver: "operator"}
 			fs.StringVar(&opts.scanID, "scan", "", "scan id to plan from (default: the most recent completed scan)")
@@ -92,7 +98,10 @@ func planCommand() *command {
 			fs.BoolVar(&opts.approveAll, "approve-all", false, "approve every mutating action in the plan")
 			fs.StringVar(&opts.approver, "approver", "operator", "who is recorded as approving")
 			fs.StringVar(&opts.note, "note", "", "note stored with the approval")
-			fs.BoolVar(&opts.noPersist, "no-store", false, "report the plan without writing it to the database")
+			fs.BoolVar(&opts.noPersist, "no-store", false, "report the plan without storing it (model usage is still recorded)")
+			fs.BoolVar(&opts.noJev, "no-jev", false, "plan from rules alone, even when the model is enabled")
+			fs.BoolVar(&opts.jevDryRun, "jev-dry-run", false, "show the exact model requests without sending them (implies --no-store)")
+			fs.BoolVar(&opts.jevDebug, "jev-debug", false, "also show the exact model requests that were sent")
 			return func(ctx context.Context, e *env, args []string) error {
 				return runPlan(ctx, e, args, opts)
 			}

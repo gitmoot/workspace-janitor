@@ -41,6 +41,17 @@ type Input struct {
 	Advisor Advisor
 }
 
+// RulesOnly is the advisor identity of a plan no model contributed to.
+const RulesOnly = "rules-only"
+
+// AdvisorKey returns the identity of the advisor that will shape a plan.
+func (in Input) AdvisorKey() string {
+	if in.Advisor == nil {
+		return RulesOnly
+	}
+	return in.Advisor.Name()
+}
+
 // Result is a plan plus the per-entry traces behind it.
 type Result struct {
 	Plan     core.Plan
@@ -117,7 +128,24 @@ func Build(ctx context.Context, in Input) (Result, error) {
 			// A failed advisor changes nothing: the rules already decided.
 			advice = map[string]core.Recommendation{}
 		} else {
-			advice = answers
+			// The advisor is outside the planner's trust boundary.
+			// Preserve the historic omitted-retention default, but drop
+			// other malformed answers before they enter the plan or its
+			// identity. The positive bounds also reject NaN.
+			for _, entry := range ambiguous {
+				recommendation, ok := answers[entry.Path]
+				if !ok {
+					continue
+				}
+				if recommendation.Retention == "" {
+					recommendation.Retention = core.RetentionNone
+				}
+				if !(recommendation.Confidence >= 0 && recommendation.Confidence <= 1) ||
+					len(recommendation.Validate("advisor")) != 0 {
+					continue
+				}
+				advice[entry.Path] = recommendation
+			}
 		}
 	}
 
@@ -128,9 +156,10 @@ func Build(ctx context.Context, in Input) (Result, error) {
 		CreatedAt:      now,
 		EvidenceDigest: EvidenceDigest(entries),
 		PolicyDigest:   PolicyDigest(in.Policy),
+		Advisor:        in.AdvisorKey(),
 		Actions:        make([]core.Action, 0, len(entries)),
 	}
-	plan.ID = PlanID(in.ScanID, plan.EvidenceDigest, plan.PolicyDigest)
+	plan.ID = PlanID(in.ScanID, plan.EvidenceDigest, plan.PolicyDigest, plan.Advisor, adviceDigest(entries, decisions, advice))
 
 	for i, entry := range entries {
 		decision := decisions[i]
@@ -143,8 +172,16 @@ func Build(ctx context.Context, in Input) (Result, error) {
 			Ambiguous:   decision.Ambiguous,
 			Fingerprint: entry.Fingerprint,
 		}
+		confidence := confidenceFor(decision)
 		if recommendation, ok := advice[entry.Path]; ok && decision.Ambiguous {
+			before := decision.Kind
 			decision, trace = applyAdvice(decision, trace, recommendation, verdicts[i], advisorName)
+			// Only a genuinely accepted model action carries model
+			// confidence. A safety-clamped or agreeing answer keeps the
+			// rules' conservative confidence.
+			if decision.Kind != before && decision.Kind == recommendation.Action {
+				confidence = recommendation.Confidence
+			}
 		}
 		trace.Action = decision.Kind
 
@@ -155,7 +192,7 @@ func Build(ctx context.Context, in Input) (Result, error) {
 			Kind:         decision.Kind,
 			Class:        decision.Class,
 			Retention:    decision.Retention,
-			Confidence:   confidenceFor(decision),
+			Confidence:   confidence,
 			Destination:  decision.Destination,
 			FilesystemID: entry.FilesystemID,
 			Fingerprint:  entry.Fingerprint,
@@ -197,15 +234,47 @@ func applyAdvice(
 	verdict core.Verdict,
 	advisor string,
 ) (Decision, Trace) {
-	clamped := safety.ClampRecommendation(verdict, recommendation)
 	trace.AdvisedBy = advisor
+	rule := "advisor:" + advisor
+	// No advisor can originate relocation or deletion. Apart from being
+	// outside the model contract, relocation requires a destination the
+	// recommendation cannot supply. Keep the rules' decision and show
+	// the rejected proposal instead of building an invalid action.
+	switch recommendation.Action {
+	case core.ActionKeep, core.ActionQuarantine, core.ActionInvestigate:
+		// These are the only actions an advisor may propose.
+	default:
+		trace.Rejected = append(trace.Rejected, core.RejectedAction{
+			Kind: recommendation.Action, Rule: rule,
+			Reason: "advisor actions are limited to keep, quarantine, and investigate",
+		})
+		decision.Rejected = trace.Rejected
+		return decision, trace
+	}
+	clamped := safety.ClampRecommendation(verdict, recommendation)
+
+	if clamped.Action == decision.Kind {
+		// The advisor agrees with the rules. Credit it with its reason —
+		// for example "confidence below threshold" — so the trace says why
+		// the entry stayed where it was, and take its class label when it
+		// has one: a label changes no action.
+		decision.Rules = append(decision.Rules, rule)
+		decision.Reasons = append(decision.Reasons, joinReasons(clamped.Reasons))
+		if clamped.Class.Valid() && clamped.Class != core.ClassUnknown {
+			decision.Class = clamped.Class
+			trace.Class = clamped.Class
+		}
+		trace.Rules = decision.Rules
+		trace.Reasons = decision.Reasons
+		return decision, trace
+	}
 
 	if clamped.Action.RiskRank() >= decision.Kind.RiskRank() {
 		trace.Rejected = append(trace.Rejected, core.RejectedAction{
 			Kind: clamped.Action,
-			Rule: "advisor:" + advisor,
-			Reason: fmt.Sprintf("the advisor proposed %s, which is not safer than the rules' %s",
-				clamped.Action, decision.Kind),
+			Rule: rule,
+			Reason: fmt.Sprintf("the advisor proposed %s, which is not safer than the rules' %s: %s",
+				clamped.Action, decision.Kind, joinReasons(clamped.Reasons)),
 		})
 		decision.Rejected = trace.Rejected
 		return decision, trace
@@ -219,6 +288,7 @@ func applyAdvice(
 	decision.Kind = clamped.Action
 	decision.Retention = clamped.Retention
 	decision.Class = clamped.Class
+	trace.Class = decision.Class
 	decision.Rules = append(decision.Rules, "advisor:"+advisor)
 	// One reason per rule: an explanation pairs them by index, so an
 	// advisor with several reasons contributes one joined entry.
@@ -387,11 +457,37 @@ func PolicyDigest(policy config.Policy) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// PlanID derives a stable identifier from what the plan is bound to. The
-// same scan, evidence, and policy always produce the same plan id.
-func PlanID(scanID, evidenceDigest, policyDigest string) string {
-	sum := sha256.Sum256([]byte(scanID + "\x00" + evidenceDigest + "\x00" + policyDigest))
+// PlanID derives a stable identifier from the scan, evidence, policy,
+// advisor, and well-formed answers considered for ambiguous entries.
+func PlanID(scanID, evidenceDigest, policyDigest, advisor, adviceDigest string) string {
+	sum := sha256.Sum256([]byte(scanID + "\x00" + evidenceDigest + "\x00" + policyDigest + "\x00" + advisor + "\x00" + adviceDigest))
 	return fmt.Sprintf("plan-%s-%s", scanID, hex.EncodeToString(sum[:])[:12])
+}
+
+// adviceDigest identifies the well-formed answers considered for a plan,
+// including proposals ultimately rejected by safety. A provider can
+// recover after a failed request and return different advice for the same
+// scan; the recovered plan must not reuse the earlier rules-shaped plan.
+// Rules-only plans have no answers and digest to "".
+func adviceDigest(entries []core.Entry, decisions []Decision, advice map[string]core.Recommendation) string {
+	h := sha256.New()
+	applied := false
+	for i, entry := range entries {
+		recommendation, ok := advice[entry.Path]
+		if !ok || !decisions[i].Ambiguous {
+			continue
+		}
+		applied = true
+		// The decision time is left out: a cached answer and the fresh one
+		// it was cached from are the same advice.
+		fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%g\x00%s\x00", entry.Path, recommendation.Action,
+			recommendation.Class, recommendation.Retention, recommendation.Confidence,
+			strings.Join(recommendation.Reasons, "\x01"))
+	}
+	if !applied {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // ActionID derives a stable identifier for one action of a plan.
