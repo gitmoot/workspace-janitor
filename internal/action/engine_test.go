@@ -35,7 +35,7 @@ func fixtureEngine(t *testing.T) (*Engine, string, *time.Time) {
 	t.Cleanup(func() { db.Close() })
 	now := time.Now().UTC()
 	quarantine := filepath.Join(state, "quarantine")
-	return &Engine{DB: db, QuarantineDir: quarantine, Policy: safety.Policy{StateDir: state, QuarantineDir: quarantine},
+	return &Engine{DB: db, QuarantineDir: quarantine, Policy: safety.Policy{StateDir: state, QuarantineDir: quarantine, ProtectedPaths: []string{state, quarantine}},
 		Collect: collect.Options{Git: true, Processes: true, Services: true, ProcRoot: proc, ServiceSources: collect.ServiceSources{SystemdDirs: []string{units}},
 			Limits: collect.Limits{GitTimeout: 5 * time.Second, CommandTimeout: 5 * time.Second, MaxEntries: 300, MaxDirEntries: 300, DeepSizeMaxEntries: 300, DeepSizeMaxDepth: 5}},
 		Now: func() time.Time { return now }}, root, &now
@@ -206,6 +206,84 @@ func TestQuarantineRefusesOccupiedDestinationWithoutMovingSource(t *testing.T) {
 	}
 }
 
+func TestPreparedManifestRecoversAfterInterruptedWrite(t *testing.T) {
+	e, root, _ := fixtureEngine(t)
+	ctx := context.Background()
+	source := filepath.Join(root, "candidate")
+	if err := os.WriteFile(source, []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	item := prepareFixture(t, e, source, core.Retention30Days)
+	path := filepath.Join(filepath.Dir(item.Destination), "manifest.json")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	} // crash between journal commit and manifest install
+	item, err := e.Quarantine(ctx, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := os.ReadFile(path); err != nil || !strings.Contains(string(raw), item.Source) {
+		t.Fatalf("recovered manifest cannot reconstruct moved source: %v", err)
+	}
+	if item.State != core.CleanupQuarantined {
+		t.Fatalf("move state: %s", item.State)
+	}
+}
+
+func TestFailedJournalInsertLeavesNoBlockingManifest(t *testing.T) {
+	e, root, _ := fixtureEngine(t)
+	ctx := context.Background()
+	source := filepath.Join(root, "candidate")
+	if err := os.WriteFile(source, []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	active := prepareFixture(t, e, source, core.Retention30Days)
+	entry, err := e.recollect(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	act := active.Action
+	act.ID, act.PlanID = "action-2", "plan-2"
+	attempt := core.CleanupItem{CleanupID: "cleanup-new", PlanID: act.PlanID, ActionID: act.ID, Source: source, Entry: entry, Action: act}
+	if _, err := e.Prepare(ctx, attempt); err == nil {
+		t.Fatal("duplicate active source was accepted")
+	}
+	manifest := filepath.Join(e.QuarantineDir, attempt.CleanupID, attempt.ActionID, "manifest.json")
+	if _, err := os.Lstat(manifest); !os.IsNotExist(err) {
+		t.Fatalf("failed insert left an orphan manifest: %v", err)
+	}
+	if _, err := e.Restore(ctx, active); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := e.Prepare(ctx, attempt)
+	if err != nil || retry.State != core.CleanupPrepared {
+		t.Fatalf("failed insert blocked retry: %+v %v", retry, err)
+	}
+}
+
+func TestPrepareRejectsReceiptPathTraversal(t *testing.T) {
+	e, root, _ := fixtureEngine(t)
+	source := filepath.Join(root, "candidate")
+	if err := os.WriteFile(source, []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := e.recollect(context.Background(), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ids := range [][2]string{{"cleanup-fixture", "../../escaped"}, {"../../escaped", "action-safe"}} {
+		act := core.Action{ID: ids[1], PlanID: "plan-1", Path: source, Kind: core.ActionQuarantine, Status: core.ActionPending,
+			Retention: core.Retention30Days, FilesystemID: entry.FilesystemID, CreatedAt: e.now()}
+		_, err := e.Prepare(context.Background(), core.CleanupItem{CleanupID: ids[0], PlanID: act.PlanID, ActionID: act.ID, Source: source, Entry: entry, Action: act})
+		if err == nil || !strings.Contains(err.Error(), "single safe path component") {
+			t.Fatalf("unsafe ID accepted: %v", err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(filepath.Dir(e.QuarantineDir), "escaped")); !os.IsNotExist(err) {
+		t.Fatalf("ID escaped receipt root: %v", err)
+	}
+}
+
 func TestQuarantineRefusesSymlinkedDestination(t *testing.T) {
 	e, root, _ := fixtureEngine(t)
 	source := filepath.Join(root, "candidate")
@@ -308,6 +386,34 @@ func TestRestartReconcilesMovedButUnjournaledItem(t *testing.T) {
 	item, err = e.Restore(ctx, item)
 	if err != nil || item.State != core.CleanupRestored {
 		t.Fatalf("restoration after crash: %+v %v", item, err)
+	}
+}
+
+func TestPreparedReceiptCanBeCancelledAndSourceReplanned(t *testing.T) {
+	e, root, _ := fixtureEngine(t)
+	ctx := context.Background()
+	source := filepath.Join(root, "candidate")
+	if err := os.WriteFile(source, []byte("unchanged"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	first := prepareFixture(t, e, source, core.Retention30Days)
+	cancelled, err := e.Restore(ctx, first)
+	if err != nil || cancelled.State != core.CleanupRestored {
+		t.Fatalf("cancel prepared receipt: %+v %v", cancelled, err)
+	}
+	if raw, err := os.ReadFile(source); err != nil || string(raw) != "unchanged" {
+		t.Fatalf("source changed: %q %v", raw, err)
+	}
+	entry, err := e.recollect(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	act := first.Action
+	act.ID, act.PlanID, act.CreatedAt = "action-2", "plan-2", e.now()
+	act.FilesystemID, act.Fingerprint = entry.FilesystemID, entry.Fingerprint
+	second, err := e.Prepare(ctx, core.CleanupItem{CleanupID: "cleanup-new", PlanID: act.PlanID, ActionID: act.ID, Source: source, Entry: entry, Action: act})
+	if err != nil || second.State != core.CleanupPrepared {
+		t.Fatalf("cancelled receipt still claims source: %+v %v", second, err)
 	}
 }
 
@@ -554,5 +660,42 @@ func TestExpiryRefusesNewSourceReference(t *testing.T) {
 	}
 	if err := e.Eligible(ctx, item); err == nil || !strings.Contains(err.Error(), "reference") {
 		t.Fatalf("new reference did not block expiry: %v", err)
+	}
+}
+
+func TestInvestigatedReceiptRechecksBeforeExpiryRetry(t *testing.T) {
+	e, root, clock := fixtureEngine(t)
+	ctx := context.Background()
+	source := filepath.Join(root, "candidate")
+	if err := os.WriteFile(source, []byte("unchanged"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	item := prepareFixture(t, e, source, core.Retention30Days)
+	item, err := e.Quarantine(ctx, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*clock = clock.Add(31 * 24 * time.Hour)
+	unit := filepath.Join(e.Collect.ServiceSources.SystemdDirs[0], "new.service")
+	if err := os.WriteFile(unit, []byte("[Service]\nWorkingDirectory="+source+"\nExecStart=/bin/true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	item, err = e.Delete(ctx, item)
+	if err == nil || item.State != core.CleanupInvestigate {
+		t.Fatalf("new reference did not investigate: %+v %v", item, err)
+	}
+	if _, err = e.Reconcile(ctx, item); err == nil {
+		t.Fatal("unresolved reference left investigate")
+	}
+	if err := os.Remove(unit); err != nil {
+		t.Fatal(err)
+	}
+	item, err = e.Reconcile(ctx, item)
+	if err != nil || item.State != core.CleanupQuarantined {
+		t.Fatalf("cleared reference did not revalidate: %+v %v", item, err)
+	}
+	item, err = e.Delete(ctx, item)
+	if err != nil || item.State != core.CleanupDeleted {
+		t.Fatalf("revalidated expiry did not delete: %+v %v", item, err)
 	}
 }

@@ -96,6 +96,10 @@ func (c *CleanupItem) Validate() error {
 		if strings.TrimSpace(id.value) == "" {
 			errs.Add(id.field, "must not be empty")
 		}
+		if (id.field == "cleanup_id" || id.field == "action_id") &&
+			(id.value == "." || id.value == ".." || strings.ContainsAny(id.value, "/\\\x00")) {
+			errs.Add(id.field, "must be a single safe path component")
+		}
 	}
 	if !isAbsClean(c.Source) {
 		errs.Add("source", "must be an absolute, cleaned path, got %q", c.Source)

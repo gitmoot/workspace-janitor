@@ -210,6 +210,8 @@ refused in this version; there is no copy-and-delete fallback.
 Filesystem mutation currently runs on Linux; other platform builds refuse
 the action because their no-replace and anchored-delete primitives are not
 implemented.
+An approved `relocate` action is refused rather than silently sent to
+quarantine; relocation is not part of this command.
 
 ```sh
 janitor apply --quarantine                         # preview approved moves
@@ -225,6 +227,8 @@ can resume by repeating the confirmed apply, or restore each completed move
 with the cleanup id. Linked worktrees move through Git so its administrative
 links remain valid. Renames preserve item permissions, timestamps, and symlink
 identity; no destination or restored source is overwritten.
+A prepared receipt that never moved can be cancelled with the same restore
+command, releasing its source for a new plan.
 
 Expiry is not deletion. To explicitly enable it, set
 `retention.delete_enabled: true`, wait for the item's retention period, then
@@ -232,6 +236,9 @@ run `janitor apply --expire --confirm --dry-run=false` as a **separate**
 invocation. It rechecks the quarantined object, original source, live
 references, Git state, and recorded fingerprint before anchored deletion.
 Changed or newly referenced items enter `investigate`; they are not deleted.
+Once the blocking evidence is resolved, a separately confirmed expiry retries
+the full safety evaluation before returning an `investigate` item to quarantine
+and considering deletion. It can also be restored while under investigation.
 
 ### Jev advice
 

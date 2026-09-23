@@ -96,6 +96,13 @@ func (e *Engine) Eligible(ctx context.Context, item core.CleanupItem) error {
 	// self-protections are not evidence about the object; all configured path,
 	// name, Git, live-reference, identity and unknown-evidence guards remain.
 	policy.StateDir, policy.QuarantineDir = "", ""
+	policy.ProtectedPaths = make([]string, 0, len(e.Policy.ProtectedPaths))
+	for _, protected := range e.Policy.ProtectedPaths {
+		if filepath.Clean(protected) != filepath.Clean(e.Policy.StateDir) &&
+			filepath.Clean(protected) != filepath.Clean(e.Policy.QuarantineDir) {
+			policy.ProtectedPaths = append(policy.ProtectedPaths, protected)
+		}
+	}
 	planned := *item.Quarantined
 	planned.Root = item.Entry.Root // symlink containment is judged against its original discovery root
 	var observed core.Entry

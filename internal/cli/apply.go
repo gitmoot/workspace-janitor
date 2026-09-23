@@ -122,6 +122,12 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	selected := make([]core.Action, 0)
 	for _, act := range stored.Actions {
 		if approved[act.ID] && act.Kind.Mutating() {
+			if act.Kind == core.ActionRelocate {
+				return fmt.Errorf("approved relocate action %s targets %s; --quarantine cannot honor a relocation destination", act.ID, act.Destination)
+			}
+			if act.Kind != core.ActionQuarantine && act.Kind != core.ActionDeleteCandidate {
+				return fmt.Errorf("unsupported approved action %s: %s", act.ID, act.Kind)
+			}
 			selected = append(selected, act)
 		}
 	}
@@ -254,8 +260,22 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 	report := cleanupReport{ID: opts.cleanupID, Mode: "expiry", DryRun: opts.dryRun, Items: []core.CleanupItem{}, Errors: []string{}}
 	for _, item := range items {
 		if item.State == core.CleanupInvestigate {
-			report.Items = append(report.Items, item)
-			continue
+			if opts.dryRun {
+				probe := item
+				probe.State = core.CleanupQuarantined
+				err = engine.Eligible(ctx, probe)
+				if err != nil {
+					report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", item.Source, err))
+				}
+				report.Items = append(report.Items, item)
+				continue
+			}
+			item, err = engine.Reconcile(ctx, item)
+			if err != nil {
+				report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", item.Source, err))
+				report.Items = append(report.Items, item)
+				continue
+			}
 		}
 		if item.State != core.CleanupQuarantined {
 			continue

@@ -96,6 +96,27 @@ func TestConfirmedExpiryRequiresExplicitPolicyOptIn(t *testing.T) {
 	}
 }
 
+func TestApplyQuarantineRefusesApprovedRelocation(t *testing.T) {
+	f := newPlanFixture(t)
+	source := filepath.Join(f.root, "scratch-clone")
+	if err := os.WriteFile(filepath.Join(source, "go.mod"), []byte("module fixture\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.scan(t)
+	doc := f.planJSON(t, "--approve", source, "--no-jev")
+	action := f.action(t, doc, source)
+	if action.Kind != core.ActionRelocate {
+		t.Fatalf("fixture did not plan relocation: %+v", action)
+	}
+	_, stderr, code := f.run(t, "apply", "--quarantine")
+	if code != ExitError || !strings.Contains(stderr, "cannot honor a relocation destination") {
+		t.Fatalf("approved relocation silently became quarantine: exit=%d stderr=%q", code, stderr)
+	}
+	if _, err := os.Lstat(source); err != nil {
+		t.Fatalf("refusal moved source: %v", err)
+	}
+}
+
 func TestStatusReportsFixturePathsAndDoesNotCreateState(t *testing.T) {
 	f := newFixture(t)
 	stdout, stderr, code := f.run(t, "status")

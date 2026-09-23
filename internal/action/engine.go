@@ -2,7 +2,6 @@ package action
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -59,6 +58,7 @@ func (e *Engine) Prepare(ctx context.Context, item core.CleanupItem) (core.Clean
 	item.State = core.CleanupPrepared
 	item.CreatedAt = e.now()
 	item.UpdatedAt = item.CreatedAt
+	item.Normalize()
 	if err := item.Validate(); err != nil {
 		return item, err
 	}
@@ -76,28 +76,10 @@ func (e *Engine) Prepare(ctx context.Context, item core.CleanupItem) (core.Clean
 	if err := syncDir(filepath.Dir(base)); err != nil {
 		return item, err
 	}
-	manifest, err := json.Marshal(item)
-	if err != nil {
-		return item, err
-	}
-	path := filepath.Join(base, "manifest.json")
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return item, fmt.Errorf("create unique manifest: %w", err)
-	}
-	if _, err = file.Write(manifest); err == nil {
-		err = file.Sync()
-	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return item, fmt.Errorf("durably write manifest: %w", err)
-	}
-	if err := syncDir(base); err != nil {
-		return item, err
-	}
 	if err := e.DB.Write(ctx, func(tx *store.Tx) error { return tx.InsertCleanup(ctx, item) }); err != nil {
+		return item, err
+	}
+	if err := ensureManifest(item); err != nil {
 		return item, err
 	}
 	return item, nil
@@ -107,6 +89,9 @@ func (e *Engine) Prepare(ctx context.Context, item core.CleanupItem) (core.Clean
 func (e *Engine) Quarantine(ctx context.Context, item core.CleanupItem) (core.CleanupItem, error) {
 	if item.State != core.CleanupPrepared {
 		return item, fmt.Errorf("item %s is not prepared", item.ActionID)
+	}
+	if err := ensureManifest(item); err != nil {
+		return item, err
 	}
 	if err := sameFilesystem(item.Source, filepath.Dir(item.Destination)); err != nil {
 		return item, err
@@ -178,6 +163,21 @@ func (e *Engine) finishMove(ctx context.Context, item core.CleanupItem) (core.Cl
 // It never guesses when both names exist, identity differs, or the Git
 // registration cannot be verified.
 func (e *Engine) Reconcile(ctx context.Context, item core.CleanupItem) (core.CleanupItem, error) {
+	if item.State == core.CleanupInvestigate && item.Quarantined != nil && item.MovedAt != nil {
+		// An investigation is not a permanent tombstone. Recheck every expiry
+		// guard before allowing an explicitly retried deletion; an unchanged
+		// reason (new reference, changed bytes, unknown collector) stays put.
+		candidate := item
+		candidate.State = core.CleanupQuarantined
+		if err := e.Eligible(ctx, candidate); err != nil {
+			return item, err
+		}
+		item.State, item.UpdatedAt, item.Reason = core.CleanupQuarantined, e.now(), ""
+		if err := e.update(ctx, item, core.CleanupInvestigate); err != nil {
+			return item, err
+		}
+		return item, nil
+	}
 	if item.State != core.CleanupPrepared && item.State != core.CleanupQuarantined {
 		return item, nil
 	}
@@ -238,6 +238,20 @@ func (e *Engine) Restore(ctx context.Context, item core.CleanupItem) (core.Clean
 		return item, err
 	}
 	if item.State == core.CleanupRestored {
+		return item, nil
+	}
+	if item.State == core.CleanupPrepared {
+		src, srcErr := os.Lstat(item.Source)
+		if srcErr != nil || !identityMatches(src, item.Entry.FilesystemID) {
+			return item, fmt.Errorf("prepared source changed: %v", srcErr)
+		}
+		if err := absent(item.Destination); err != nil {
+			return item, fmt.Errorf("prepared destination is occupied: %w", err)
+		}
+		item.State, item.UpdatedAt = core.CleanupRestored, e.now()
+		if err := e.update(ctx, item, core.CleanupPrepared); err != nil {
+			return item, err
+		}
 		return item, nil
 	}
 	if item.State != core.CleanupQuarantined && item.State != core.CleanupInvestigate {

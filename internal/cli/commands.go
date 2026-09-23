@@ -29,21 +29,6 @@ func rootCommand() *command {
 	}
 }
 
-// planned registers a command that exists in the contract but is not
-// implemented by this build. Its flags are declared so the interface is
-// reviewable, and running it always fails with ExitNotImplemented.
-func planned(cmd *command, flags func(fs *flag.FlagSet)) *command {
-	cmd.register = func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
-		if flags != nil {
-			flags(fs)
-		}
-		return func(context.Context, *env, []string) error {
-			return &notImplementedError{command: cmd.name, tracking: cmd.tracking}
-		}
-	}
-	return cmd
-}
-
 func scanCommand() *command {
 	return &command{
 		name:    "scan",
