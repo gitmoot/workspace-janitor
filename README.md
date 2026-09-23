@@ -9,14 +9,10 @@ deletion is always preceded by quarantine.
 
 ## Status
 
-This repository contains the **foundation** (issue #2), the **inventory
-collectors** (issue #6), the **safety engine** (issue #3), the **policy
-and planner** (issue #7), and the optional **Jev advisor** (issue #9): the
-command tree, configuration and policy loading, the versioned domain
-contracts, the local SQLite store, the output contracts, a bounded
-fail-closed `scan`, the deterministic protections that decide whether a
-path may ever be mutated, and model advice for entries the rules could not
-classify.
+This repository implements inventory, safety, planning, the optional Jev
+advisor, and reversible quarantine and restore. The local SQLite journal and
+manifest retain a record of each move; deletion is separate and disabled by
+default.
 
 | Command | State |
 | --- | --- |
@@ -27,11 +23,9 @@ classify.
 | `janitor version` | implemented |
 | `janitor plan` | implemented |
 | `janitor explain` | implemented |
-| `janitor apply` | not implemented (issue #4) |
-| `janitor restore` | not implemented (issue #4) |
-
-Commands that are not implemented exit with status `3` and say so. They never
-report success they cannot deliver.
+| `janitor apply --quarantine` | implemented (dry-run by default) |
+| `janitor apply --expire` | implemented (deletion disabled by default) |
+| `janitor restore <cleanup-id>` | implemented (preview by default) |
 
 ## Inventory
 
@@ -205,6 +199,46 @@ janitor explain /path/to/thing            # trace one decision
 `explain` prints the winning rules and their reasons, the alternatives that
 were rejected and why, the collected evidence, the safety verdict, and
 whether the action is approved.
+
+### Quarantine, restore, and expiry
+
+`apply` requires a stored plan with individually approved mutating actions.
+It checks the latest scan and policy binding, then recollects each target and
+reruns the safety guards immediately before moving it. Approved overlapping
+paths are refused as a batch. A destination on another filesystem is always
+refused in this version; there is no copy-and-delete fallback.
+Filesystem mutation currently runs on Linux; other platform builds refuse
+the action because their no-replace and anchored-delete primitives are not
+implemented.
+An approved `relocate` action is refused rather than silently sent to
+quarantine; relocation is not part of this command.
+
+```sh
+janitor apply --quarantine                         # preview approved moves
+janitor apply --quarantine --confirm --dry-run=false
+janitor restore <cleanup-id>                       # preview recovery
+janitor restore --confirm <cleanup-id>             # refuse occupied originals
+janitor apply --expire                             # inspect retained receipts
+```
+
+The cleanup id appears in apply output. Each action has a manifest beside its
+quarantined object and a durable SQLite transition journal. A stopped batch
+can resume by repeating the confirmed apply, or restore each completed move
+with the cleanup id. Linked worktrees move through Git so its administrative
+links remain valid. Renames preserve item permissions, timestamps, and symlink
+identity; no destination or restored source is overwritten.
+A prepared receipt that never moved can be cancelled with the same restore
+command, releasing its source for a new plan.
+
+Expiry is not deletion. To explicitly enable it, set
+`retention.delete_enabled: true`, wait for the item's retention period, then
+run `janitor apply --expire --confirm --dry-run=false` as a **separate**
+invocation. It rechecks the quarantined object, original source, live
+references, Git state, and recorded fingerprint before anchored deletion.
+Changed or newly referenced items enter `investigate`; they are not deleted.
+Once the blocking evidence is resolved, a separately confirmed expiry retries
+the full safety evaluation before returning an `investigate` item to quarantine
+and considering deletion. It can also be restored while under investigation.
 
 ### Jev advice
 

@@ -1,10 +1,7 @@
 // Package cli implements the janitor command tree.
 //
-// Two rules shape this package. Commands that are not implemented yet fail
-// with a distinct exit code and a pointer to the tracking issue: they never
-// print an empty success. And nothing reads the process environment directly
-// — every run receives its environment lookup, so tests run against fixture
-// homes and can never reach the operator's real state.
+// Environment lookups are injected so fixture runs cannot reach the
+// operator's real configuration or state.
 package cli
 
 import (
@@ -32,9 +29,6 @@ const (
 	ExitError ExitCode = 1
 	// ExitUsage means the invocation was rejected before any work happened.
 	ExitUsage ExitCode = 2
-	// ExitNotImplemented means the command exists in the contract but this
-	// build cannot perform it. It is never returned for work that ran.
-	ExitNotImplemented ExitCode = 3
 )
 
 // Options configures one CLI run.
@@ -135,14 +129,11 @@ type command struct {
 	usage       string
 	summary     string
 	long        string
-	tracking    string // issue reference when not implemented
 	subcommands []*command
 
 	// register binds this command's flags to fs and returns its runner.
 	register func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error
 }
-
-func (c *command) implemented() bool { return c.tracking == "" }
 
 func (c *command) find(name string) *command {
 	for _, sub := range c.subcommands {
@@ -160,17 +151,6 @@ type usageError struct {
 }
 
 func (e *usageError) Error() string { return e.msg }
-
-// notImplementedError reports a contract command this build cannot perform.
-type notImplementedError struct {
-	command  string
-	tracking string
-}
-
-func (e *notImplementedError) Error() string {
-	return fmt.Sprintf("%q is not implemented in this build (tracked by %s); this command refuses to report success it cannot deliver",
-		e.command, e.tracking)
-}
 
 // Run executes one CLI invocation and returns the process exit code.
 func Run(ctx context.Context, opts Options) ExitCode {
@@ -255,9 +235,6 @@ func dispatch(ctx context.Context, parent *command, e *env, global *globalOpts, 
 		}
 		return &usageError{msg: err.Error(), cmd: cmd}
 	}
-	if !cmd.implemented() {
-		return &notImplementedError{command: cmd.name, tracking: cmd.tracking}
-	}
 	return run(ctx, e, fs.Args())
 }
 
@@ -265,11 +242,6 @@ func dispatch(ctx context.Context, parent *command, e *env, global *globalOpts, 
 func report(e *env, err error) ExitCode {
 	if err == nil {
 		return ExitOK
-	}
-	var notImpl *notImplementedError
-	if errors.As(err, &notImpl) {
-		fmt.Fprintf(e.stderr, "janitor: %v\n", notImpl)
-		return ExitNotImplemented
 	}
 	var usage *usageError
 	if errors.As(err, &usage) {
@@ -347,9 +319,6 @@ func writeCommandHelp(w io.Writer, cmd *command, global *globalOpts) {
 	if cmd.long != "" {
 		fmt.Fprintf(w, "\n%s\n", strings.TrimRight(cmd.long, "\n"))
 	}
-	if !cmd.implemented() {
-		fmt.Fprintf(w, "\nStatus: not implemented in this build (tracked by %s).\n", cmd.tracking)
-	}
 	if len(cmd.subcommands) > 0 {
 		fmt.Fprintln(w, "\nSubcommands:")
 		rows := make([][]string, 0, len(cmd.subcommands))
@@ -397,12 +366,7 @@ func flagHelp(fs *flag.FlagSet) string {
 	return b.String()
 }
 
-// helpRow renders one command row, omitting the status column entirely when
-// the command is implemented so help output carries no trailing padding.
+// helpRow renders one command row.
 func helpRow(cmd *command) []string {
-	row := []string{"  " + cmd.usage, cmd.summary}
-	if !cmd.implemented() {
-		row = append(row, "(not implemented: "+cmd.tracking+")")
-	}
-	return row
+	return []string{"  " + cmd.usage, cmd.summary}
 }

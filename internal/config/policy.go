@@ -80,6 +80,8 @@ type Protect struct {
 type RetentionPolicy struct {
 	Default       core.Retention `yaml:"default" json:"default"`
 	QuarantineDir string         `yaml:"quarantine_dir" json:"quarantine_dir"`
+	// DeleteEnabled is an explicit policy opt-in. Expiry alone never deletes.
+	DeleteEnabled bool `yaml:"delete_enabled" json:"delete_enabled"`
 }
 
 // CacheRule declares a known regenerable cache location.
