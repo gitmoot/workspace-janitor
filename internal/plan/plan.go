@@ -41,6 +41,17 @@ type Input struct {
 	Advisor Advisor
 }
 
+// RulesOnly is the advisor identity of a plan no model contributed to.
+const RulesOnly = "rules-only"
+
+// AdvisorKey returns the identity of the advisor that will shape a plan.
+func (in Input) AdvisorKey() string {
+	if in.Advisor == nil {
+		return RulesOnly
+	}
+	return in.Advisor.Name()
+}
+
 // Result is a plan plus the per-entry traces behind it.
 type Result struct {
 	Plan     core.Plan
@@ -128,9 +139,10 @@ func Build(ctx context.Context, in Input) (Result, error) {
 		CreatedAt:      now,
 		EvidenceDigest: EvidenceDigest(entries),
 		PolicyDigest:   PolicyDigest(in.Policy),
+		Advisor:        in.AdvisorKey(),
 		Actions:        make([]core.Action, 0, len(entries)),
 	}
-	plan.ID = PlanID(in.ScanID, plan.EvidenceDigest, plan.PolicyDigest)
+	plan.ID = PlanID(in.ScanID, plan.EvidenceDigest, plan.PolicyDigest, plan.Advisor, adviceDigest(entries, decisions, advice))
 
 	for i, entry := range entries {
 		decision := decisions[i]
@@ -199,13 +211,30 @@ func applyAdvice(
 ) (Decision, Trace) {
 	clamped := safety.ClampRecommendation(verdict, recommendation)
 	trace.AdvisedBy = advisor
+	rule := "advisor:" + advisor
+
+	if clamped.Action == decision.Kind {
+		// The advisor agrees with the rules. Credit it with its reason —
+		// for example "confidence below threshold" — so the trace says why
+		// the entry stayed where it was, and take its class label when it
+		// has one: a label changes no action.
+		decision.Rules = append(decision.Rules, rule)
+		decision.Reasons = append(decision.Reasons, joinReasons(clamped.Reasons))
+		if clamped.Class.Valid() && clamped.Class != core.ClassUnknown {
+			decision.Class = clamped.Class
+			trace.Class = clamped.Class
+		}
+		trace.Rules = decision.Rules
+		trace.Reasons = decision.Reasons
+		return decision, trace
+	}
 
 	if clamped.Action.RiskRank() >= decision.Kind.RiskRank() {
 		trace.Rejected = append(trace.Rejected, core.RejectedAction{
 			Kind: clamped.Action,
-			Rule: "advisor:" + advisor,
-			Reason: fmt.Sprintf("the advisor proposed %s, which is not safer than the rules' %s",
-				clamped.Action, decision.Kind),
+			Rule: rule,
+			Reason: fmt.Sprintf("the advisor proposed %s, which is not safer than the rules' %s: %s",
+				clamped.Action, decision.Kind, joinReasons(clamped.Reasons)),
 		})
 		decision.Rejected = trace.Rejected
 		return decision, trace
@@ -388,10 +417,37 @@ func PolicyDigest(policy config.Policy) string {
 }
 
 // PlanID derives a stable identifier from what the plan is bound to. The
-// same scan, evidence, and policy always produce the same plan id.
-func PlanID(scanID, evidenceDigest, policyDigest string) string {
-	sum := sha256.Sum256([]byte(scanID + "\x00" + evidenceDigest + "\x00" + policyDigest))
+// same scan, evidence, policy, advisor, and applied advice always produce
+// the same plan id.
+func PlanID(scanID, evidenceDigest, policyDigest, advisor, adviceDigest string) string {
+	sum := sha256.Sum256([]byte(scanID + "\x00" + evidenceDigest + "\x00" + policyDigest + "\x00" + advisor + "\x00" + adviceDigest))
 	return fmt.Sprintf("plan-%s-%s", scanID, hex.EncodeToString(sum[:])[:12])
+}
+
+// adviceDigest identifies the advice a plan applied. It is part of the
+// plan id because the same inputs can yield different advice: a request
+// that failed once and succeeds later must produce a new plan, not be
+// answered with the stored plan the failure shaped. Rules-only plans
+// apply no advice and digest to "".
+func adviceDigest(entries []core.Entry, decisions []Decision, advice map[string]core.Recommendation) string {
+	h := sha256.New()
+	applied := false
+	for i, entry := range entries {
+		recommendation, ok := advice[entry.Path]
+		if !ok || !decisions[i].Ambiguous {
+			continue
+		}
+		applied = true
+		// The decision time is left out: a cached answer and the fresh one
+		// it was cached from are the same advice.
+		fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%g\x00%s\x00", entry.Path, recommendation.Action,
+			recommendation.Class, recommendation.Retention, recommendation.Confidence,
+			strings.Join(recommendation.Reasons, "\x01"))
+	}
+	if !applied {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // ActionID derives a stable identifier for one action of a plan.

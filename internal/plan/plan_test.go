@@ -404,6 +404,41 @@ func TestAdvisorCanOnlyLowerRisk(t *testing.T) {
 	}
 }
 
+// An advisor that agrees with the rules is still credited, so the trace
+// says why the entry stayed where it was.
+func TestAgreeingAdviceIsCreditedWithoutChangingTheAction(t *testing.T) {
+	policy := fixturePolicy()
+	unsure := &stubAdvisor{name: "jev", answers: map[string]core.Recommendation{
+		"/home/fixture/mystery": {
+			Action: core.ActionInvestigate, Class: core.ClassCache,
+			Retention: core.RetentionNone, Confidence: 0.4, Origin: core.OriginModel,
+			Reasons: []string{"confidence 0.40 is below the 0.70 threshold"}, DecidedAt: plannedAt,
+		},
+	}}
+	action := actionFor(t, buildPlan(t, []core.Entry{entryAt("/home/fixture/mystery")}, policy, unsure), "/home/fixture/mystery")
+	if action.Kind != core.ActionInvestigate {
+		t.Fatalf("action = %q, want investigate", action.Kind)
+	}
+	if len(action.Rules) != len(action.Reasons) {
+		t.Fatalf("rules %v and reasons %v are not aligned", action.Rules, action.Reasons)
+	}
+	credited := false
+	for i, rule := range action.Rules {
+		if rule == "advisor:jev" && strings.Contains(action.Reasons[i], "below the 0.70 threshold") {
+			credited = true
+		}
+	}
+	if !credited {
+		t.Errorf("rules %v / reasons %v do not credit the advisor with its reason", action.Rules, action.Reasons)
+	}
+	if action.Class != core.ClassCache {
+		t.Errorf("class = %q, want the advisor's label on an unchanged action", action.Class)
+	}
+	if len(action.Rejected) != 0 {
+		t.Errorf("an agreeing advisor was recorded as rejected: %+v", action.Rejected)
+	}
+}
+
 // A failing advisor must not change what the rules decided.
 func TestAdvisorFailureLeavesTheRulesDecision(t *testing.T) {
 	policy := fixturePolicy()

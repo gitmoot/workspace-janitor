@@ -29,6 +29,9 @@ type storeStatus struct {
 	Initialized     bool         `json:"initialized"`
 	ExpectedVersion int          `json:"expected_schema_version"`
 	Stats           *store.Stats `json:"stats,omitempty"`
+	// ModelUsage totals every recorded model request. Cost is an estimate
+	// from reported tokens and the configured price.
+	ModelUsage *store.UsageTotals `json:"model_usage,omitempty"`
 }
 
 // statusReport is the `status` result contract.
@@ -83,8 +86,17 @@ func runStatus(ctx context.Context, e *env) error {
 		if err != nil {
 			return err
 		}
+		var usage store.UsageTotals
+		if err := db.Read(ctx, func(tx *store.Tx) error {
+			var err error
+			usage, err = tx.UsageTotals(ctx)
+			return err
+		}); err != nil {
+			return err
+		}
 		report.Store.Initialized = true
 		report.Store.Stats = &stats
+		report.Store.ModelUsage = &usage
 	}
 
 	if format == output.FormatJSON {
@@ -116,8 +128,14 @@ func writeStatusText(e *env, report statusReport) error {
 		output.Field{Key: "inventory entries:", Value: strconv.FormatInt(stats.InventoryEntries, 10)},
 		output.Field{Key: "plans:", Value: strconv.FormatInt(stats.Plans, 10)},
 		output.Field{Key: "actions:", Value: strconv.FormatInt(stats.Actions, 10)},
-		output.Field{Key: "model usage rows:", Value: strconv.FormatInt(stats.ModelUsageRows, 10)},
 	)
+	if usage := report.Store.ModelUsage; usage != nil {
+		fields = append(fields, output.Field{
+			Key: "model usage:",
+			Value: fmt.Sprintf("%d request(s), %d input / %d output tokens, est. $%.6f",
+				usage.Records, usage.PromptTokens, usage.CompletionTokens, usage.EstimatedCostUSD),
+		})
+	}
 	if stats.LatestScanID != "" {
 		latest := stats.LatestScanID
 		if stats.LatestScanAt != nil {

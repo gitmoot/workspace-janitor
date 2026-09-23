@@ -378,8 +378,13 @@ type Plan struct {
 	EvidenceDigest string `json:"evidence_digest"`
 	// PolicyDigest binds the plan to the policy that produced it, so a
 	// changed rule set is visible rather than silently applied.
-	PolicyDigest string   `json:"policy_digest"`
-	Actions      []Action `json:"actions"`
+	PolicyDigest string `json:"policy_digest"`
+	// Advisor names what, beyond the deterministic rules, contributed:
+	// "rules-only", or a provider and model. It is part of the plan's
+	// identity, because the same scan and policy planned with and without
+	// a model are different plans.
+	Advisor string   `json:"advisor"`
+	Actions []Action `json:"actions"`
 }
 
 // Normalize applies defaults, stamps the plan id on every action, and sorts
@@ -390,6 +395,9 @@ func (p *Plan) Normalize() {
 	}
 	if p.Status == "" {
 		p.Status = PlanDraft
+	}
+	if p.Advisor == "" {
+		p.Advisor = "rules-only"
 	}
 	p.CreatedAt = p.CreatedAt.UTC()
 	for i := range p.Actions {

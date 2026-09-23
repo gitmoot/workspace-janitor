@@ -2,8 +2,10 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
+	"github.com/gitmoot/workspace-janitor/internal/jev"
 	"github.com/gitmoot/workspace-janitor/internal/output"
 	"github.com/gitmoot/workspace-janitor/internal/plan"
 	"github.com/gitmoot/workspace-janitor/internal/safety"
@@ -26,6 +29,9 @@ type planOptions struct {
 	approver   string
 	note       string
 	noPersist  bool
+	noJev      bool
+	jevDryRun  bool
+	jevDebug   bool
 }
 
 // planReport is the `plan` result contract.
@@ -42,6 +48,9 @@ type planReport struct {
 	// option. Reporting them is the difference between arbitration and a
 	// silent choice.
 	Conflicts []planConflict `json:"conflicts"`
+	// Advisor reports what the optional model did: its mode, requests,
+	// cache hits, failures, and the usage and estimated cost it incurred.
+	Advisor jev.Report `json:"advisor"`
 }
 
 // planConflict is one recorded disagreement between rules.
@@ -77,7 +86,19 @@ func runPlan(ctx context.Context, e *env, args []string, opts planOptions) error
 	}
 	defer db.Close()
 
-	built, entries, err := buildOrLoadPlan(ctx, e, db, paths, policy, opts)
+	if opts.jevDryRun && opts.noJev {
+		return &usageError{msg: "--jev-dry-run and --no-jev cannot be combined"}
+	}
+	if opts.jevDryRun && opts.planID != "" {
+		return &usageError{msg: "--jev-dry-run builds a new plan and cannot be combined with --plan"}
+	}
+	if opts.jevDryRun {
+		// A dry run shows what would be sent; it records nothing, so the
+		// plan it prints is never mistaken for one that was stored.
+		opts.noPersist = true
+	}
+
+	built, entries, advice, err := buildOrLoadPlan(ctx, e, db, paths, policy, opts)
 	if err != nil {
 		return err
 	}
@@ -86,6 +107,7 @@ func runPlan(ctx context.Context, e *env, args []string, opts planOptions) error
 		Summary:   built.Plan.Summary(),
 		Traces:    built.Traces,
 		Conflicts: conflictsOf(built.Plan),
+		Advisor:   advice.report(),
 	}
 
 	if !opts.noPersist {
@@ -107,6 +129,13 @@ func runPlan(ctx context.Context, e *env, args []string, opts planOptions) error
 			return err
 		}
 		report.Persisted = true
+	}
+
+	// Model usage is recorded even under --no-store: the plan is optional
+	// to keep, but money spent and answers bought are facts about the host.
+	// A dry run sends nothing, so it has nothing to record.
+	if err := persistAdvice(ctx, db, advice.advisor); err != nil {
+		return err
 	}
 
 	approvals, err := applyApprovals(ctx, db, report.Plan, opts)
@@ -132,11 +161,12 @@ func buildOrLoadPlan(
 	paths config.Paths,
 	policy config.Policy,
 	opts planOptions,
-) (plan.Result, []core.Entry, error) {
+) (plan.Result, []core.Entry, advisorRun, error) {
 	var (
 		result  plan.Result
 		entries []core.Entry
 	)
+	rulesOnly := advisorRun{static: jev.Report{Provider: jev.Provider, Model: policy.Jev.Model, Mode: jev.ModeRulesOnly}}
 
 	if opts.planID != "" {
 		err := db.Read(ctx, func(tx *store.Tx) error {
@@ -157,12 +187,13 @@ func buildOrLoadPlan(
 			return err
 		})
 		if err != nil {
-			return plan.Result{}, nil, err
+			return plan.Result{}, nil, advisorRun{}, err
 		}
 		if err := plan.VerifyBinding(result.Plan, result.Plan.ScanID, entries, policy); err != nil {
-			return plan.Result{}, nil, err
+			return plan.Result{}, nil, advisorRun{}, err
 		}
-		return result, entries, nil
+		rulesOnly.static.Note = "stored plan loaded; no model was consulted"
+		return result, entries, rulesOnly, nil
 	}
 
 	scanID := opts.scanID
@@ -184,28 +215,55 @@ func buildOrLoadPlan(
 		return err
 	})
 	if errors.Is(err, store.ErrNotFound) && opts.scanID != "" {
-		return plan.Result{}, nil, fmt.Errorf("no scan %s is stored", opts.scanID)
+		return plan.Result{}, nil, advisorRun{}, fmt.Errorf("no scan %s is stored", opts.scanID)
 	}
 	if errors.Is(err, store.ErrNotFound) {
-		return plan.Result{}, nil, fmt.Errorf("no completed scan is stored: run \"janitor scan\" first")
+		return plan.Result{}, nil, advisorRun{}, fmt.Errorf("no completed scan is stored: run \"janitor scan\" first")
 	}
 	if err != nil {
-		return plan.Result{}, nil, err
+		return plan.Result{}, nil, advisorRun{}, err
+	}
+
+	run, err := selectAdvisor(e, db, policy, scanID, opts)
+	if err != nil {
+		return plan.Result{}, nil, advisorRun{}, err
 	}
 
 	target := safety.ResolveTarget(policy.Retention.QuarantineDir)
-	result, err = plan.Build(ctx, plan.Input{
+	input := plan.Input{
 		ScanID:  scanID,
 		Entries: entries,
 		Policy:  policy,
 		Safety:  enginePolicy(paths, policy),
 		Target:  &target,
 		Now:     time.Now().UTC(),
-	})
-	if err != nil {
-		return plan.Result{}, nil, err
 	}
-	return result, entries, nil
+	if run.advisor != nil && !opts.jevDryRun {
+		input.Advisor = run.advisor
+	}
+	result, err = plan.Build(ctx, input)
+	if err != nil {
+		return plan.Result{}, nil, advisorRun{}, err
+	}
+
+	if run.advisor != nil && opts.jevDryRun {
+		// Build the exact requests the ambiguous entries would produce,
+		// without sending any of them.
+		ambiguous := make([]core.Entry, 0, len(result.Traces))
+		byPath := make(map[string]core.Entry, len(entries))
+		for _, entry := range entries {
+			byPath[entry.Path] = entry
+		}
+		for _, trace := range result.Traces {
+			if trace.Ambiguous {
+				ambiguous = append(ambiguous, byPath[trace.Path])
+			}
+		}
+		if _, err := run.advisor.Classify(ctx, ambiguous); err != nil {
+			return plan.Result{}, nil, advisorRun{}, err
+		}
+	}
+	return result, entries, run, nil
 }
 
 // applyApprovals records the operator's selection, if any, and returns the
@@ -370,6 +428,9 @@ func writePlanText(e *env, report planReport) error {
 	if err := output.WriteFields(e.stdout, fields); err != nil {
 		return err
 	}
+	if err := writeAdvisorText(e, report.Advisor); err != nil {
+		return err
+	}
 
 	if _, err := fmt.Fprintln(e.stdout, "\nActions:"); err != nil {
 		return err
@@ -416,4 +477,185 @@ func writePlanText(e *env, report planReport) error {
 	_, err := fmt.Fprintf(e.stdout,
 		"\nRun \"janitor explain <path>\" for the reasoning behind one action.\n")
 	return err
+}
+
+// advisorRun is the advisor chosen for one planning run, or the reason
+// there is none.
+type advisorRun struct {
+	advisor *jev.Advisor
+	static  jev.Report
+}
+
+func (r advisorRun) report() jev.Report {
+	if r.advisor != nil {
+		return r.advisor.Report()
+	}
+	return r.static
+}
+
+// selectAdvisor decides whether this run consults the model.
+//
+// Rules-only is the default and must stay fully useful. The model is used
+// only when the policy enables it, the run did not opt out, and a key is
+// configured; a missing key is a normal state, reported, not an error.
+func selectAdvisor(e *env, db *store.Store, policy config.Policy, scanID string, opts planOptions) (advisorRun, error) {
+	static := jev.Report{Provider: jev.Provider, Model: policy.Jev.Model, Mode: jev.ModeRulesOnly}
+	switch {
+	case opts.noJev:
+		static.Note = "disabled for this run by --no-jev"
+		return advisorRun{static: static}, nil
+	case !policy.Jev.Enabled && !opts.jevDryRun:
+		static.Note = "jev.enabled is false; set it to true and provide a key to consult the model"
+		return advisorRun{static: static}, nil
+	}
+
+	options := jev.Options{
+		Policy:       policy.Jev,
+		PolicyDigest: plan.PolicyDigest(policy),
+		ScanID:       scanID,
+		Redactor: jev.Redactor{
+			Segments:       policy.Jev.RedactSegments,
+			SensitiveNames: policy.Protect.NamePatterns,
+		},
+		Cache: storeCache{db: db},
+		Debug: opts.jevDebug,
+	}
+
+	if opts.jevDryRun {
+		options.DryRun = true
+		advisor, err := jev.New(options)
+		if err != nil {
+			return advisorRun{}, err
+		}
+		return advisorRun{advisor: advisor}, nil
+	}
+
+	key, _ := e.lookup(policy.Jev.APIKeyEnv)
+	if strings.TrimSpace(key) == "" {
+		static.Mode = jev.ModeNoCredentials
+		static.Note = fmt.Sprintf("no API key in $%s; planning rules-only", policy.Jev.APIKeyEnv)
+		return advisorRun{static: static}, nil
+	}
+	options.Client = &jev.Client{
+		Endpoint:    policy.Jev.Endpoint,
+		APIKey:      strings.TrimSpace(key),
+		HTTP:        &http.Client{},
+		Timeout:     policy.Jev.Timeout.Duration(),
+		MaxRetries:  policy.Jev.MaxRetries,
+		MinInterval: policy.Jev.MinInterval.Duration(),
+		BackoffBase: 500 * time.Millisecond,
+		MaxBackoff:  10 * time.Second,
+	}
+	advisor, err := jev.New(options)
+	if err != nil {
+		return advisorRun{}, err
+	}
+	return advisorRun{advisor: advisor}, nil
+}
+
+// storeCache adapts the store to the advisor's cache interface.
+type storeCache struct{ db *store.Store }
+
+func (c storeCache) Lookup(ctx context.Context, key string, now time.Time) (core.Recommendation, bool, error) {
+	var (
+		recommendation core.Recommendation
+		found          bool
+	)
+	err := c.db.Read(ctx, func(tx *store.Tx) error {
+		var err error
+		recommendation, found, err = tx.ModelDecision(ctx, key, now)
+		return err
+	})
+	return recommendation, found, err
+}
+
+// persistAdvice records the advisor's usage and new decisions in one
+// transaction, so cost is never recorded without the answers it bought.
+func persistAdvice(ctx context.Context, db *store.Store, advisor *jev.Advisor) error {
+	if advisor == nil {
+		return nil
+	}
+	usage := advisor.Usage()
+	decisions := advisor.Decisions()
+	if len(usage) == 0 && len(decisions) == 0 {
+		return nil
+	}
+	return db.Write(ctx, func(tx *store.Tx) error {
+		for _, record := range usage {
+			if err := tx.RecordModelUsage(ctx, record); err != nil {
+				return err
+			}
+		}
+		for _, decision := range decisions {
+			if err := tx.PutModelDecision(ctx, store.ModelDecision{
+				Key:            decision.Key,
+				Fingerprint:    decision.Fingerprint,
+				SchemaVersion:  decision.SchemaVersion,
+				Model:          decision.Model,
+				PolicyDigest:   decision.PolicyDigest,
+				ResolvedModel:  decision.ResolvedModel,
+				Recommendation: decision.Recommendation,
+				CreatedAt:      decision.CreatedAt,
+				ExpiresAt:      decision.ExpiresAt,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// writeAdvisorText reports what the model did. A dry run or debug run
+// prints the exact requests, with the credential replaced, so an operator
+// can see every byte that leaves — or would leave — the host.
+func writeAdvisorText(e *env, report jev.Report) error {
+	if _, err := fmt.Fprintln(e.stdout, "\nModel:"); err != nil {
+		return err
+	}
+	fields := []output.Field{
+		{Key: "  advisor:", Value: report.Provider + ":" + report.Model},
+		{Key: "  mode:", Value: string(report.Mode)},
+	}
+	if report.Note != "" {
+		fields = append(fields, output.Field{Key: "  note:", Value: report.Note})
+	}
+	if report.Mode == jev.ModeLive || report.Mode == jev.ModeDryRun {
+		fields = append(fields,
+			output.Field{Key: "  offered:", Value: strconv.Itoa(report.Offered)},
+			output.Field{Key: "  cache hits:", Value: strconv.Itoa(report.CacheHits)},
+		)
+	}
+	if report.Mode == jev.ModeLive {
+		fields = append(fields,
+			output.Field{Key: "  requests:", Value: fmt.Sprintf("%d (%d attempts, %d failed)", report.Requests, report.Attempts, report.FailedRequests)},
+			output.Field{Key: "  investigate:", Value: strconv.Itoa(report.Investigate)},
+			output.Field{Key: "  circuit open:", Value: strconv.FormatBool(report.CircuitOpen)},
+			output.Field{Key: "  tokens:", Value: fmt.Sprintf("%d in, %d out", report.Usage.InputTokens, report.Usage.OutputTokens)},
+			output.Field{Key: "  est. cost:", Value: fmt.Sprintf("$%.6f", report.Usage.EstimatedCostUSD)},
+		)
+	}
+	if report.Oversized > 0 {
+		fields = append(fields, output.Field{Key: "  oversized:", Value: strconv.Itoa(report.Oversized)})
+	}
+	if err := output.WriteFields(e.stdout, fields); err != nil {
+		return err
+	}
+	for _, failure := range report.Failures {
+		if _, err := fmt.Fprintf(e.stdout, "  failure: %s\n", failure); err != nil {
+			return err
+		}
+	}
+	for i, payload := range report.Payloads {
+		if _, err := fmt.Fprintf(e.stdout, "\n  request %d of %d:\n  ", i+1, len(report.Payloads)); err != nil {
+			return err
+		}
+		// Unescaped, so the body reads exactly as the bytes that are sent.
+		encoder := json.NewEncoder(e.stdout)
+		encoder.SetEscapeHTML(false)
+		encoder.SetIndent("  ", "  ")
+		if err := encoder.Encode(payload); err != nil {
+			return err
+		}
+	}
+	return nil
 }

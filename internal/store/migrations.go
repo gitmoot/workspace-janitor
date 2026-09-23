@@ -132,6 +132,30 @@ var migrations = []migration{
 			`CREATE INDEX approvals_plan_idx ON approvals(plan_id)`,
 		},
 	},
+	{
+		version: 4,
+		name:    "plan_advisor_and_model_decisions",
+		statements: []string{
+			// Which advisor shaped a plan is part of its identity.
+			`ALTER TABLE plans ADD COLUMN advisor TEXT NOT NULL DEFAULT 'rules-only'`,
+			// Model decisions are cached by everything that could change
+			// the answer: the entry's metadata fingerprint, the question
+			// schema, the model, and the policy. Any of them changing is a
+			// cache miss, not a stale hit.
+			`CREATE TABLE model_decisions (
+				cache_key        TEXT PRIMARY KEY,
+				fingerprint      TEXT NOT NULL,
+				schema_version   INTEGER NOT NULL,
+				model            TEXT NOT NULL,
+				policy_digest    TEXT NOT NULL,
+				resolved_model   TEXT NOT NULL,
+				recommendation   TEXT NOT NULL,
+				created_at       TEXT NOT NULL,
+				expires_at       TEXT NOT NULL
+			)`,
+			`CREATE INDEX model_decisions_expiry_idx ON model_decisions(expires_at)`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.
