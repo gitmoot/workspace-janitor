@@ -8,6 +8,14 @@ deleter: generic deletion requires quarantine and a separate confirmed
 expiry; a dedicated provider cache may instead use an explicitly approved,
 confirmed official prune.
 
+Operator guides: [threat model](docs/threat-model.md),
+[privacy and outbound Jev example](docs/privacy.md),
+[policy reference and isolated examples](docs/policy-reference.md),
+[recovery and restore](docs/recovery.md),
+[contributing and security reporting](docs/contributing-security.md), and
+[Linux release-readiness checklist](docs/release-readiness.md). The checklist
+prepares an artifact; release and deployment require separate owner approval.
+
 ## Status
 
 This repository implements inventory, safety, planning, the optional Jev
@@ -397,8 +405,9 @@ least one root; without one it fails and says so.
 
 ## Policy
 
-See [`docs/policy.example.yaml`](docs/policy.example.yaml) for a documented
-example. Three rules govern loading:
+See the [annotated example](docs/policy.example.yaml) and
+[policy reference with isolated worked examples](docs/policy-reference.md).
+Three rules govern loading:
 
 - **Unknown fields are rejected.** A typo must fail loudly rather than
   silently disable a protection.
@@ -444,12 +453,12 @@ internal/output      deterministic JSON and terminal rendering
 internal/buildinfo   version and build metadata
 ```
 
-Tests run against isolated fixture homes and never read the operator's real
-configuration, state, process table, or service definitions: path resolution
-takes an injected environment lookup, the CLI has no implicit fallback to the
-process environment, and every collector location — procfs root, systemd
-directories, cron paths, PM2 dumps, and the `git` binary itself — is an
-explicit option a test points at a fixture.
+Tests run against isolated fixture homes and never scan the operator's real
+configuration, state, process table, service definitions or repositories.
+Path resolution takes an injected environment lookup; fixture policies point
+procfs, systemd, cron and PM2 collectors at synthetic locations. Git tests
+use scratch repositories and the installed Git executable with an isolated
+HOME and disabled system/global Git configuration.
 
 ## License
 

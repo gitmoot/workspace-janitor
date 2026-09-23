@@ -4,6 +4,8 @@
 # ~/.config/workspace-janitor/policy.yaml) and validate with:
 #
 #   janitor policy check
+# See docs/policy-reference.md for field semantics and isolated worked examples;
+# docs/privacy.md describes the optional outbound Jev projection.
 #
 # Unknown fields are rejected, so a typo fails loudly instead of silently
 # disabling a protection. Omitted keys keep their built-in default; a key you

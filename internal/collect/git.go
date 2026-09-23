@@ -63,8 +63,9 @@ func (g gitRunner) run(ctx context.Context, dir string, args ...string) (string,
 
 	cmd := exec.CommandContext(ctx, g.binary, args...)
 	cmd.Dir = dir
-	// A scan must never prompt, never take an optional lock, and never reach
-	// a credential helper or the network.
+	// A scan must never prompt or take an optional lock. Git status can run
+	// core.fsmonitor from repository config; override that executable hook
+	// (and ordinary hooks) at command scope, above local repository config.
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + dir,
@@ -73,6 +74,11 @@ func (g gitRunner) run(ctx context.Context, dir string, args ...string) (string,
 		"GIT_ASKPASS=true",
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=core.fsmonitor",
+		"GIT_CONFIG_VALUE_0=false",
+		"GIT_CONFIG_KEY_1=core.hooksPath",
+		"GIT_CONFIG_VALUE_1=/dev/null",
 		"LC_ALL=C",
 	}
 	var stdout, stderr bytes.Buffer

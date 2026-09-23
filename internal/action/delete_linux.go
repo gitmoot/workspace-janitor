@@ -26,7 +26,7 @@ func fileIdentity(info os.FileInfo) core.FilesystemID {
 // opened quarantine parent. A partial recursive deletion remains a recorded
 // quarantined item requiring investigation; it is never retried blindly.
 func deleteAnchored(path string, expected core.FilesystemID) error {
-	parent, err := unix.Open(filepath.Dir(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	parent, err := openExistingDirNoSymlinks(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
@@ -49,7 +49,7 @@ func deleteAnchored(path string, expected core.FilesystemID) error {
 // same no-follow descriptor traversal as removeAt but retains no inode map
 // and no directory-sized listing in memory.
 func verifyDeletionTree(ctx context.Context, path string, expected core.FilesystemID) error {
-	parent, err := unix.Open(filepath.Dir(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	parent, err := openExistingDirNoSymlinks(filepath.Dir(path))
 	if err != nil {
 		return err
 	}

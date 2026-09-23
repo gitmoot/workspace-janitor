@@ -44,3 +44,27 @@ func createReceiptDir(path string) error {
 	}
 	return unix.Fsync(fd)
 }
+
+// openExistingDirNoSymlinks anchors every path component from /, not only
+// the final component of the parent. The caller owns the returned descriptor.
+func openExistingDirNoSymlinks(path string) (int, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return -1, fmt.Errorf("directory path must be absolute and canonical: %s", path)
+	}
+	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	for _, part := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+		if part == "" {
+			continue
+		}
+		next, err := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		unix.Close(fd)
+		if err != nil {
+			return -1, fmt.Errorf("open directory component %q without symlinks: %w", part, err)
+		}
+		fd = next
+	}
+	return fd, nil
+}
