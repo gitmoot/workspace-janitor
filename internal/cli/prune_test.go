@@ -29,7 +29,11 @@ func TestApprovedOfficialPrunePreviewsThenRunsInFixture(t *testing.T) {
 	if err := os.Mkdir(services, 0700); err != nil {
 		t.Fatal(err)
 	}
-	f.writePolicy(t, "roots:\n  - path: "+workspace+"\n    max_depth: 2\ncollectors:\n  git: false\n  processes: false\n  services: false\n  systemd_dirs:\n    - "+services+"\n  cron_paths: []\n  pm2_dumps: []\n  deep_size: true\ncaches:\n  - name: uv\n    path: "+cache+"\n    action: delete_candidate\n    dedicated: true\n    official_binary: "+binary+"\n")
+	proc := filepath.Join(workspace, "proc")
+	if err := os.Mkdir(proc, 0700); err != nil {
+		t.Fatal(err)
+	}
+	f.writePolicy(t, "roots:\n  - path: "+workspace+"\n    max_depth: 2\ncollectors:\n  git: false\n  processes: false\n  services: false\n  proc_root: "+proc+"\n  systemd_dirs:\n    - "+services+"\n  cron_paths: []\n  pm2_dumps: []\n  deep_size: true\ncaches:\n  - name: uv\n    path: "+cache+"\n    action: delete_candidate\n    dedicated: true\n    official_binary: "+binary+"\n")
 	if _, stderr, code := f.run(t, "scan"); code != ExitOK {
 		t.Fatalf("fixture scan: %d %s", code, stderr)
 	}
