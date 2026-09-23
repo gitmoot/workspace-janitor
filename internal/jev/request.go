@@ -11,8 +11,8 @@ import (
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
 
-// Request is the body of POST /v1/systemone, per the TypeSafe API
-// reference: a state, a model, and a map of typed questions.
+// Request is the body of POST /api/v1/systemone on OpenRouter: a state,
+// a pinned model, and a map of typed questions.
 type Request struct {
 	State     State               `json:"state"`
 	Model     string              `json:"model"`
@@ -167,10 +167,9 @@ func Build(model string, batch []Projection) Request {
 	}
 }
 
-// Documented limits, per request: 64k tokens overall, and 32k for the
-// state plus the longest single question. The overall ceiling here keeps a
-// margin below 64k because token counts are estimated, not measured.
-const requestTokenLimit = 56000
+// Jev on OpenRouter accepts a 32k-token context. Keep a margin because
+// tokens are estimated rather than measured.
+const requestTokenLimit = 28000
 
 // estimateTokens over-estimates tokens from encoded size. Three bytes per
 // token is deliberately pessimistic: an under-estimate would produce a

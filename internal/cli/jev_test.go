@@ -36,6 +36,11 @@ func newFakeJev(t *testing.T, action, class string) *fakeJev {
 	t.Helper()
 	f := &fakeJev{t: t, status: http.StatusOK, action: action, class: class}
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/systemone" {
+			t.Errorf("unexpected OpenRouter request: %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusNotFound)
+			return
+		}
 		raw, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
 		f.bodies = append(f.bodies, string(raw))
@@ -51,6 +56,11 @@ func newFakeJev(t *testing.T, action, class string) *fakeJev {
 		if err := json.Unmarshal(raw, &request); err != nil {
 			t.Errorf("undecodable request: %v", err)
 		}
+		if request.Model != "typesafe/jev-1.13" ||
+			len(request.Questions) != 4*len(request.State.Entries) {
+			t.Errorf("unexpected pinned model or typed questions: model=%q entries=%d questions=%d",
+				request.Model, len(request.State.Entries), len(request.Questions))
+		}
 		confidence, unsafe := 0.95, 0.01
 		answers := map[string]jev.Answer{}
 		for _, entry := range request.State.Entries {
@@ -60,7 +70,7 @@ func newFakeJev(t *testing.T, action, class string) *fakeJev {
 			answers[entry.Ref+"_unsafe"] = jev.Answer{Type: "noul", Noul: &unsafe}
 		}
 		_ = json.NewEncoder(w).Encode(jev.Response{
-			Model: "jev-1.13.0", Answers: answers,
+			Model: "typesafe/jev-1.13", Answers: answers,
 			Usage: jev.Usage{InputTokens: 1000, OutputTokens: 40},
 		})
 	}))
@@ -91,7 +101,7 @@ func (f *planFixture) enableJev(t *testing.T, endpoint string, extra ...string) 
 		"    path: " + f.repos,
 		"jev:",
 		"  enabled: true",
-		"  endpoint: " + endpoint,
+		"  endpoint: " + endpoint + "/api/v1/systemone",
 		"  max_retries: 0",
 		"  min_interval: 0s",
 	}, extra...), "\n")+"\n")
@@ -137,7 +147,7 @@ func TestPlanConsultsJevForAmbiguousEntriesOnly(t *testing.T) {
 	server := newFakeJev(t, "keep", "operational_tool")
 	f := newPlanFixture(t)
 	f.enableJev(t, server.server.URL)
-	f.env["TYPESAFE_API_KEY"] = fakeKey
+	f.env["OPENROUTER_API_KEY"] = fakeKey
 	f.scan(t)
 
 	doc, _ := f.advisedPlan(t)
@@ -158,14 +168,15 @@ func TestPlanConsultsJevForAmbiguousEntriesOnly(t *testing.T) {
 	}
 
 	report := doc.Data.Advisor
-	if report.Mode != jev.ModeLive || report.Requests != 1 || report.Usage.InputTokens != 1000 {
+	if report.Provider != "openrouter" || report.Model != "typesafe/jev-1.13" ||
+		report.Mode != jev.ModeLive || report.Requests != 1 || report.Usage.InputTokens != 1000 {
 		t.Errorf("advisor report = %+v", report)
 	}
-	if doc.Data.Plan.Advisor != "typesafe:jev-latest" {
+	if doc.Data.Plan.Advisor != "openrouter:typesafe/jev-1.13" {
 		t.Errorf("plan advisor = %q", doc.Data.Plan.Advisor)
 	}
 	mystery := actionAt(t, doc.Data.Plan, filepath.Join(f.root, "mystery"))
-	if mystery.Kind != core.ActionKeep || !containsRule(mystery.Rules, "advisor:typesafe:jev-latest") {
+	if mystery.Kind != core.ActionKeep || !containsRule(mystery.Rules, "advisor:openrouter:typesafe/jev-1.13") {
 		t.Errorf("mystery = %s via %v, want the safer keep credited to the advisor", mystery.Kind, mystery.Rules)
 	}
 	if got := actionAt(t, doc.Data.Plan, filepath.Join(f.root, "node_modules")); got.Kind != core.ActionQuarantine {
@@ -227,7 +238,7 @@ func TestPlanWithoutTheModelSendsNothing(t *testing.T) {
 
 	optOut := newPlanFixture(t)
 	optOut.enableJev(t, server.server.URL)
-	optOut.env["TYPESAFE_API_KEY"] = fakeKey
+	optOut.env["OPENROUTER_API_KEY"] = fakeKey
 	optOut.scan(t)
 	doc, _ = optOut.advisedPlan(t, "--no-jev")
 	if doc.Data.Advisor.Mode != jev.ModeRulesOnly || doc.Data.Plan.Advisor != "rules-only" {
@@ -235,7 +246,7 @@ func TestPlanWithoutTheModelSendsNothing(t *testing.T) {
 	}
 
 	disabled := newPlanFixture(t)
-	disabled.env["TYPESAFE_API_KEY"] = fakeKey
+	disabled.env["OPENROUTER_API_KEY"] = fakeKey
 	disabled.scan(t)
 	doc, _ = disabled.advisedPlan(t)
 	if doc.Data.Advisor.Mode != jev.ModeRulesOnly {
@@ -253,7 +264,7 @@ func TestPlanDryRunShowsRequestsWithoutSending(t *testing.T) {
 	server := newFakeJev(t, "keep", "operational_tool")
 	f := newPlanFixture(t)
 	f.enableJev(t, server.server.URL)
-	f.env["TYPESAFE_API_KEY"] = fakeKey
+	f.env["OPENROUTER_API_KEY"] = fakeKey
 	f.scan(t)
 
 	doc, stdout := f.advisedPlan(t, "--jev-dry-run")
@@ -264,7 +275,8 @@ func TestPlanDryRunShowsRequestsWithoutSending(t *testing.T) {
 		t.Fatalf("dry run: persisted=%t advisor=%+v", doc.Data.Persisted, doc.Data.Advisor)
 	}
 	payload := doc.Data.Advisor.Payloads[0]
-	if payload.Headers["Authorization"] != "Bearer [redacted]" || payload.Endpoint != server.server.URL {
+	if payload.Headers["Authorization"] != "Bearer [redacted]" ||
+		payload.Endpoint != server.server.URL+"/api/v1/systemone" {
 		t.Errorf("payload = %+v", payload)
 	}
 	if strings.Contains(stdout, fakeKey) || strings.Contains(string(payload.Body), f.home) {
@@ -286,13 +298,29 @@ func TestPlanDryRunShowsRequestsWithoutSending(t *testing.T) {
 	}
 }
 
+// A stale policy from the direct-provider implementation must fail
+// configuration validation before the CLI can construct an HTTP client.
+func TestPlanRejectsDirectProviderEndpoint(t *testing.T) {
+	f := newPlanFixture(t)
+	f.scan(t)
+	f.enableJev(t, "https://api.typesafe.ai")
+	f.env["OPENROUTER_API_KEY"] = fakeKey
+	_, stderr, code := f.run(t, "plan")
+	if code != ExitUsage || !strings.Contains(stderr, "jev.endpoint") {
+		t.Errorf("stale endpoint: exit=%d stderr=%q; want a policy error", code, stderr)
+	}
+	if strings.Contains(stderr, fakeKey) {
+		t.Error("configuration error leaked the credential")
+	}
+}
+
 // A failing provider leaves the rules' plan intact and says what failed.
 func TestPlanSurvivesAFailingProvider(t *testing.T) {
 	server := newFakeJev(t, "keep", "operational_tool")
 	server.status = http.StatusServiceUnavailable
 	f := newPlanFixture(t)
 	f.enableJev(t, server.server.URL)
-	f.env["TYPESAFE_API_KEY"] = fakeKey
+	f.env["OPENROUTER_API_KEY"] = fakeKey
 	f.scan(t)
 
 	doc, _ := f.advisedPlan(t)
@@ -333,7 +361,7 @@ func TestModelCannotMoveAProtectedEntry(t *testing.T) {
 	f := newPlanFixture(t)
 	protected := filepath.Join(f.root, "mystery")
 	f.enableJev(t, server.server.URL, "protect:", "  paths:", "    - "+protected)
-	f.env["TYPESAFE_API_KEY"] = fakeKey
+	f.env["OPENROUTER_API_KEY"] = fakeKey
 	f.scan(t)
 
 	doc, _ := f.advisedPlan(t)
@@ -346,7 +374,7 @@ func TestModelCannotMoveAProtectedEntry(t *testing.T) {
 	}
 	rejected := false
 	for _, alternative := range got.Rejected {
-		if alternative.Rule == "advisor:typesafe:jev-latest" {
+		if alternative.Rule == "advisor:openrouter:typesafe/jev-1.13" {
 			rejected = true
 		}
 	}

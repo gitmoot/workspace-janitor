@@ -120,7 +120,8 @@ func (c *Client) once(ctx context.Context, body []byte) (Response, time.Duration
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.httpClient().Do(req)
+	client := c.httpClient()
+	resp, err := client.Do(req)
 	if err != nil {
 		// Timeouts and connection failures are transient by nature.
 		return Response{}, 0, &APIError{Message: redactKey(err.Error(), c.APIKey), Retryable: ctx.Err() == nil}
@@ -217,11 +218,19 @@ func (c *Client) maxBackoff() time.Duration {
 	return c.MaxBackoff
 }
 
-func (c *Client) httpClient() *http.Client {
-	if c.HTTP != nil {
-		return c.HTTP
+// httpClient preserves the caller's transport and timeout but refuses
+// redirects: neither the key nor the sanitized host projection may be
+// forwarded to a different endpoint.
+func (c *Client) httpClient() http.Client {
+	base := c.HTTP
+	if base == nil {
+		base = http.DefaultClient
 	}
-	return http.DefaultClient
+	client := *base
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return client
 }
 
 func (c *Client) now() time.Time {

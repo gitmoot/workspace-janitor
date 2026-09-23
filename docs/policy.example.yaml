@@ -80,12 +80,13 @@ caches:
 # projection, and advice is applied only when it is safer than the rules.
 jev:
   enabled: false
-  model: jev-latest
-  # HTTPS, or plain HTTP on a loopback address only.
-  endpoint: https://api.typesafe.ai/v1/systemone
-  # The NAME of the environment variable holding the key. The key itself
-  # never belongs in a policy file; without it, planning is rules-only.
-  api_key_env: TYPESAFE_API_KEY
+  model: typesafe/jev-1.13
+  # Hosted calls go only to OpenRouter's System One endpoint. Loopback
+  # HTTP is accepted for isolated fake-server tests.
+  endpoint: https://openrouter.ai/api/v1/systemone
+  # The NAME of the environment variable holding the OpenRouter key.
+  # The key itself never belongs in a policy file or debug output.
+  api_key_env: OPENROUTER_API_KEY
   # Entries per request, and the token budget for one request's state.
   max_batch: 20
   max_state_tokens: 24000

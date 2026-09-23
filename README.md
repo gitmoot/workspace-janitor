@@ -209,11 +209,15 @@ whether the action is approved.
 ### Jev advice
 
 Rules-only planning is the default and is complete on its own. With
-`jev.enabled: true` and a key in the environment variable named by
-`jev.api_key_env` (`TYPESAFE_API_KEY` by default), `plan` offers the
-entries the rules left **ambiguous** — and only those, after every rule has
-run — to the TypeSafe Jev model. A missing key is not an error: the plan is
-built from rules alone and says so.
+`jev.enabled: true` and an OpenRouter key in the environment variable
+named by `jev.api_key_env` (`OPENROUTER_API_KEY` by default), `plan`
+offers entries the rules left **ambiguous** — and only those, after
+every rule has run — to pinned Jev `typesafe/jev-1.13` through
+`https://openrouter.ai/api/v1/systemone`. The direct TypeSafe endpoint
+is rejected. A missing key is not an error: the plan is built from rules
+alone and says so. The CLI reads process environment; it does not load
+dotenv files itself. Supply only the named variable to a future live
+process through the host's secure environment mechanism.
 
 What is sent is an allowlisted projection, never the entry itself: a
 `<root>/`-relative path with configured, protected, and secret-looking
@@ -236,11 +240,13 @@ janitor plan --jev-debug     # also print the requests that were sent
 janitor plan --no-jev        # rules only for this run
 ```
 
-Requests are batched within `max_batch` and `max_state_tokens`, paced by
-`min_interval`, bounded by `timeout`, and retried up to `max_retries` times
-on 429, 529, 5xx, and transport errors, honoring `Retry-After`. A rejected
-key or request is not retried. After `breaker_failures` consecutive
-failures the run stops calling the model and plans the rest from rules.
+Requests are batched within `max_batch` and `max_state_tokens` and
+under a conservative 28k-token total estimate for Jev's 32k context.
+They are paced by `min_interval`, bounded by `timeout`, and retried up
+to `max_retries` times on 429, 529, 5xx, and transport errors, honoring
+`Retry-After`. Redirects are refused; a rejected key or request is not
+retried. After `breaker_failures` consecutive failures the run stops
+calling the model and plans the rest from rules.
 Well-formed answers are cached by entry fingerprint, request schema,
 model, and policy for `cache_ttl`, so re-planning unchanged entries sends
 nothing; malformed answers are retried on the next plan.

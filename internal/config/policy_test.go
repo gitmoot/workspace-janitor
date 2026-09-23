@@ -411,11 +411,15 @@ func TestProjectMarkerGlobsAreRejected(t *testing.T) {
 	}
 }
 
-// The API key travels in a header, so an endpoint that is not HTTPS is
-// refused unless it is this machine. A policy may name the variable that
-// holds the key, never the key itself.
+// Only OpenRouter's hosted System One endpoint or loopback HTTP is
+// accepted. The policy names a credential variable, never the key.
 func TestJevProviderSettingsAreValidated(t *testing.T) {
 	paths := fixturePaths(t)
+	defaults := DefaultPolicy(paths).Jev
+	if defaults.Enabled || defaults.Endpoint != "https://openrouter.ai/api/v1/systemone" ||
+		defaults.Model != "typesafe/jev-1.13" || defaults.APIKeyEnv != "OPENROUTER_API_KEY" {
+		t.Errorf("unsafe or unpinned Jev defaults: %+v", defaults)
+	}
 	_, err := parse(t, paths, strings.Join([]string{
 		"roots:",
 		"  - path: /repos",
@@ -439,12 +443,31 @@ func TestJevProviderSettingsAreValidated(t *testing.T) {
 	}
 
 	for _, endpoint := range []string{
-		"https://api.typesafe.ai/v1/systemone",
+		"https://openrouter.ai/api/v1/systemone",
 		"http://127.0.0.1:8080/v1/systemone",
 		"http://localhost:9/v1/systemone",
 	} {
 		if _, err := parse(t, paths, "roots:\n  - path: /repos\njev:\n  endpoint: "+endpoint+"\n"); err != nil {
 			t.Errorf("endpoint %s must be accepted: %v", endpoint, err)
+		}
+	}
+	for _, endpoint := range []string{
+		"https://api.typesafe.ai/v1/systemone",
+		"https://example.invalid/v1/systemone",
+		"https://openrouter.ai/api/v1/systemone?redirect=1",
+	} {
+		if _, err := parse(t, paths, "roots:\n  - path: /repos\njev:\n  endpoint: "+endpoint+"\n"); err == nil {
+			t.Errorf("endpoint %s must be rejected before any request", endpoint)
+		}
+	}
+	for _, model := range []string{"typesafe/jev-1.13", "jev-1.13"} {
+		if _, err := parse(t, paths, "roots:\n  - path: /repos\njev:\n  model: "+model+"\n"); err != nil {
+			t.Errorf("pinned model %s must be accepted: %v", model, err)
+		}
+	}
+	for _, model := range []string{"jev-latest", `""`} {
+		if _, err := parse(t, paths, "roots:\n  - path: /repos\njev:\n  model: "+model+"\n"); err == nil {
+			t.Errorf("unpinned model %s must be rejected", model)
 		}
 	}
 

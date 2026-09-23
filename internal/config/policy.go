@@ -16,6 +16,8 @@ import (
 // A document with a different version is rejected rather than guessed at.
 const PolicyVersion = 1
 
+const openRouterSystemOneEndpoint = "https://openrouter.ai/api/v1/systemone"
+
 // Duration is a YAML/JSON duration written in Go syntax, for example "5s".
 type Duration time.Duration
 
@@ -97,11 +99,12 @@ type CacheRule struct {
 // shown in full without exposing a secret.
 type JevPolicy struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
-	// Model is sent as the request's model field. An alias such as
-	// "jev-latest" can move to a new version; pin a versioned id to keep
-	// cached decisions and confidence thresholds tied to one model.
+	// Model is sent to OpenRouter's System One endpoint. Pin a versioned
+	// ID so cache entries and confidence thresholds do not silently
+	// follow an alias to a different model.
 	Model string `yaml:"model" json:"model"`
-	// Endpoint is the TypeSafe evaluation endpoint.
+	// Endpoint is OpenRouter's System One endpoint. Loopback is accepted
+	// for isolated fixture tests, never a different hosted provider.
 	Endpoint string `yaml:"endpoint" json:"endpoint"`
 	// APIKeyEnv names the environment variable holding the API key.
 	APIKeyEnv string `yaml:"api_key_env" json:"api_key_env"`
@@ -126,8 +129,8 @@ type JevPolicy struct {
 	// MaxUnsafe is the highest unsafe-to-remove probability tolerated;
 	// anything more becomes investigate.
 	MaxUnsafe float64 `yaml:"max_unsafe" json:"max_unsafe"`
-	// PricePerMTokUSD estimates cost from reported input tokens. The API
-	// reports tokens, not money, so cost is always an estimate.
+	// PricePerMTokUSD estimates cost from reported input tokens using the
+	// configured rate. It is an estimate, not the provider's billed total.
 	PricePerMTokUSD float64 `yaml:"price_per_mtok_usd" json:"price_per_mtok_usd"`
 	// CacheTTL bounds how long a cached decision is reused.
 	CacheTTL Duration `yaml:"cache_ttl" json:"cache_ttl"`
@@ -263,12 +266,12 @@ func DefaultPolicy(p Paths) Policy {
 		Caches: []CacheRule{},
 		Jev: JevPolicy{
 			Enabled:   false,
-			Model:     "jev-latest",
-			Endpoint:  "https://api.typesafe.ai/v1/systemone",
-			APIKeyEnv: "TYPESAFE_API_KEY",
+			Model:     "typesafe/jev-1.13",
+			Endpoint:  openRouterSystemOneEndpoint,
+			APIKeyEnv: "OPENROUTER_API_KEY",
 			MaxBatch:  20,
-			// Documented limits: 64k tokens per request, 32k for the state
-			// plus the longest question. 24k leaves room for both.
+			// Jev on OpenRouter has a 32k context window. The request
+			// budget is lower; 24k for state leaves room for questions.
 			MaxStateTokens:  24000,
 			Timeout:         Duration(20 * time.Second),
 			MaxRetries:      2,
@@ -711,11 +714,14 @@ func validateJev(j JevPolicy) core.FieldErrors {
 	if err := validateEndpoint(j.Endpoint); err != nil {
 		errs.Add("jev.endpoint", "%v", err)
 	}
+	if j.Model != "typesafe/jev-1.13" && j.Model != "jev-1.13" {
+		errs.Add("jev.model", "must pin the OpenRouter Jev 1.13 model, got %q", j.Model)
+	}
 	if !isEnvName(j.APIKeyEnv) {
 		errs.Add("jev.api_key_env", "must name an environment variable, got %q", j.APIKeyEnv)
 	}
-	if j.MaxStateTokens <= 0 || j.MaxStateTokens > 32000 {
-		errs.Add("jev.max_state_tokens", "must be within (0, 32000], the per-request state limit; got %d", j.MaxStateTokens)
+	if j.MaxStateTokens <= 0 || j.MaxStateTokens > 28000 {
+		errs.Add("jev.max_state_tokens", "must be within (0, 28000], the bounded request budget; got %d", j.MaxStateTokens)
 	}
 	if j.Timeout.Duration() <= 0 {
 		errs.Add("jev.timeout", "must be greater than zero, got %s", j.Timeout)
@@ -744,18 +750,18 @@ func validateJev(j JevPolicy) core.FieldErrors {
 	return errs
 }
 
-// validateEndpoint requires HTTPS, allowing plain HTTP only to a loopback
-// address. The API key travels in a header, so sending it in the clear to
-// anything but this machine is refused.
+// validateEndpoint only accepts OpenRouter's System One endpoint in
+// production. Loopback HTTP remains available for isolated fake-server
+// tests; stale direct-provider URLs must fail before any request is made.
 func validateEndpoint(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		return fmt.Errorf("must be an absolute URL, got %q", raw)
-	}
-	switch u.Scheme {
-	case "https":
+	if raw == openRouterSystemOneEndpoint {
 		return nil
-	case "http":
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" {
+		return fmt.Errorf("must be the OpenRouter System One endpoint or loopback HTTP")
+	}
+	if u.Scheme == "http" {
 		host := u.Hostname()
 		if host == "localhost" {
 			return nil
@@ -763,10 +769,8 @@ func validateEndpoint(raw string) error {
 		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 			return nil
 		}
-		return fmt.Errorf("must use https unless it is a loopback address, got %q", raw)
-	default:
-		return fmt.Errorf("must use https, got %q", raw)
 	}
+	return fmt.Errorf("must be the OpenRouter System One endpoint or loopback HTTP")
 }
 
 // isEnvName reports whether s is a valid environment variable name.
