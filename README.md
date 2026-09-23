@@ -207,6 +207,9 @@ It checks the latest scan and policy binding, then recollects each target and
 reruns the safety guards immediately before moving it. Approved overlapping
 paths are refused as a batch. A destination on another filesystem is always
 refused in this version; there is no copy-and-delete fallback.
+Filesystem mutation currently runs on Linux; other platform builds refuse
+the action because their no-replace and anchored-delete primitives are not
+implemented.
 
 ```sh
 janitor apply --quarantine                         # preview approved moves

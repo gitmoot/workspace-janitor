@@ -29,6 +29,14 @@ func MoveLinkedWorktree(ctx context.Context, owner, from, to string) error {
 	if from == to {
 		return errors.New("source and destination are the same")
 	}
+	rootMetadata, err := captureGitMetadata(from)
+	if err != nil {
+		return fmt.Errorf("capture worktree metadata: %w", err)
+	}
+	gitfileMetadata, err := captureGitMetadata(filepath.Join(from, ".git"))
+	if err != nil {
+		return fmt.Errorf("capture worktree gitfile metadata: %w", err)
+	}
 	if _, err := inspectLinkedWorktree(ctx, owner, from); err != nil {
 		return err
 	}
@@ -45,6 +53,12 @@ func MoveLinkedWorktree(ctx context.Context, owner, from, to string) error {
 	}
 	if _, err := inspectLinkedWorktree(ctx, owner, to); err != nil {
 		return fmt.Errorf("verify moved linked worktree: %w", err)
+	}
+	if err := restoreGitMetadata(filepath.Join(to, ".git"), gitfileMetadata); err != nil {
+		return fmt.Errorf("preserve moved worktree gitfile metadata: %w", err)
+	}
+	if err := restoreGitMetadata(to, rootMetadata); err != nil {
+		return fmt.Errorf("preserve moved worktree directory metadata: %w", err)
 	}
 	return nil
 }
