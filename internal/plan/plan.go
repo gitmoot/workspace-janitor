@@ -128,7 +128,16 @@ func Build(ctx context.Context, in Input) (Result, error) {
 			// A failed advisor changes nothing: the rules already decided.
 			advice = map[string]core.Recommendation{}
 		} else {
-			advice = answers
+			// Only finite confidence in [0,1] can become action
+			// confidence. Invalid advisor confidence must not abort a
+			// rules-only plan; the positive comparisons also reject NaN.
+			for _, entry := range ambiguous {
+				recommendation, ok := answers[entry.Path]
+				if !ok || !(recommendation.Confidence >= 0 && recommendation.Confidence <= 1) {
+					continue
+				}
+				advice[entry.Path] = recommendation
+			}
 		}
 	}
 

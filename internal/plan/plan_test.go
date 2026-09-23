@@ -3,6 +3,7 @@ package plan
 import (
 	"context"
 	"errors"
+	"math"
 	"math/rand/v2"
 	"strings"
 	"testing"
@@ -422,6 +423,35 @@ func TestAcceptedAdviceClassAndConfidenceAgreeWithTrace(t *testing.T) {
 	}
 	if len(result.Traces) != 1 || result.Traces[0].Class != action.Class || result.Traces[0].Action != action.Kind {
 		t.Errorf("trace = %+v, action = %+v", result.Traces, action)
+	}
+}
+
+// An advisor can be implemented by something other than Jev. Invalid
+// recommendations must never cause the complete rules plan to fail.
+func TestMalformedAdvisorConfidenceLeavesRulesPlan(t *testing.T) {
+	entry := entryAt("/home/fixture/mystery")
+	for _, tc := range []struct {
+		name       string
+		confidence float64
+	}{
+		{name: "above one", confidence: 1.5},
+		{name: "not a number", confidence: math.NaN()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			advisor := &stubAdvisor{name: "other", answers: map[string]core.Recommendation{
+				entry.Path: {
+					Action: core.ActionKeep, Class: core.ClassOperationalTool,
+					Confidence: tc.confidence, Origin: core.OriginModel,
+					Reasons: []string{"unsafe advisor value"}, DecidedAt: plannedAt,
+				},
+			}}
+			result := buildPlan(t, []core.Entry{entry}, fixturePolicy(), advisor)
+			action := actionFor(t, result, entry.Path)
+			if action.Kind != core.ActionInvestigate || action.Confidence != ambiguousConfidence ||
+				containsString(action.Rules, "advisor:other") {
+				t.Errorf("malformed advice changed the rules plan: %+v", action)
+			}
+		})
 	}
 }
 
