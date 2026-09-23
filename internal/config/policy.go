@@ -90,6 +90,21 @@ type CacheRule struct {
 	Path      string          `yaml:"path" json:"path"`
 	Action    core.ActionKind `yaml:"action" json:"action"`
 	Retention core.Retention  `yaml:"retention" json:"retention"`
+	// MaxBytes is the largest logical cache size permitted before this rule
+	// proposes its action. TTL requires every observed child to be older.
+	MaxBytes int64    `yaml:"max_bytes" json:"max_bytes"`
+	TTL      Duration `yaml:"ttl" json:"ttl"`
+	// Dedicated is an explicit operator assertion that this exact cache root
+	// is exclusively owned and idle for an irreversible official prune.
+	Dedicated      bool   `yaml:"dedicated" json:"dedicated"`
+	OfficialBinary string `yaml:"official_binary" json:"official_binary"`
+}
+
+// GitmootPolicy locates Gitmoot's own lifecycle ledger. Its managed tree is
+// always protected from generic filesystem cleanup, even if the DB is absent.
+type GitmootPolicy struct {
+	Home     string `yaml:"home" json:"home"`
+	Database string `yaml:"database" json:"database"`
 }
 
 // JevPolicy configures the optional model classifier. It is disabled by
@@ -233,6 +248,7 @@ type Policy struct {
 	Protect    Protect         `yaml:"protect" json:"protect"`
 	Retention  RetentionPolicy `yaml:"retention" json:"retention"`
 	Caches     []CacheRule     `yaml:"caches" json:"caches"`
+	Gitmoot    GitmootPolicy   `yaml:"gitmoot" json:"gitmoot"`
 	Collectors Collectors      `yaml:"collectors" json:"collectors"`
 	Safety     Safety          `yaml:"safety" json:"safety"`
 
@@ -330,10 +346,13 @@ func DefaultPolicy(p Paths) Policy {
 		FromFile: false,
 	}
 	if p.Home != "" {
+		policy.Gitmoot = GitmootPolicy{Home: filepath.Join(p.Home, ".gitmoot"),
+			Database: filepath.Join(p.Home, ".gitmoot", "gitmoot.db")}
 		policy.Roots = []Root{{Path: p.Home, MaxDepth: 1}}
 		for _, rel := range []string{".ssh", ".gnupg", ".aws", ".kube", ".config"} {
 			policy.Protect.Paths = append(policy.Protect.Paths, filepath.Join(p.Home, rel))
 		}
+		policy.Protect.Paths = append(policy.Protect.Paths, policy.Gitmoot.Home)
 		policy.Collectors.SystemdDirs = append(policy.Collectors.SystemdDirs, filepath.Join(p.Home, ".config", "systemd", "user"))
 		policy.Collectors.PM2Dumps = append(policy.Collectors.PM2Dumps, filepath.Join(p.Home, ".pm2", "dump.pm2"))
 	} else {
@@ -358,6 +377,7 @@ func (p Policy) clone() Policy {
 	out.Protect.Paths = append([]string(nil), p.Protect.Paths...)
 	out.Protect.NamePatterns = append([]string(nil), p.Protect.NamePatterns...)
 	out.Caches = append([]CacheRule(nil), p.Caches...)
+	out.Gitmoot = p.Gitmoot
 	out.Jev.RedactSegments = append([]string(nil), p.Jev.RedactSegments...)
 	out.Collectors.SystemdDirs = append([]string(nil), p.Collectors.SystemdDirs...)
 	out.Collectors.CronPaths = append([]string(nil), p.Collectors.CronPaths...)
@@ -391,12 +411,21 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	}
 	for i := range p.Caches {
 		p.Caches[i].Path = expand(fmt.Sprintf("caches[%d].path", i), p.Caches[i].Path)
+		if p.Caches[i].OfficialBinary != "" {
+			p.Caches[i].OfficialBinary = expand(fmt.Sprintf("caches[%d].official_binary", i), p.Caches[i].OfficialBinary)
+		}
 		if p.Caches[i].Action == "" {
 			p.Caches[i].Action = core.ActionInvestigate
 		}
 		if p.Caches[i].Retention == "" {
 			p.Caches[i].Retention = p.Retention.Default
 		}
+	}
+	if p.Gitmoot.Home != "" {
+		p.Gitmoot.Home = expand("gitmoot.home", p.Gitmoot.Home)
+	}
+	if p.Gitmoot.Database != "" {
+		p.Gitmoot.Database = expand("gitmoot.database", p.Gitmoot.Database)
 	}
 	if p.Retention.QuarantineDir != "" {
 		p.Retention.QuarantineDir = expand("retention.quarantine_dir", p.Retention.QuarantineDir)
@@ -423,6 +452,9 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	// whatever location the document actually configured.
 	if p.Retention.QuarantineDir != "" {
 		p.Protect.Paths = mergeUnique(p.Protect.Paths, []string{p.Retention.QuarantineDir})
+	}
+	if p.Gitmoot.Home != "" {
+		p.Protect.Paths = mergeUnique(p.Protect.Paths, []string{p.Gitmoot.Home})
 	}
 	if p.Caches == nil {
 		p.Caches = []CacheRule{}
@@ -535,6 +567,30 @@ func (p *Policy) Validate() core.FieldErrors {
 		}
 		if !cache.Retention.Valid() {
 			errs.Add(field+".retention", "unknown retention %q (allowed: %s)", string(cache.Retention), joinRetentions())
+		}
+		if cache.Dedicated {
+			if cache.Action != core.ActionDeleteCandidate {
+				errs.Add(field+".action", "dedicated official prune requires delete_candidate")
+			}
+			if !core.IsCanonicalPath(cache.OfficialBinary) {
+				errs.Add(field+".official_binary", "dedicated official prune requires an absolute executable path")
+			}
+		} else if cache.OfficialBinary != "" {
+			errs.Add(field+".official_binary", "official binary requires dedicated: true")
+		}
+	}
+	if p.Gitmoot.Home != "" && !core.IsCanonicalPath(p.Gitmoot.Home) {
+		errs.Add("gitmoot.home", "must be an absolute path, got %q", p.Gitmoot.Home)
+	}
+	if p.Gitmoot.Database != "" && !core.IsCanonicalPath(p.Gitmoot.Database) {
+		errs.Add("gitmoot.database", "must be an absolute path, got %q", p.Gitmoot.Database)
+	}
+	for i, cache := range p.Caches {
+		if cache.MaxBytes < 0 {
+			errs.Add(fmt.Sprintf("caches[%d].max_bytes", i), "must not be negative")
+		}
+		if cache.TTL.Duration() < 0 {
+			errs.Add(fmt.Sprintf("caches[%d].ttl", i), "must not be negative")
 		}
 	}
 	if p.Jev.Enabled && p.Jev.Model == "" {

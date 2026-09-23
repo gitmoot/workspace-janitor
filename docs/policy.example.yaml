@@ -69,6 +69,13 @@ ownership:
   # 0 means "do not check ownership".
   expected_uid: 0
 
+# Gitmoot's managed home and ledger. The ledger is read-only to janitor;
+# managed paths are never candidates for generic quarantine or deletion.
+# A missing or uncertain ledger protects them rather than proving them idle.
+gitmoot:
+  home: ~/.gitmoot
+  database: ~/.gitmoot/gitmoot.db
+
 # Known regenerable caches. action is one of keep, quarantine,
 # delete_candidate, or investigate (the default when omitted).
 caches:
@@ -76,6 +83,19 @@ caches:
     path: ~/.cache/go-build
     action: delete_candidate
     retention: 30d
+    # Optional bounds: a size bound acts only when exceeded, and ttl requires
+    # the newest content to be old enough. Both need scan --deep-size.
+    # max_bytes: 10737418240
+    # ttl: 720h
+  # Official pruning is separate, irreversible, Linux-only, and requires a
+  # dedicated, idle cache with an exact approved delete_candidate action.
+  # Set the real absolute executable path on this host; preview with
+  # janitor apply --prune --action <id> before confirming it.
+  # - name: uv-dedicated
+  #   path: ~/.cache/uv
+  #   action: delete_candidate
+  #   dedicated: true
+  #   official_binary: /usr/bin/uv
 
 # The Jev model classifier is optional and disabled by default: the tool must
 # be fully useful with no credentials and no network. When enabled, only

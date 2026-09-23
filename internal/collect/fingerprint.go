@@ -31,6 +31,9 @@ func Fingerprint(entry core.Entry) string {
 	write("size=%d", entry.SizeBytes)
 	write("deep=%t", entry.SizeIsDeep)
 	write("modified=%d", entry.ModifiedAt.UTC().UnixNano())
+	if !entry.LatestModifiedAt.IsZero() {
+		write("latest_modified=%d", entry.LatestModifiedAt.UTC().UnixNano())
+	}
 	write("link=%s", entry.SymlinkTarget)
 	if entry.Git == nil {
 		write("git=none")

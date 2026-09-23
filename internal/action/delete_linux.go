@@ -4,6 +4,7 @@ package action
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -37,16 +38,19 @@ func deleteAnchored(path string, expected core.FilesystemID) error {
 	if expected.Device != uint64(stat.Dev) || expected.Inode != stat.Ino {
 		return fmt.Errorf("quarantined identity changed")
 	}
-	if err := removeAt(parent, name); err != nil {
+	if err := removeAt(parent, name, uint64(stat.Dev)); err != nil {
 		return err
 	}
 	return unix.Fsync(parent)
 }
 
-func removeAt(parent int, name string) error {
+func removeAt(parent int, name string, device uint64) error {
 	var stat unix.Stat_t
 	if err := unix.Fstatat(parent, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return err
+	}
+	if uint64(stat.Dev) != device {
+		return fmt.Errorf("mounted child %s crossed the deletion filesystem", name)
 	}
 	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
 		return unix.Unlinkat(parent, name, 0)
@@ -65,13 +69,26 @@ func removeAt(parent int, name string) error {
 		return fmt.Errorf("directory changed during deletion")
 	}
 	file := os.NewFile(uintptr(fd), name)
-	children, err := file.Readdirnames(-1)
-	if err == nil {
+	for {
+		var children []string
+		children, err = file.Readdirnames(128)
+		if err != nil && err != io.EOF {
+			break
+		}
 		for _, child := range children {
-			if err = removeAt(fd, child); err != nil {
+			if err = removeAt(fd, child, device); err != nil {
 				break
 			}
 		}
+		if err != nil {
+			break
+		}
+		if len(children) == 0 {
+			break
+		}
+	}
+	if err == io.EOF {
+		err = nil
 	}
 	if err == nil {
 		err = unix.Fsync(fd)

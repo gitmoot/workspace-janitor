@@ -33,6 +33,7 @@ const (
 	CollectorProcesses  = "processes"
 	CollectorAgents     = "agents"
 	CollectorServices   = "services"
+	CollectorGitmoot    = "gitmoot"
 )
 
 // RootSpec is one discovery root and the bounds that apply inside it.
@@ -88,6 +89,10 @@ type Options struct {
 	Git       bool
 	Processes bool
 	Services  bool
+	// GitmootHome is the protected Gitmoot-managed tree. GitmootDatabase is
+	// observed read-only; it never grants the generic janitor mutation rights.
+	GitmootHome     string
+	GitmootDatabase string
 
 	// ProcRoot is the procfs mount to read process references from.
 	ProcRoot string
@@ -223,6 +228,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		report.Recorded = attachReferences(entries, refs, now)
 		result.Reports = append(result.Reports, report)
 	}
+	result.Reports = append(result.Reports, collectGitmoot(ctx, &opts, entries, now))
 
 	// Overlapping roots are valid policy input, so the same path can be
 	// reached twice. Merging keeps one entry per path with the union of its

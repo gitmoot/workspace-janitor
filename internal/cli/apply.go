@@ -20,16 +20,26 @@ import (
 )
 
 type applyOptions struct {
-	planID, cleanupID                   string
-	quarantine, expire, dryRun, confirm bool
+	planID, cleanupID, actionID                string
+	quarantine, expire, prune, dryRun, confirm bool
+}
+
+type officialCommandHint struct {
+	Path    string   `json:"path"`
+	Argv    []string `json:"argv"`
+	Timeout string   `json:"timeout"`
+	Note    string   `json:"note"`
 }
 
 type cleanupReport struct {
-	ID     string             `json:"cleanup_id,omitempty"`
-	Mode   string             `json:"mode"`
-	DryRun bool               `json:"dry_run"`
-	Items  []core.CleanupItem `json:"items"`
-	Errors []string           `json:"errors"`
+	ID            string                  `json:"cleanup_id,omitempty"`
+	Mode          string                  `json:"mode"`
+	DryRun        bool                    `json:"dry_run"`
+	Items         []core.CleanupItem      `json:"items"`
+	Official      []officialCommandHint   `json:"official_commands,omitempty"`
+	Estimate      *action.ReclaimEstimate `json:"expected_reclaim,omitempty"`
+	EstimateError string                  `json:"estimate_unavailable,omitempty"`
+	Errors        []string                `json:"errors"`
 }
 
 func cleanupEngine(e *env, db *store.Store, paths config.Paths, policy config.Policy) *action.Engine {
@@ -38,6 +48,7 @@ func cleanupEngine(e *env, db *store.Store, paths config.Paths, policy config.Po
 		Policy: enginePolicy(paths, policy),
 		Collect: collect.Options{
 			Limits: collectLimits(policy, scanOptions{}), Git: true, Processes: true, Services: true,
+			GitmootHome: policy.Gitmoot.Home, GitmootDatabase: policy.Gitmoot.Database,
 			ProcRoot: policy.Collectors.ProcRoot, ProjectMarkers: policy.Classification.ProjectMarkers,
 			ServiceSources: collect.ServiceSources{
 				SystemdDirs: policy.Collectors.SystemdDirs, CronPaths: policy.Collectors.CronPaths, PM2Dumps: policy.Collectors.PM2Dumps,
@@ -50,14 +61,22 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	if len(args) != 0 {
 		return &usageError{msg: "apply takes no arguments"}
 	}
-	if opts.quarantine == opts.expire {
-		return &usageError{msg: "choose exactly one of --quarantine or --expire"}
+	modes := 0
+	for _, selected := range []bool{opts.quarantine, opts.expire, opts.prune} {
+		if selected {
+			modes++
+		}
+	}
+	if modes != 1 {
+		return &usageError{msg: "choose exactly one of --quarantine, --expire or --prune"}
 	}
 	if !opts.dryRun && !opts.confirm {
 		return &usageError{msg: "--confirm is required with --dry-run=false"}
 	}
-	if opts.expire && opts.planID != "" || opts.quarantine && opts.cleanupID != "" {
-		return &usageError{msg: "--plan applies only to quarantine; --cleanup only to expiry"}
+	if (opts.expire && (opts.planID != "" || opts.actionID != "")) ||
+		(!opts.expire && opts.cleanupID != "") ||
+		(opts.prune && opts.actionID == "") {
+		return &usageError{msg: "--prune requires --action and a plan; --cleanup applies only to expiry"}
 	}
 	format, err := e.format()
 	if err != nil {
@@ -121,6 +140,9 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	}
 	selected := make([]core.Action, 0)
 	for _, act := range stored.Actions {
+		if opts.actionID != "" && act.ID != opts.actionID {
+			continue
+		}
 		if approved[act.ID] && act.Kind.Mutating() {
 			if act.Kind == core.ActionRelocate {
 				return fmt.Errorf("approved relocate action %s targets %s; --quarantine cannot honor a relocation destination", act.ID, act.Destination)
@@ -144,7 +166,22 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 			}
 		}
 	}
+	if opts.prune {
+		if len(selected) != 1 {
+			return fmt.Errorf("official prune requires one approved cache action")
+		}
+		return runOfficialPrune(ctx, e, format, paths.StateDir, policy, engine, selected[0], byPath[selected[0].Path], opts)
+	}
 	report := cleanupReport{Mode: "quarantine", DryRun: opts.dryRun, Items: []core.CleanupItem{}, Errors: []string{}}
+	for _, selectedAction := range selected {
+		if adapter, ok := plan.DescribeAdapter(byPath[selectedAction.Path], policy); ok && len(adapter.OfficialCommand) > 0 {
+			report.Official = append(report.Official, officialCommandHint{
+				Path: selectedAction.Path, Argv: adapter.OfficialCommand,
+				Timeout: policy.Limits.CommandTimeout.String(),
+				Note:    "advisory only; never executed by janitor; run only for an exclusively owned, idle cache under an external timeout",
+			})
+		}
+	}
 	prior, err := engine.Items(ctx, "")
 	if err != nil {
 		return err
@@ -188,6 +225,15 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 			report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", a.Path, err))
 		}
 		report.Items = append(report.Items, item)
+	}
+	if opts.dryRun {
+		candidates := make([]core.Entry, 0, len(report.Items))
+		for _, item := range report.Items {
+			if item.State == core.CleanupPrepared {
+				candidates = append(candidates, item.Entry)
+			}
+		}
+		addReclaimEstimate(ctx, &report, candidates, policy.Limits.DeepSizeMaxEntries)
 	}
 	if err := writeCleanup(e.stdout, format, report); err != nil {
 		return err
@@ -258,6 +304,7 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 		return fmt.Errorf("no receipt %s", opts.cleanupID)
 	}
 	report := cleanupReport{ID: opts.cleanupID, Mode: "expiry", DryRun: opts.dryRun, Items: []core.CleanupItem{}, Errors: []string{}}
+	eligible := make([]core.Entry, 0)
 	for _, item := range items {
 		if item.State == core.CleanupInvestigate {
 			if opts.dryRun {
@@ -292,7 +339,15 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 		if err != nil {
 			report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", item.Source, err))
 		}
+		if opts.dryRun && err == nil {
+			entry := item.Entry
+			entry.Path = item.Destination
+			eligible = append(eligible, entry)
+		}
 		report.Items = append(report.Items, item)
+	}
+	if opts.dryRun {
+		addReclaimEstimate(ctx, &report, eligible, policy.Limits.DeepSizeMaxEntries)
 	}
 	if err := writeCleanup(out, format, report); err != nil {
 		return err
@@ -308,12 +363,29 @@ func pathContains(parent, child string) bool {
 	return err == nil && rel != ".." && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+func addReclaimEstimate(ctx context.Context, report *cleanupReport, entries []core.Entry, limit int) {
+	if len(entries) == 0 {
+		return
+	}
+	estimate, err := action.EstimateReclaim(ctx, entries, limit)
+	if err != nil {
+		report.EstimateError = err.Error()
+		return
+	}
+	report.Estimate = &estimate
+}
+
 func writeCleanup(out io.Writer, format output.Format, report cleanupReport) error {
 	if format == output.FormatJSON {
 		return output.WriteJSON(out, report.Mode, report)
 	}
 	if _, err := fmt.Fprintf(out, "cleanup: %s\nmode: %s\ndry run: %t\n", report.ID, report.Mode, report.DryRun); err != nil {
 		return err
+	}
+	for _, hint := range report.Official {
+		if _, err := fmt.Fprintf(out, "  official maintenance (not executed): %q; max runtime if run: %s; %s\n", hint.Argv, hint.Timeout, hint.Note); err != nil {
+			return err
+		}
 	}
 	for _, item := range report.Items {
 		if _, err := fmt.Fprintf(out, "  %s %s -> %s (%s)\n", item.ActionID, item.Source, item.Destination, item.State); err != nil {
@@ -322,6 +394,15 @@ func writeCleanup(out io.Writer, format output.Format, report cleanupReport) err
 	}
 	for _, reason := range report.Errors {
 		if _, err := fmt.Fprintf(out, "  refused: %s\n", reason); err != nil {
+			return err
+		}
+	}
+	if report.Estimate != nil {
+		if _, err := fmt.Fprintf(out, "  expected reclaim after deletion: %d allocated byte(s) (%d externally hardlinked inode(s) excluded; conditional on safety revalidation)\n", report.Estimate.Bytes, report.Estimate.SharedInodes); err != nil {
+			return err
+		}
+	} else if report.EstimateError != "" {
+		if _, err := fmt.Fprintf(out, "  reclaim estimate unavailable: %s\n", report.EstimateError); err != nil {
 			return err
 		}
 	}

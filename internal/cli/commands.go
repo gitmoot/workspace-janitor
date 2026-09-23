@@ -112,15 +112,16 @@ func explainCommand() *command {
 		},
 	}
 }
-
 func applyCommand() *command {
 	return &command{
 		name:    "apply",
-		usage:   "janitor apply --quarantine [--plan ID] --confirm --dry-run=false | janitor apply --expire [--cleanup ID] --confirm --dry-run=false",
-		summary: "Quarantine approved plan actions or inspect expired receipts",
-		long:    "Dry-run is the default. Quarantine is reversible; expiry requires policy opt-in, a separate invocation, and a fresh safety evaluation.",
+		usage:   "janitor apply (--quarantine | --expire | --prune --action ID) [flags]",
+		summary: "Preview or perform approved cleanup, expiry, or official dedicated-cache pruning",
+		long:    "Dry-run is the default. Quarantine is reversible; expiry needs policy opt-in. Official prune is irreversible and requires an approved action, an explicitly dedicated cache, a configured executable, confirmation, and a bounded runtime.",
 		register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
 			opts := applyOptions{dryRun: true}
+			fs.BoolVar(&opts.prune, "prune", false, "run an approved provider command for an explicitly dedicated cache")
+			fs.StringVar(&opts.actionID, "action", "", "approved action ID (required for --prune)")
 			fs.StringVar(&opts.planID, "plan", "", "stored plan id (default: latest)")
 			fs.StringVar(&opts.cleanupID, "cleanup", "", "expiry scan restricted to one receipt id")
 			fs.BoolVar(&opts.quarantine, "quarantine", false, "move approved actions into quarantine")

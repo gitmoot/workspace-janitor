@@ -85,6 +85,31 @@ func (e *Engine) Prepare(ctx context.Context, item core.CleanupItem) (core.Clean
 	return item, nil
 }
 
+// PreflightOfficial reruns the complete safety decision immediately before a
+// provider-owned prune. An approved plan alone is never mutation permission.
+func (e *Engine) PreflightOfficial(ctx context.Context, entry core.Entry, action core.Action) error {
+	if action.Kind != core.ActionDeleteCandidate || action.Path != entry.Path ||
+		entry.Kind != core.EntryKindDirectory || entry.Git != nil {
+		return fmt.Errorf("official prune requires an exact approved cache directory, not a repository")
+	}
+	handle, err := safety.Open(entry.Path)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+	verdict := safety.Revalidate(ctx, safety.RevalidateInput{
+		Planned: entry, Action: action, Policy: e.Policy,
+		Now: e.now(), Handle: handle,
+		Recollect: func(ctx context.Context, path string) (core.Entry, error) {
+			return e.recollectWithSize(ctx, path, entry.SizeIsDeep)
+		},
+	})
+	if !verdict.Allows(action.Kind) {
+		return fmt.Errorf("official prune refused %s: %s (%v)", entry.Path, verdict.Summary(), verdict.Protections)
+	}
+	return nil
+}
+
 // Quarantine moves one prepared item, with a fresh complete safety verdict.
 func (e *Engine) Quarantine(ctx context.Context, item core.CleanupItem) (core.CleanupItem, error) {
 	if item.State != core.CleanupPrepared {
@@ -104,7 +129,10 @@ func (e *Engine) Quarantine(ctx context.Context, item core.CleanupItem) (core.Cl
 	target := safety.ResolveTarget(filepath.Dir(item.Destination))
 	verdict := safety.Revalidate(ctx, safety.RevalidateInput{
 		Planned: item.Entry, Action: item.Action, Policy: e.Policy,
-		Target: &target, Now: e.now(), Handle: handle, Recollect: e.recollect,
+		Target: &target, Now: e.now(), Handle: handle,
+		Recollect: func(ctx context.Context, path string) (core.Entry, error) {
+			return e.recollectWithSize(ctx, path, item.Entry.SizeIsDeep)
+		},
 	})
 	if !verdict.Allows(item.Action.Kind) {
 		return item, fmt.Errorf("revalidation refused %s: %s", item.Source, verdict.Summary())
