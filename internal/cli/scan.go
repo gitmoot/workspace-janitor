@@ -23,11 +23,13 @@ type scanOptions struct {
 	maxDepth     int
 	deepSize     bool
 	noGit        bool
+	noDeepSize   bool
 	noProcesses  bool
 	noServices   bool
 	noPersist    bool
 	noPriorScan  bool
 	entriesLimit int
+	recordScanID *string
 }
 
 // scanReport is the `scan` result contract.
@@ -138,7 +140,7 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 	result, err := collect.Run(ctx, collect.Options{
 		Roots:           roots,
 		Limits:          collectLimits(policy, opts),
-		DeepSize:        opts.deepSize || policy.Collectors.DeepSize,
+		DeepSize:        !opts.noDeepSize && (opts.deepSize || policy.Collectors.DeepSize),
 		Git:             policy.Collectors.Git && !opts.noGit,
 		Processes:       policy.Collectors.Processes && !opts.noProcesses,
 		Services:        policy.Collectors.Services && !opts.noServices,
@@ -214,6 +216,9 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 			return err
 		}
 		report.Persisted = true
+		if opts.recordScanID != nil {
+			*opts.recordScanID = scan.ID
+		}
 	}
 
 	if format == output.FormatJSON {

@@ -18,6 +18,9 @@ default.
 | Command | State |
 | --- | --- |
 | `janitor scan` | implemented (reports safety verdicts) |
+| `janitor watch` | Linux top-level watcher; inventory and guidance only |
+| `janitor cycle` | Linux daily one-shot metadata scan, weekly deep scan when due, disk alerts; expiry opt-in |
+| `janitor service generate` | writes user service/timer files to an explicit directory; never installs them |
 | `janitor status` | implemented |
 | `janitor policy check` | implemented |
 | `janitor doctor` | implemented |
@@ -272,6 +275,50 @@ Changed or newly referenced items enter `investigate`; they are not deleted.
 Once the blocking evidence is resolved, a separately confirmed expiry retries
 the full safety evaluation before returning an `investigate` item to quarantine
 and considering deletion. It can also be restored while under investigation.
+
+### Prevention without autonomous cleanup
+
+`janitor watch` monitors only the immediate children of configured roots. It
+coalesces create, rename, and delete events into bounded whole-root inventory
+scans; no event directly moves or deletes anything. A newly discovered review
+clone gets canonical-location guidance, not relocation. Newly created
+directories are revisited after two seconds so a clone whose `.git` metadata
+arrives after its directory can receive guidance. Startup and inotify overflow
+trigger full reconciliation; partial collector results remain unknown rather
+than proving a deletion. Event-triggered scans are metadata-only and never
+advance the deep-scan clock.
+
+`janitor cycle` is a one-shot timer target: each invocation records a metadata
+scan, or a deep scan if `prevention.deep_interval` has elapsed since the last
+successful scheduled deep scan (default seven days). `collectors.deep_size`
+controls ad-hoc `scan`, not the scheduled `cycle`: a due cycle explicitly runs
+deep-size collection even when that collector is false in policy. To avoid
+scheduled deep scans, do not install the timer; use `janitor scan --no-deep-size`
+for metadata-only inventory. `prevention.min_free_bytes`
+or `prevention.min_free_percent` triggers a per-filesystem alert. It reports
+potential physical bytes by reclaimable, protected, and unknown class; a
+bounded or uncertain estimate is **unmeasured**, not zero. Alerts are
+deduplicated per filesystem by a durable SQLite cooldown, default 24 hours.
+Only configured inventory roots are measured.
+
+Automatic expiry is **off** by default. To opt in, set both
+`retention.delete_enabled: true` and `prevention.auto_expire: true`. The cycle
+then calls the same confirmed `apply --expire` path as an operator: process
+lock, fresh reference collection, original-path and receipt checks, and
+anchored deletion. It reports each expiry outcome; an expired timestamp alone
+is not permission. All confirmed apply and restore operations share one
+cross-process lock on Linux; a second process fails closed instead of racing.
+On other platforms confirmed apply remains unsupported, while confirmed
+restore retains its prior behavior without this Linux-only lock.
+
+`janitor service generate --output /absolute/private/directory --binary
+/absolute/janitor` writes three units without installing or enabling them:
+`janitor-watch.service`, `janitor-cycle.service`, and
+`janitor-cycle.timer` (`OnCalendar=daily`). Review the generated paths and
+policy before installing them yourself. Both generated services clear
+`OPENROUTER_API_KEY` and request `IPAddressDeny=any`; watch and cycle never
+call the model. The service restriction is an OS-level network boundary when
+systemd enforces it; direct manual invocations do not acquire that sandbox.
 
 ### Jev advice
 

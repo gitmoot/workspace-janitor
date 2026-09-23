@@ -16,6 +16,9 @@ func rootCommand() *command {
 		name:  buildinfo.Name,
 		usage: "janitor [global flags] <command> [flags] [arguments]",
 		subcommands: []*command{
+			watchCommand(),
+			cycleCommand(),
+			serviceCommand(),
 			scanCommand(),
 			planCommand(),
 			explainCommand(),
@@ -130,6 +133,29 @@ func applyCommand() *command {
 			fs.BoolVar(&opts.confirm, "confirm", false, "required for every filesystem mutation")
 			return func(ctx context.Context, e *env, args []string) error { return runApply(ctx, e, args, opts) }
 		},
+	}
+}
+
+func watchCommand() *command {
+	return &command{
+		name: "watch", usage: "janitor watch",
+		summary:  "Watch configured top-level roots and reconcile bounded inventory snapshots; never clean up",
+		register: func(*flag.FlagSet) func(context.Context, *env, []string) error { return runWatch },
+	}
+}
+func cycleCommand() *command {
+	return &command{
+		name: "cycle", usage: "janitor cycle",
+		summary:  "Run the daily offline inventory, weekly deep scan when due, disk alerts, and opt-in expiry",
+		register: func(*flag.FlagSet) func(context.Context, *env, []string) error { return runCycle },
+	}
+}
+
+func serviceCommand() *command {
+	return &command{
+		name: "service", usage: "janitor service generate --output DIR --binary ABSOLUTE_PATH",
+		summary:     "Generate but do not install Linux user service and timer files",
+		subcommands: []*command{serviceGenerateCommand()},
 	}
 }
 

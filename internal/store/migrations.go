@@ -213,6 +213,21 @@ var migrations = []migration{
 			 BEGIN SELECT RAISE(ABORT, 'cleanup events are immutable'); END`,
 		},
 	},
+	{
+		version: 6,
+		name:    "prevention_state",
+		statements: []string{
+			`CREATE TABLE disk_alerts (
+				filesystem_key  TEXT PRIMARY KEY,
+				last_emitted_ns INTEGER NOT NULL,
+				summary         TEXT NOT NULL
+			)`,
+			`CREATE TABLE prevention_state (
+				key               TEXT PRIMARY KEY,
+				last_completed_ns INTEGER NOT NULL
+			)`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.

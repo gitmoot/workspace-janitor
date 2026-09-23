@@ -118,6 +118,28 @@ func TestCacheBoundsRejectNegativeValues(t *testing.T) {
 	}
 }
 
+func TestPreventionDefaultsAndInvalidBounds(t *testing.T) {
+	paths := fixturePaths(t)
+	policy, err := parse(t, paths, "roots:\n  - path: ~/repos\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Prevention.DeepInterval.Duration() != 7*24*time.Hour ||
+		policy.Prevention.AlertInterval.Duration() != 24*time.Hour ||
+		policy.Prevention.AutoExpire {
+		t.Fatalf("old policy enabled unexpected background mutation or lost cadence: %+v", policy.Prevention)
+	}
+	_, err = parse(t, paths, "prevention:\n  deep_interval: 0s\n  alert_interval: 0s\n  min_free_bytes: -1\n  min_free_percent: 101\n")
+	if err == nil {
+		t.Fatal("invalid prevention thresholds were accepted")
+	}
+	for _, field := range []string{"prevention.deep_interval", "prevention.alert_interval", "prevention.min_free_bytes", "prevention.min_free_percent"} {
+		if !strings.Contains(err.Error(), field) {
+			t.Errorf("validation did not identify %s: %v", field, err)
+		}
+	}
+}
+
 func TestParsePolicyAppliesDefaultsForOmittedKeys(t *testing.T) {
 	paths := fixturePaths(t)
 	policy, err := parse(t, paths, "roots:\n  - path: ~/repos\n    max_depth: 3\n")
