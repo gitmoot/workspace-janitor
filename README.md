@@ -4,8 +4,9 @@ Safe, Jev-assisted workspace hygiene for developer and AI-agent machines.
 
 `janitor` inventories what is on a machine, applies deterministic safety
 rules, and produces reversible cleanup plans. It is not an autonomous
-deleter: nothing is mutated without an explicit, confirmed apply step, and
-deletion is always preceded by quarantine.
+deleter: generic deletion requires quarantine and a separate confirmed
+expiry; a dedicated provider cache may instead use an explicitly approved,
+confirmed official prune.
 
 ## Status
 
@@ -24,6 +25,7 @@ default.
 | `janitor plan` | implemented |
 | `janitor explain` | implemented |
 | `janitor apply --quarantine` | implemented (dry-run by default) |
+| `janitor apply --prune --action <id>` | implemented for explicitly dedicated uv/npm caches (dry-run by default, Linux only) |
 | `janitor apply --expire` | implemented (deletion disabled by default) |
 | `janitor restore <cleanup-id>` | implemented (preview by default) |
 
@@ -39,13 +41,14 @@ no decisions and mutates nothing.
 | `git` | common dir, remote, branch, HEAD, dirty count, stashes, upstream, worktree metadata, locks | per-command timeout, read-only verbs only |
 | `processes` | `cwd` and `exe` links plus `comm` from procfs | directory-entry bound |
 | `agents` | registered-agent directories from an adapter | command timeout per adapter |
+| `gitmoot` | read-only Gitmoot job, task, and cleanup-obligation ledger for exact paths | command timeout, entry bound; missing or uncertain state fails closed |
 | `services` | systemd `WorkingDirectory`/`Exec*`, cron command paths, PM2 `pm_cwd`/`pm_exec_path` | per-file byte bound, per-directory entries |
 
 Three properties hold across all of them:
 
-- **A default scan is top-level and metadata-only.** No file contents are
-  read and no directory is walked recursively unless `--deep-size` asks for
-  it.
+- **Filesystem discovery is top-level and metadata-only by default.** No
+  discovered directory is walked recursively unless `--deep-size` asks for it.
+  Reference collectors may read local Gitmoot and service metadata.
 - **Unknown state fails closed.** A collector that cannot observe something
   records `unknown:` evidence and, where the safety contract requires it, a
   blocking protection. A Git command that times out protects the path; it
@@ -167,6 +170,17 @@ janitor --format json scan     # machine-readable inventory and collector report
 saying so — `delete_candidate`. The built-in policy never recommends a
 direct deletion.
 
+Provider adapters recognize selected uv, npm, pnpm, Bun, Gradle, Go,
+Playwright, and Puppeteer cache roots, plus project-local virtualenvs,
+dependencies, and derived outputs. Plans name the reinstall or rebuild cost.
+Shared provider caches default to `investigate`; a mutating recommendation
+needs an exact operator cache rule. `max_bytes` applies only above the stated
+logical byte count; `ttl` requires the newest content to be old enough. Either
+bound requires a complete `scan --deep-size` for directories. Unmeasured or
+partial evidence is not treated as expired. Gitmoot-managed paths stay under
+Gitmoot's cleanup ledger: even a final owner with a live obligation is only
+reclaimable through Gitmoot, never by a generic janitor action.
+
 Rules run in precedence order, and the first tier that has an opinion
 decides:
 
@@ -229,6 +243,25 @@ links remain valid. Renames preserve item permissions, timestamps, and symlink
 identity; no destination or restored source is overwritten.
 A prepared receipt that never moved can be cancelled with the same restore
 command, releasing its source for a new plan.
+
+### Official provider pruning
+
+An approved `delete_candidate` for an exact, dedicated cache may use
+`janitor apply --prune --action <id>` instead of generic quarantine. This
+irreversible operation is limited to the configured absolute `uv` or `npm`
+binary on Linux. Set `dedicated: true` and `official_binary` only when the
+cache is exclusively owned and idle. Preview is the default; confirmed
+execution requires `--confirm --dry-run=false`, prints the exact argv before
+execution, takes a lock, journals the attempt and outcome, and enforces
+`limits.command_timeout` on the provider process group. The provider receives
+offline settings and no inherited credential environment (not a network
+isolation boundary); janitor does not infer ownership from a cache-shaped
+path. Other provider commands are guidance only.
+
+Quarantine dry-runs show an expected physical reclaim estimate where it can
+be measured. Sparse holes, external hardlinks, and nested selected roots do
+not count as independently reclaimable bytes; unavailable estimates are
+reported as unavailable, not zero.
 
 Expiry is not deletion. To explicitly enable it, set
 `retention.delete_enabled: true`, wait for the item's retention period, then

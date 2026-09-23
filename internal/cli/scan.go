@@ -136,14 +136,16 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 	}
 
 	result, err := collect.Run(ctx, collect.Options{
-		Roots:          roots,
-		Limits:         collectLimits(policy, opts),
-		DeepSize:       opts.deepSize || policy.Collectors.DeepSize,
-		Git:            policy.Collectors.Git && !opts.noGit,
-		Processes:      policy.Collectors.Processes && !opts.noProcesses,
-		Services:       policy.Collectors.Services && !opts.noServices,
-		ProcRoot:       policy.Collectors.ProcRoot,
-		ProjectMarkers: policy.Classification.ProjectMarkers,
+		Roots:           roots,
+		Limits:          collectLimits(policy, opts),
+		DeepSize:        opts.deepSize || policy.Collectors.DeepSize,
+		Git:             policy.Collectors.Git && !opts.noGit,
+		Processes:       policy.Collectors.Processes && !opts.noProcesses,
+		Services:        policy.Collectors.Services && !opts.noServices,
+		GitmootHome:     policy.Gitmoot.Home,
+		GitmootDatabase: policy.Gitmoot.Database,
+		ProcRoot:        policy.Collectors.ProcRoot,
+		ProjectMarkers:  policy.Classification.ProjectMarkers,
 		ServiceSources: collect.ServiceSources{
 			SystemdDirs: policy.Collectors.SystemdDirs,
 			CronPaths:   policy.Collectors.CronPaths,

@@ -217,26 +217,29 @@ func (p Protection) Validate(field string) FieldErrors {
 
 // Entry is one discovered path together with everything known about it.
 type Entry struct {
-	ContractVersion int             `json:"contract_version"`
-	Path            string          `json:"path"`
-	Root            string          `json:"root"`
-	Kind            EntryKind       `json:"kind"`
-	FilesystemID    FilesystemID    `json:"filesystem_id"`
-	Ownership       Ownership       `json:"ownership"`
-	SizeBytes       int64           `json:"size_bytes"`
-	SizeIsDeep      bool            `json:"size_is_deep"`
-	ModifiedAt      time.Time       `json:"modified_at"`
-	AccessedAt      time.Time       `json:"accessed_at"`
-	SymlinkTarget   string          `json:"symlink_target,omitempty"`
-	CanonicalPath   string          `json:"canonical_path,omitempty"`
-	Destination     string          `json:"destination,omitempty"`
-	Fingerprint     string          `json:"fingerprint,omitempty"`
-	Class           ArtifactClass   `json:"class"`
-	Git             *GitState       `json:"git,omitempty"`
-	Evidence        []Evidence      `json:"evidence,omitempty"`
-	Protections     []Protection    `json:"protections,omitempty"`
-	Recommendation  *Recommendation `json:"recommendation,omitempty"`
-	ObservedAt      time.Time       `json:"observed_at"`
+	ContractVersion int          `json:"contract_version"`
+	Path            string       `json:"path"`
+	Root            string       `json:"root"`
+	Kind            EntryKind    `json:"kind"`
+	FilesystemID    FilesystemID `json:"filesystem_id"`
+	Ownership       Ownership    `json:"ownership"`
+	SizeBytes       int64        `json:"size_bytes"`
+	SizeIsDeep      bool         `json:"size_is_deep"`
+	ModifiedAt      time.Time    `json:"modified_at"`
+	// LatestModifiedAt is set only by a complete deep walk. A cache TTL
+	// cannot infer subtree age from the directory inode's mtime alone.
+	LatestModifiedAt time.Time       `json:"latest_modified_at,omitempty"`
+	AccessedAt       time.Time       `json:"accessed_at"`
+	SymlinkTarget    string          `json:"symlink_target,omitempty"`
+	CanonicalPath    string          `json:"canonical_path,omitempty"`
+	Destination      string          `json:"destination,omitempty"`
+	Fingerprint      string          `json:"fingerprint,omitempty"`
+	Class            ArtifactClass   `json:"class"`
+	Git              *GitState       `json:"git,omitempty"`
+	Evidence         []Evidence      `json:"evidence,omitempty"`
+	Protections      []Protection    `json:"protections,omitempty"`
+	Recommendation   *Recommendation `json:"recommendation,omitempty"`
+	ObservedAt       time.Time       `json:"observed_at"`
 }
 
 // Protected reports whether any blocking protection applies. Callers must
@@ -263,6 +266,9 @@ func (e *Entry) Normalize() {
 		e.Kind = EntryKindUnknown
 	}
 	e.ModifiedAt = e.ModifiedAt.UTC()
+	if !e.LatestModifiedAt.IsZero() {
+		e.LatestModifiedAt = e.LatestModifiedAt.UTC()
+	}
 	e.AccessedAt = e.AccessedAt.UTC()
 	e.ObservedAt = e.ObservedAt.UTC()
 	for i := range e.Evidence {

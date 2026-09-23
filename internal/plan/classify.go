@@ -50,6 +50,10 @@ func Classify(entry core.Entry, policy config.Policy) Classification {
 		return Classification{core.ClassBackup, "classify.backup",
 			fmt.Sprintf("%s matches a backup or archive name", name)}
 	}
+	if signal := gitmootSignal(entry); signal != "" {
+		return Classification{core.ClassOperationalTool, "classify.gitmoot_managed",
+			fmt.Sprintf("Gitmoot lifecycle evidence %s marks this as managed, not generic cleanup", signal)}
+	}
 	if entry.Git != nil {
 		if entry.Git.WorktreeOf != "" {
 			return Classification{core.ClassTaskWorktree, "classify.git_worktree",
@@ -62,11 +66,18 @@ func Classify(entry core.Entry, policy config.Policy) Classification {
 		return Classification{core.ClassTaskWorktree, "classify.worktree_name",
 			fmt.Sprintf("%s matches a task worktree name", name)}
 	}
-	if matchAny(name, rules.GeneratedNames) {
+	if adapter, ok := DescribeAdapter(entry, policy); ok {
+		reason := fmt.Sprintf("%s is the selected %s root; %s", entry.Path, adapter.Provider, adapter.Rebuild)
+		if len(adapter.OfficialCommand) != 0 {
+			reason += fmt.Sprintf("; official argv (display only, not executed): %q", adapter.OfficialCommand)
+		}
+		return Classification{adapter.Class, "classify.adapter:" + adapter.Provider, reason}
+	}
+	if selectedGenericRoot(entry) && matchAny(name, rules.GeneratedNames) {
 		return Classification{core.ClassGeneratedArtifact, "classify.generated",
 			fmt.Sprintf("%s matches a generated artifact name", name)}
 	}
-	if matchAny(name, rules.CacheNames) {
+	if selectedGenericRoot(entry) && matchAny(name, rules.CacheNames) {
 		return Classification{core.ClassCache, "classify.cache_name",
 			fmt.Sprintf("%s matches a cache name", name)}
 	}
@@ -76,6 +87,26 @@ func Classify(entry core.Entry, policy config.Policy) Classification {
 	}
 	return Classification{core.ClassUnknown, "classify.unknown",
 		"no built-in classification matched"}
+}
+
+// A policy name is not evidence that a same-named directory buried inside
+// another tree is its independently reclaimable output root. Provider-specific
+// nested layouts are handled by DescribeAdapter instead.
+func selectedGenericRoot(entry core.Entry) bool {
+	return entry.Kind == core.EntryKindDirectory &&
+		core.IsCanonicalPath(entry.Path) && core.IsCanonicalPath(entry.Root) &&
+		(entry.Path == entry.Root || filepath.Dir(entry.Path) == entry.Root)
+}
+
+// gitmootSignal identifies lifecycle-managed entries from attached evidence.
+func gitmootSignal(entry core.Entry) string {
+	for _, evidence := range entry.Evidence {
+		switch evidence.Signal {
+		case "gitmoot:final_reclaimable", "gitmoot:pinned", "unknown:gitmoot":
+			return evidence.Signal
+		}
+	}
+	return ""
 }
 
 // hasProjectMarker reports whether a collector recorded a project marker

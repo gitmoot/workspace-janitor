@@ -15,7 +15,12 @@ import (
 // recollect refuses incomplete reference observation, rather than interpreting
 // a partial or skipped collector as proof that nobody uses a path.
 func (e *Engine) recollect(ctx context.Context, path string) (core.Entry, error) {
+	return e.recollectWithSize(ctx, path, false)
+}
+
+func (e *Engine) recollectWithSize(ctx context.Context, path string, deep bool) (core.Entry, error) {
 	opts := e.Collect
+	opts.DeepSize = deep
 	// Resolve a live source symlink only to check containment; quarantine
 	// snapshots never follow links because a relative target may be absent
 	// until restore. In both cases the filesystem move operates on the link.
@@ -37,6 +42,10 @@ func (e *Engine) recollect(ctx context.Context, path string) (core.Entry, error)
 			// its entry and blocked by the safety engine.
 			if report.Status != core.CollectorRan && report.Status != core.CollectorPartial {
 				return core.Entry{}, fmt.Errorf("%s Git evidence incomplete: %s", path, report.Detail)
+			}
+		case collect.CollectorGitmoot:
+			if report.Status != core.CollectorRan && report.Status != core.CollectorSkipped {
+				return core.Entry{}, fmt.Errorf("%s Gitmoot evidence incomplete: %s", path, report.Detail)
 			}
 		case collect.CollectorAgents:
 			if len(opts.AgentSources) != 0 && report.Status != core.CollectorRan {
@@ -128,6 +137,12 @@ func (e *Engine) Eligible(ctx context.Context, item core.CleanupItem) error {
 	original := safety.Evaluate(safety.Input{Entry: mirror, Policy: e.Policy, Now: e.now()})
 	if !original.Allows(core.ActionDeleteCandidate) {
 		return fmt.Errorf("original source safety refused: %s", original.Summary())
+	}
+	// Inspect the full tree for mount boundaries before deleting any child.
+	// This streams directory names without the estimator's entry cap or
+	// per-inode accounting: large valid receipts must still be eligible.
+	if err := verifyDeletionTree(ctx, item.Destination, planned.FilesystemID); err != nil {
+		return fmt.Errorf("deletion footprint is unproven: %w", err)
 	}
 	return nil
 }

@@ -43,6 +43,7 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 			device:          entry.FilesystemID.Device,
 			maxDepth:        opts.Limits.DeepSizeMaxDepth,
 			budget:          budget,
+			newest:          entry.ModifiedAt,
 		}
 		sum.walk(ctx, entry.Path, 1)
 		budget = sum.budget
@@ -50,6 +51,9 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 		report.Recorded++
 
 		entry.SizeBytes = sum.bytes
+		if !sum.partial() {
+			entry.LatestModifiedAt = sum.newest
+		}
 		entry.SizeIsDeep = true
 		detail := fmt.Sprintf("%d byte(s) across %d entrie(s)", sum.bytes, sum.visited)
 		if sum.partial() {
@@ -87,6 +91,7 @@ type sizeSum struct {
 
 	bytes    int64
 	visited  int
+	newest   time.Time
 	bounded  bool
 	failures int
 	reason   string
@@ -137,12 +142,16 @@ func (s *sizeSum) walk(ctx context.Context, dir string, depth int) {
 		}
 		s.budget--
 		s.visited++
+		if info.ModTime().After(s.newest) {
+			s.newest = info.ModTime()
+		}
 		s.bytes += info.Size()
 
 		if info.Mode()&fs.ModeSymlink != 0 || !info.IsDir() {
 			continue
 		}
 		if stat := statOf(info); stat.Known && stat.Device != s.device && !s.crossFilesystem {
+			s.bounded = true
 			s.note(fmt.Sprintf("stopped at mount boundary %s", path))
 			continue
 		}

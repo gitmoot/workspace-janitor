@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -98,6 +99,20 @@ func proposals(entry core.Entry, class Classification, policy config.Policy, ver
 			Reason:      fmt.Sprintf("%s overlaps the protected path %s", entry.Path, protected),
 		})
 	}
+	if policy.Gitmoot.Home != "" && core.PathsOverlap(entry.Path, policy.Gitmoot.Home) {
+		out = append(out, Proposal{
+			Rule: "policy.gitmoot_home", Tier: TierProtected, Kind: core.ActionKeep,
+			Specificity: len(policy.Gitmoot.Home),
+			Reason:      fmt.Sprintf("%s overlaps Gitmoot's managed home %s", entry.Path, policy.Gitmoot.Home),
+		})
+	}
+	if signal := gitmootSignal(entry); signal != "" {
+		out = append(out, Proposal{
+			Rule: "policy.gitmoot_managed", Tier: TierProtected, Kind: core.ActionKeep,
+			Specificity: len(entry.Path),
+			Reason:      fmt.Sprintf("Gitmoot lifecycle evidence %s requires managed review, not generic filesystem cleanup", signal),
+		})
+	}
 
 	canonical, hasCanonical := canonicalRootFor(policy, class.Class)
 	switch {
@@ -131,10 +146,11 @@ func proposals(entry core.Entry, class Classification, policy config.Policy, ver
 		if !core.PathWithin(entry.Path, rule.Path) {
 			continue
 		}
+		kind, reason := boundedCacheAction(entry, rule)
 		out = append(out, Proposal{
-			Rule: "policy.cache:" + rule.Name, Tier: TierExplicit, Kind: rule.Action,
+			Rule: "policy.cache:" + rule.Name, Tier: TierExplicit, Kind: kind,
 			Retention: rule.Retention, Specificity: len(rule.Path),
-			Reason: fmt.Sprintf("cache rule %q covers %s", rule.Name, rule.Path),
+			Reason: fmt.Sprintf("cache rule %q covers %s; %s", rule.Name, rule.Path, reason),
 		})
 	}
 
@@ -158,6 +174,36 @@ func proposals(entry core.Entry, class Classification, policy config.Policy, ver
 		return out[i].Rule < out[j].Rule
 	})
 	return out
+}
+
+// boundedCacheAction uses only inventory evidence and the scan observation
+// time, never the planner's wall clock. Zero bounds preserve legacy rules.
+func boundedCacheAction(entry core.Entry, rule config.CacheRule) (core.ActionKind, string) {
+	if rule.MaxBytes == 0 && rule.TTL == 0 {
+		return rule.Action, "no size or age bound is configured"
+	}
+	if entry.Kind != core.EntryKindDirectory && entry.Kind != core.EntryKindFile {
+		return core.ActionInvestigate, "bounded cache cleanup requires a regular file or a completely sized directory"
+	}
+	if entry.Kind == core.EntryKindDirectory && !entry.SizeIsDeep {
+		return core.ActionInvestigate, "complete deep-size evidence is required for bounded directory cleanup"
+	}
+	modified := entry.ModifiedAt
+	if entry.Kind == core.EntryKindDirectory {
+		modified = entry.LatestModifiedAt
+	}
+	if rule.TTL > 0 && (modified.IsZero() || entry.ObservedAt.IsZero() || modified.After(entry.ObservedAt)) {
+		return core.ActionInvestigate, "complete latest modification time and observation time are required for ttl"
+	}
+	if rule.MaxBytes > 0 && entry.SizeBytes <= rule.MaxBytes {
+		return core.ActionKeep, fmt.Sprintf("size %d bytes is at or below max_bytes %d", entry.SizeBytes, rule.MaxBytes)
+	}
+	if rule.TTL > 0 {
+		if age := entry.ObservedAt.Sub(modified); age < rule.TTL.Duration() {
+			return core.ActionKeep, fmt.Sprintf("newest content age %s is below ttl %s", age, rule.TTL.Duration())
+		}
+	}
+	return rule.Action, fmt.Sprintf("complete evidence meets max_bytes %d and ttl %s at observation time", rule.MaxBytes, rule.TTL.Duration())
 }
 
 // builtinProposal is the default action for a class.
@@ -186,6 +232,13 @@ func builtinProposal(entry core.Entry, class Classification, policy config.Polic
 	case core.ClassCache:
 		base.Rule, base.Kind = "builtin.cache", core.ActionQuarantine
 		base.Retention = policy.Retention.Default
+		if strings.HasPrefix(class.Rule, "classify.adapter:") {
+			// Shared provider stores are not equivalent to an isolated
+			// project output. The operator must select and bound one.
+			base.Kind = core.ActionInvestigate
+			base.Retention = core.RetentionNone
+			base.Reason += "; shared provider caches need explicit scoped policy and review"
+		}
 	default:
 		base.Rule, base.Kind, base.Tier = "builtin.unknown", core.ActionInvestigate, TierFallback
 		base.Reason = "nothing classified this path, so it is left for a human to look at"

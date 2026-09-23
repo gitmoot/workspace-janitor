@@ -105,6 +105,19 @@ func TestParsePolicyKeepsExplicitZeroValues(t *testing.T) {
 	}
 }
 
+func TestCacheBoundsRejectNegativeValues(t *testing.T) {
+	paths := fixturePaths(t)
+	_, err := parse(t, paths, "caches:\n  - name: uv\n    path: ~/repo/.uv-cache\n    max_bytes: -1\n    ttl: -1h\n")
+	if err == nil {
+		t.Fatal("negative cache thresholds were accepted")
+	}
+	for _, field := range []string{"caches[0].max_bytes", "caches[0].ttl"} {
+		if !strings.Contains(err.Error(), field) {
+			t.Errorf("error %q does not identify %s", err, field)
+		}
+	}
+}
+
 func TestParsePolicyAppliesDefaultsForOmittedKeys(t *testing.T) {
 	paths := fixturePaths(t)
 	policy, err := parse(t, paths, "roots:\n  - path: ~/repos\n    max_depth: 3\n")
@@ -288,7 +301,7 @@ func TestParsePolicyProtectsConfiguredQuarantineDir(t *testing.T) {
 func TestDefaultPolicyProtectsStateAndQuarantine(t *testing.T) {
 	paths := fixturePaths(t)
 	policy := DefaultPolicy(paths)
-	for _, want := range []string{paths.StateDir, paths.QuarantineDir} {
+	for _, want := range []string{paths.StateDir, paths.QuarantineDir, filepath.Join(paths.Home, ".gitmoot")} {
 		if !contains(policy.Protect.Paths, want) {
 			t.Errorf("default protections missing %q: %v", want, policy.Protect.Paths)
 		}
