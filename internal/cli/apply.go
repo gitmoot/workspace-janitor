@@ -94,6 +94,13 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	if err != nil {
 		return err
 	}
+	if !opts.dryRun {
+		unlock, err := lockApply(paths.StateDir)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
 	db, err := store.OpenExisting(ctx, paths.DatabaseFile)
 	if err != nil {
 		return err
@@ -263,6 +270,13 @@ func runRestore(ctx context.Context, e *env, args []string, confirm bool) error 
 	policy, err := e.loadPolicy()
 	if err != nil {
 		return err
+	}
+	if confirm {
+		unlock, err := lockApply(paths.StateDir)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 	}
 	db, err := store.OpenExisting(ctx, paths.DatabaseFile)
 	if err != nil {

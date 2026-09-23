@@ -41,6 +41,20 @@ retention:
   # a fresh complete safety evaluation, and a separate confirmed apply --expire.
   delete_enabled: false
 
+# Background prevention is read-only by default. Generate user units with
+# janitor service generate; this file never installs or starts them.
+prevention:
+  # The daily timer calls janitor cycle. After a successful scheduled deep
+  # scan, another is due seven days later; watch events stay metadata-only.
+  deep_interval: 168h
+  # Alert if either non-zero bound is crossed; zero disables that bound.
+  min_free_bytes: 0
+  min_free_percent: 10
+  alert_interval: 24h
+  # Requires retention.delete_enabled too. Expiry still uses the confirmed
+  # apply path and a fresh, complete second safety observation.
+  auto_expire: false
+
 # Where entries of a class are supposed to live. A primary project found
 # outside its canonical root is a relocation candidate, never a deletion
 # candidate.

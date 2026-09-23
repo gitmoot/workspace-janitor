@@ -241,6 +241,16 @@ type Safety struct {
 	AllowCrossFilesystemQuarantine bool `yaml:"allow_cross_filesystem_quarantine" json:"allow_cross_filesystem_quarantine"`
 }
 
+// Prevention configures read-only background scans and disk alerts. Expiry
+// remains a separate opt-in on top of retention.delete_enabled.
+type Prevention struct {
+	DeepInterval   Duration `yaml:"deep_interval" json:"deep_interval"`
+	MinFreeBytes   int64    `yaml:"min_free_bytes" json:"min_free_bytes"`
+	MinFreePercent int      `yaml:"min_free_percent" json:"min_free_percent"`
+	AlertInterval  Duration `yaml:"alert_interval" json:"alert_interval"`
+	AutoExpire     bool     `yaml:"auto_expire" json:"auto_expire"`
+}
+
 // Policy is the validated policy document.
 type Policy struct {
 	Version    int             `yaml:"version" json:"version"`
@@ -252,6 +262,7 @@ type Policy struct {
 	Collectors Collectors      `yaml:"collectors" json:"collectors"`
 	Safety     Safety          `yaml:"safety" json:"safety"`
 
+	Prevention     Prevention      `yaml:"prevention" json:"prevention"`
 	CanonicalRoots []CanonicalRoot `yaml:"canonical_roots" json:"canonical_roots"`
 	Classification Classification  `yaml:"classification" json:"classification"`
 	Ownership      Ownership       `yaml:"ownership" json:"ownership"`
@@ -341,6 +352,11 @@ func DefaultPolicy(p Paths) Policy {
 			MaxDirEntries:      5000,
 			DeepSizeMaxEntries: 200000,
 			DeepSizeMaxDepth:   16,
+		},
+		Prevention: Prevention{
+			DeepInterval:   Duration(7 * 24 * time.Hour),
+			MinFreePercent: 10,
+			AlertInterval:  Duration(24 * time.Hour),
 		},
 		Source:   "built-in defaults",
 		FromFile: false,
@@ -593,6 +609,19 @@ func (p *Policy) Validate() core.FieldErrors {
 			errs.Add(fmt.Sprintf("caches[%d].ttl", i), "must not be negative")
 		}
 	}
+	if p.Prevention.DeepInterval.Duration() <= 0 {
+		errs.Add("prevention.deep_interval", "must be greater than zero")
+	}
+	if p.Prevention.MinFreeBytes < 0 {
+		errs.Add("prevention.min_free_bytes", "must not be negative")
+	}
+	if p.Prevention.MinFreePercent < 0 || p.Prevention.MinFreePercent > 100 {
+		errs.Add("prevention.min_free_percent", "must be between 0 and 100")
+	}
+	if p.Prevention.AlertInterval.Duration() <= 0 {
+		errs.Add("prevention.alert_interval", "must be greater than zero")
+	}
+
 	if p.Jev.Enabled && p.Jev.Model == "" {
 		errs.Add("jev.model", "must be set when jev.enabled is true")
 	}
