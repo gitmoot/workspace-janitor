@@ -189,8 +189,8 @@ a conflict. File order is never consulted: rules sort by tier, then
 specificity, then name, so reordering a policy file cannot change a
 decision.
 
-A plan is bound to the scan, the evidence digest, the policy digest, the
-advisor, and any advice it applied, and is immutable once stored.
+A plan is bound to the scan, evidence digest, policy digest, advisor, and
+well-formed advice considered (even if rejected), and is immutable once stored.
 Re-planning unchanged inputs produces the same plan id and reuses the
 stored plan; using a plan whose evidence or policy has changed is refused.
 Approval is recorded beside the plan:

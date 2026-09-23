@@ -405,6 +405,39 @@ func TestAdvisorCanOnlyLowerRisk(t *testing.T) {
 	}
 }
 
+// A relocation could rank safer than a rule's quarantine, but the
+// advisor has no destination to supply. It must be rejected before
+// becoming an invalid plan action.
+func TestAdvisorCannotProposeRelocation(t *testing.T) {
+	entry := entryAt("/home/fixture/mystery")
+	policy := fixturePolicy()
+	policy.Caches = []config.CacheRule{{
+		Name: "mystery", Path: entry.Path,
+		Action: core.ActionQuarantine, Retention: core.Retention30Days,
+	}}
+	advisor := &stubAdvisor{name: "other", answers: map[string]core.Recommendation{
+		entry.Path: {
+			Action: core.ActionRelocate, Class: core.ClassCache,
+			Retention: core.RetentionNone, Confidence: 0.9,
+			Origin: core.OriginModel, Reasons: []string{"move this"}, DecidedAt: plannedAt,
+		},
+	}}
+	result := buildPlan(t, []core.Entry{entry}, policy, advisor)
+	action := actionFor(t, result, entry.Path)
+	if action.Kind != core.ActionQuarantine {
+		t.Errorf("action = %q, want the rules' quarantine", action.Kind)
+	}
+	found := false
+	for _, rejected := range action.Rejected {
+		if rejected.Kind == core.ActionRelocate && rejected.Rule == "advisor:other" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("unsupported relocation not recorded as rejected: %+v", action.Rejected)
+	}
+}
+
 // A safer accepted answer carries its own confidence and class through
 // both the action and the trace; rules-only ambiguity remains conservative.
 func TestAcceptedAdviceClassAndConfidenceAgreeWithTrace(t *testing.T) {

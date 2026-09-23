@@ -234,9 +234,24 @@ func applyAdvice(
 	verdict core.Verdict,
 	advisor string,
 ) (Decision, Trace) {
-	clamped := safety.ClampRecommendation(verdict, recommendation)
 	trace.AdvisedBy = advisor
 	rule := "advisor:" + advisor
+	// No advisor can originate relocation or deletion. Apart from being
+	// outside the model contract, relocation requires a destination the
+	// recommendation cannot supply. Keep the rules' decision and show
+	// the rejected proposal instead of building an invalid action.
+	switch recommendation.Action {
+	case core.ActionKeep, core.ActionQuarantine, core.ActionInvestigate:
+		// These are the only actions an advisor may propose.
+	default:
+		trace.Rejected = append(trace.Rejected, core.RejectedAction{
+			Kind: recommendation.Action, Rule: rule,
+			Reason: "advisor actions are limited to keep, quarantine, and investigate",
+		})
+		decision.Rejected = trace.Rejected
+		return decision, trace
+	}
+	clamped := safety.ClampRecommendation(verdict, recommendation)
 
 	if clamped.Action == decision.Kind {
 		// The advisor agrees with the rules. Credit it with its reason —
@@ -442,19 +457,18 @@ func PolicyDigest(policy config.Policy) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// PlanID derives a stable identifier from what the plan is bound to. The
-// same scan, evidence, policy, advisor, and applied advice always produce
-// the same plan id.
+// PlanID derives a stable identifier from the scan, evidence, policy,
+// advisor, and well-formed answers considered for ambiguous entries.
 func PlanID(scanID, evidenceDigest, policyDigest, advisor, adviceDigest string) string {
 	sum := sha256.Sum256([]byte(scanID + "\x00" + evidenceDigest + "\x00" + policyDigest + "\x00" + advisor + "\x00" + adviceDigest))
 	return fmt.Sprintf("plan-%s-%s", scanID, hex.EncodeToString(sum[:])[:12])
 }
 
-// adviceDigest identifies the advice a plan applied. It is part of the
-// plan id because the same inputs can yield different advice: a request
-// that failed once and succeeds later must produce a new plan, not be
-// answered with the stored plan the failure shaped. Rules-only plans
-// apply no advice and digest to "".
+// adviceDigest identifies the well-formed answers considered for a plan,
+// including proposals ultimately rejected by safety. A provider can
+// recover after a failed request and return different advice for the same
+// scan; the recovered plan must not reuse the earlier rules-shaped plan.
+// Rules-only plans have no answers and digest to "".
 func adviceDigest(entries []core.Entry, decisions []Decision, advice map[string]core.Recommendation) string {
 	h := sha256.New()
 	applied := false
