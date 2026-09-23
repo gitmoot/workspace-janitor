@@ -84,12 +84,13 @@ func planCommand() *command {
 			"A plan is bound to the scan, the evidence, and the policy it was built\n" +
 			"from, and is immutable once stored. Approving selects actions by id or\n" +
 			"path; it never edits the plan.\n\n" +
-			"Entries the rules leave ambiguous can be offered to the Jev model when\n" +
-			"jev.enabled is true and an API key is in the environment variable named\n" +
-			"by jev.api_key_env. Only a redacted, allowlisted projection is sent. The\n" +
-			"model may only propose keep, quarantine, or investigate, and its advice\n" +
-			"is accepted only when the safety engine allows it and it is safer than\n" +
-			"the rules' choice. Without a key the plan is built from rules alone.",
+			"Entries the rules leave ambiguous can be offered to pinned Jev via\n" +
+			"OpenRouter when jev.enabled is true and an API key is in the environment\n" +
+			"variable named by jev.api_key_env (default OPENROUTER_API_KEY). Only a\n" +
+			"redacted, allowlisted projection is sent. The model may only propose\n" +
+			"keep, quarantine, or investigate; its advice is accepted only when the\n" +
+			"safety engine allows it and it is safer than the rules' choice. Without\n" +
+			"a key the plan is built from rules alone.",
 		register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
 			opts := planOptions{approver: "operator"}
 			fs.StringVar(&opts.scanID, "scan", "", "scan id to plan from (default: the most recent completed scan)")

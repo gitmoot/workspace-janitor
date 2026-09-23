@@ -556,7 +556,7 @@ func TestModelUsageIsRecordedAndTotalled(t *testing.T) {
 			return err
 		}
 		if err := tx.RecordModelUsage(ctx, core.ModelUsage{
-			ID: "usage-1", ScanID: "scan-1", Provider: "typesafe", Model: "jev-small",
+			ID: "usage-1", ScanID: "scan-1", Provider: "openrouter", Model: "typesafe/jev-1.13",
 			RequestKind: "classify", PromptTokens: 1200, CompletionTokens: 80,
 			EstimatedCostUSD: 0.004, CreatedAt: at,
 		}); err != nil {
@@ -564,7 +564,7 @@ func TestModelUsageIsRecordedAndTotalled(t *testing.T) {
 		}
 		// Usage without a scan must still be attributable.
 		return tx.RecordModelUsage(ctx, core.ModelUsage{
-			ID: "usage-2", Provider: "typesafe", Model: "jev-small",
+			ID: "usage-2", Provider: "openrouter", Model: "typesafe/jev-1.13",
 			RequestKind: "probe", PromptTokens: 10, CompletionTokens: 5,
 			EstimatedCostUSD: 0.001, CreatedAt: at,
 		})
@@ -927,8 +927,8 @@ func TestModelDecisionIsCachedUntilItExpires(t *testing.T) {
 		Confidence: 0.9, Origin: core.OriginModel, Reasons: []string{"model: keep"}, DecidedAt: at,
 	}
 	decision := ModelDecision{
-		Key: "key-1", Fingerprint: "fp-1", SchemaVersion: 1, Model: "jev-latest",
-		PolicyDigest: "policy-1", ResolvedModel: "jev-1.13.0", Recommendation: want,
+		Key: "key-1", Fingerprint: "fp-1", SchemaVersion: 1, Model: "typesafe/jev-1.13",
+		PolicyDigest: "policy-1", ResolvedModel: "typesafe/jev-1.13", Recommendation: want,
 		CreatedAt: at, ExpiresAt: at.Add(24 * time.Hour),
 	}
 	if err := db.Write(ctx, func(tx *Tx) error { return tx.PutModelDecision(ctx, decision) }); err != nil {

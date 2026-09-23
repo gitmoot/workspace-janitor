@@ -1,5 +1,5 @@
-// Package jev is the optional TypeSafe Jev advisor for entries the
-// deterministic rules could not classify.
+// Package jev is the optional Jev advisor, accessed through OpenRouter,
+// for entries the deterministic rules could not classify.
 //
 // It is an advisor, never an authority. It sees only entries the planner
 // marked ambiguous, only after every rule has run, and only as a sanitized

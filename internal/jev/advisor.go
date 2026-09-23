@@ -14,7 +14,7 @@ import (
 )
 
 // Provider is the name recorded for usage and plan identity.
-const Provider = "typesafe"
+const Provider = "openrouter"
 
 // Mode says what the advisor actually did during a run.
 type Mode string
