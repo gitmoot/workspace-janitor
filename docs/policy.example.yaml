@@ -37,6 +37,9 @@ retention:
   # Defaults to <state-dir>/quarantine. Wherever it points, it is added to
   # protect.paths automatically: the janitor never acts on its own staging area.
   quarantine_dir: ~/.local/state/workspace-janitor/quarantine
+  # Off by default. Even when enabled, deletion requires an expired receipt,
+  # a fresh complete safety evaluation, and a separate confirmed apply --expire.
+  delete_enabled: false
 
 # Where entries of a class are supposed to live. A primary project found
 # outside its canonical root is a relocation candidate, never a deletion
@@ -135,8 +138,8 @@ safety:
   # Headroom that must remain on the destination filesystem after a
   # quarantine.
   min_free_bytes: 1073741824
-  # Allowing a destination on another filesystem turns an atomic rename
-  # into a copy and delete, so it is off by default.
+  # The v0.1 action engine rejects cross-filesystem quarantine even if this
+  # planner option is enabled; no verified copy mode is implemented.
   allow_cross_filesystem_quarantine: false
 
 # Bounds that keep one slow repository or one enormous directory from

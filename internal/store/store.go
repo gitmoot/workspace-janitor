@@ -270,7 +270,7 @@ func dsn(path string) string {
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", "journal_mode(wal)")
-	q.Add("_pragma", "synchronous(normal)")
+	q.Add("_pragma", "synchronous(full)")
 	u.RawQuery = q.Encode()
 	return u.String()
 }

@@ -70,13 +70,6 @@ func TestHelpExposesIntendedCommandTree(t *testing.T) {
 			t.Errorf("help does not document %q", flagName)
 		}
 	}
-	// Commands this build cannot perform must say so in help.
-	if !strings.Contains(stdout, "not implemented: issue #4") {
-		t.Errorf("help does not mark apply as unimplemented:\n%s", stdout)
-	}
-	if strings.Contains(stdout, "janitor scan [flags] [root...]  Inventory configured roots and collect safety evidence  (not implemented") {
-		t.Errorf("scan is implemented and must not be marked otherwise:\n%s", stdout)
-	}
 
 	policyHelp, _, code := f.run(t, "help", "policy")
 	if code != ExitOK {
@@ -87,28 +80,19 @@ func TestHelpExposesIntendedCommandTree(t *testing.T) {
 	}
 }
 
-// Commands in the contract that this build cannot perform must fail loudly
-// with their own exit code, print nothing to stdout, and name their issue.
-func TestUnimplementedCommandsFailWithoutFakingSuccess(t *testing.T) {
-	cases := []struct {
-		args     []string
-		tracking string
-	}{
-		{[]string{"apply", "--plan", "plan-1", "--confirm"}, "issue #4"},
-		{[]string{"restore", "receipt-1", "--confirm"}, "issue #4"},
+func TestConfirmedExpiryRequiresExplicitPolicyOptIn(t *testing.T) {
+	f := newFixture(t)
+	root := filepath.Join(f.home, "workspace")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		f := newFixture(t)
-		stdout, stderr, code := f.run(t, tc.args...)
-		if code != ExitNotImplemented {
-			t.Errorf("%v exit = %d, want %d", tc.args, code, ExitNotImplemented)
-		}
-		if stdout != "" {
-			t.Errorf("%v wrote to stdout: %q", tc.args, stdout)
-		}
-		if !strings.Contains(stderr, "not implemented") || !strings.Contains(stderr, tc.tracking) {
-			t.Errorf("%v stderr = %q, want a clear failure naming %s", tc.args, stderr, tc.tracking)
-		}
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: false\n")
+	if _, stderr, code := f.run(t, "scan"); code != ExitOK {
+		t.Fatalf("fixture scan: %d %s", code, stderr)
+	}
+	_, stderr, code := f.run(t, "apply", "--expire", "--confirm", "--dry-run=false")
+	if code != ExitError || !strings.Contains(stderr, "deletion is disabled by policy") {
+		t.Fatalf("default policy allowed confirmed deletion: exit=%d stderr=%q", code, stderr)
 	}
 }
 

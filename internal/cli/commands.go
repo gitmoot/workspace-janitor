@@ -129,30 +129,34 @@ func explainCommand() *command {
 }
 
 func applyCommand() *command {
-	return planned(&command{
-		name:     "apply",
-		usage:    "janitor apply [flags]",
-		summary:  "Execute an approved plan through quarantine",
-		tracking: "issue #4",
-		long: "Re-validates every guard immediately before mutating, moves items to\n" +
-			"quarantine rather than deleting them, and records a reversible receipt.",
-	}, func(fs *flag.FlagSet) {
-		fs.String("plan", "", "plan id to apply")
-		fs.Bool("dry-run", true, "report what would change without mutating anything")
-		fs.Bool("confirm", false, "required to perform mutations")
-	})
+	return &command{
+		name:    "apply",
+		usage:   "janitor apply --quarantine [--plan ID] --confirm --dry-run=false | janitor apply --expire [--cleanup ID] --confirm --dry-run=false",
+		summary: "Quarantine approved plan actions or inspect expired receipts",
+		long:    "Dry-run is the default. Quarantine is reversible; expiry requires policy opt-in, a separate invocation, and a fresh safety evaluation.",
+		register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
+			opts := applyOptions{dryRun: true}
+			fs.StringVar(&opts.planID, "plan", "", "stored plan id (default: latest)")
+			fs.StringVar(&opts.cleanupID, "cleanup", "", "expiry scan restricted to one receipt id")
+			fs.BoolVar(&opts.quarantine, "quarantine", false, "move approved actions into quarantine")
+			fs.BoolVar(&opts.expire, "expire", false, "scan quarantined receipts for expiry")
+			fs.BoolVar(&opts.dryRun, "dry-run", true, "show proposed moves or deletions without mutating")
+			fs.BoolVar(&opts.confirm, "confirm", false, "required for every filesystem mutation")
+			return func(ctx context.Context, e *env, args []string) error { return runApply(ctx, e, args, opts) }
+		},
+	}
 }
 
 func restoreCommand() *command {
-	return planned(&command{
-		name:     "restore",
-		usage:    "janitor restore [flags] <receipt-id>",
-		summary:  "Restore quarantined items from a receipt",
-		tracking: "issue #4",
-		long:     "Returns quarantined items to their recorded original locations.",
-	}, func(fs *flag.FlagSet) {
-		fs.Bool("confirm", false, "required to perform the restore")
-	})
+	return &command{
+		name:    "restore",
+		usage:   "janitor restore [--confirm] <cleanup-id>",
+		summary: "Restore quarantined items without overwriting occupied paths",
+		register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
+			confirm := fs.Bool("confirm", false, "required to perform the restore")
+			return func(ctx context.Context, e *env, args []string) error { return runRestore(ctx, e, args, *confirm) }
+		},
+	}
 }
 
 func statusCommand() *command {

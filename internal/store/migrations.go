@@ -156,6 +156,63 @@ var migrations = []migration{
 			`CREATE INDEX model_decisions_expiry_idx ON model_decisions(expires_at)`,
 		},
 	},
+	{
+		version: 5,
+		name:    "durable_cleanup_journal",
+		statements: []string{
+			`CREATE TABLE cleanup_items (
+				cleanup_id       TEXT NOT NULL,
+				plan_id          TEXT NOT NULL,
+				action_id        TEXT NOT NULL,
+				source           TEXT NOT NULL,
+				destination      TEXT NOT NULL,
+				state            TEXT NOT NULL CHECK (state IN ('prepared', 'quarantined', 'restored', 'deleted', 'investigate')),
+				entry_json       TEXT NOT NULL,
+				action_json      TEXT NOT NULL,
+				quarantined_json TEXT,
+				created_at       TEXT NOT NULL,
+				updated_at       TEXT NOT NULL,
+				moved_at         TEXT,
+				expires_at       TEXT,
+				reason           TEXT NOT NULL DEFAULT '',
+				PRIMARY KEY (cleanup_id, action_id)
+			)`,
+			// Terminal records retain their history without claiming the
+			// source path; active records must never race to move one source.
+			`CREATE UNIQUE INDEX cleanup_items_active_source_idx ON cleanup_items(source)
+			 WHERE state IN ('prepared', 'quarantined', 'investigate')`,
+			`CREATE INDEX cleanup_items_cleanup_idx ON cleanup_items(cleanup_id, created_at, action_id)`,
+			`CREATE INDEX cleanup_items_pending_idx ON cleanup_items(state, updated_at)`,
+			`CREATE TABLE cleanup_events (
+				id          INTEGER PRIMARY KEY AUTOINCREMENT,
+				cleanup_id  TEXT NOT NULL,
+				action_id   TEXT NOT NULL,
+				from_state  TEXT,
+				to_state    TEXT NOT NULL,
+				occurred_at TEXT NOT NULL,
+				reason      TEXT NOT NULL,
+				FOREIGN KEY (cleanup_id, action_id) REFERENCES cleanup_items(cleanup_id, action_id)
+			)`,
+			`CREATE INDEX cleanup_events_item_idx ON cleanup_events(cleanup_id, action_id, id)`,
+			// Triggers make the item mutation and its event indivisible even
+			// when a caller ignores an error before committing the outer Tx.
+			`CREATE TRIGGER cleanup_items_insert_event AFTER INSERT ON cleanup_items
+			 BEGIN
+			   INSERT INTO cleanup_events (cleanup_id, action_id, from_state, to_state, occurred_at, reason)
+			   VALUES (NEW.cleanup_id, NEW.action_id, NULL, NEW.state, NEW.updated_at, NEW.reason);
+			 END`,
+			`CREATE TRIGGER cleanup_items_transition_event AFTER UPDATE OF state ON cleanup_items
+			 WHEN OLD.state != NEW.state
+			 BEGIN
+			   INSERT INTO cleanup_events (cleanup_id, action_id, from_state, to_state, occurred_at, reason)
+			   VALUES (NEW.cleanup_id, NEW.action_id, OLD.state, NEW.state, NEW.updated_at, NEW.reason);
+			 END`,
+			`CREATE TRIGGER cleanup_events_no_update BEFORE UPDATE ON cleanup_events
+			 BEGIN SELECT RAISE(ABORT, 'cleanup events are immutable'); END`,
+			`CREATE TRIGGER cleanup_events_no_delete BEFORE DELETE ON cleanup_events
+			 BEGIN SELECT RAISE(ABORT, 'cleanup events are immutable'); END`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.
