@@ -8,6 +8,7 @@ import (
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
+	"github.com/gitmoot/workspace-janitor/internal/safety"
 )
 
 func TestProviderRootsAndAdjacentLookalikes(t *testing.T) {
@@ -47,6 +48,17 @@ func TestProviderRootsAndAdjacentLookalikes(t *testing.T) {
 			}
 			if len(adapter.OfficialCommand) > 0 && !strings.Contains(classification.Reason, adapter.OfficialCommand[len(adapter.OfficialCommand)-1]) {
 				t.Fatalf("official argv absent from trace: %s", classification.Reason)
+			}
+			// Recognition cannot override a live owner, even for regenerable content.
+			pinned := safety.Evaluate(safety.Input{
+				Entry: entry, Now: plannedAt,
+				Jobs: []safety.JobRef{{ID: "fixture-job", State: safety.JobRunning, Path: entry.Path}},
+			})
+			if !pinned.Refused() {
+				t.Fatal("live owner was not protected")
+			}
+			if got := Evaluate(entry, policy, pinned); got.Kind != core.ActionKeep {
+				t.Fatalf("provider root bypassed live owner: %+v", got)
 			}
 		})
 		t.Run(tc.provider+":selected_scan_root", func(t *testing.T) {
