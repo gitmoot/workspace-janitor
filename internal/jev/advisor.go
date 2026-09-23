@@ -241,11 +241,14 @@ func (a *Advisor) Classify(ctx context.Context, entries []core.Entry) (map[strin
 
 		for _, projection := range batch {
 			entry := byRef[projection.Ref]
-			recommendation := MapAnswers(projection.Ref, exchange.Response, thresholds, now)
+			recommendation, cacheable := mapAnswers(projection.Ref, exchange.Response, thresholds, now)
 			if recommendation.Action == core.ActionInvestigate {
 				a.report.Investigate++
 			}
 			advice[entry.Path] = recommendation
+			if !cacheable {
+				continue
+			}
 			a.decisions = append(a.decisions, Decision{
 				Key:            a.key(entry),
 				Fingerprint:    entry.Fingerprint,

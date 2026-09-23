@@ -241,8 +241,9 @@ Requests are batched within `max_batch` and `max_state_tokens`, paced by
 on 429, 529, 5xx, and transport errors, honoring `Retry-After`. A rejected
 key or request is not retried. After `breaker_failures` consecutive
 failures the run stops calling the model and plans the rest from rules.
-Answers are cached by entry fingerprint, request schema, model, and policy
-for `cache_ttl`, so re-planning unchanged entries sends nothing.
+Well-formed answers are cached by entry fingerprint, request schema,
+model, and policy for `cache_ttl`, so re-planning unchanged entries sends
+nothing; malformed answers are retried on the next plan.
 
 Usage is recorded for every answered request, even with `--no-store`.
 `plan` shows the run's tokens and estimated cost, and `status` shows the

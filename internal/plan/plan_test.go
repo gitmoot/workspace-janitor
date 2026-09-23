@@ -404,6 +404,27 @@ func TestAdvisorCanOnlyLowerRisk(t *testing.T) {
 	}
 }
 
+// A safer accepted answer carries its own confidence and class through
+// both the action and the trace; rules-only ambiguity remains conservative.
+func TestAcceptedAdviceClassAndConfidenceAgreeWithTrace(t *testing.T) {
+	entry := entryAt("/home/fixture/mystery")
+	advisor := &stubAdvisor{name: "jev", answers: map[string]core.Recommendation{
+		entry.Path: {
+			Action: core.ActionKeep, Class: core.ClassOperationalTool,
+			Confidence: 0.95, Origin: core.OriginModel,
+			Reasons: []string{"operator tooling"}, DecidedAt: plannedAt,
+		},
+	}}
+	result := buildPlan(t, []core.Entry{entry}, fixturePolicy(), advisor)
+	action := actionFor(t, result, entry.Path)
+	if action.Kind != core.ActionKeep || action.Confidence != 0.95 || action.Class != core.ClassOperationalTool {
+		t.Fatalf("accepted action = %+v", action)
+	}
+	if len(result.Traces) != 1 || result.Traces[0].Class != action.Class || result.Traces[0].Action != action.Kind {
+		t.Errorf("trace = %+v, action = %+v", result.Traces, action)
+	}
+}
+
 // An advisor that agrees with the rules is still credited, so the trace
 // says why the entry stayed where it was.
 func TestAgreeingAdviceIsCreditedWithoutChangingTheAction(t *testing.T) {

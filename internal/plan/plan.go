@@ -155,8 +155,16 @@ func Build(ctx context.Context, in Input) (Result, error) {
 			Ambiguous:   decision.Ambiguous,
 			Fingerprint: entry.Fingerprint,
 		}
+		confidence := confidenceFor(decision)
 		if recommendation, ok := advice[entry.Path]; ok && decision.Ambiguous {
+			before := decision.Kind
 			decision, trace = applyAdvice(decision, trace, recommendation, verdicts[i], advisorName)
+			// Only a genuinely accepted model action carries model
+			// confidence. A safety-clamped or agreeing answer keeps the
+			// rules' conservative confidence.
+			if decision.Kind != before && decision.Kind == recommendation.Action {
+				confidence = recommendation.Confidence
+			}
 		}
 		trace.Action = decision.Kind
 
@@ -167,7 +175,7 @@ func Build(ctx context.Context, in Input) (Result, error) {
 			Kind:         decision.Kind,
 			Class:        decision.Class,
 			Retention:    decision.Retention,
-			Confidence:   confidenceFor(decision),
+			Confidence:   confidence,
 			Destination:  decision.Destination,
 			FilesystemID: entry.FilesystemID,
 			Fingerprint:  entry.Fingerprint,
@@ -248,6 +256,7 @@ func applyAdvice(
 	decision.Kind = clamped.Action
 	decision.Retention = clamped.Retention
 	decision.Class = clamped.Class
+	trace.Class = decision.Class
 	decision.Rules = append(decision.Rules, "advisor:"+advisor)
 	// One reason per rule: an explanation pairs them by index, so an
 	// advisor with several reasons contributes one joined entry.

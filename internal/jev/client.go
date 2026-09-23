@@ -150,6 +150,9 @@ func (c *Client) once(ctx context.Context, body []byte) (Response, time.Duration
 	if response.Answers == nil {
 		return Response{}, 0, &APIError{Status: resp.StatusCode, Message: "response carried no answers"}
 	}
+	if response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 {
+		return Response{}, 0, &APIError{Status: resp.StatusCode, Message: "response carried negative token usage"}
+	}
 	return response, 0, nil
 }
 

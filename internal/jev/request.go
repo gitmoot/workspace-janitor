@@ -236,6 +236,13 @@ type Thresholds struct {
 // investigate with the reason stated: a model that is unsure, or whose
 // answer cannot be parsed, must not move a decision anywhere.
 func MapAnswers(ref string, response Response, thresholds Thresholds, decidedAt time.Time) core.Recommendation {
+	recommendation, _ := mapAnswers(ref, response, thresholds, decidedAt)
+	return recommendation
+}
+
+// mapAnswers distinguishes valid uncertainty from malformed answers.
+// Only valid answers are cached, so a transient malformed reply is retried.
+func mapAnswers(ref string, response Response, thresholds Thresholds, decidedAt time.Time) (core.Recommendation, bool) {
 	investigate := func(class core.ArtifactClass, confidence float64, reason string) core.Recommendation {
 		return core.Recommendation{
 			Action:     core.ActionInvestigate,
@@ -250,36 +257,36 @@ func MapAnswers(ref string, response Response, thresholds Thresholds, decidedAt 
 
 	class, classConfidence, err := choiceAnswer(response.Answers[classKey(ref)], classCriteria)
 	if err != nil {
-		return investigate(core.ClassUnknown, 0, "class answer unusable: "+err.Error())
+		return investigate(core.ClassUnknown, 0, "class answer unusable: "+err.Error()), false
+	}
+	labelled := core.ArtifactClass(class)
+	if classConfidence < thresholds.MinConfidence {
+		labelled = core.ClassUnknown
 	}
 	action, actionConfidence, err := choiceAnswer(response.Answers[actionKey(ref)], actionCriteria)
 	if err != nil {
-		return investigate(core.ArtifactClass(class), 0, "action answer unusable: "+err.Error())
+		return investigate(labelled, 0, "action answer unusable: "+err.Error()), false
 	}
 	retention, _, err := choiceAnswer(response.Answers[retentionKey(ref)], retentionCriteria)
 	if err != nil {
-		return investigate(core.ArtifactClass(class), 0, "retention answer unusable: "+err.Error())
+		return investigate(labelled, 0, "retention answer unusable: "+err.Error()), false
 	}
 	unsafe, err := noulAnswer(response.Answers[unsafeKey(ref)])
 	if err != nil {
-		return investigate(core.ArtifactClass(class), 0, "unsafe-probability answer unusable: "+err.Error())
+		return investigate(labelled, 0, "unsafe-probability answer unusable: "+err.Error()), false
 	}
 
 	confidence := classConfidence
 	if actionConfidence < confidence {
 		confidence = actionConfidence
 	}
-	labelled := core.ArtifactClass(class)
-	if classConfidence < thresholds.MinConfidence {
-		labelled = core.ClassUnknown
-	}
 	switch {
 	case confidence < thresholds.MinConfidence:
 		return investigate(labelled, confidence,
-			fmt.Sprintf("confidence %.2f is below the %.2f threshold", confidence, thresholds.MinConfidence))
+			fmt.Sprintf("confidence %.2f is below the %.2f threshold", confidence, thresholds.MinConfidence)), true
 	case unsafe > thresholds.MaxUnsafe:
 		return investigate(labelled, confidence,
-			fmt.Sprintf("unsafe-to-remove probability %.2f exceeds the %.2f threshold", unsafe, thresholds.MaxUnsafe))
+			fmt.Sprintf("unsafe-to-remove probability %.2f exceeds the %.2f threshold", unsafe, thresholds.MaxUnsafe)), true
 	}
 
 	recommendation := core.Recommendation{
@@ -295,7 +302,7 @@ func MapAnswers(ref string, response Response, thresholds Thresholds, decidedAt 
 	if recommendation.Action == core.ActionQuarantine {
 		recommendation.Retention = core.Retention(retention)
 	}
-	return recommendation
+	return recommendation, true
 }
 
 // choiceAnswer validates a choice answer against the options that were

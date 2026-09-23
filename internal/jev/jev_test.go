@@ -377,6 +377,70 @@ func TestUnusableAnswersBecomeInvestigate(t *testing.T) {
 	}
 }
 
+// A class label with inadequate confidence cannot leak into an
+// investigate recommendation when another answer is unusable.
+func TestUnusableAnswerDoesNotKeepUncertainClass(t *testing.T) {
+	response := answersFor(Request{State: State{Entries: []Projection{{Ref: "e1"}}}},
+		"quarantine", "cache", "7d", 0.9, 0)
+	response.Answers["e1_class"] = Answer{Type: "choice", Choice: "cache", Confidence: f64(0.1)}
+	delete(response.Answers, "e1_action")
+	recommendation, cacheable := mapAnswers("e1", response, Thresholds{MinConfidence: 0.7}, fixedNow)
+	if recommendation.Action != core.ActionInvestigate || recommendation.Class != core.ClassUnknown || cacheable {
+		t.Errorf("unusable answer = %+v, cacheable=%t; want investigate with unknown class and no cache", recommendation, cacheable)
+	}
+}
+
+// A malformed response may be used safely for this run, but must not
+// suppress a later valid answer for the full cache lifetime.
+func TestMalformedAnswerIsNotCached(t *testing.T) {
+	server := newFakeServer(t, func(n int, request Request) (int, http.Header, any) {
+		if n == 1 {
+			return http.StatusOK, nil, Response{Model: "jev-1.13.0", Answers: map[string]Answer{},
+				Usage: Usage{InputTokens: 100}}
+		}
+		return http.StatusOK, nil, answersFor(request, "keep", "cache", "none", 0.9, 0)
+	})
+	advisor := liveAdvisor(t, testPolicy(server.server.URL), server.client(), nil)
+	entry := mystery("/home/fixture/uncertain")
+	first, err := advisor.Classify(context.Background(), []core.Entry{entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first[entry.Path].Action != core.ActionInvestigate || len(advisor.Decisions()) != 0 {
+		t.Fatalf("malformed answer = %+v, decisions = %+v", first, advisor.Decisions())
+	}
+	second, err := advisor.Classify(context.Background(), []core.Entry{entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if server.calls() != 2 || second[entry.Path].Action != core.ActionKeep || len(advisor.Decisions()) != 1 {
+		t.Errorf("after recovery calls=%d, advice=%+v, decisions=%+v", server.calls(), second, advisor.Decisions())
+	}
+}
+
+// A malformed usage counter must not create invalid store records or
+// trusted model decisions.
+func TestNegativeUsageRejectsTheResponse(t *testing.T) {
+	server := newFakeServer(t, func(_ int, request Request) (int, http.Header, any) {
+		response := answersFor(request, "keep", "cache", "none", 0.9, 0)
+		response.Usage.InputTokens = -1
+		return http.StatusOK, nil, response
+	})
+	advisor := liveAdvisor(t, testPolicy(server.server.URL), server.client(), nil)
+	entry := mystery("/home/fixture/uncertain")
+	advice, err := advisor.Classify(context.Background(), []core.Entry{entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if server.calls() != 1 || len(advice) != 0 || len(advisor.Usage()) != 0 || len(advisor.Decisions()) != 0 {
+		t.Errorf("negative usage accepted: calls=%d advice=%+v usage=%+v decisions=%+v",
+			server.calls(), advice, advisor.Usage(), advisor.Decisions())
+	}
+	if advisor.Report().FailedRequests != 1 {
+		t.Errorf("malformed usage not reported as a failure: %+v", advisor.Report())
+	}
+}
+
 // 429 and 529 are retried after the server's Retry-After, capped by the
 // client's own bound; a success after them counts every attempt.
 func TestClientRetriesBackpressureHonouringRetryAfter(t *testing.T) {
