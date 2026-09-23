@@ -272,7 +272,7 @@ func runRestore(ctx context.Context, e *env, args []string, confirm bool) error 
 		return err
 	}
 	if confirm {
-		unlock, err := lockApply(paths.StateDir)
+		unlock, err := lockRestore(paths.StateDir)
 		if err != nil {
 			return err
 		}

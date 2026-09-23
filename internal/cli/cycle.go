@@ -81,7 +81,7 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 }
 
 func deepScanDue(ctx context.Context, database string, interval time.Duration, now time.Time) (bool, error) {
-	db, err := store.OpenReadOnly(ctx, database)
+	db, err := store.OpenExisting(ctx, database)
 	if errors.Is(err, store.ErrNotInitialized) {
 		return true, nil
 	}

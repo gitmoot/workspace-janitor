@@ -239,9 +239,14 @@ func TestWatchOverflowAndRestartReconcileMissedChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	lost := filepath.Join(root, "created-during-loss")
-	first := &scriptedWatcher{events: []watchEvent{{Overflow: true}}, before: func() {
-		if err := os.Mkdir(lost, 0700); err != nil {
-			t.Error(err)
+	known := filepath.Join(root, "delivered-event")
+	first := &scriptedWatcher{events: []watchEvent{
+		{Root: root, Name: "delivered-event"}, {Overflow: true},
+	}, before: func() {
+		for _, path := range []string{known, lost} {
+			if err := os.Mkdir(path, 0700); err != nil {
+				t.Error(err)
+			}
 		}
 	}}
 	second := &scriptedWatcher{}
@@ -267,6 +272,12 @@ func TestWatchOverflowAndRestartReconcileMissedChanges(t *testing.T) {
 	}
 	if startup.ScanID == recovery.ScanID || !recovery.Reconciled || opens != 2 || !first.closed {
 		t.Fatalf("overflow did not re-arm and rescan: startup=%+v recovery=%+v opens=%d", startup, recovery, opens)
+	}
+	if guidance := guidanceFor(t, recovery, lost); !guidance.New || guidance.ObservedAbsent {
+		t.Fatalf("lost-window entry omitted from mixed overflow guidance: %+v", guidance)
+	}
+	if guidance := guidanceFor(t, recovery, known); !guidance.New || guidance.ObservedAbsent {
+		t.Fatalf("delivered entry omitted from mixed overflow guidance: %+v", guidance)
 	}
 	cancel()
 	assertInventoryPath(t, paths.DatabaseFile, recovery.ScanID, lost)

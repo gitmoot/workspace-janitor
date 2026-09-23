@@ -46,6 +46,8 @@ retention:
 prevention:
   # The daily timer calls janitor cycle. After a successful scheduled deep
   # scan, another is due seven days later; watch events stay metadata-only.
+  # This scheduled pass runs deep_size even if collectors.deep_size is false;
+  # that flag only controls ad-hoc scans. Omit the timer to avoid deep cycles.
   deep_interval: 168h
   # Alert if either non-zero bound is crossed; zero disables that bound.
   min_free_bytes: 0

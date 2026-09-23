@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/gitmoot/workspace-janitor/internal/store"
 )
 
 func TestCycleDailyMetadataWeeklyDeepAndNoModelCalls(t *testing.T) {
@@ -24,7 +27,7 @@ func TestCycleDailyMetadataWeeklyDeepAndNoModelCalls(t *testing.T) {
 	}))
 	defer server.Close()
 	f.env["OPENROUTER_API_KEY"] = "fixture-only"
-	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  deep_size: true\n  git: false\n  processes: false\n  services: false\nprevention:\n  deep_interval: 168h\n  min_free_percent: 0\njev:\n  enabled: true\n  endpoint: "+server.URL+"/api/v1/systemone\n")
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\nprevention:\n  deep_interval: 168h\n  min_free_percent: 0\njev:\n  enabled: true\n  endpoint: "+server.URL+"/api/v1/systemone\n")
 	out, stderr, code := f.run(t, "cycle")
 	if code != ExitOK {
 		t.Fatalf("first cycle: %s %s", out, stderr)
@@ -53,6 +56,45 @@ func TestCycleDailyMetadataWeeklyDeepAndNoModelCalls(t *testing.T) {
 	var third cycleReport
 	if err := json.Unmarshal([]byte(out), &third); err != nil || !third.Deep {
 		t.Fatalf("overdue deep scan: %+v %v", third, err)
+	}
+}
+
+func TestCycleMigratesPreviousSchemaBeforeCheckingDeepCadence(t *testing.T) {
+	f := newFixture(t)
+	root := filepath.Join(f.home, "workspace")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: false\n")
+	if out, stderr, code := f.run(t, "scan"); code != ExitOK {
+		t.Fatalf("seed scan: %s %s", out, stderr)
+	}
+	dbPath := filepath.Join(f.home, ".local", "state", "workspace-janitor", "janitor.db")
+	db, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		"DROP TABLE disk_alerts",
+		"DROP TABLE prevention_state",
+		"DELETE FROM schema_migrations WHERE version = 6",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	setUserVersion(t, dbPath, 5)
+
+	out, stderr, code := f.run(t, "cycle")
+	if code != ExitOK {
+		t.Fatalf("cycle did not upgrade prior schema: %s %s", out, stderr)
+	}
+	if got := userVersion(t, dbPath); got != store.SchemaVersion() {
+		t.Fatalf("cycle schema version = %d, want %d", got, store.SchemaVersion())
 	}
 }
 

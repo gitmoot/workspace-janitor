@@ -290,7 +290,11 @@ advance the deep-scan clock.
 
 `janitor cycle` is a one-shot timer target: each invocation records a metadata
 scan, or a deep scan if `prevention.deep_interval` has elapsed since the last
-successful scheduled deep scan (default seven days). `prevention.min_free_bytes`
+successful scheduled deep scan (default seven days). `collectors.deep_size`
+controls ad-hoc `scan`, not the scheduled `cycle`: a due cycle explicitly runs
+deep-size collection even when that collector is false in policy. To avoid
+scheduled deep scans, do not install the timer; use `janitor scan --no-deep-size`
+for metadata-only inventory. `prevention.min_free_bytes`
 or `prevention.min_free_percent` triggers a per-filesystem alert. It reports
 potential physical bytes by reclaimable, protected, and unknown class; a
 bounded or uncertain estimate is **unmeasured**, not zero. Alerts are
@@ -304,6 +308,8 @@ lock, fresh reference collection, original-path and receipt checks, and
 anchored deletion. It reports each expiry outcome; an expired timestamp alone
 is not permission. All confirmed apply and restore operations share one
 cross-process lock on Linux; a second process fails closed instead of racing.
+On other platforms confirmed apply remains unsupported, while confirmed
+restore retains its prior behavior without this Linux-only lock.
 
 `janitor service generate --output /absolute/private/directory --binary
 /absolute/janitor` writes three units without installing or enabling them:

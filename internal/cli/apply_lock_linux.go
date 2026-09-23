@@ -34,3 +34,5 @@ func lockApply(stateDir string) (func(), error) {
 	}
 	return func() { _ = syscall.Flock(fd, syscall.LOCK_UN); _ = file.Close() }, nil
 }
+
+func lockRestore(stateDir string) (func(), error) { return lockApply(stateDir) }

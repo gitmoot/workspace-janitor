@@ -210,8 +210,12 @@ func reconcileWatch(ctx context.Context, e *env, paths config.Paths, policy conf
 	for _, entry := range entries {
 		byPath[entry.Path] = entry
 	}
-	if overflow && len(changed) == 0 {
-		changed = make(map[string]bool)
+	if overflow {
+		// Merge the complete-scan delta with delivered events. The lost
+		// window can contain entries unrelated to the queued event paths.
+		if changed == nil {
+			changed = make(map[string]bool)
+		}
 		for _, entry := range entries {
 			for _, evidence := range entry.Evidence {
 				if evidence.Signal == "new_since_prior_scan" {
