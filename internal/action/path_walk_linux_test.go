@@ -115,6 +115,11 @@ func TestRenameThroughSearchOnlyAncestor(t *testing.T) {
 	if err := os.Chmod(restricted, 0111); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := os.Chmod(restricted, 0700); err != nil {
+			t.Errorf("restore fixture directory permissions: %v", err)
+		}
+	})
 	destination := filepath.Join(destinationDir, "valuable")
 	if os.Geteuid() == 0 {
 		// go test stores its binary under a private 0700 build directory,
