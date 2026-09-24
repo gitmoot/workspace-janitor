@@ -85,6 +85,25 @@ Unit=janitor-cycle.service
 [Install]
 WantedBy=timers.target
 `},
+		// Installing this service and the separate drop-in is an explicit
+		// host-rollout action. Merely generating or installing the offline
+		// watch/cycle units never starts an advisory.
+		{"janitor-advisory.service", fmt.Sprintf(`[Unit]
+Description=Workspace Janitor bounded review-only daily advice
+After=janitor-cycle.service
+
+[Service]
+Type=oneshot
+ExecStart=%s --policy %s advisory run --key-file /root/.env
+Environment=OPENROUTER_API_KEY=
+UMask=0077
+NoNewPrivileges=true
+`, binary, paths.PolicyFile)},
+		{"janitor-cycle-advisory.conf", `[Unit]
+# Opt-in only: install as janitor-cycle.service.d/advisory.conf.
+# The advisory CLI independently verifies a successful current-day cycle.
+OnSuccess=janitor-advisory.service
+`},
 	}
 	for _, unit := range units {
 		if _, err := os.Lstat(filepath.Join(output, unit.name)); err == nil {

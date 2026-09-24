@@ -24,6 +24,8 @@ type APIError struct {
 	Status    int
 	Message   string
 	Retryable bool
+	// Fatal means later batches cannot repair the provider response.
+	Fatal bool
 }
 
 func (e *APIError) Error() string {
@@ -36,12 +38,15 @@ func (e *APIError) Error() string {
 // Client calls the evaluation endpoint with bounded time, retries, and
 // request rate.
 type Client struct {
-	Endpoint    string
-	APIKey      string
-	HTTP        *http.Client
-	Timeout     time.Duration
-	MaxRetries  int
-	MinInterval time.Duration
+	Endpoint   string
+	APIKey     string
+	HTTP       *http.Client
+	Timeout    time.Duration
+	MaxRetries int
+	// RequireUsage is enabled by the bounded daily advisory: absent input
+	// usage cannot be presented as a measured zero or a complete report.
+	RequireUsage bool
+	MinInterval  time.Duration
 	// BackoffBase and MaxBackoff shape exponential backoff. Retry-After is
 	// honoured but never beyond MaxBackoff: a server may not stall the
 	// scan indefinitely by asking it to wait.
@@ -51,6 +56,9 @@ type Client struct {
 	// waiting for it.
 	Sleep func(ctx context.Context, d time.Duration) error
 	Now   func() time.Time
+	// BeforeAttempt must durably reserve an allowed attempt before HTTP Do.
+	// A rejected reservation never sends, including on retries.
+	BeforeAttempt func(context.Context, Request, []byte) error
 
 	mu          sync.Mutex
 	lastRequest time.Time
@@ -75,10 +83,17 @@ func (c *Client) Evaluate(ctx context.Context, request Request) (Exchange, error
 	attempts := c.MaxRetries + 1
 	var last error
 	for attempt := range attempts {
-		exchange.Attempts = attempt + 1
+		// Attempts counts reservations that may have reached the server,
+		// not rejected retries or local pacing failures.
 		if err := c.pace(ctx); err != nil {
 			return exchange, &APIError{Message: "cancelled: " + err.Error()}
 		}
+		if c.BeforeAttempt != nil {
+			if err := c.BeforeAttempt(ctx, request, body); err != nil {
+				return exchange, &APIError{Message: "advisory attempt admission refused", Fatal: true}
+			}
+		}
+		exchange.Attempts++
 		response, wait, err := c.once(ctx, body)
 		if err == nil {
 			exchange.Response = response
@@ -153,6 +168,10 @@ func (c *Client) once(ctx context.Context, body []byte) (Response, time.Duration
 	}
 	if response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 {
 		return Response{}, 0, &APIError{Status: resp.StatusCode, Message: "response carried negative token usage"}
+	}
+	if c.RequireUsage && response.Usage.InputTokens == 0 {
+		return Response{}, 0, &APIError{Status: resp.StatusCode,
+			Message: "response carried no input token usage", Fatal: true}
 	}
 	return response, 0, nil
 }
