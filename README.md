@@ -398,6 +398,15 @@ collectors, including Gitmoot's ledger, omit all entries; per-entry unknown
 evidence omits only affected entries, so unaffected ambiguous entries may
 still receive advice. Zero candidates send nothing. Restart/concurrent
 launches cannot reopen a running or interrupted day's claim.
+Systemd unit aliases count as known only when a bounded, unchanged chain
+reaches a unit already scanned under a configured definition root (or the
+exact `/dev/null` mask). Broken, escaping, looping or changed aliases keep
+the service collector partial and therefore block all outbound advice.
+On non-Linux builds, configured systemd roots are not a supported deployment
+path: a concurrent FIFO swap before opening a unit can block the scanner.
+The reserved day is rechecked immediately before each HTTP transport attempt,
+with a request deadline at UTC midnight. A pause after reservation cannot
+start a new-day request against the old day's budget.
 A newer inventory supersedes the completed cycle;
 the advisory then stops rather than consulting stale evidence.
 If a provider response lacks input-token usage, the advisory rejects that

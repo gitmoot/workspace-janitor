@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -208,6 +209,133 @@ func TestServiceReferencesProtectEntries(t *testing.T) {
 	}
 	if report.Visited != 3 {
 		t.Errorf("visited = %d, want the unit, cron file, and pm2 dump", report.Visited)
+	}
+}
+
+func TestSystemdAliasesReuseProvenUnitWithoutPartial(t *testing.T) {
+	workspace := t.TempDir()
+	service := mustMkdir(t, filepath.Join(workspace, "service"))
+	units := t.TempDir()
+	system := t.TempDir()
+	canonical := filepath.Join(system, "canonical.service")
+	mustWrite(t, canonical, "WorkingDirectory="+service+"\n")
+	if err := os.Symlink("canonical.service", filepath.Join(system, "same-dir.service")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(canonical, filepath.Join(units, "cross-root.service")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/null", filepath.Join(units, "masked.service")); err != nil {
+		t.Fatal(err)
+	}
+	opts := fixtureOptions(workspace)
+	opts.Services = true
+	opts.ServiceSources = ServiceSources{SystemdDirs: []string{units, system}}
+	refs, report := gatherServiceReferences(context.Background(), &opts)
+	if report.Status != core.CollectorRan || report.Unknowns != 0 {
+		t.Fatalf("ordinary aliases treated as unknown: %+v", report)
+	}
+	if len(refs) != 1 || refs[0].Path != service {
+		t.Fatalf("alias duplicated or dropped the canonical reference: %+v", refs)
+	}
+}
+
+func TestSystemdAliasesFailClosedWhenTargetUnproven(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func(t *testing.T, units, outside string)
+	}{
+		{"broken", func(t *testing.T, units, _ string) {
+			t.Helper()
+			if err := os.Symlink("missing.service", filepath.Join(units, "alias.service")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"escaping", func(t *testing.T, units, outside string) {
+			t.Helper()
+			if err := os.Symlink(filepath.Join(outside, "unscanned.service"), filepath.Join(units, "alias.service")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"relative escape", func(t *testing.T, units, _ string) {
+			t.Helper()
+			if err := os.Symlink("../outside.service", filepath.Join(units, "alias.service")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"loop", func(t *testing.T, units, _ string) {
+			t.Helper()
+			if err := os.Symlink("other.service", filepath.Join(units, "alias.service")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("alias.service", filepath.Join(units, "other.service")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"unscanned", func(t *testing.T, units, _ string) {
+			t.Helper()
+			mustWrite(t, filepath.Join(units, "large.service"), strings.Repeat("x", maxUnitFileBytes+1))
+			if err := os.Symlink("large.service", filepath.Join(units, "alias.service")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"external device", func(t *testing.T, units, _ string) {
+			t.Helper()
+			if err := os.Symlink("/dev/zero", filepath.Join(units, "alias.service")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			units := t.TempDir()
+			outside := t.TempDir()
+			mustWrite(t, filepath.Join(outside, "unscanned.service"), "WorkingDirectory="+workspace+"\n")
+			tc.build(t, units, outside)
+			opts := fixtureOptions(workspace)
+			opts.Services = true
+			opts.ServiceSources = ServiceSources{SystemdDirs: []string{units}}
+			refs, report := gatherServiceReferences(context.Background(), &opts)
+			if report.Status != core.CollectorPartial || report.Unknowns == 0 || len(refs) != 0 {
+				t.Fatalf("unproven alias was trusted: report=%+v refs=%+v", report, refs)
+			}
+		})
+	}
+}
+
+func TestSystemdAliasChangedAfterListingIsUnknown(t *testing.T) {
+	units := t.TempDir()
+	canonical := filepath.Join(units, "canonical.service")
+	mustWrite(t, canonical, "[Service]\n")
+	link := filepath.Join(units, "alias.service")
+	if err := os.Symlink("canonical.service", link); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(units)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	initial, err := root.Lstat("alias.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := root.Lstat("canonical.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/zero", link); err != nil {
+		t.Fatal(err)
+	}
+	alias := unitLocation{directory: 0, name: "alias.service"}
+	regular := unitLocation{directory: 0, name: "canonical.service"}
+	err = proveSystemdAlias(alias, []systemdDirectory{{path: units, root: root}},
+		map[unitLocation]os.FileInfo{regular: target}, map[unitLocation]os.FileInfo{alias: initial})
+	if err == nil {
+		t.Fatal("changed alias was proven from its stale listing")
 	}
 }
 

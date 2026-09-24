@@ -578,6 +578,68 @@ func TestClientTimesOutASlowServer(t *testing.T) {
 	}
 }
 
+func TestClientRetriesOrdinarySendGateTimeoutBeforeMidnight(t *testing.T) {
+	server := newFakeServer(t, func(_ int, request Request) (int, http.Header, any) {
+		return http.StatusOK, nil, answersFor(request, "keep", "cache", "none", 0.9, 0)
+	})
+	client := server.client()
+	client.MaxRetries = 1
+	client.SendDeadline = time.Now().Add(time.Minute)
+	client.Sleep = func(context.Context, time.Duration) error { return nil }
+	reservations := 0
+	client.BeforeAttempt = func(context.Context, Request, []byte) error {
+		reservations++
+		return nil
+	}
+	client.BeforeSend = func(context.Context) error {
+		if reservations == 1 {
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	exchange, err := client.Evaluate(context.Background(), Build("typesafe/jev-1.13", []Projection{{Ref: "e1"}}))
+	if err != nil || exchange.Attempts != 2 || reservations != 2 || server.calls() != 1 {
+		t.Fatalf("ordinary timeout consumed the rest of the advisory: err=%v attempts=%d reservations=%d calls=%d",
+			err, exchange.Attempts, reservations, server.calls())
+	}
+}
+
+type waitingBeforeWire struct {
+	entered chan struct{}
+}
+
+func (t waitingBeforeWire) RoundTrip(req *http.Request) (*http.Response, error) {
+	close(t.entered)
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
+func TestClientSendDeadlineCancelsPausedTransportWithoutRetry(t *testing.T) {
+	transport := waitingBeforeWire{entered: make(chan struct{})}
+	checks := 0
+	var client *Client
+	client = &Client{
+		Endpoint: "http://127.0.0.1:1/api/v1/systemone", APIKey: testKey,
+		HTTP:    &http.Client{Transport: transport},
+		Timeout: 3 * time.Second, MaxRetries: 2,
+		BeforeAttempt: func(context.Context, Request, []byte) error {
+			client.SendDeadline = time.Now().Add(time.Second)
+			return nil
+		},
+		BeforeSend: func(context.Context) error { checks++; return nil },
+	}
+	exchange, err := client.Evaluate(context.Background(), Build("typesafe/jev-1.13", nil))
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || !apiErr.Fatal || exchange.Attempts != 1 || checks != 1 {
+		t.Fatalf("expired send deadline retried: err=%v exchange=%+v gate checks=%d", err, exchange, checks)
+	}
+	select {
+	case <-transport.entered:
+	default:
+		t.Fatal("transport never entered; deadline was not exercised")
+	}
+}
+
 // Consecutive failures open the breaker, after which nothing more is sent;
 // a rejected key opens it at once.
 func TestCircuitBreakerStopsSendingAfterFailures(t *testing.T) {
