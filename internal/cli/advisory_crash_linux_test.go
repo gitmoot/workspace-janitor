@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -48,5 +49,19 @@ func TestDailyAdvisoryKilledAfterRequestCannotRepeat(t *testing.T) {
 	out, stderr, err := advisoryCLI(t, binary, f, "advisory", "run", "--key-file", keyFile)
 	if err == nil || !strings.Contains(out+stderr, "earlier run still active or interrupted") || calls.Load() != 1 {
 		t.Fatalf("crash reopened request: %v %s %s calls=%d", err, out, stderr, calls.Load())
+	}
+	var summary advisorySummary
+	if parseErr := json.Unmarshal([]byte(out), &summary); parseErr != nil ||
+		summary.Budget.Attempts != 1 || summary.Budget.EstimatedInputTokens == 0 {
+		t.Fatalf("interrupted summary concealed durable reservation: %+v %v", summary, parseErr)
+	}
+	out, stderr, err = advisoryCLI(t, binary, f, "advisory", "report")
+	if err != nil {
+		t.Fatalf("interrupted report: %v %s", err, stderr)
+	}
+	var report advisoryReport
+	if parseErr := json.Unmarshal([]byte(out), &report); parseErr != nil ||
+		report.Budget.Attempts != 1 || !report.ProviderUsageUnknown || report.Advisor.Mode != "" {
+		t.Fatalf("interrupted report claimed no spend or known usage: %+v %v", report, parseErr)
 	}
 }

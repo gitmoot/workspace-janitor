@@ -393,17 +393,22 @@ At most one run starts per UTC day. SQLite reserves each HTTP attempt
 7 attempts, 140 offered entries counted per attempt, 100000 estimated input
 tokens and $0.01 estimated input cost. An unknown/understated configured
 price, missing key, failed cycle or spent budget blocks calls. Partial
-inventories label the report incomplete and omit entries with unknown safety
-evidence; unaffected ambiguous entries may receive advice. Zero candidates
-send nothing. Restart/concurrent launches cannot reopen a running or
-interrupted day's claim. A newer inventory supersedes the completed cycle;
+inventories label the report incomplete. Failed/partial global reference
+collectors, including Gitmoot's ledger, omit all entries; per-entry unknown
+evidence omits only affected entries, so unaffected ambiguous entries may
+still receive advice. Zero candidates send nothing. Restart/concurrent
+launches cannot reopen a running or interrupted day's claim.
+A newer inventory supersedes the completed cycle;
 the advisory then stops rather than consulting stale evidence.
 If a provider response lacks input-token usage, the advisory rejects that
 answer and stops later batches; it never treats an unmeasured cost as zero.
 
 `janitor advisory report [--day YYYY-MM-DD]` reads the private state
-database's review-only report: scan binding, skipped counts, suggested
-recommendations, errors, reservations and provider-reported token usage.
+database's review-only report: scan binding, skipped/unknown/budget counts,
+suggested recommendations, errors, reservations and provider-reported token
+usage. An interrupted run overlays the durable reservation ledger rather
+than the stale claim-time JSON, and marks provider usage unknown; reserved
+input cost is not an actual bill.
 Advisory execution refuses a state directory not owned privately by the
 current user, including a symlink or group/world-accessible directory.
 The scheduled command logs only counts, not paths. The report contains no

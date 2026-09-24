@@ -90,7 +90,7 @@ func (c *Client) Evaluate(ctx context.Context, request Request) (Exchange, error
 		}
 		if c.BeforeAttempt != nil {
 			if err := c.BeforeAttempt(ctx, request, body); err != nil {
-				return exchange, &APIError{Message: "daily advisory budget unavailable"}
+				return exchange, &APIError{Message: "advisory attempt admission refused", Fatal: true}
 			}
 		}
 		exchange.Attempts++

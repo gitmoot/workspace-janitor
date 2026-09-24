@@ -66,8 +66,8 @@ func TestAdvisoryBudgetReservesAttemptsEntriesTokensAndCost(t *testing.T) {
 			}
 			if err := db.Write(ctx, func(tx *Tx) error {
 				return tx.ReserveAdvisoryAttempt(ctx, day, scanID, 1, 1, 1, now.Add(24*time.Hour))
-			}); !errors.Is(err, ErrAdvisoryBudget) {
-				t.Fatalf("UTC-day rollover = %v, want refusal", err)
+			}); !errors.Is(err, ErrAdvisoryDayChanged) {
+				t.Fatalf("UTC-day rollover = %v, want distinct day-change refusal", err)
 			}
 			var budget AdvisoryBudget
 			if err := db.Read(ctx, func(tx *Tx) error { var err error; budget, err = tx.AdvisoryBudget(ctx, day); return err }); err != nil {
@@ -114,5 +114,34 @@ func TestAdvisoryClaimIsSingleAcrossStoresAndInterruptedRuns(t *testing.T) {
 	}
 	if record.Status != "running" || record.ScanID != scanID {
 		t.Fatalf("interrupted run lost: %+v", record)
+	}
+}
+
+func TestAdvisoryReservationDistinguishesSupersededScan(t *testing.T) {
+	now := time.Now().UTC()
+	db := openFixture(t)
+	day, scanID := seedAdvisory(t, db, now)
+	ctx := context.Background()
+	if err := db.Write(ctx, func(tx *Tx) error {
+		return tx.CreateScan(ctx, fixtureScan("newer-inventory", now.Add(time.Second)))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := db.Write(ctx, func(tx *Tx) error {
+		return tx.ReserveAdvisoryAttempt(ctx, day, scanID, 1, 100, 1, now)
+	})
+	if !errors.Is(err, ErrAdvisorySuperseded) {
+		t.Fatalf("newer inventory = %v, want distinct superseded refusal", err)
+	}
+	var budget AdvisoryBudget
+	if err := db.Read(ctx, func(tx *Tx) error {
+		var err error
+		budget, err = tx.AdvisoryBudget(ctx, day)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if budget.Attempts != 0 {
+		t.Fatalf("superseded scan reserved an attempt: %+v", budget)
 	}
 }

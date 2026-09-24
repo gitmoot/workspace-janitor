@@ -20,6 +20,8 @@ const (
 var (
 	ErrAdvisoryAlreadyRun = errors.New("store: daily advisory already started")
 	ErrAdvisoryBudget     = errors.New("store: daily advisory budget exhausted or unavailable")
+	ErrAdvisoryDayChanged = errors.New("store: UTC day changed during advisory")
+	ErrAdvisorySuperseded = errors.New("store: inventory superseded advisory scan")
 )
 
 type AdvisoryBudget struct {
@@ -130,20 +132,29 @@ func (t *Tx) AdvisoryBudget(ctx context.Context, day string) (AdvisoryBudget, er
 // admission write across processes. An error, timeout or crash does not refund
 // a reservation, including an attempt that may never have reached the server.
 func (t *Tx) ReserveAdvisoryAttempt(ctx context.Context, day, scanID string, entries, tokens, costMicroUSD int64, now time.Time) error {
-	if day != advisoryDay(now) || entries <= 0 || tokens <= 0 || costMicroUSD <= 0 ||
+	if day != advisoryDay(now) {
+		return ErrAdvisoryDayChanged
+	}
+	if entries <= 0 || tokens <= 0 || costMicroUSD <= 0 ||
 		entries > AdvisoryMaxEntries || tokens > AdvisoryMaxInputTokens || costMicroUSD > AdvisoryMaxCostMicroUSD {
 		return ErrAdvisoryBudget
 	}
 	var status string
-	if err := t.tx.QueryRowContext(ctx, `SELECT status FROM advisory_runs WHERE day=? AND scan_id=?`, day, scanID).Scan(&status); err != nil || status != "running" {
-		return ErrAdvisoryBudget
+	if err := t.tx.QueryRowContext(ctx, `SELECT status FROM advisory_runs WHERE day=? AND scan_id=?`, day, scanID).Scan(&status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrAdvisoryAlreadyRun
+		}
+		return err
+	}
+	if status != "running" {
+		return ErrAdvisoryAlreadyRun
 	}
 	latest, err := t.ListScans(ctx, 1)
 	if err != nil {
 		return err
 	}
 	if len(latest) != 1 || latest[0].ID != scanID || latest[0].Status != "completed" {
-		return ErrAdvisoryBudget
+		return ErrAdvisorySuperseded
 	}
 	budget, err := t.AdvisoryBudget(ctx, day)
 	if err != nil {

@@ -68,11 +68,11 @@ func advisoryFixture(t *testing.T, endpoint string, maxRetries ...int) (*planFix
 	return f, keyFile
 }
 
-func advisoryFakeServer(t *testing.T, status int) (*httptest.Server, *atomic.Int64) {
+func advisoryFakeServer(t *testing.T, status int, onRequest ...func(int)) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 	calls := &atomic.Int64{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		requestNumber := calls.Add(1)
 		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/systemone" ||
 			r.Header.Get("Authorization") != "Bearer synthetic-only-key" {
 			t.Errorf("invalid synthetic advisory request")
@@ -83,6 +83,9 @@ func advisoryFakeServer(t *testing.T, status int) (*httptest.Server, *atomic.Int
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Errorf("decode request: %v", err)
 			return
+		}
+		if len(onRequest) != 0 {
+			onRequest[0](int(requestNumber))
 		}
 		if status != http.StatusOK {
 			w.WriteHeader(status)
@@ -305,5 +308,80 @@ func TestDailyAdvisoryPartialEvidenceSkipsOnlyUnknown(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("unaffected ambiguous entry missing from review report")
+	}
+}
+
+func TestDailyAdvisoryFailedGitmootEvidenceBlocksOutbound(t *testing.T) {
+	binary := advisoryTestBinary(t)
+	server, calls := advisoryFakeServer(t, http.StatusOK)
+	f, keyFile := advisoryFixture(t, server.URL)
+	if _, stderr, err := advisoryCLI(t, binary, f, "cycle"); err != nil {
+		t.Fatalf("cycle: %v %s", err, stderr)
+	}
+	db, err := store.Open(context.Background(), filepath.Join(f.home, ".local", "state", "workspace-janitor", "janitor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = db.Write(context.Background(), func(tx *store.Tx) error {
+		id, err := tx.CompletedCycle(context.Background(), time.Now().UTC().Format("2006-01-02"))
+		if err != nil {
+			return err
+		}
+		scan, err := tx.Scan(context.Background(), id)
+		if err != nil {
+			return err
+		}
+		for i := range scan.Collectors {
+			if scan.Collectors[i].Name == collect.CollectorGitmoot {
+				scan.Collectors[i].Status = core.CollectorFailed
+				scan.Collectors[i].Unknowns++
+				return tx.UpdateScan(context.Background(), scan)
+			}
+		}
+		return fmt.Errorf("missing synthetic Gitmoot collector report")
+	})
+	_ = db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, err := advisoryCLI(t, binary, f, "advisory", "run", "--key-file", keyFile)
+	if err != nil || calls.Load() != 0 {
+		t.Fatalf("failed reference ledger allowed outbound advice: %v %s %s calls=%d", err, out, stderr, calls.Load())
+	}
+	var summary advisorySummary
+	if err := json.Unmarshal([]byte(out), &summary); err != nil || !summary.Incomplete || summary.SkippedUnknown == 0 {
+		t.Fatalf("unknown global references not reported: %+v %v", summary, err)
+	}
+}
+
+func TestDailyAdvisorySummaryDisclosesEntryCapSkips(t *testing.T) {
+	binary := advisoryTestBinary(t)
+	server, calls := advisoryFakeServer(t, http.StatusOK)
+	f, keyFile := advisoryFixture(t, server.URL)
+	for i := range 142 {
+		if err := os.Mkdir(filepath.Join(f.root, fmt.Sprintf("mystery-%03d", i)), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, stderr, err := advisoryCLI(t, binary, f, "cycle"); err != nil {
+		t.Fatalf("cycle: %v %s", err, stderr)
+	}
+	out, stderr, err := advisoryCLI(t, binary, f, "advisory", "run", "--key-file", keyFile)
+	if err != nil {
+		t.Fatalf("bounded advice: %v %s %s", err, stderr, out)
+	}
+	var summary advisorySummary
+	if err := json.Unmarshal([]byte(out), &summary); err != nil ||
+		summary.Candidates != store.AdvisoryMaxEntries || summary.SkippedBudget == 0 ||
+		!summary.Incomplete || calls.Load() > store.AdvisoryMaxAttempts {
+		t.Fatalf("summary hid entry cap: %+v %v calls=%d", summary, err, calls.Load())
+	}
+	out, stderr, err = advisoryCLI(t, binary, f, "advisory", "report")
+	if err != nil {
+		t.Fatalf("report: %v %s", err, stderr)
+	}
+	var report advisoryReport
+	if err := json.Unmarshal([]byte(out), &report); err != nil || report.SkippedBudget != summary.SkippedBudget {
+		t.Fatalf("summary and private report disagree on skipped entries: %+v %v", report, err)
 	}
 }

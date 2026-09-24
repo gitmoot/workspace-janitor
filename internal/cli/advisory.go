@@ -33,17 +33,18 @@ type advisorySuggestion struct {
 // or mutation authority. Only `advisory report` prints paths; the scheduled
 // run's stdout is a path-free summary suitable for the service journal.
 type advisoryReport struct {
-	Day            string               `json:"utc_day"`
-	ScanID         string               `json:"scan_id"`
-	Status         string               `json:"status"`
-	Reason         string               `json:"reason,omitempty"`
-	Incomplete     bool                 `json:"incomplete"`
-	Candidates     int                  `json:"candidate_entries"`
-	SkippedUnknown int                  `json:"skipped_unknown"`
-	SkippedBudget  int                  `json:"skipped_budget"`
-	Suggestions    []advisorySuggestion `json:"suggestions,omitempty"`
-	Advisor        jev.Report           `json:"advisor"`
-	Budget         store.AdvisoryBudget `json:"reserved_daily_budget"`
+	Day                  string               `json:"utc_day"`
+	ScanID               string               `json:"scan_id"`
+	Status               string               `json:"status"`
+	Reason               string               `json:"reason,omitempty"`
+	Incomplete           bool                 `json:"incomplete"`
+	Candidates           int                  `json:"candidate_entries"`
+	SkippedUnknown       int                  `json:"skipped_unknown"`
+	SkippedBudget        int                  `json:"skipped_budget"`
+	Suggestions          []advisorySuggestion `json:"suggestions,omitempty"`
+	ProviderUsageUnknown bool                 `json:"provider_usage_unknown,omitempty"`
+	Advisor              jev.Report           `json:"advisor"`
+	Budget               store.AdvisoryBudget `json:"reserved_daily_budget"`
 	// The API reports tokens, not billed money. Advisor's cost is estimated
 	// from the response's token count; Budget uses pre-request estimates.
 }
@@ -56,6 +57,7 @@ type advisorySummary struct {
 	Incomplete     bool                 `json:"incomplete"`
 	Candidates     int                  `json:"candidate_entries"`
 	SkippedUnknown int                  `json:"skipped_unknown"`
+	SkippedBudget  int                  `json:"skipped_budget"`
 	Budget         store.AdvisoryBudget `json:"reserved_daily_budget"`
 }
 
@@ -186,15 +188,16 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 		byPath[entry.Path] = entry
 	}
 	// A partial global reference collector cannot prove any entry free of
-	// unseen references. Per-entry filesystem/Git unknowns are filtered below;
-	// unaffected entries can still receive review-only advice.
+	// unseen references. Gitmoot's ledger can also reference scanned paths
+	// outside its managed home; a failed read leaves all of those unknown.
+	// Per-entry filesystem/Git unknowns are filtered below.
 	globalUnknown := false
 	for _, collector := range scan.Collectors {
 		if collector.Status != core.CollectorFailed && collector.Status != core.CollectorPartial {
 			continue
 		}
 		switch collector.Name {
-		case collect.CollectorProcesses, collect.CollectorServices, collect.CollectorAgents:
+		case collect.CollectorProcesses, collect.CollectorServices, collect.CollectorAgents, collect.CollectorGitmoot:
 			globalUnknown = true
 		}
 	}
@@ -271,7 +274,7 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 		_ = writeAdvisorySummary(e, r)
 		return errUnsafeAdvisoryKey
 	}
-	budgetRejected := false
+	admissionReason := ""
 	client := &jev.Client{Endpoint: policy.Jev.Endpoint, APIKey: key, HTTP: &http.Client{},
 		Timeout: policy.Jev.Timeout.Duration(), MaxRetries: policy.Jev.MaxRetries, RequireUsage: true,
 		MinInterval: policy.Jev.MinInterval.Duration(), BackoffBase: 500 * time.Millisecond,
@@ -280,14 +283,25 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 		tokens := int64((len(body) + 2) / 3)
 		cost := int64(math.Ceil(float64(tokens) * price)) // micro-USD, rounded up
 		if tokens <= 0 || cost <= 0 || cost > store.AdvisoryMaxCostMicroUSD {
-			budgetRejected = true
+			admissionReason = "request estimate exceeds daily cap; no further outbound call"
 			return store.ErrAdvisoryBudget
 		}
 		err := db.Write(ctx, func(tx *store.Tx) error {
 			return tx.ReserveAdvisoryAttempt(ctx, day, scan.ID, int64(len(request.State.Entries)), tokens, cost, time.Now().UTC())
 		})
 		if err != nil {
-			budgetRejected = true
+			switch {
+			case errors.Is(err, store.ErrAdvisoryBudget):
+				admissionReason = "daily budget exhausted; no further outbound call"
+			case errors.Is(err, store.ErrAdvisoryDayChanged):
+				admissionReason = "UTC day changed during run; no further outbound call"
+			case errors.Is(err, store.ErrAdvisorySuperseded):
+				admissionReason = "newer or failed inventory superseded the cycle; no further outbound call"
+			case errors.Is(err, store.ErrAdvisoryAlreadyRun):
+				admissionReason = "daily claim is no longer running; no further outbound call"
+			default:
+				admissionReason = "advisory state unavailable; no further outbound call"
+			}
 		}
 		return err
 	}
@@ -308,16 +322,19 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 		}
 	}
 	usageErr := persistAdvice(ctx, db, advisor)
-	if classifyErr != nil || usageErr != nil || budgetRejected || r.Advisor.FailedRequests > 0 ||
+	if classifyErr != nil || usageErr != nil || admissionReason != "" || r.Advisor.FailedRequests > 0 ||
 		r.Advisor.Oversized > 0 || r.Advisor.CircuitOpen || len(answers) < len(candidates) {
 		r.Incomplete = true
+	}
+	if r.Advisor.FailedRequests > 0 && r.Advisor.Attempts > 0 {
+		r.ProviderUsageUnknown = true
 	}
 	status, reason := "complete", "review-only advice; no mutation was authorized"
 	if r.Incomplete {
 		status, reason = "incomplete", "some entries or requests lack verified advice; review required"
 	}
-	if budgetRejected {
-		reason = "daily budget exhausted or unavailable; no further outbound call"
+	if admissionReason != "" {
+		reason = admissionReason
 	}
 	if err := finish(status, reason); err != nil {
 		return err
@@ -331,8 +348,8 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 	if usageErr != nil {
 		return usageErr
 	}
-	if budgetRejected {
-		return store.ErrAdvisoryBudget
+	if admissionReason != "" {
+		return errors.New(admissionReason)
 	}
 	return nil
 }
@@ -340,32 +357,58 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 func writeAdvisorySummary(e *env, r advisoryReport) error {
 	return json.NewEncoder(e.stdout).Encode(advisorySummary{Day: r.Day, ScanID: r.ScanID,
 		Status: r.Status, Reason: r.Reason, Incomplete: r.Incomplete,
-		Candidates: r.Candidates, SkippedUnknown: r.SkippedUnknown, Budget: r.Budget})
+		Candidates: r.Candidates, SkippedUnknown: r.SkippedUnknown,
+		SkippedBudget: r.SkippedBudget, Budget: r.Budget})
 }
 
 func existingDailyAdvisory(ctx context.Context, e *env, db *store.Store, day string) error {
-	var record store.AdvisoryRecord
-	if err := db.Read(ctx, func(tx *store.Tx) error {
-		var err error
-		record, err = tx.Advisory(ctx, day)
-		return err
-	}); err != nil {
+	r, status, err := storedDailyAdvisory(ctx, db, day)
+	if err != nil {
 		return err
 	}
-	var r advisoryReport
-	if json.Unmarshal([]byte(record.Report), &r) != nil {
-		return errors.New("stored advisory report is invalid; no outbound call")
-	}
-	if record.Status == "running" {
-		r.Status, r.Reason, r.Incomplete = "incomplete", "earlier run still active or interrupted; no outbound call", true
+	if status == "running" {
+		r.Reason += "; no outbound call"
 	}
 	if err := writeAdvisorySummary(e, r); err != nil {
 		return err
 	}
-	if record.Status != "complete" {
+	if status != "complete" {
 		return errors.New("daily advisory already started; no outbound call")
 	}
 	return nil
+}
+
+// Read the report and immutable reservations in one snapshot: the initial
+// claim-time JSON is never an authoritative spend ledger after a crash.
+func storedDailyAdvisory(ctx context.Context, db *store.Store, day string) (advisoryReport, string, error) {
+	var record store.AdvisoryRecord
+	var budget store.AdvisoryBudget
+	err := db.Read(ctx, func(tx *store.Tx) error {
+		var err error
+		record, err = tx.Advisory(ctx, day)
+		if err != nil {
+			return err
+		}
+		budget, err = tx.AdvisoryBudget(ctx, day)
+		return err
+	})
+	if err != nil {
+		return advisoryReport{}, "", err
+	}
+	var r advisoryReport
+	if json.Unmarshal([]byte(record.Report), &r) != nil {
+		return advisoryReport{}, "", errors.New("stored advisory report is invalid; no outbound call")
+	}
+	r.Budget = budget
+	if record.Status == "running" {
+		r.Status, r.Reason, r.Incomplete = "incomplete", "earlier run still active or interrupted", true
+		if budget.Attempts > 0 {
+			r.ProviderUsageUnknown = true
+			r.Advisor.Mode = ""
+			r.Advisor.Note = "provider usage is unknown; reservations are estimates, not billing"
+		}
+	}
+	return r, record.Status, nil
 }
 
 func showDailyAdvisory(ctx context.Context, e *env, day string) error {
@@ -385,21 +428,9 @@ func showDailyAdvisory(ctx context.Context, e *env, day string) error {
 		return err
 	}
 	defer db.Close()
-	var record store.AdvisoryRecord
-	err = db.Read(ctx, func(tx *store.Tx) error {
-		var err error
-		record, err = tx.Advisory(ctx, day)
-		return err
-	})
+	report, _, err := storedDailyAdvisory(ctx, db, day)
 	if err != nil {
 		return err
-	}
-	var report advisoryReport
-	if err := json.Unmarshal([]byte(record.Report), &report); err != nil {
-		return errors.New("stored advisory report is invalid")
-	}
-	if record.Status == "running" {
-		report.Status, report.Reason, report.Incomplete = "incomplete", "earlier run still active or interrupted", true
 	}
 	return json.NewEncoder(e.stdout).Encode(report)
 }
