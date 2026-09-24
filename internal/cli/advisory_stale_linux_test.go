@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gitmoot/workspace-janitor/internal/jev"
 )
 
 func TestDailyAdvisoryRefusesSupersededSuccessfulCycle(t *testing.T) {
@@ -32,7 +34,7 @@ func TestDailyAdvisoryLaterScanStopsSecondBatchWithReason(t *testing.T) {
 	binary := advisoryTestBinary(t)
 	var f *planFixture
 	ready := make(chan struct{})
-	server, calls := advisoryFakeServer(t, http.StatusOK, func(n int) {
+	server, calls := advisoryFakeServer(t, http.StatusOK, func(n int, _ jev.Request) {
 		<-ready
 		if n == 1 {
 			if _, stderr, err := advisoryCLI(t, binary, f, "scan"); err != nil {

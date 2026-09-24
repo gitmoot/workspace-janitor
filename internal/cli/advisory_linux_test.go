@@ -68,7 +68,7 @@ func advisoryFixture(t *testing.T, endpoint string, maxRetries ...int) (*planFix
 	return f, keyFile
 }
 
-func advisoryFakeServer(t *testing.T, status int, onRequest ...func(int)) (*httptest.Server, *atomic.Int64) {
+func advisoryFakeServer(t *testing.T, status int, onRequest ...func(int, jev.Request)) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 	calls := &atomic.Int64{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -85,7 +85,7 @@ func advisoryFakeServer(t *testing.T, status int, onRequest ...func(int)) (*http
 			return
 		}
 		if len(onRequest) != 0 {
-			onRequest[0](int(requestNumber))
+			onRequest[0](int(requestNumber), request)
 		}
 		if status != http.StatusOK {
 			w.WriteHeader(status)

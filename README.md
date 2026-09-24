@@ -393,11 +393,13 @@ At most one run starts per UTC day. SQLite reserves each HTTP attempt
 7 attempts, 140 offered entries counted per attempt, 100000 estimated input
 tokens and $0.01 estimated input cost. An unknown/understated configured
 price, missing key, failed cycle or spent budget blocks calls. Partial
-inventories label the report incomplete. Failed/partial global reference
-collectors, including Gitmoot's ledger, omit all entries; per-entry unknown
-evidence omits only affected entries, so unaffected ambiguous entries may
-still receive advice. Zero candidates send nothing. Restart/concurrent
-launches cannot reopen a running or interrupted day's claim.
+inventories label the report incomplete. A report-only discovery root still
+forbids mutation, but its root protection alone does not block sanitized
+review-only advice for an otherwise safe ambiguous entry. Sensitive, active,
+protected-path and unknown entries remain excluded. Failed/partial global
+reference collectors, including Gitmoot's ledger, omit all entries; per-entry
+unknown evidence omits only affected entries. Zero candidates send nothing.
+Restart/concurrent launches cannot reopen a running or interrupted day's claim.
 Systemd unit aliases count as known only when a bounded, unchanged chain
 reaches a unit already scanned under a configured definition root (or the
 exact `/dev/null` mask). Broken, escaping, looping or changed aliases keep
