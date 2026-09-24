@@ -18,15 +18,22 @@ import (
 	"github.com/gitmoot/workspace-janitor/internal/store"
 )
 
-// watchReport describes only observed inventory changes. It never authorizes
-// or performs a filesystem action.
+// In-place changes in known protected directories do not change the top-level
+// inventory. Reconcile them hourly so reference evidence never stays stale
+// indefinitely, without persisting a scan for each operational state write.
+const watchChurnInterval = time.Hour
+
+// watchReport describes a persisted inventory reconciliation or a deferred
+// incomplete observation. It never authorizes a filesystem action.
 type watchReport struct {
-	Reason     string          `json:"reason"`
-	ScanID     string          `json:"scan_id"`
-	Paths      []watchGuidance `json:"paths"`
-	Reconciled bool            `json:"reconciled"`
-	Incomplete bool            `json:"incomplete"`
-	DiskAlerts []diskAlert     `json:"disk_alerts,omitempty"`
+	Reason          string          `json:"reason"`
+	ScanID          string          `json:"scan_id"`
+	Paths           []watchGuidance `json:"paths"`
+	Reconciled      bool            `json:"reconciled"`
+	Incomplete      bool            `json:"incomplete"`
+	DeferredEvents  uint64          `json:"deferred_events,omitempty"`
+	NextReconcileAt *time.Time      `json:"next_reconcile_at,omitempty"`
+	DiskAlerts      []diskAlert     `json:"disk_alerts,omitempty"`
 }
 
 type watchGuidance struct {
@@ -63,7 +70,7 @@ func runWatch(ctx context.Context, e *env, args []string) error {
 	}
 	return watchLoop(ctx, e, paths, policy, func() (eventWatcher, error) {
 		return openTopWatcher(roots)
-	})
+	}, watchChurnInterval)
 }
 
 type eventWatcher interface {
@@ -71,33 +78,51 @@ type eventWatcher interface {
 	close() error
 }
 
-func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Policy, open func() (eventWatcher, error)) error {
+func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Policy,
+	open func() (eventWatcher, error), churnInterval time.Duration) error {
 	watcher, err := open()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = watcher.close() }()
-	// Register watches before reconciling missed events at startup. Events
-	// arriving during the full scan stay queued and cause another scan.
-	if err := reconcileWatch(ctx, e, paths, policy, "startup", nil, true); err != nil {
+	// Snapshot protected directory identities before the startup scan. Events
+	// queued during reconciliation still expose new, removed or replaced paths.
+	protected := newProtectedWatchDirs(policy)
+	if err := reconcileWatch(ctx, e, paths, policy, "startup", nil, true, 0); err != nil {
 		return err
 	}
 	pendingSettle := map[string]bool{}
-	var settleAt time.Time
+	var settleAt, churnAt time.Time
+	var deferred uint64
 	for {
+		deadline := settleAt
+		if !churnAt.IsZero() && (deadline.IsZero() || churnAt.Before(deadline)) {
+			deadline = churnAt
+		}
 		eventCtx := ctx
 		cancelWait := func() {}
-		if !settleAt.IsZero() {
-			eventCtx, cancelWait = context.WithDeadline(ctx, settleAt)
+		if !deadline.IsZero() {
+			eventCtx, cancelWait = context.WithDeadline(ctx, deadline)
 		}
 		first, err := watcher.next(eventCtx)
 		cancelWait()
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-			if err := reconcileWatch(ctx, e, paths, policy, "settled", pendingSettle, false); err != nil {
-				return err
+			now := time.Now()
+			if !settleAt.IsZero() && !now.Before(settleAt) {
+				// Settling is a full scan too; it satisfies any deferred churn.
+				if err := reconcileWatch(ctx, e, paths, policy, "settled", pendingSettle, false, deferred); err != nil {
+					return err
+				}
+				pendingSettle = map[string]bool{}
+				settleAt, churnAt, deferred = time.Time{}, time.Time{}, 0
+			} else if !churnAt.IsZero() && !now.Before(churnAt) {
+				// Full reconciliation recovers even a top-level event lost
+				// during protected churn or an inotify overflow.
+				if err := reconcileWatch(ctx, e, paths, policy, "churn", nil, true, deferred); err != nil {
+					return err
+				}
+				churnAt, deferred = time.Time{}, 0
 			}
-			pendingSettle = map[string]bool{}
-			settleAt = time.Time{}
 			continue
 		}
 		if errors.Is(err, context.Canceled) {
@@ -106,10 +131,33 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		if err != nil {
 			return err
 		}
-		changed := map[string]bool{}
+		var changed map[string]bool
+		add := func(event watchEvent) error {
+			if event.Name == "" {
+				return nil
+			}
+			path := filepath.Join(event.Root, event.Name)
+			if !event.Overflow && protected.suppress(path) {
+				if deferred < ^uint64(0) {
+					deferred++
+				}
+				if churnAt.IsZero() {
+					churnAt = time.Now().Add(churnInterval)
+					if err := emitDeferredWatch(e, churnAt); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			if changed == nil {
+				changed = make(map[string]bool)
+			}
+			changed[path] = true
+			return nil
+		}
 		overflow := first.Overflow
-		if first.Name != "" {
-			changed[filepath.Join(first.Root, first.Name)] = true
+		if err := add(first); err != nil {
+			return err
 		}
 		// One bounded burst produces one complete snapshot, never a partial
 		// child-only snapshot that could become the planner's latest scan.
@@ -124,8 +172,9 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 				return err
 			}
 			overflow = event.Overflow
-			if event.Name != "" {
-				changed[filepath.Join(event.Root, event.Name)] = true
+			if err := add(event); err != nil {
+				cancel()
+				return err
 			}
 		}
 		cancel()
@@ -138,16 +187,18 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 			_ = watcher.close()
 			rearmed, openErr := open()
 			if openErr != nil {
-				// A removed root cannot be re-armed yet. Still report the
-				// bounded reconciliation; the service can restart once the
-				// root returns, without asserting an empty event stream.
-				return errors.Join(openErr, reconcileWatch(ctx, e, paths, policy, "change", changed, true))
+				return errors.Join(openErr, reconcileWatch(ctx, e, paths, policy, "change", changed, true, deferred))
 			}
 			watcher = rearmed
+			protected = newProtectedWatchDirs(policy)
 		}
-		if err := reconcileWatch(ctx, e, paths, policy, "change", changed, overflow); err != nil {
+		if !overflow && len(changed) == 0 {
+			continue
+		}
+		if err := reconcileWatch(ctx, e, paths, policy, "change", changed, overflow, deferred); err != nil {
 			return err
 		}
+		churnAt, deferred = time.Time{}, 0
 		// A direct clone first creates an empty directory and fills .git
 		// below our top-level watch. Revisit newly seen directories after
 		// they settle; the watcher itself never acts on them.
@@ -160,7 +211,57 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 	}
 }
 
-func reconcileWatch(ctx context.Context, e *env, paths config.Paths, policy config.Policy, reason string, changed map[string]bool, overflow bool) error {
+// Only explicitly protected directories immediately below a watched root
+// qualify. Missing paths are tracked so their creation cannot be suppressed.
+type protectedWatchDirs map[string]os.FileInfo
+
+func newProtectedWatchDirs(policy config.Policy) protectedWatchDirs {
+	roots := make(map[string]bool, len(policy.Roots))
+	for _, root := range policy.Roots {
+		roots[root.Path] = true
+	}
+	dirs := make(protectedWatchDirs)
+	for _, path := range policy.Protect.Paths {
+		if !roots[filepath.Dir(path)] {
+			continue
+		}
+		if info, err := os.Lstat(path); err == nil && info.IsDir() {
+			dirs[path] = info
+		} else {
+			dirs[path] = nil
+		}
+	}
+	return dirs
+}
+
+func (dirs protectedWatchDirs) suppress(path string) bool {
+	prior, tracked := dirs[path]
+	if !tracked {
+		return false
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() {
+		dirs[path] = nil
+		return false
+	}
+	dirs[path] = info
+	return prior != nil && os.SameFile(prior, info) && prior.Mode() == info.Mode()
+}
+
+func emitDeferredWatch(e *env, due time.Time) error {
+	encoded, err := json.Marshal(watchReport{
+		Reason: "deferred", Paths: []watchGuidance{}, Incomplete: true,
+		DeferredEvents: 1, NextReconcileAt: &due,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(e.stdout, string(encoded))
+	return err
+}
+
+func reconcileWatch(ctx context.Context, e *env, paths config.Paths, policy config.Policy,
+	reason string, changed map[string]bool, overflow bool, deferred uint64) error {
 	quiet := *e
 	quiet.stdout = io.Discard
 	// Background inventory is local and rules-only; neither planning nor
@@ -188,7 +289,8 @@ func reconcileWatch(ctx context.Context, e *env, paths config.Paths, policy conf
 	if err != nil {
 		return err
 	}
-	report := watchReport{Reason: reason, ScanID: scan.ID, Reconciled: overflow, Paths: []watchGuidance{}}
+	report := watchReport{Reason: reason, ScanID: scan.ID, Reconciled: overflow,
+		Paths: []watchGuidance{}, DeferredEvents: deferred}
 	alerts, err := reportDiskPressure(ctx, policy, paths, scan.ID, time.Now().UTC())
 	if err != nil {
 		return err

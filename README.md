@@ -296,6 +296,21 @@ trigger full reconciliation; partial collector results remain unknown rather
 than proving a deletion. Event-triggered scans are metadata-only and never
 advance the deep-scan clock.
 
+Repeated events on an already-present, explicitly protected top-level
+directory (such as `.gitmoot`) do not each persist a scan while its directory
+identity and mode stay unchanged. The first suppressed event emits a
+`reason: "deferred"` JSON diagnostic with `incomplete: true`, no `scan_id`,
+and `next_reconcile_at`; a full `reason: "churn"` scan follows within one hour
+and reports `deferred_events`. A genuinely new, removed, replaced, or
+permission-changed top-level path still triggers an immediate full scan.
+Startup, inotify overflow, and two-second settling still reconcile. The
+hourly bound applies to protected-directory churn alone: overflow or real
+changes can require more scans. Protected metadata may be up to one hour
+stale between scans; safety protections remain in force, and the daily cycle
+does its own full scan. This limits the growth rate, not total database size;
+operators must monitor disk use and retain the watcher off after an incident
+until a read-only preflight establishes a safe rate.
+
 `janitor cycle` is a one-shot timer target: each invocation records a metadata
 scan, or a deep scan if `prevention.deep_interval` has elapsed since the last
 successful scheduled deep scan (default seven days). `collectors.deep_size`
