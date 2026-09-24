@@ -332,5 +332,5 @@ func isFatal(err error) bool {
 	if !ok {
 		return false
 	}
-	return apiErr.Status == 401 || apiErr.Status == 403 || apiErr.Status == 422
+	return apiErr.Fatal || apiErr.Status == 401 || apiErr.Status == 403 || apiErr.Status == 422
 }

@@ -398,6 +398,8 @@ evidence; unaffected ambiguous entries may receive advice. Zero candidates
 send nothing. Restart/concurrent launches cannot reopen a running or
 interrupted day's claim. A newer inventory supersedes the completed cycle;
 the advisory then stops rather than consulting stale evidence.
+If a provider response lacks input-token usage, the advisory rejects that
+answer and stops later batches; it never treats an unmeasured cost as zero.
 
 `janitor advisory report [--day YYYY-MM-DD]` reads the private state
 database's review-only report: scan binding, skipped counts, suggested

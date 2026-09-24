@@ -273,7 +273,7 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 	}
 	budgetRejected := false
 	client := &jev.Client{Endpoint: policy.Jev.Endpoint, APIKey: key, HTTP: &http.Client{},
-		Timeout: policy.Jev.Timeout.Duration(), MaxRetries: policy.Jev.MaxRetries,
+		Timeout: policy.Jev.Timeout.Duration(), MaxRetries: policy.Jev.MaxRetries, RequireUsage: true,
 		MinInterval: policy.Jev.MinInterval.Duration(), BackoffBase: 500 * time.Millisecond,
 		MaxBackoff: 10 * time.Second}
 	client.BeforeAttempt = func(ctx context.Context, request jev.Request, body []byte) error {
