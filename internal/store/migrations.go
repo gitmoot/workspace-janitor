@@ -228,6 +228,38 @@ var migrations = []migration{
 			)`,
 		},
 	},
+	{
+		version: 7,
+		name:    "daily_advisory",
+		statements: []string{
+			`CREATE TABLE completed_cycles (
+				day TEXT PRIMARY KEY,
+				scan_id TEXT NOT NULL REFERENCES scans(id),
+				completed_at_ns INTEGER NOT NULL
+			)`,
+			`CREATE TABLE advisory_runs (
+				day TEXT PRIMARY KEY,
+				scan_id TEXT NOT NULL REFERENCES scans(id),
+				status TEXT NOT NULL,
+				report TEXT NOT NULL,
+				started_at_ns INTEGER NOT NULL,
+				finished_at_ns INTEGER
+			)`,
+			`CREATE TABLE advisory_attempts (
+				id INTEGER PRIMARY KEY,
+				day TEXT NOT NULL REFERENCES advisory_runs(day),
+				scan_id TEXT NOT NULL REFERENCES scans(id),
+				entries INTEGER NOT NULL CHECK (entries > 0),
+				estimated_tokens INTEGER NOT NULL CHECK (estimated_tokens > 0),
+				estimated_cost_micro_usd INTEGER NOT NULL CHECK (estimated_cost_micro_usd > 0),
+				reserved_at_ns INTEGER NOT NULL
+			)`,
+			`CREATE TRIGGER advisory_attempts_no_update BEFORE UPDATE ON advisory_attempts
+			 BEGIN SELECT RAISE(ABORT, 'advisory attempts are immutable'); END`,
+			`CREATE TRIGGER advisory_attempts_no_delete BEFORE DELETE ON advisory_attempts
+			 BEGIN SELECT RAISE(ABORT, 'advisory attempts are immutable'); END`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.

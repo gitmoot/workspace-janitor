@@ -51,6 +51,9 @@ type Client struct {
 	// waiting for it.
 	Sleep func(ctx context.Context, d time.Duration) error
 	Now   func() time.Time
+	// BeforeAttempt must durably reserve an allowed attempt before HTTP Do.
+	// A rejected reservation never sends, including on retries.
+	BeforeAttempt func(context.Context, Request, []byte) error
 
 	mu          sync.Mutex
 	lastRequest time.Time
@@ -75,10 +78,17 @@ func (c *Client) Evaluate(ctx context.Context, request Request) (Exchange, error
 	attempts := c.MaxRetries + 1
 	var last error
 	for attempt := range attempts {
-		exchange.Attempts = attempt + 1
+		// Attempts counts reservations that may have reached the server,
+		// not rejected retries or local pacing failures.
 		if err := c.pace(ctx); err != nil {
 			return exchange, &APIError{Message: "cancelled: " + err.Error()}
 		}
+		if c.BeforeAttempt != nil {
+			if err := c.BeforeAttempt(ctx, request, body); err != nil {
+				return exchange, &APIError{Message: "daily advisory budget unavailable"}
+			}
+		}
+		exchange.Attempts++
 		response, wait, err := c.once(ctx, body)
 		if err == nil {
 			exchange.Response = response

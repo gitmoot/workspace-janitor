@@ -18,6 +18,7 @@ func rootCommand() *command {
 		subcommands: []*command{
 			watchCommand(),
 			cycleCommand(),
+			advisoryCommand(),
 			serviceCommand(),
 			scanCommand(),
 			planCommand(),

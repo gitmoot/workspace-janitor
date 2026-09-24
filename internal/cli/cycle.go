@@ -72,6 +72,22 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 			return fmt.Errorf("scheduled expiry: %w; %s", err, report.ExpiryReport)
 		}
 	}
+	// The daily advisory accepts only a cycle that completed its scan and
+	// enabled post-scan actions. Watcher/standalone scans cannot trigger it.
+	db, err := store.OpenExisting(ctx, paths.DatabaseFile)
+	if err != nil {
+		return err
+	}
+	err = db.Write(ctx, func(tx *store.Tx) error {
+		return tx.RecordCompletedCycle(ctx, scanID, time.Now().UTC())
+	})
+	closeErr := db.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
 	data, err := json.Marshal(report)
 	if err != nil {
 		return err

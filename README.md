@@ -320,13 +320,13 @@ On other platforms confirmed apply remains unsupported, while confirmed
 restore retains its prior behavior without this Linux-only lock.
 
 `janitor service generate --output /absolute/private/directory --binary
-/absolute/janitor` writes three units without installing or enabling them:
-`janitor-watch.service`, `janitor-cycle.service`, and
-`janitor-cycle.timer` (`OnCalendar=daily`). Review the generated paths and
-policy before installing them yourself. Both generated services clear
-`OPENROUTER_API_KEY` and request `IPAddressDeny=any`; watch and cycle never
-call the model. The service restriction is an OS-level network boundary when
-systemd enforces it; direct manual invocations do not acquire that sandbox.
+/absolute/janitor` writes units without installing or enabling them: the
+offline `janitor-watch.service`, `janitor-cycle.service`, and
+`janitor-cycle.timer` (`OnCalendar=daily`), plus a separate
+`janitor-advisory.service` and **uninstalled** `janitor-cycle-advisory.conf`
+drop-in template. Both offline services clear `OPENROUTER_API_KEY` and request
+`IPAddressDeny=any`; watch and cycle never call the model. The OS enforces the
+network boundary for installed units; direct invocations do not acquire it.
 
 ### Jev advice
 
@@ -377,6 +377,50 @@ Usage is recorded for every answered request, even with `--no-store`.
 `plan` shows the run's tokens and estimated cost, and `status` shows the
 totals. Cost is an estimate: reported input tokens times
 `price_per_mtok_usd`.
+
+### Opt-in daily advisory (review only)
+
+`janitor advisory run` requires `jev.enabled: true` and a successful cycle
+stored on the same UTC day. It does not modify the watcher or cycle; a
+standalone scan is insufficient. The run reads only `OPENROUTER_API_KEY` from
+an owner-only regular `--key-file` (default `/root/.env`) through no-follow
+file descriptors. It rejects symlinks, unsafe ownership/mode, malformed or
+duplicate keys, and never sources the file or loads other variables. Manual
+`plan` still uses its existing environment-based credential behavior.
+
+At most one run starts per UTC day. SQLite reserves each HTTP attempt
+**before** sending, including retries, and never refunds errors or crashes:
+7 attempts, 140 offered entries counted per attempt, 100000 estimated input
+tokens and $0.01 estimated input cost. An unknown/understated configured
+price, missing key, failed cycle or spent budget blocks calls. Partial
+inventories label the report incomplete and omit entries with unknown safety
+evidence; unaffected ambiguous entries may receive advice. Zero candidates
+send nothing. Restart/concurrent launches cannot reopen a running or
+interrupted day's claim. A newer inventory supersedes the completed cycle;
+the advisory then stops rather than consulting stale evidence.
+
+`janitor advisory report [--day YYYY-MM-DD]` reads the private state
+database's review-only report: scan binding, skipped counts, suggested
+recommendations, errors, reservations and provider-reported token usage.
+Advisory execution refuses a state directory not owned privately by the
+current user, including a symlink or group/world-accessible directory.
+The scheduled command logs only counts, not paths. The report contains no
+approval or executable apply command; deterministic guards remain in force.
+Both token-to-cost figures are estimates, not exact billing. Root-relative
+metadata may still identify private work after heuristic redaction.
+
+**Host rollout is separate and requires operator approval.** After reviewing
+the exact binary, policy, key-file owner/mode and generated units, the
+operator may install `janitor-advisory.service` as a user unit and install
+`janitor-cycle-advisory.conf` specifically at
+`janitor-cycle.service.d/advisory.conf`, then reload systemd. Installing
+only the three offline units does not opt in. The optional drop-in starts
+advice via `OnSuccess=` only after a successful cycle; the CLI also checks
+the persisted same-day cycle. Do not add an `EnvironmentFile`, enable the
+advisory unit independently, or change watch/cycle's offline restrictions.
+The operator owns the first bounded live run and checks the actual service
+result, provider usage and private report. Public releases and automatic
+cleanup remain held.
 
 ## Configuration
 

@@ -32,6 +32,20 @@ func TestServiceGenerationWritesOfflineUnitsWithoutInstalling(t *testing.T) {
 			t.Fatalf("unit %s did not disable networking", name)
 		}
 	}
+	advisory, err := os.ReadFile(filepath.Join(output, "janitor-advisory.service"))
+	if err != nil || !strings.Contains(string(advisory), " advisory run --key-file /root/.env") ||
+		!strings.Contains(string(advisory), "Environment=OPENROUTER_API_KEY=") ||
+		strings.Contains(string(advisory), "EnvironmentFile=") {
+		t.Fatalf("advisory unit does not read only the key at execution time: %v", err)
+	}
+	dropin, err := os.ReadFile(filepath.Join(output, "janitor-cycle-advisory.conf"))
+	if err != nil || !strings.Contains(string(dropin), "OnSuccess=janitor-advisory.service") {
+		t.Fatalf("opt-in success drop-in missing: %v", err)
+	}
+	offlineCycle, _ := os.ReadFile(filepath.Join(output, "janitor-cycle.service"))
+	if strings.Contains(string(offlineCycle), "OnSuccess=") {
+		t.Fatal("default offline cycle gained an automatic advisory trigger")
+	}
 	if _, err := os.Stat(filepath.Join(f.home, ".config", "systemd", "user", "janitor-watch.service")); !os.IsNotExist(err) {
 		t.Fatalf("generator installed a live unit: %v", err)
 	}
