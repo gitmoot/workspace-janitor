@@ -202,13 +202,19 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 			globalUnknown = true
 		}
 	}
+	reportOnlyReasons := make(map[string]string, len(policy.Roots))
+	for _, root := range policy.Roots {
+		if root.ReportOnly {
+			reportOnlyReasons[root.Path] = "root " + root.Path + " is report-only"
+		}
+	}
 	candidates := make([]core.Entry, 0)
 	for i, trace := range built.Traces {
 		if !trace.Ambiguous {
 			continue
 		}
 		entry := byPath[trace.Path]
-		unknown := globalUnknown || built.Verdicts[i].Refused() || entry.Protected()
+		unknown := globalUnknown || !advisorySafeForAdvice(entry, built.Verdicts[i], reportOnlyReasons)
 		for _, evidence := range entry.Evidence {
 			if strings.HasPrefix(evidence.Signal, "unknown:") {
 				unknown = true
@@ -369,6 +375,43 @@ func advisorySendDay(day string, now time.Time) error {
 		return store.ErrAdvisoryDayChanged
 	}
 	return nil
+}
+
+// A report-only discovery root forbids mutations, not sanitized review-only
+// advice. The exception is valid only for the exact collector-attested root
+// protection; any other blocking entry or safety verdict guard still wins.
+func advisorySafeForAdvice(entry core.Entry, verdict core.Verdict, reportOnlyReasons map[string]string) bool {
+	if !entry.Protected() && !verdict.Refused() {
+		return true
+	}
+	reason, ok := reportOnlyReasons[entry.Root]
+	if !ok {
+		return false
+	}
+	attested := false
+	for _, evidence := range entry.Evidence {
+		if evidence.Source == core.SourcePolicy && evidence.Signal == "report_only_root" && evidence.Detail == reason {
+			attested = true
+			break
+		}
+	}
+	return attested && onlyReportOnlyRootProtection(entry.Protections, reason) &&
+		onlyReportOnlyRootProtection(verdict.Protections, reason)
+}
+
+func onlyReportOnlyRootProtection(protections []core.Protection, reason string) bool {
+	found := false
+	for _, protection := range protections {
+		if !protection.Blocking {
+			continue
+		}
+		if protection.Kind != core.ProtectPolicyProtected || protection.Source != core.SourcePolicy ||
+			protection.Reason != reason {
+			return false
+		}
+		found = true
+	}
+	return found
 }
 
 func writeAdvisorySummary(e *env, r advisoryReport) error {
