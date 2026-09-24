@@ -578,6 +578,32 @@ func TestClientTimesOutASlowServer(t *testing.T) {
 	}
 }
 
+func TestClientRetriesOrdinarySendGateTimeoutBeforeMidnight(t *testing.T) {
+	server := newFakeServer(t, func(_ int, request Request) (int, http.Header, any) {
+		return http.StatusOK, nil, answersFor(request, "keep", "cache", "none", 0.9, 0)
+	})
+	client := server.client()
+	client.MaxRetries = 1
+	client.SendDeadline = time.Now().Add(time.Minute)
+	client.Sleep = func(context.Context, time.Duration) error { return nil }
+	reservations := 0
+	client.BeforeAttempt = func(context.Context, Request, []byte) error {
+		reservations++
+		return nil
+	}
+	client.BeforeSend = func(context.Context) error {
+		if reservations == 1 {
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	exchange, err := client.Evaluate(context.Background(), Build("typesafe/jev-1.13", []Projection{{Ref: "e1"}}))
+	if err != nil || exchange.Attempts != 2 || reservations != 2 || server.calls() != 1 {
+		t.Fatalf("ordinary timeout consumed the rest of the advisory: err=%v attempts=%d reservations=%d calls=%d",
+			err, exchange.Attempts, reservations, server.calls())
+	}
+}
+
 type waitingBeforeWire struct {
 	entered chan struct{}
 }

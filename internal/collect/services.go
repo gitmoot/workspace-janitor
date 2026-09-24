@@ -66,10 +66,6 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 // actually read from one of these opened definition roots (or to the exact
 // systemd /dev/null mask). Never follow an alias to read arbitrary content.
 func gatherSystemd(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
-	type alias struct {
-		unit unitLocation
-		info os.FileInfo
-	}
 	var sources []systemdDirectory
 	defer func() {
 		for _, source := range sources {
@@ -108,7 +104,7 @@ func gatherSystemd(ctx context.Context, opts *Options, report *core.CollectorRep
 
 	var refs []Reference
 	scanned := make(map[unitLocation]os.FileInfo)
-	aliases := make([]alias, 0)
+	aliases := make([]unitLocation, 0)
 	aliasInfos := make(map[unitLocation]os.FileInfo)
 	for i, source := range sources {
 		for _, name := range source.names {
@@ -125,7 +121,7 @@ func gatherSystemd(ctx context.Context, opts *Options, report *core.CollectorRep
 				continue
 			}
 			if info.Mode()&os.ModeSymlink != 0 {
-				aliases = append(aliases, alias{unit: unit, info: info})
+				aliases = append(aliases, unit)
 				aliasInfos[unit] = info
 				continue
 			}
@@ -143,9 +139,9 @@ func gatherSystemd(ctx context.Context, opts *Options, report *core.CollectorRep
 		if ctx.Err() != nil {
 			return refs
 		}
-		if err := proveSystemdAlias(link.unit, link.info, sources, scanned, aliasInfos); err != nil {
+		if err := proveSystemdAlias(link, sources, scanned, aliasInfos); err != nil {
 			noteUnreadable(report, fmt.Sprintf("unproven unit alias %s: %v",
-				filepath.Join(sources[link.unit.directory].path, link.unit.name), err))
+				filepath.Join(sources[link.directory].path, link.name), err))
 			continue
 		}
 		report.Visited++ // known alias/mask, never a second copy of its target's refs
@@ -197,7 +193,7 @@ func readSystemdUnit(root *os.Root, name string, before os.FileInfo) (string, er
 
 const maxSystemdAliasHops = 8
 
-func proveSystemdAlias(start unitLocation, initial os.FileInfo, sources []systemdDirectory,
+func proveSystemdAlias(start unitLocation, sources []systemdDirectory,
 	scanned, aliasInfos map[unitLocation]os.FileInfo) error {
 	type step struct {
 		unit   unitLocation
@@ -227,8 +223,7 @@ func proveSystemdAlias(start unitLocation, initial os.FileInfo, sources []system
 			break
 		}
 		known, ok := aliasInfos[current]
-		if !ok || info.Mode()&os.ModeSymlink == 0 || !sameUnitFile(known, info) ||
-			current == start && !sameUnitFile(initial, info) {
+		if !ok || info.Mode()&os.ModeSymlink == 0 || !sameUnitFile(known, info) {
 			return fmt.Errorf("alias was not listed or changed")
 		}
 		target, err := source.root.Readlink(current.name)

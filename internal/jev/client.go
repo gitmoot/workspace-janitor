@@ -284,6 +284,9 @@ type sendGuardTransport struct {
 
 func (t sendGuardTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err := t.before(req.Context()); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err // Ordinary attempt timeout remains retryable before midnight.
+		}
 		return nil, fmt.Errorf("%w: %v", errSendRefused, err)
 	}
 	return t.next.RoundTrip(req)

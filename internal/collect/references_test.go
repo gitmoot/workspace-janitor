@@ -332,7 +332,7 @@ func TestSystemdAliasChangedAfterListingIsUnknown(t *testing.T) {
 	}
 	alias := unitLocation{directory: 0, name: "alias.service"}
 	regular := unitLocation{directory: 0, name: "canonical.service"}
-	err = proveSystemdAlias(alias, initial, []systemdDirectory{{path: units, root: root}},
+	err = proveSystemdAlias(alias, []systemdDirectory{{path: units, root: root}},
 		map[unitLocation]os.FileInfo{regular: target}, map[unitLocation]os.FileInfo{alias: initial})
 	if err == nil {
 		t.Fatal("changed alias was proven from its stale listing")
