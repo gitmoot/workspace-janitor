@@ -338,6 +338,12 @@ func readDirNamesBounded(dir string, limit int) (boundedNames, error) {
 		return boundedNames{}, err
 	}
 	defer f.Close()
+	return readDirNamesFromFile(f, limit)
+}
+
+// readDirNamesFromFile keeps service listing anchored to the same opened
+// directory used for definition reads, even if a parent path is renamed.
+func readDirNamesFromFile(f *os.File, limit int) (boundedNames, error) {
 	names, err := f.Readdirnames(limit + 1)
 	if err != nil && len(names) == 0 {
 		if errors.Is(err, io.EOF) {

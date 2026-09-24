@@ -137,6 +137,7 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 	defer db.Close()
 	now := time.Now().UTC()
 	day := now.Format("2006-01-02")
+	sendDeadline := now.Truncate(24 * time.Hour).Add(24 * time.Hour)
 	var scan core.Scan
 	var entries []core.Entry
 	err = db.Read(ctx, func(tx *store.Tx) error {
@@ -278,7 +279,7 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 	client := &jev.Client{Endpoint: policy.Jev.Endpoint, APIKey: key, HTTP: &http.Client{},
 		Timeout: policy.Jev.Timeout.Duration(), MaxRetries: policy.Jev.MaxRetries, RequireUsage: true,
 		MinInterval: policy.Jev.MinInterval.Duration(), BackoffBase: 500 * time.Millisecond,
-		MaxBackoff: 10 * time.Second}
+		MaxBackoff: 10 * time.Second, SendDeadline: sendDeadline}
 	client.BeforeAttempt = func(ctx context.Context, request jev.Request, body []byte) error {
 		tokens := int64((len(body) + 2) / 3)
 		cost := int64(math.Ceil(float64(tokens) * price)) // micro-USD, rounded up
@@ -304,6 +305,13 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 			}
 		}
 		return err
+	}
+	client.BeforeSend = func(ctx context.Context) error {
+		if err := advisorySendDay(day, time.Now()); err != nil {
+			admissionReason = "UTC day changed after reservation; no further outbound call"
+			return err
+		}
+		return ctx.Err()
 	}
 	advisor, err := jev.New(jev.Options{Policy: policy.Jev, PolicyDigest: plan.PolicyDigest(policy),
 		ScanID: scan.ID, Redactor: jev.Redactor{Segments: policy.Jev.RedactSegments,
@@ -350,6 +358,15 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 	}
 	if admissionReason != "" {
 		return errors.New(admissionReason)
+	}
+	return nil
+}
+
+// The reservation's day is checked again at the transport boundary. A
+// reservation made just before midnight cannot authorize a new-day send.
+func advisorySendDay(day string, now time.Time) error {
+	if now.UTC().Format("2006-01-02") != day {
+		return store.ErrAdvisoryDayChanged
 	}
 	return nil
 }

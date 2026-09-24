@@ -578,6 +578,42 @@ func TestClientTimesOutASlowServer(t *testing.T) {
 	}
 }
 
+type waitingBeforeWire struct {
+	entered chan struct{}
+}
+
+func (t waitingBeforeWire) RoundTrip(req *http.Request) (*http.Response, error) {
+	close(t.entered)
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
+func TestClientSendDeadlineCancelsPausedTransportWithoutRetry(t *testing.T) {
+	transport := waitingBeforeWire{entered: make(chan struct{})}
+	checks := 0
+	var client *Client
+	client = &Client{
+		Endpoint: "http://127.0.0.1:1/api/v1/systemone", APIKey: testKey,
+		HTTP:    &http.Client{Transport: transport},
+		Timeout: 3 * time.Second, MaxRetries: 2,
+		BeforeAttempt: func(context.Context, Request, []byte) error {
+			client.SendDeadline = time.Now().Add(time.Second)
+			return nil
+		},
+		BeforeSend: func(context.Context) error { checks++; return nil },
+	}
+	exchange, err := client.Evaluate(context.Background(), Build("typesafe/jev-1.13", nil))
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || !apiErr.Fatal || exchange.Attempts != 1 || checks != 1 {
+		t.Fatalf("expired send deadline retried: err=%v exchange=%+v gate checks=%d", err, exchange, checks)
+	}
+	select {
+	case <-transport.entered:
+	default:
+		t.Fatal("transport never entered; deadline was not exercised")
+	}
+}
+
 // Consecutive failures open the breaker, after which nothing more is sent;
 // a rejected key opens it at once.
 func TestCircuitBreakerStopsSendingAfterFailures(t *testing.T) {

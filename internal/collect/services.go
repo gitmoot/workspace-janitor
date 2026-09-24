@@ -61,43 +61,236 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 	return refs, report
 }
 
+// A unit alias has no independent directives. Scan regular definitions first,
+// then accept an alias only when a bounded, unchanged chain leads to a unit
+// actually read from one of these opened definition roots (or to the exact
+// systemd /dev/null mask). Never follow an alias to read arbitrary content.
 func gatherSystemd(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
-	var refs []Reference
+	type alias struct {
+		unit unitLocation
+		info os.FileInfo
+	}
+	var sources []systemdDirectory
+	defer func() {
+		for _, source := range sources {
+			_ = source.root.Close()
+		}
+	}()
 	for _, dir := range opts.ServiceSources.SystemdDirs {
 		if ctx.Err() != nil {
-			return refs
+			return nil
 		}
-		names, err := readDirNamesBounded(dir, opts.Limits.MaxDirEntries)
+		root, err := os.OpenRoot(dir)
 		if err != nil {
-			if os.IsNotExist(err) {
-				continue
+			if !os.IsNotExist(err) {
+				noteUnreadable(report, fmt.Sprintf("could not open unit directory %s: %v", dir, err))
 			}
-			noteUnreadable(report, fmt.Sprintf("could not list %s: %v", dir, err))
+			continue
+		}
+		listing, err := root.Open(".")
+		if err != nil {
+			_ = root.Close()
+			noteUnreadable(report, fmt.Sprintf("could not list unit directory %s: %v", dir, err))
+			continue
+		}
+		names, err := readDirNamesFromFile(listing, opts.Limits.MaxDirEntries)
+		_ = listing.Close()
+		if err != nil {
+			_ = root.Close()
+			noteUnreadable(report, fmt.Sprintf("could not list unit directory %s: %v", dir, err))
 			continue
 		}
 		if names.bounded {
-			// Units past the bound were not read, so their references are
-			// unknown; a truncated listing must not read as "no more units".
 			noteUnreadable(report, fmt.Sprintf("listing of %s was truncated at %d entries", dir, opts.Limits.MaxDirEntries))
 		}
-		for _, name := range names.names {
+		sources = append(sources, systemdDirectory{path: filepath.Clean(dir), root: root, names: names.names})
+	}
+
+	var refs []Reference
+	scanned := make(map[unitLocation]os.FileInfo)
+	aliases := make([]alias, 0)
+	aliasInfos := make(map[unitLocation]os.FileInfo)
+	for i, source := range sources {
+		for _, name := range source.names {
 			if ctx.Err() != nil {
 				return refs
 			}
 			if !strings.HasSuffix(name, ".service") {
 				continue
 			}
-			path := filepath.Join(dir, name)
-			content, err := readFileBounded(path, maxUnitFileBytes)
+			unit := unitLocation{directory: i, name: name}
+			info, err := source.root.Lstat(name)
 			if err != nil {
-				noteUnreadable(report, fmt.Sprintf("could not read %s: %v", path, err))
+				noteUnreadable(report, fmt.Sprintf("could not inspect %s: %v", filepath.Join(source.path, name), err))
 				continue
 			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				aliases = append(aliases, alias{unit: unit, info: info})
+				aliasInfos[unit] = info
+				continue
+			}
+			content, err := readSystemdUnit(source.root, name, info)
+			if err != nil {
+				noteUnreadable(report, fmt.Sprintf("could not read %s: %v", filepath.Join(source.path, name), err))
+				continue
+			}
+			scanned[unit] = info
 			report.Visited++
 			refs = append(refs, systemdUnitReferences(name, content)...)
 		}
 	}
+	for _, link := range aliases {
+		if ctx.Err() != nil {
+			return refs
+		}
+		if err := proveSystemdAlias(link.unit, link.info, sources, scanned, aliasInfos); err != nil {
+			noteUnreadable(report, fmt.Sprintf("unproven unit alias %s: %v",
+				filepath.Join(sources[link.unit.directory].path, link.unit.name), err))
+			continue
+		}
+		report.Visited++ // known alias/mask, never a second copy of its target's refs
+	}
 	return refs
+}
+
+type systemdDirectory struct {
+	path  string
+	root  *os.Root
+	names []string
+}
+
+type unitLocation struct {
+	directory int
+	name      string
+}
+
+// The opened file, both observations of its directory entry, and its content
+// must describe the same bounded regular inode. A swapped-in special file
+// cannot block the reader or become a clean empty definition.
+func readSystemdUnit(root *os.Root, name string, before os.FileInfo) (string, error) {
+	if !before.Mode().IsRegular() {
+		return "", fmt.Errorf("not a regular file (%s)", before.Mode().Type())
+	}
+	file, err := openSystemdUnit(root, name)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !sameUnitFile(before, opened) {
+		return "", fmt.Errorf("unit changed before read")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxUnitFileBytes+1))
+	if err != nil || int64(len(data)) > maxUnitFileBytes {
+		return "", fmt.Errorf("unit read failed or exceeded %d bytes: %v", maxUnitFileBytes, err)
+	}
+	after, err := file.Stat()
+	if err != nil || !sameUnitFile(opened, after) {
+		return "", fmt.Errorf("unit changed during read")
+	}
+	entry, err := root.Lstat(name)
+	if err != nil || !sameUnitFile(opened, entry) {
+		return "", fmt.Errorf("unit changed after read")
+	}
+	return string(data), nil
+}
+
+const maxSystemdAliasHops = 8
+
+func proveSystemdAlias(start unitLocation, initial os.FileInfo, sources []systemdDirectory,
+	scanned, aliasInfos map[unitLocation]os.FileInfo) error {
+	type step struct {
+		unit   unitLocation
+		info   os.FileInfo
+		target string
+	}
+	steps := make([]step, 0, 2)
+	seen := make(map[unitLocation]bool)
+	current := start
+	proven := false
+	for range maxSystemdAliasHops {
+		if seen[current] {
+			return fmt.Errorf("alias loop")
+		}
+		seen[current] = true
+		source := sources[current.directory]
+		info, err := source.root.Lstat(current.name)
+		if err != nil {
+			return fmt.Errorf("alias target unavailable: %w", err)
+		}
+		if info.Mode().IsRegular() {
+			known, ok := scanned[current]
+			if !ok || !sameUnitFile(known, info) {
+				return fmt.Errorf("target was not scanned or changed")
+			}
+			proven = true
+			break
+		}
+		known, ok := aliasInfos[current]
+		if !ok || info.Mode()&os.ModeSymlink == 0 || !sameUnitFile(known, info) ||
+			current == start && !sameUnitFile(initial, info) {
+			return fmt.Errorf("alias was not listed or changed")
+		}
+		target, err := source.root.Readlink(current.name)
+		if err != nil {
+			return fmt.Errorf("alias target unreadable: %w", err)
+		}
+		steps = append(steps, step{unit: current, info: info, target: target})
+		if target == "/dev/null" {
+			if !provenSystemdMask() {
+				return fmt.Errorf("mask device is not proven")
+			}
+			proven = true
+			break
+		}
+		next, ok := systemdAliasTarget(current, target, sources)
+		if !ok {
+			return fmt.Errorf("target escapes or is not a configured service definition")
+		}
+		current = next
+	}
+	if !proven {
+		return fmt.Errorf("alias chain exceeds %d hops", maxSystemdAliasHops)
+	}
+	for _, link := range steps {
+		source := sources[link.unit.directory]
+		info, err := source.root.Lstat(link.unit.name)
+		if err != nil || !sameUnitFile(link.info, info) {
+			return fmt.Errorf("alias changed during proof")
+		}
+		target, err := source.root.Readlink(link.unit.name)
+		if err != nil || target != link.target {
+			return fmt.Errorf("alias changed during proof")
+		}
+	}
+	if target, ok := scanned[current]; ok {
+		info, err := sources[current.directory].root.Lstat(current.name)
+		if err != nil || !sameUnitFile(target, info) {
+			return fmt.Errorf("target changed during proof")
+		}
+	}
+	return nil
+}
+
+func systemdAliasTarget(from unitLocation, target string, sources []systemdDirectory) (unitLocation, bool) {
+	if target == "" || target != filepath.Clean(target) {
+		return unitLocation{}, false
+	}
+	if !filepath.IsAbs(target) {
+		if filepath.Base(target) != target || !strings.HasSuffix(target, ".service") {
+			return unitLocation{}, false
+		}
+		return unitLocation{directory: from.directory, name: target}, true
+	}
+	if !strings.HasSuffix(target, ".service") {
+		return unitLocation{}, false
+	}
+	for i, source := range sources {
+		if filepath.Dir(target) == source.path {
+			return unitLocation{directory: i, name: filepath.Base(target)}, true
+		}
+	}
+	return unitLocation{}, false
 }
 
 // systemdUnitReferences extracts path-valued directives from a unit file.

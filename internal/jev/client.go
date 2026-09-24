@@ -19,6 +19,8 @@ import (
 // trust.
 const maxResponseBytes = 4 << 20
 
+var errSendRefused = errors.New("advisory send gate refused")
+
 // APIError is a failed evaluation, with whether retrying could help.
 type APIError struct {
 	Status    int
@@ -59,6 +61,12 @@ type Client struct {
 	// BeforeAttempt must durably reserve an allowed attempt before HTTP Do.
 	// A rejected reservation never sends, including on retries.
 	BeforeAttempt func(context.Context, Request, []byte) error
+	// BeforeSend runs on the transport path, after the durable reservation
+	// and immediately before an HTTP attempt. It is also checked on retries.
+	BeforeSend func(context.Context) error
+	// SendDeadline caps the request context at the next UTC midnight.
+	// A paused transport cannot start or continue a new-day attempt.
+	SendDeadline time.Time
 
 	mu          sync.Mutex
 	lastRequest time.Time
@@ -122,8 +130,15 @@ func (c *Client) Evaluate(ctx context.Context, request Request) (Exchange, error
 // requested wait, when one was given.
 func (c *Client) once(ctx context.Context, body []byte) (Response, time.Duration, error) {
 	attemptCtx, cancel := ctx, context.CancelFunc(func() {})
+	deadline := c.SendDeadline
 	if c.Timeout > 0 {
-		attemptCtx, cancel = context.WithTimeout(ctx, c.Timeout)
+		timeout := time.Now().Add(c.Timeout)
+		if deadline.IsZero() || timeout.Before(deadline) {
+			deadline = timeout
+		}
+	}
+	if !deadline.IsZero() {
+		attemptCtx, cancel = context.WithDeadline(ctx, deadline)
 	}
 	defer cancel()
 
@@ -137,6 +152,9 @@ func (c *Client) once(ctx context.Context, body []byte) (Response, time.Duration
 
 	client := c.httpClient()
 	resp, err := client.Do(req)
+	if err != nil && (errors.Is(err, errSendRefused) || (!c.SendDeadline.IsZero() && !time.Now().Before(c.SendDeadline))) {
+		return Response{}, 0, &APIError{Message: "advisory UTC-day send gate refused; no outbound call", Fatal: true}
+	}
 	if err != nil {
 		// Timeouts and connection failures are transient by nature.
 		return Response{}, 0, &APIError{Message: redactKey(err.Error(), c.APIKey), Retryable: ctx.Err() == nil}
@@ -249,7 +267,26 @@ func (c *Client) httpClient() http.Client {
 	client.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
+	if c.BeforeSend != nil {
+		next := client.Transport
+		if next == nil {
+			next = http.DefaultTransport
+		}
+		client.Transport = sendGuardTransport{next: next, before: c.BeforeSend}
+	}
 	return client
+}
+
+type sendGuardTransport struct {
+	next   http.RoundTripper
+	before func(context.Context) error
+}
+
+func (t sendGuardTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := t.before(req.Context()); err != nil {
+		return nil, fmt.Errorf("%w: %v", errSendRefused, err)
+	}
+	return t.next.RoundTrip(req)
 }
 
 func (c *Client) now() time.Time {
