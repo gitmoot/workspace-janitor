@@ -232,6 +232,9 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 		if err == nil && item.State == core.CleanupPrepared {
 			item, err = engine.Quarantine(ctx, item)
 		}
+		if err == nil && item.State != core.CleanupQuarantined {
+			err = fmt.Errorf("cleanup remains %s; inspect receipt %s before retrying", item.State, report.ID)
+		}
 		if err != nil {
 			report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", a.Path, err))
 		}

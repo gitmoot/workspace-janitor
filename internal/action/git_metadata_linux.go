@@ -19,7 +19,7 @@ type gitMetadata struct {
 }
 
 func captureGitMetadata(path string) (gitMetadata, error) {
-	parent, err := unix.Open(filepath.Dir(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	parent, err := openExistingDirNoSymlinks(filepath.Dir(path))
 	if err != nil {
 		return gitMetadata{}, err
 	}
@@ -36,7 +36,7 @@ func captureGitMetadata(path string) (gitMetadata, error) {
 }
 
 func restoreGitMetadata(path string, before gitMetadata) error {
-	parent, err := unix.Open(filepath.Dir(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	parent, err := openExistingDirNoSymlinks(filepath.Dir(path))
 	if err != nil {
 		return err
 	}

@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   build:
-    name: format, vet, build, test (linux)
+    name: format, vet, build, test, release-readiness (linux)
     runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "0"
@@ -41,25 +41,6 @@ jobs:
       - name: go build
         run: go build ./...
 
-      - name: build release binary
-        run: |
-          go build -trimpath \
-            -ldflags "-s -w -X github.com/gitmoot/workspace-janitor/internal/buildinfo.version=ci-${GITHUB_SHA::12}" \
-            -o dist/janitor ./cmd/janitor
-
-      - name: verify the binary is static
-        run: |
-          file dist/janitor
-          if file dist/janitor | grep -q 'dynamically linked'; then
-            echo "release binary must be statically linked (CGO_ENABLED=0)"
-            exit 1
-          fi
-
-      - name: smoke test the binary
-        run: |
-          ./dist/janitor --help
-          ./dist/janitor version
-
       - name: go test
         run: go test ./...
 
@@ -67,3 +48,31 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
+
+      # PR checks exercise GitHub's merge ref above; artifacts must instead
+      # identify and reproduce the submitted full head, not that temporary ref.
+      - name: checkout exact candidate head for artifact
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: verify candidate source identity
+        run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+
+      - name: build and verify reproducible static linux/amd64 artifact
+        run: make release-linux-amd64
+
+      - name: smoke test the binary
+        run: |
+          ./dist/janitor-linux-amd64 --help
+          ./dist/janitor-linux-amd64 version
+
+      - name: upload release-readiness artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: janitor-linux-amd64
+          path: |
+            dist/janitor-linux-amd64
+            dist/SHA256SUMS
+          if-no-files-found: error

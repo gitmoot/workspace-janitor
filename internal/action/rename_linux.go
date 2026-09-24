@@ -15,12 +15,12 @@ import (
 // follows the source's final symlink. A collision cannot overwrite a receipt
 // or an occupied original location.
 func renameNoReplace(from, to string, expected core.FilesystemID) error {
-	fromDir, err := unix.Open(filepath.Dir(from), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fromDir, err := openExistingDirNoSymlinks(filepath.Dir(from))
 	if err != nil {
 		return fmt.Errorf("open source parent: %w", err)
 	}
 	defer unix.Close(fromDir)
-	toDir, err := unix.Open(filepath.Dir(to), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	toDir, err := openExistingDirNoSymlinks(filepath.Dir(to))
 	if err != nil {
 		return fmt.Errorf("open destination parent: %w", err)
 	}
