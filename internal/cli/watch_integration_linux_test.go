@@ -195,7 +195,7 @@ func TestWatchMetadataDoesNotAdvanceWeeklyDeepScan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reconcileWatch(context.Background(), e, paths, policy, "startup", nil, true); err != nil {
+	if err := reconcileWatch(context.Background(), e, paths, policy, "startup", nil, true, 0); err != nil {
 		t.Fatal(err)
 	}
 	due, err := deepScanDue(context.Background(), paths.DatabaseFile, 7*24*time.Hour, time.Now().UTC())
@@ -259,7 +259,7 @@ func TestWatchOverflowAndRestartReconcileMissedChanges(t *testing.T) {
 				return first, nil
 			}
 			return second, nil
-		})
+		}, watchChurnInterval)
 	}()
 	startup := nextWatchReport(t, sink.reports, "")
 	var recovery watchReport
@@ -295,7 +295,7 @@ func TestWatchOverflowAndRestartReconcileMissedChanges(t *testing.T) {
 	}
 	var out bytes.Buffer
 	e.stdout = &out
-	if err := reconcileWatch(context.Background(), e, paths, policy, "startup", nil, true); err != nil {
+	if err := reconcileWatch(context.Background(), e, paths, policy, "startup", nil, true, 0); err != nil {
 		t.Fatal(err)
 	}
 	var restart watchReport
@@ -324,5 +324,208 @@ func assertInventoryPath(t *testing.T, database, scanID, path string) {
 		return err
 	}); err != nil {
 		t.Fatalf("scan %s did not record %s: %v", scanID, path, err)
+	}
+}
+
+// pulseWatcher lets the integration test drive distinct event bursts without
+// waiting for a wall-clock debounce per event. The real watch loop, scan and
+// store still run; only the event source's short burst wait is accelerated.
+type pulseWatcher struct {
+	events chan watchEvent
+	ready  chan struct{}
+}
+
+func (w *pulseWatcher) next(ctx context.Context) (watchEvent, error) {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < 200*time.Millisecond {
+		return watchEvent{}, context.DeadlineExceeded
+	}
+	select {
+	case w.ready <- struct{}{}:
+	default:
+	}
+	select {
+	case event := <-w.events:
+		return event, nil
+	case <-ctx.Done():
+		return watchEvent{}, ctx.Err()
+	}
+}
+
+func (*pulseWatcher) close() error { return nil }
+
+func TestWatchBoundsProtectedChurnWithoutLosingRealDirectories(t *testing.T) {
+	f, root, canonical := watchFixture(t)
+	operational := filepath.Join(root, ".gitmoot")
+	if err := os.Mkdir(operational, 0700); err != nil {
+		t.Fatal(err)
+	}
+	f.writePolicy(t, "roots:\n  - path: "+root+"\n    max_depth: 1\n    report_only: true\n"+
+		"protect:\n  paths:\n    - "+operational+"\n"+
+		"canonical_roots:\n  - class: primary_project\n    path: "+canonical+"\n"+
+		"collectors:\n  git: false\n  processes: false\n  services: false\n"+
+		"prevention:\n  min_free_percent: 0\n  auto_expire: false\n"+
+		"retention:\n  delete_enabled: false\n")
+	sink := &watchSink{reports: make(chan watchReport, 64)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard,
+		lookup: config.MapLookup(f.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	watcher := &pulseWatcher{events: make(chan watchEvent), ready: make(chan struct{}, 1)}
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(ctx, e, paths, policy, func() (eventWatcher, error) { return watcher, nil }, 800*time.Millisecond)
+	}()
+	startup := nextWatchReport(t, sink.reports, "")
+	if startup.Reason != "startup" || !startup.Reconciled {
+		t.Fatalf("initial inventory was not reconciled: %+v", startup)
+	}
+	send := func(name string) {
+		t.Helper()
+		select {
+		case <-watcher.ready:
+		case err := <-done:
+			t.Fatalf("watch stopped before event: %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("watch did not become ready")
+		}
+		select {
+		case watcher.events <- watchEvent{Root: root, Name: name}:
+		case <-time.After(5 * time.Second):
+			t.Fatal("watch did not accept event")
+		}
+	}
+	counts := func() (int, int) {
+		t.Helper()
+		db, err := store.OpenReadOnly(ctx, paths.DatabaseFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		scans, rows := 0, 0
+		if err := db.Read(ctx, func(tx *store.Tx) error {
+			all, err := tx.ListScans(ctx, 0)
+			if err != nil {
+				return err
+			}
+			scans = len(all)
+			for _, scan := range all {
+				rows += scan.EntryCount
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return scans, rows
+	}
+	assertProtected := func(scanID string) {
+		t.Helper()
+		db, err := store.OpenReadOnly(ctx, paths.DatabaseFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		protected := false
+		if err := db.Read(ctx, func(tx *store.Tx) error {
+			entry, err := tx.Entry(ctx, scanID, operational)
+			if err == nil {
+				protected = entry.Protected()
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !protected {
+			t.Fatalf("operational directory lost its safety protection in scan %s", scanID)
+		}
+	}
+	assertProtected(startup.ScanID)
+	start := time.Now()
+	for i := range 8 {
+		if err := os.WriteFile(filepath.Join(operational, "state"), []byte{byte(i)}, 0600); err != nil {
+			t.Fatal(err)
+		}
+		send(".gitmoot")
+	}
+	// The next ready signal proves every prior burst was processed.
+	select {
+	case <-watcher.ready:
+	case err := <-done:
+		t.Fatalf("watch stopped after churn: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("watch did not drain churn")
+	}
+	// The watcher is already inside next: restore its readiness token so a
+	// real event is delivered now, rather than waiting for the churn timer.
+	watcher.ready <- struct{}{}
+	scans, rows := counts()
+	t.Logf("protected churn: 8 bursts in %s, persisted scans=%d inventory rows=%d", time.Since(start), scans, rows)
+	if scans > 2 {
+		t.Fatalf("protected operational churn amplified persisted scans: %d scans for 8 bursts", scans)
+	}
+	deferred := nextWatchReport(t, sink.reports, "")
+	if deferred.Reason != "deferred" || !deferred.Incomplete || deferred.ScanID != "" ||
+		deferred.NextReconcileAt == nil {
+		t.Fatalf("suppressed inventory was not marked incomplete: %+v", deferred)
+	}
+	fresh := filepath.Join(root, "new-workspace")
+	if err := os.Mkdir(fresh, 0700); err != nil {
+		t.Fatal(err)
+	}
+	send("new-workspace")
+	createdReport := nextWatchReport(t, sink.reports, fresh)
+	if createdReport.DeferredEvents != 8 {
+		t.Fatalf("real event did not immediately reconcile deferred churn: %+v", createdReport)
+	}
+	created := guidanceFor(t, createdReport, fresh)
+	if !created.New {
+		t.Fatalf("new workspace was suppressed behind churn: %+v", created)
+	}
+	if err := os.Remove(fresh); err != nil {
+		t.Fatal(err)
+	}
+	send("new-workspace")
+	removedReport := nextWatchReport(t, sink.reports, fresh)
+	removed := guidanceFor(t, removedReport, fresh)
+	if !removed.ObservedAbsent || removed.Unknown {
+		t.Fatalf("removed workspace was not reconciled: %+v", removed)
+	}
+	scans, rows = counts()
+	if scans != 3 {
+		t.Fatalf("new and removed workspace did not each trigger a scan: %d", scans)
+	}
+	if err := os.WriteFile(filepath.Join(operational, "state"), []byte("again"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	send(".gitmoot")
+	nextDeferred := nextWatchReport(t, sink.reports, "")
+	if nextDeferred.Reason != "deferred" || !nextDeferred.Incomplete {
+		t.Fatalf("second protected churn was not deferred: %+v", nextDeferred)
+	}
+	periodic := nextWatchReport(t, sink.reports, "")
+	if periodic.Reason != "churn" || !periodic.Reconciled || periodic.DeferredEvents != 1 {
+		t.Fatalf("deferred evidence was not reconciled at the bound: %+v", periodic)
+	}
+	assertProtected(periodic.ScanID)
+	scans, rows = counts()
+	t.Logf("churn plus two real changes: persisted scans=%d inventory rows=%d", scans, rows)
+	if scans > 4 || rows > 8 {
+		t.Fatalf("real events amplified or were not bounded: %d scans", scans)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("watch stopped with error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("watch did not stop on cancellation")
 	}
 }
