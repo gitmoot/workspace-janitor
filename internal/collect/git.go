@@ -61,11 +61,13 @@ func (g gitRunner) run(ctx context.Context, dir string, args ...string) (string,
 	ctx, cancel := context.WithTimeout(ctx, g.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, g.binary, args...)
+	// Git's -c options override repository config even on versions that do
+	// not support GIT_CONFIG_COUNT. Status must never run an fsmonitor hook.
+	commandArgs := make([]string, 0, len(args)+4)
+	commandArgs = append(commandArgs, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+	commandArgs = append(commandArgs, args...)
+	cmd := exec.CommandContext(ctx, g.binary, commandArgs...)
 	cmd.Dir = dir
-	// A scan must never prompt or take an optional lock. Git status can run
-	// core.fsmonitor from repository config; override that executable hook
-	// (and ordinary hooks) at command scope, above local repository config.
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + dir,
@@ -74,11 +76,6 @@ func (g gitRunner) run(ctx context.Context, dir string, args ...string) (string,
 		"GIT_ASKPASS=true",
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_CONFIG_COUNT=2",
-		"GIT_CONFIG_KEY_0=core.fsmonitor",
-		"GIT_CONFIG_VALUE_0=false",
-		"GIT_CONFIG_KEY_1=core.hooksPath",
-		"GIT_CONFIG_VALUE_1=/dev/null",
 		"LC_ALL=C",
 	}
 	var stdout, stderr bytes.Buffer

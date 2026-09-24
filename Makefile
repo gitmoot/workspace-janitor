@@ -40,12 +40,12 @@ release-linux-amd64:
 	   readelf -dW dist/janitor-linux-amd64 | grep -Eq '\(NEEDED\)'; then \
 		echo "release binary must have no ELF interpreter or shared-library dependencies" >&2; exit 1; \
 	fi; \
-	sha256sum dist/janitor-linux-amd64 > dist/SHA256SUMS; \
+	(cd dist && sha256sum janitor-linux-amd64 > SHA256SUMS); \
 	second=$$(mktemp dist/.janitor-linux-amd64.XXXXXXXX); \
 	trap 'rm -f "$$second"' EXIT HUP INT TERM; \
 	go build -mod=readonly -trimpath -buildvcs=false -ldflags "$$flags" -o "$$second" ./cmd/janitor; \
 	cmp dist/janitor-linux-amd64 "$$second"; \
-	sha256sum -c dist/SHA256SUMS
+	(cd dist && sha256sum -c SHA256SUMS)
 
 test:
 	go test ./...

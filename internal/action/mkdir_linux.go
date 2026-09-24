@@ -46,7 +46,8 @@ func createReceiptDir(path string) error {
 }
 
 // openExistingDirNoSymlinks anchors every path component from /, not only
-// the final component of the parent. The caller owns the returned descriptor.
+// the final component. Intermediate directories need search, not read,
+// permission; the returned parent descriptor is readable for mutations.
 func openExistingDirNoSymlinks(path string) (int, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return -1, fmt.Errorf("directory path must be absolute and canonical: %s", path)
@@ -55,11 +56,16 @@ func openExistingDirNoSymlinks(path string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	for _, part := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	for i, part := range parts {
 		if part == "" {
 			continue
 		}
-		next, err := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		flags := unix.O_PATH | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+		if i == len(parts)-1 {
+			flags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+		}
+		next, err := unix.Openat(fd, part, flags, 0)
 		unix.Close(fd)
 		if err != nil {
 			return -1, fmt.Errorf("open directory component %q without symlinks: %w", part, err)

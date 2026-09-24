@@ -232,6 +232,32 @@ func TestGitRunnerRefusesCommandsOutsideTheReadOnlyAllowlist(t *testing.T) {
 	}
 }
 
+// Old Git ignores GIT_CONFIG_COUNT. Simulate that behavior while exercising
+// the real runner: argv-level overrides must still prevent repository hooks.
+func TestGitRunnerDisablesFsmonitorWithoutEnvironmentConfig(t *testing.T) {
+	requireGit(t)
+	home := t.TempDir()
+	repo := newRepo(t, home, filepath.Join(home, "repo"))
+	hook := filepath.Join(home, "fsmonitor.sh")
+	marker := filepath.Join(home, "hook-ran")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nprintf ran > \"${0%/*}/hook-ran\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, home, repo, "config", "core.fsmonitor", hook)
+	mustWrite(t, filepath.Join(repo, "dirty"), "uncommitted\n")
+	wrapper := filepath.Join(home, "old-git")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nunset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1\nexec git \"$@\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	runner := gitRunner{binary: wrapper, timeout: time.Second}
+	if _, err := runner.run(context.Background(), repo, "status", "--porcelain=v2", "--branch"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(marker); !os.IsNotExist(err) {
+		t.Fatalf("repository fsmonitor ran despite command-line override: %v", err)
+	}
+}
+
 func TestGitCollectorSkipsNonRepositories(t *testing.T) {
 	requireGit(t)
 	root := t.TempDir()
