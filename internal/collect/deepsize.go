@@ -21,12 +21,15 @@ import (
 // measured total.
 func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, now time.Time) core.CollectorReport {
 	report := core.CollectorReport{Name: CollectorDeepSize, Status: core.CollectorRan}
-	budget := opts.Limits.DeepSizeMaxEntries
+	// Each root gets its own budget, so one enormous tree cannot leave every
+	// later root unsized.
+	budgets := make(map[string]int, len(opts.Roots))
 	rootsByPath := make(map[string]RootSpec, len(opts.Roots))
 	for _, root := range opts.Roots {
 		rootsByPath[root.Path] = root
 	}
 
+	lowerBounds := 0
 	for i := range entries {
 		entry := &entries[i]
 		if entry.Kind != core.EntryKindDirectory {
@@ -38,6 +41,10 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 			return report
 		}
 		root := rootsByPath[entry.Root]
+		budget, seen := budgets[entry.Root]
+		if !seen {
+			budget = opts.Limits.DeepSizeMaxEntries
+		}
 		sum := &sizeSum{
 			crossFilesystem: root.CrossFilesystem,
 			device:          entry.FilesystemID.Device,
@@ -46,7 +53,7 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 			newest:          entry.ModifiedAt,
 		}
 		sum.walk(ctx, entry.Path, 1)
-		budget = sum.budget
+		budgets[entry.Root] = sum.budget
 		report.Visited += sum.visited
 		report.Recorded++
 
@@ -55,8 +62,10 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 			entry.LatestModifiedAt = sum.newest
 		}
 		entry.SizeIsDeep = true
+		entry.SizeIsLowerBound = sum.limited
 		detail := fmt.Sprintf("%d byte(s) across %d entrie(s)", sum.bytes, sum.visited)
-		if sum.partial() {
+		switch {
+		case sum.unknown():
 			report.Unknowns++
 			report.Status = core.CollectorPartial
 			addEvidence(entry, core.Evidence{
@@ -65,19 +74,34 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 				Detail:     fmt.Sprintf("%s; incomplete: %s", detail, sum.reason),
 				ObservedAt: now,
 			})
-			continue
+		case sum.limited:
+			// Hitting the entry or depth budget only stops counting: the
+			// size is a lower bound, not a blind spot. Nothing unseen here
+			// bears on safety, which re-observes the target and walks the
+			// whole deletion tree for mount points before mutating.
+			lowerBounds++
+			addEvidence(entry, core.Evidence{
+				Source:     core.SourceFilesystem,
+				Signal:     "deep_size_lower_bound",
+				Detail:     fmt.Sprintf("at least %s; stopped: %s", detail, sum.reason),
+				ObservedAt: now,
+			})
+		default:
+			addEvidence(entry, core.Evidence{
+				Source:     core.SourceFilesystem,
+				Signal:     "deep_size",
+				Detail:     detail,
+				ObservedAt: now,
+			})
 		}
-		addEvidence(entry, core.Evidence{
-			Source:     core.SourceFilesystem,
-			Signal:     "deep_size",
-			Detail:     detail,
-			ObservedAt: now,
-		})
 	}
 
 	if report.Detail == "" {
 		report.Detail = fmt.Sprintf("sized %d director(ies) within %d entrie(s)",
 			report.Recorded, opts.Limits.DeepSizeMaxEntries)
+		if lowerBounds > 0 {
+			report.Detail += fmt.Sprintf("; %d size(s) are lower bounds", lowerBounds)
+		}
 	}
 	return report
 }
@@ -89,15 +113,23 @@ type sizeSum struct {
 	maxDepth        int
 	budget          int
 
-	bytes    int64
-	visited  int
-	newest   time.Time
-	bounded  bool
+	bytes   int64
+	visited int
+	newest  time.Time
+	// limited means the entry or depth budget stopped the count.
+	limited bool
+	// blind means part of the tree could not be observed at all: a
+	// cancelled walk or a mount boundary the root does not cross.
+	blind    bool
 	failures int
 	reason   string
 }
 
-func (s *sizeSum) partial() bool { return s.bounded || s.failures > 0 }
+func (s *sizeSum) partial() bool { return s.limited || s.unknown() }
+
+// unknown reports a gap in what was observed, as opposed to a count that
+// was merely cut short.
+func (s *sizeSum) unknown() bool { return s.blind || s.failures > 0 }
 
 func (s *sizeSum) note(reason string) {
 	if s.reason == "" {
@@ -107,12 +139,12 @@ func (s *sizeSum) note(reason string) {
 
 func (s *sizeSum) walk(ctx context.Context, dir string, depth int) {
 	if ctx.Err() != nil {
-		s.bounded = true
+		s.blind = true
 		s.note("collection was cancelled")
 		return
 	}
 	if depth > s.maxDepth {
-		s.bounded = true
+		s.limited = true
 		s.note(fmt.Sprintf("depth limit %d reached at %s", s.maxDepth, dir))
 		return
 	}
@@ -123,13 +155,13 @@ func (s *sizeSum) walk(ctx context.Context, dir string, depth int) {
 		return
 	}
 	if names.bounded {
-		s.bounded = true
+		s.limited = true
 		s.note(fmt.Sprintf("entry budget reached in %s", dir))
 	}
 
 	for _, name := range names.names {
 		if s.budget <= 0 {
-			s.bounded = true
+			s.limited = true
 			s.note("entry budget exhausted")
 			return
 		}
@@ -151,7 +183,7 @@ func (s *sizeSum) walk(ctx context.Context, dir string, depth int) {
 			continue
 		}
 		if stat := statOf(info); stat.Known && stat.Device != s.device && !s.crossFilesystem {
-			s.bounded = true
+			s.blind = true
 			s.note(fmt.Sprintf("stopped at mount boundary %s", path))
 			continue
 		}

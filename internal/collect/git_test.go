@@ -307,3 +307,112 @@ func TestGitLockIsProtected(t *testing.T) {
 		t.Errorf("held lock is not protected: %+v", entry.Protections)
 	}
 }
+
+// pushedRepo creates a repository whose main branch is on a bare remote's
+// tracking ref, pushed without configuring an upstream.
+func pushedRepo(t *testing.T, home, root, name string) string {
+	t.Helper()
+	remote := filepath.Join(t.TempDir(), name+".git")
+	git(t, home, root, "init", "--bare", "--initial-branch=main", remote)
+	repo := newRepo(t, home, filepath.Join(root, name))
+	git(t, home, repo, "remote", "add", "origin", remote)
+	git(t, home, repo, "push", "origin", "main")
+	return repo
+}
+
+// Publication is judged against every remote-tracking branch, not only a
+// configured upstream: a clone pushed without -u is published, and a clean
+// current branch does not hide unpushed commits on another local branch.
+func TestGitPublicationCoversEveryRemoteTrackingBranch(t *testing.T) {
+	requireGit(t)
+	home := t.TempDir()
+	root := t.TempDir()
+
+	published := pushedRepo(t, home, root, "published")
+	sideBranch := pushedRepo(t, home, root, "side-branch")
+	git(t, home, sideBranch, "switch", "-c", "local-only")
+	mustWrite(t, filepath.Join(sideBranch, "work.txt"), "unpushed\n")
+	git(t, home, sideBranch, "add", "work.txt")
+	git(t, home, sideBranch, "commit", "-m", "unpushed work")
+	git(t, home, sideBranch, "switch", "main")
+
+	result := run(t, gitOptions(root))
+
+	entry := entryFor(t, result, published)
+	if entry.Git.UpstreamKnown {
+		t.Fatal("fixture must have no configured upstream")
+	}
+	if !entry.Git.PublicationKnown || entry.Git.UnpublishedCommits != 0 || !entry.Git.Clean() {
+		t.Errorf("pushed clone state = %+v, want published and clean", entry.Git)
+	}
+	if hasProtection(entry, core.ProtectUnpublishedCommits) || hasSignal(entry, "unknown:upstream_unknown") {
+		t.Errorf("pushed clone is protected as unpublished: %+v", entry.Protections)
+	}
+
+	entry = entryFor(t, result, sideBranch)
+	if entry.Git.UnpublishedCommits != 1 || !hasProtection(entry, core.ProtectUnpublishedCommits) {
+		t.Errorf("an unpushed commit on another branch is not protected: state %+v protections %+v", entry.Git, entry.Protections)
+	}
+}
+
+// Removing a linked worktree keeps its repository's branches, so only the
+// worktree's own HEAD decides publication.
+func TestLinkedWorktreePublicationIsJudgedByItsHead(t *testing.T) {
+	requireGit(t)
+	home := t.TempDir()
+	root := t.TempDir()
+	repo := pushedRepo(t, home, root, "app")
+
+	pushed := filepath.Join(root, "app-wt-pushed")
+	git(t, home, repo, "worktree", "add", pushed, "main~0", "--detach")
+
+	unpushed := filepath.Join(root, "app-wt-unpushed")
+	git(t, home, repo, "worktree", "add", unpushed, "-b", "feature")
+	mustWrite(t, filepath.Join(unpushed, "feature.txt"), "feature\n")
+	git(t, home, unpushed, "add", "feature.txt")
+	git(t, home, unpushed, "commit", "-m", "feature work")
+	// An unpushed branch elsewhere in the shared repository must not block
+	// a worktree whose own HEAD is published.
+	git(t, home, repo, "switch", "-c", "local-in-main")
+	git(t, home, repo, "commit", "--allow-empty", "-m", "main-repo local commit")
+
+	result := run(t, gitOptions(root))
+	entry := entryFor(t, result, pushed)
+	if !entry.Git.PublicationKnown || entry.Git.UnpublishedCommits != 0 || hasProtection(entry, core.ProtectUnpublishedCommits) {
+		t.Errorf("published worktree state = %+v protections %+v, want publication known with nothing unpublished", entry.Git, entry.Protections)
+	}
+	entry = entryFor(t, result, unpushed)
+	if entry.Git.UnpublishedCommits != 1 || !hasProtection(entry, core.ProtectUnpublishedCommits) {
+		t.Errorf("worktree with an unpushed HEAD commit: state %+v protections %+v, want protected", entry.Git, entry.Protections)
+	}
+}
+
+// A worktree's last activity is its newest checkout, staging, or commit,
+// read from the linked Git directory rather than the checkout alone.
+func TestLinkedWorktreeRecordsLastGitActivity(t *testing.T) {
+	requireGit(t)
+	home := t.TempDir()
+	root := t.TempDir()
+	repo := pushedRepo(t, home, root, "app")
+	wt := filepath.Join(root, "app-wt")
+	git(t, home, repo, "worktree", "add", wt, "--detach")
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	gitDir := filepath.Join(repo, ".git", "worktrees", "app-wt")
+	for _, p := range []string{wt, filepath.Join(gitDir, "HEAD"), filepath.Join(gitDir, "index"), filepath.Join(gitDir, "logs", "HEAD")} {
+		if err := os.Chtimes(p, old, old); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	entry := entryFor(t, run(t, gitOptions(root)), wt)
+	if got := entry.Git.LastActivity; got.IsZero() || got.After(old.Add(time.Minute)) {
+		t.Fatalf("idle worktree last activity = %v, want about %v", got, old)
+	}
+	recent := time.Now()
+	if err := os.Chtimes(filepath.Join(gitDir, "index"), recent, recent); err != nil {
+		t.Fatal(err)
+	}
+	entry = entryFor(t, run(t, gitOptions(root)), wt)
+	if entry.Git.LastActivity.Before(recent.Add(-time.Minute)) {
+		t.Fatalf("staging in the worktree did not count as activity: %v", entry.Git.LastActivity)
+	}
+}

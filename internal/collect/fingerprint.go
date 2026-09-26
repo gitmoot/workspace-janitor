@@ -38,15 +38,15 @@ func Fingerprint(entry core.Entry) string {
 	if entry.Git == nil {
 		write("git=none")
 	} else {
-		// Upstream availability, bareness, worktree ownership, and the
-		// remote all feed protections, so a change in any of them must
-		// change the fingerprint. Configuring an upstream at the same HEAD
-		// removes the unknown-publication protection; if that were excluded
-		// here, the entry would still compare as unchanged.
-		write("git=%s|%s|%d|%d|%d|%t|%t|%t|%t|%s|%s",
+		// Publication, bareness, worktree ownership, and the remote all
+		// feed protections, so a change in any of them must change the
+		// fingerprint. Measuring publication at the same HEAD removes the
+		// unknown-publication protection; if that were excluded here, the
+		// entry would still compare as unchanged.
+		write("git=%s|%s|%d|%d|%d|%t|%t|%t|%t|%t|%s|%s",
 			entry.Git.Head, entry.Git.Branch, entry.Git.DirtyFiles, entry.Git.Stashes,
 			entry.Git.UnpublishedCommits, entry.Git.Locked, entry.Git.Degraded,
-			entry.Git.UpstreamKnown, entry.Git.Bare, entry.Git.WorktreeOf, entry.Git.Remote)
+			entry.Git.UpstreamKnown, entry.Git.PublicationKnown, entry.Git.Bare, entry.Git.WorktreeOf, entry.Git.Remote)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

@@ -89,12 +89,12 @@ func guardGitState(in Input) []core.Protection {
 	case state.Degraded:
 		// Publication cannot be judged from a degraded collection, and the
 		// degraded protection above already covers it.
-	case !state.UpstreamKnown && !state.Bare:
+	case !state.PublicationKnown && !state.Bare:
 		out = append(out, protect(core.ProtectUnpublishedCommits, core.SourceGit,
-			"no upstream is configured, so local commits cannot be shown as published"))
+			"publication against remote-tracking branches was not measured, so local commits cannot be shown as published"))
 	case state.UnpublishedCommits > 0:
 		out = append(out, protect(core.ProtectUnpublishedCommits, core.SourceGit,
-			fmt.Sprintf("%d commit(s) ahead of upstream", state.UnpublishedCommits)))
+			fmt.Sprintf("%d commit(s) are not on any remote-tracking branch", state.UnpublishedCommits)))
 	}
 	return out
 }

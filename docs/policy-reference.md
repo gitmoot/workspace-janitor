@@ -11,7 +11,7 @@ The policy defaults to `<config-dir>/policy.yaml`; `--policy` overrides `JANITOR
 | `roots` | Discovery paths, `max_depth`, symlink and filesystem traversal, `report_only` (no mutations under that root). |
 | `protect` | Additive protected paths and basename patterns; built-in credential names, Gitmoot home, state and effective quarantine remain protected. |
 | `retention` | Default quarantine period (`none`, `7d`, `30d`, `90d`, `permanent`), quarantine directory, and separate deletion opt-in. |
-| `prevention` | Deep-scan interval, disk alert thresholds/cooldown, and opt-in automatic expiry; a policy never installs a timer. |
+| `prevention` | Deep-scan interval, disk alert thresholds/cooldown, and opt-in automatic quarantine and expiry; a policy never installs a timer. |
 | `canonical_roots`, `classification`, `ownership`, `gitmoot` | Canonical project locations, literal project markers and name signals, foreign ownership checks, and read-only Gitmoot ledger location. |
 | `caches` | Exact declared cache roots; `action` is `keep`, `quarantine`, `delete_candidate`, or `investigate`. Omitted action means `investigate`; TTL/size bounds need complete evidence for directories. Dedicated irreversible prune has further restrictions. |
 | `jev` | Disabled by default; model, endpoint, key **environment variable name**, request bounds, thresholds, caching and redaction. See [privacy](privacy.md). |

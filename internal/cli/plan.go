@@ -26,12 +26,15 @@ type planOptions struct {
 	planID     string
 	approve    string
 	approveAll bool
-	approver   string
-	note       string
-	noPersist  bool
-	noJev      bool
-	jevDryRun  bool
-	jevDebug   bool
+	// approveQuarantine approves every quarantine action that overlaps no
+	// other quarantine action; the scheduled cycle uses it.
+	approveQuarantine bool
+	approver          string
+	note              string
+	noPersist         bool
+	noJev             bool
+	jevDryRun         bool
+	jevDebug          bool
 }
 
 // planReport is the `plan` result contract.
@@ -316,6 +319,9 @@ func applyApprovals(ctx context.Context, db *store.Store, built core.Plan, opts 
 // editing the plan, and only mutating actions can be approved, because
 // approving a "keep" would mean nothing.
 func selectedActions(built core.Plan, opts planOptions) ([]core.Action, error) {
+	if opts.approveQuarantine {
+		return quarantineActions(built), nil
+	}
 	if !opts.approveAll && strings.TrimSpace(opts.approve) == "" {
 		return nil, nil
 	}
@@ -361,6 +367,32 @@ func selectedActions(built core.Plan, opts planOptions) ([]core.Action, error) {
 }
 
 // loadStoredPlan fetches a plan by id.
+// quarantineActions selects the plan's quarantine actions, leaving out any
+// that overlaps another: apply refuses an overlapping batch as a whole, and
+// which of two nested paths should move is not a decision to make silently.
+func quarantineActions(built core.Plan) []core.Action {
+	var candidates []core.Action
+	for _, action := range built.Actions {
+		if action.Kind == core.ActionQuarantine {
+			candidates = append(candidates, action)
+		}
+	}
+	out := make([]core.Action, 0, len(candidates))
+	for i, a := range candidates {
+		overlaps := false
+		for j, b := range candidates {
+			if i != j && core.PathsOverlap(a.Path, b.Path) {
+				overlaps = true
+				break
+			}
+		}
+		if !overlaps {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 func loadStoredPlan(ctx context.Context, db *store.Store, id string) (core.Plan, error) {
 	var stored core.Plan
 	err := db.Read(ctx, func(tx *store.Tx) error {

@@ -122,6 +122,9 @@ type Result struct {
 	Entries []core.Entry
 	// Reports say which collectors ran, failed, or were skipped.
 	Reports []core.CollectorReport
+	// References are the process, agent, and service references observed,
+	// including those naming a path no entry covers.
+	References []Reference
 }
 
 // Validate reports option problems that would make a run meaningless.
@@ -226,6 +229,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	} {
 		refs, report := runBounded(ctx, &opts, collector.name, collector.gather)
 		report.Recorded = attachReferences(entries, refs, now)
+		result.References = append(result.References, refs...)
 		result.Reports = append(result.Reports, report)
 	}
 	// Gitmoot probes a separate snapshot: a timed-out collector may still be

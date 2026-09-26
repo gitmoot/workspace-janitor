@@ -48,8 +48,8 @@ no decisions and mutates nothing.
 | Collector | What it reads | Bounds |
 | --- | --- | --- |
 | `filesystem` | `lstat` metadata for each root's children | per-root depth, per-directory entries, total entries |
-| `deep_size` | recursive directory sizes, opt-in via `--deep-size` | entry budget, depth, stays on the filesystem |
-| `git` | common dir, remote, branch, HEAD, dirty count, stashes, upstream, worktree metadata, locks | per-command timeout, read-only verbs only |
+| `deep_size` | recursive directory sizes, opt-in via `--deep-size` | per-root entry budget and depth (a size cut short is a lower bound, not an unknown), stays on the filesystem |
+| `git` | common dir, remote, branch, HEAD, dirty count, stashes, commits on no remote-tracking branch, last activity, worktree metadata, locks | per-command timeout, read-only verbs only |
 | `processes` | `cwd` and `exe` links plus `comm` from procfs | directory-entry bound |
 | `agents` | registered-agent directories from an adapter | command timeout per adapter |
 | `gitmoot` | read-only Gitmoot job, task, and cleanup-obligation ledger for exact paths | command timeout, entry bound; missing or uncertain state fails closed |
@@ -333,6 +333,22 @@ is not permission. All confirmed apply and restore operations share one
 cross-process lock on Linux; a second process fails closed instead of racing.
 On other platforms confirmed apply remains unsupported, while confirmed
 restore retains its prior behavior without this Linux-only lock.
+
+Expiry checks references at or under the original path, not its siblings: a
+home directory's parent always has live processes. A directory recreated at
+the original path, such as a cache a service regenerates, is a new object:
+expiry neither deletes it nor is blocked by it, unless something references a
+path inside it.
+
+Automatic quarantine is also **off** by default. With
+`prevention.auto_quarantine: true` the cycle plans its own scan from rules
+alone, approves every quarantine action that overlaps no other, and applies
+them through the same revalidating path. Items stay restorable with
+`janitor restore <cleanup-id>` until their retention expires. Rules propose
+quarantine only for caches, generated artifacts, and linked worktrees that
+are clean, have every commit on a remote-tracking branch, and have had no
+checkout, staging, commit, or top-level change for seven days. A home
+`.cache` directory is never one cache; select its tools with cache rules.
 
 `janitor service generate --output /absolute/private/directory --binary
 /absolute/janitor` writes units without installing or enabling them: the

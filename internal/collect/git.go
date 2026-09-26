@@ -27,6 +27,7 @@ const maxGitFileBytes = 4096
 // editing this list, and runGit refuses anything absent from it.
 var gitReadOnlyVerbs = map[string]struct{}{
 	"rev-parse": {},
+	"rev-list":  {},
 	"status":    {},
 	"stash":     {},
 	"config":    {},
@@ -207,6 +208,8 @@ func collectRepository(ctx context.Context, runner gitRunner, entry *core.Entry,
 		return true
 	}
 
+	state.LastActivity = lastActivity(entry.ModifiedAt, marker)
+
 	commonDir, err := runner.run(ctx, entry.Path, "rev-parse", "--git-common-dir")
 	if err != nil {
 		return degrade(err.Error(), degradeKind(err), "git_rev_parse_failed")
@@ -236,6 +239,14 @@ func collectRepository(ctx context.Context, runner gitRunner, entry *core.Entry,
 		return degrade(err.Error(), degradeKind(err), "git_stash_failed")
 	} else {
 		state.Stashes = countLines(stashes)
+	}
+
+	if !state.Bare {
+		unpublished, err := unpublishedCommits(ctx, runner, entry.Path, state.Head != "", kind == gitMarkerFile)
+		if err != nil {
+			return degrade(err.Error(), degradeKind(err), "git_publication_unknown")
+		}
+		state.UnpublishedCommits, state.PublicationKnown = unpublished, true
 	}
 
 	state.Locked = gitLocked(commonDir, marker, kind)
@@ -272,22 +283,59 @@ func collectRepository(ctx context.Context, runner gitRunner, entry *core.Entry,
 			Blocking: true,
 		})
 	}
-	switch {
-	case !state.UpstreamKnown && !state.Bare:
-		// No upstream means publication cannot be shown, and a scan may not
-		// fetch to find out. Unknown publication fails closed.
-		addUnknown(entry, core.SourceGit, core.ProtectUnpublishedCommits,
-			"upstream_unknown", "no upstream is configured, so local commits cannot be shown as published", now)
-		return true
-	case state.UnpublishedCommits > 0:
+	if state.UnpublishedCommits > 0 {
 		addProtection(entry, core.Protection{
 			Kind:     core.ProtectUnpublishedCommits,
-			Reason:   fmt.Sprintf("%d commit(s) ahead of upstream", state.UnpublishedCommits),
+			Reason:   fmt.Sprintf("%d commit(s) are not on any remote-tracking branch", state.UnpublishedCommits),
 			Source:   core.SourceGit,
 			Blocking: true,
 		})
 	}
 	return false
+}
+
+// lastActivity is the newest of the checkout's own modification time and
+// its Git directory's HEAD, index, and HEAD reflog. A missing file (no
+// commit yet, no reflog) is skipped rather than treated as unknown.
+func lastActivity(checkout time.Time, gitDir string) time.Time {
+	newest := checkout
+	for _, name := range []string{"HEAD", "index", filepath.Join("logs", "HEAD")} {
+		if info, err := os.Lstat(filepath.Join(gitDir, name)); err == nil && info.ModTime().After(newest) {
+			newest = info.ModTime()
+		}
+	}
+	return newest.UTC()
+}
+
+// unpublishedCommits counts commits that removing this checkout would lose:
+// those not contained in any remote-tracking branch. It reads only local
+// refs; a scan never fetches, so "published" means "was on a remote as of
+// the last fetch". A repository without remotes counts all of its history.
+//
+// A linked worktree's branches live in the shared repository, which
+// survives the worktree, so only its HEAD is at risk. A primary repository
+// takes every local branch with it.
+func unpublishedCommits(ctx context.Context, runner gitRunner, dir string, hasHead, linked bool) (int, error) {
+	args := []string{"rev-list", "--count"}
+	if hasHead {
+		args = append(args, "HEAD")
+	}
+	if !linked {
+		args = append(args, "--branches")
+	}
+	if len(args) == 2 {
+		// An unborn linked worktree has nothing of its own to lose.
+		return 0, nil
+	}
+	out, err := runner.run(ctx, dir, append(args, "--not", "--remotes")...)
+	if err != nil {
+		return 0, err
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil || count < 0 {
+		return 0, fmt.Errorf("git rev-list returned %q, not a commit count", out)
+	}
+	return count, nil
 }
 
 // degradeKind maps a Git failure onto the protection that describes it.
@@ -326,20 +374,8 @@ func parseStatus(output string, state *core.GitState) {
 			}
 		case "branch.upstream":
 			state.UpstreamKnown = true
-		case "branch.ab":
-			if len(fields) >= 4 {
-				state.UnpublishedCommits = parseAhead(fields[2])
-			}
 		}
 	}
-}
-
-func parseAhead(field string) int {
-	value, err := strconv.Atoi(strings.TrimPrefix(field, "+"))
-	if err != nil || value < 0 {
-		return 0
-	}
-	return value
 }
 
 // gitLocked reports whether a lock file is present in the repository or in

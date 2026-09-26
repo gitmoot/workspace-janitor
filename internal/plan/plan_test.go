@@ -113,17 +113,29 @@ func TestPolicyFixturesProduceTheExpectedActions(t *testing.T) {
 	policy := fixturePolicy()
 	entries := []core.Entry{
 		entryAt("/home/fixture/repos/app", withGit(&core.GitState{
-			RepoRoot: "/home/fixture/repos/app", Branch: "main", UpstreamKnown: true,
+			RepoRoot: "/home/fixture/repos/app", Branch: "main", UpstreamKnown: true, PublicationKnown: true,
 		})),
 		entryAt("/home/fixture/scratch/clone", withGit(&core.GitState{
-			RepoRoot: "/home/fixture/scratch/clone", Branch: "main", UpstreamKnown: true,
+			RepoRoot: "/home/fixture/scratch/clone", Branch: "main", UpstreamKnown: true, PublicationKnown: true,
 		})),
 		entryAt("/home/fixture/repos/app-wt-review", withGit(&core.GitState{
 			RepoRoot: "/home/fixture/repos/app-wt-review", WorktreeOf: "/home/fixture/repos/app",
-			Branch: "review", UpstreamKnown: true,
+			Branch: "review", UpstreamKnown: true, PublicationKnown: true,
+			LastActivity: plannedAt.Add(-WorktreeIdle - time.Hour),
+		})),
+		entryAt("/home/fixture/repos/app-wt-current", withGit(&core.GitState{
+			RepoRoot: "/home/fixture/repos/app-wt-current", WorktreeOf: "/home/fixture/repos/app",
+			Branch: "current", UpstreamKnown: true, PublicationKnown: true,
+			LastActivity: plannedAt.Add(-time.Hour),
+		})),
+		entryAt("/home/fixture/repos/app-wt-local", withGit(&core.GitState{
+			RepoRoot: "/home/fixture/repos/app-wt-local", WorktreeOf: "/home/fixture/repos/app",
+			Branch: "local", UpstreamKnown: true, PublicationKnown: true, UnpublishedCommits: 1,
+			LastActivity: plannedAt.Add(-WorktreeIdle - time.Hour),
 		})),
 		entryAt("/home/fixture/repos/app/node_modules"),
 		entryAt("/home/fixture/.cache"),
+		entryAt("/home/fixture/.pytest_cache"),
 		entryAt("/home/fixture/backups"),
 		entryAt("/home/fixture/mystery"),
 		entryAt("/home/fixture/incidents", withClass(core.ClassEvidence)),
@@ -136,9 +148,12 @@ func TestPolicyFixturesProduceTheExpectedActions(t *testing.T) {
 	}{
 		"/home/fixture/repos/app":              {core.ActionKeep, core.ClassPrimaryProject},
 		"/home/fixture/scratch/clone":          {core.ActionRelocate, core.ClassPrimaryProject},
-		"/home/fixture/repos/app-wt-review":    {core.ActionInvestigate, core.ClassTaskWorktree},
+		"/home/fixture/repos/app-wt-review":    {core.ActionQuarantine, core.ClassTaskWorktree},
+		"/home/fixture/repos/app-wt-current":   {core.ActionInvestigate, core.ClassTaskWorktree},
+		"/home/fixture/repos/app-wt-local":     {core.ActionKeep, core.ClassTaskWorktree},
 		"/home/fixture/repos/app/node_modules": {core.ActionQuarantine, core.ClassGeneratedArtifact},
-		"/home/fixture/.cache":                 {core.ActionQuarantine, core.ClassCache},
+		"/home/fixture/.cache":                 {core.ActionInvestigate, core.ClassCache},
+		"/home/fixture/.pytest_cache":          {core.ActionQuarantine, core.ClassCache},
 		"/home/fixture/backups":                {core.ActionKeep, core.ClassBackup},
 		"/home/fixture/mystery":                {core.ActionInvestigate, core.ClassUnknown},
 		"/home/fixture/incidents":              {core.ActionKeep, core.ClassEvidence},
@@ -311,7 +326,7 @@ func TestSafetyRefusalOutranksEveryRule(t *testing.T) {
 		Action: core.ActionDeleteCandidate, Retention: core.RetentionNone,
 	}}
 	dirty := entryAt("/home/fixture/.cache", withGit(&core.GitState{
-		RepoRoot: "/home/fixture/.cache", UpstreamKnown: true, DirtyFiles: 2,
+		RepoRoot: "/home/fixture/.cache", UpstreamKnown: true, PublicationKnown: true, DirtyFiles: 2,
 	}))
 
 	result := buildPlan(t, []core.Entry{dirty}, policy, nil)
@@ -352,7 +367,7 @@ func TestAdvisorRunsAfterRulesAndOnlyOnAmbiguousEntries(t *testing.T) {
 		entryAt("/home/fixture/.cache"),
 		entryAt("/home/fixture/mystery"),
 		entryAt("/home/fixture/repos/app", withGit(&core.GitState{
-			RepoRoot: "/home/fixture/repos/app", UpstreamKnown: true,
+			RepoRoot: "/home/fixture/repos/app", UpstreamKnown: true, PublicationKnown: true,
 		})),
 	}
 	advisor := &stubAdvisor{name: "jev", answers: map[string]core.Recommendation{}}
@@ -646,7 +661,7 @@ func TestRelocateIsRefusedWhenTheDestinationIsInsideTheEntry(t *testing.T) {
 		{Class: core.ClassPrimaryProject, Path: "/home/fixture/project/repos"},
 	}
 	entry := entryAt("/home/fixture/project", withGit(&core.GitState{
-		RepoRoot: "/home/fixture/project", UpstreamKnown: true,
+		RepoRoot: "/home/fixture/project", UpstreamKnown: true, PublicationKnown: true,
 	}))
 
 	action := actionFor(t, buildPlan(t, []core.Entry{entry}, policy, nil), "/home/fixture/project")
@@ -666,13 +681,13 @@ func TestRelocateIsRefusedWhenTheDestinationIsInsideTheEntry(t *testing.T) {
 func TestCollidingRelocationsAreDowngradedAndReported(t *testing.T) {
 	policy := fixturePolicy()
 	first := entryAt("/home/fixture/a/dup", withGit(&core.GitState{
-		RepoRoot: "/home/fixture/a/dup", UpstreamKnown: true,
+		RepoRoot: "/home/fixture/a/dup", UpstreamKnown: true, PublicationKnown: true,
 	}))
 	second := entryAt("/home/fixture/b/dup", withGit(&core.GitState{
-		RepoRoot: "/home/fixture/b/dup", UpstreamKnown: true,
+		RepoRoot: "/home/fixture/b/dup", UpstreamKnown: true, PublicationKnown: true,
 	}))
 	unique := entryAt("/home/fixture/c/solo", withGit(&core.GitState{
-		RepoRoot: "/home/fixture/c/solo", UpstreamKnown: true,
+		RepoRoot: "/home/fixture/c/solo", UpstreamKnown: true, PublicationKnown: true,
 	}))
 
 	result := buildPlan(t, []core.Entry{first, second, unique}, policy, nil)
@@ -721,7 +736,7 @@ func TestRulesAndReasonsStayAligned(t *testing.T) {
 		entryAt("/home/fixture/.cache"),
 		entryAt("/home/fixture/mystery"),
 		entryAt("/home/fixture/repos/app", withGit(&core.GitState{
-			RepoRoot: "/home/fixture/repos/app", UpstreamKnown: true,
+			RepoRoot: "/home/fixture/repos/app", UpstreamKnown: true, PublicationKnown: true,
 		})),
 	}
 	for _, action := range buildPlan(t, entries, policy, advisor).Plan.Actions {
@@ -738,7 +753,7 @@ func TestRelocationOntoAnExistingPathIsReported(t *testing.T) {
 	policy := fixturePolicy()
 	existing := entryAt("/home/fixture/repos/dup")
 	candidate := entryAt("/home/fixture/a/dup", withGit(&core.GitState{
-		RepoRoot: "/home/fixture/a/dup", UpstreamKnown: true,
+		RepoRoot: "/home/fixture/a/dup", UpstreamKnown: true, PublicationKnown: true,
 	}))
 
 	result := buildPlan(t, []core.Entry{existing, candidate}, policy, nil)
@@ -762,7 +777,7 @@ func TestRelocationOntoAnExistingPathIsReported(t *testing.T) {
 	// A free destination still relocates, or the guard would block
 	// everything and teach operators to ignore it.
 	free := entryAt("/home/fixture/b/solo", withGit(&core.GitState{
-		RepoRoot: "/home/fixture/b/solo", UpstreamKnown: true,
+		RepoRoot: "/home/fixture/b/solo", UpstreamKnown: true, PublicationKnown: true,
 	}))
 	solo := actionFor(t, buildPlan(t, []core.Entry{free}, policy, nil), "/home/fixture/b/solo")
 	if solo.Kind != core.ActionRelocate || solo.Destination != "/home/fixture/repos/solo" {
@@ -776,10 +791,10 @@ func TestCollisionDowngradeLowersConfidence(t *testing.T) {
 	policy := fixturePolicy()
 	occupied := entryAt("/home/fixture/repos/dup")
 	candidate := entryAt("/home/fixture/a/dup", withGit(&core.GitState{
-		RepoRoot: "/home/fixture/a/dup", UpstreamKnown: true,
+		RepoRoot: "/home/fixture/a/dup", UpstreamKnown: true, PublicationKnown: true,
 	}))
 	free := entryAt("/home/fixture/b/solo", withGit(&core.GitState{
-		RepoRoot: "/home/fixture/b/solo", UpstreamKnown: true,
+		RepoRoot: "/home/fixture/b/solo", UpstreamKnown: true, PublicationKnown: true,
 	}))
 
 	result := buildPlan(t, []core.Entry{occupied, candidate, free}, policy, nil)

@@ -118,6 +118,8 @@ func TestBoundedCacheRuleEvidenceAndBoundaries(t *testing.T) {
 		edit func(*core.Entry)
 		want core.ActionKind
 	}{
+		{"lower bound under max", func(e *core.Entry) { e.SizeIsLowerBound, e.SizeBytes = true, 99 }, core.ActionInvestigate},
+		{"lower bound over max", func(e *core.Entry) { e.SizeIsLowerBound = true }, core.ActionQuarantine},
 		{"over_limit", nil, core.ActionQuarantine},
 		{"at_limit", func(e *core.Entry) { e.SizeBytes = 100 }, core.ActionKeep},
 		{"youngest_child", func(e *core.Entry) { e.LatestModifiedAt = plannedAt.Add(-23 * time.Hour) }, core.ActionKeep},

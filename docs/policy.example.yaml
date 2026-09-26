@@ -58,6 +58,12 @@ prevention:
   # Requires retention.delete_enabled too. Expiry still uses the confirmed
   # apply path and a fresh, complete second safety observation.
   auto_expire: false
+  # Lets the daily cycle plan from rules alone (never the model), approve
+  # every quarantine action that overlaps no other, and move them. Apply
+  # still revalidates each target first. Items stay restorable until their
+  # retention expires; with auto_expire they are then deleted. A cache rule
+  # with retention: none is therefore removed in the same cycle.
+  auto_quarantine: false
 
 # Where entries of a class are supposed to live. A primary project found
 # outside its canonical root is a relocation candidate, never a deletion
@@ -181,8 +187,10 @@ safety:
   allow_cross_filesystem_quarantine: false
 
 # Bounds that keep one slow repository or one enormous directory from
-# stalling or unbounding a scan. Hitting a bound is reported as partial, not
-# hidden.
+# stalling or unbounding a scan. Hitting a bound is reported, not hidden. A
+# deep size cut short by its entry or depth budget is recorded as a lower
+# bound; it does not block cleanup, because apply walks the whole tree for
+# mount points before deleting anything.
 limits:
   git_timeout: 5s
   command_timeout: 10s

@@ -23,7 +23,7 @@ func TestReleaseReadinessFixtureWorkflow(t *testing.T) {
 	dirty := filepath.Join(root, "dirty")
 	active := filepath.Join(root, "active")
 	service := filepath.Join(root, "service")
-	cache := filepath.Join(root, ".cache")
+	cache := filepath.Join(root, ".pytest_cache")
 	artifact := filepath.Join(root, "dist")
 	backup := filepath.Join(root, "backups")
 	outside := filepath.Join(f.home, "outside-root")
