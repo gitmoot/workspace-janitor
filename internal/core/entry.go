@@ -141,13 +141,20 @@ type Ownership struct {
 // working tree"; a non-nil value with Degraded set means the collector could
 // not finish and the entry must be treated as unknown, never as clean.
 type GitState struct {
-	RepoRoot           string `json:"repo_root"`
-	WorktreeOf         string `json:"worktree_of,omitempty"`
-	Bare               bool   `json:"bare"`
-	Remote             string `json:"remote,omitempty"`
-	Branch             string `json:"branch,omitempty"`
-	Head               string `json:"head,omitempty"`
-	UpstreamKnown      bool   `json:"upstream_known"`
+	RepoRoot      string `json:"repo_root"`
+	WorktreeOf    string `json:"worktree_of,omitempty"`
+	Bare          bool   `json:"bare"`
+	Remote        string `json:"remote,omitempty"`
+	Branch        string `json:"branch,omitempty"`
+	Head          string `json:"head,omitempty"`
+	UpstreamKnown bool   `json:"upstream_known"`
+	// LastActivity is the newest modification of the checkout directory or
+	// its Git HEAD, index, or HEAD reflog: when anyone last checked out,
+	// staged, committed, or created a top-level file. Zero means unknown.
+	LastActivity time.Time `json:"last_activity,omitempty"`
+	// PublicationKnown records that UnpublishedCommits was measured against
+	// every remote-tracking branch. Without it publication is unknown.
+	PublicationKnown   bool   `json:"publication_known"`
 	DirtyFiles         int    `json:"dirty_files"`
 	Stashes            int    `json:"stashes"`
 	UnpublishedCommits int    `json:"unpublished_commits"`
@@ -162,7 +169,8 @@ func (g *GitState) Clean() bool {
 	if g == nil {
 		return false
 	}
-	return !g.Degraded && g.DirtyFiles == 0 && g.Stashes == 0 && g.UnpublishedCommits == 0 && !g.Locked
+	return !g.Degraded && g.DirtyFiles == 0 && g.Stashes == 0 && g.UnpublishedCommits == 0 && !g.Locked &&
+		(g.Bare || g.PublicationKnown)
 }
 
 // Evidence is one observation about an entry, attributed to its collector.
@@ -224,8 +232,11 @@ type Entry struct {
 	FilesystemID    FilesystemID `json:"filesystem_id"`
 	Ownership       Ownership    `json:"ownership"`
 	SizeBytes       int64        `json:"size_bytes"`
-	SizeIsDeep      bool         `json:"size_is_deep"`
-	ModifiedAt      time.Time    `json:"modified_at"`
+	// SizeIsLowerBound means a deep size stopped at a budget: the entry is
+	// at least SizeBytes, possibly much larger.
+	SizeIsLowerBound bool      `json:"size_is_lower_bound,omitempty"`
+	SizeIsDeep       bool      `json:"size_is_deep"`
+	ModifiedAt       time.Time `json:"modified_at"`
 	// LatestModifiedAt is set only by a complete deep walk. A cache TTL
 	// cannot infer subtree age from the directory inode's mtime alone.
 	LatestModifiedAt time.Time       `json:"latest_modified_at,omitempty"`

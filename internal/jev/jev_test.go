@@ -63,8 +63,8 @@ func sensitiveEntry() core.Entry {
 			Remote:        "https://alice:tok3nvalue@github.com/acme/private.git",
 			Branch:        "feature/acme-merger",
 			Head:          "deadbeefcafebabe0123456789abcdef01234567",
-			UpstreamKnown: true,
-			DirtyFiles:    2,
+			UpstreamKnown: true, PublicationKnown: true,
+			DirtyFiles: 2,
 		},
 		Evidence: []core.Evidence{
 			{Source: core.SourceProcess, Signal: "active_process",

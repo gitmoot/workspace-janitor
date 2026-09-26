@@ -105,3 +105,78 @@ func TestScheduledExpiryRechecksOriginalReferences(t *testing.T) {
 		t.Fatalf("expired receipt remains: %v", err)
 	}
 }
+
+// With auto_quarantine and auto_expire, the daily cycle frees space on its
+// own: a regenerable cache with no restore window is moved and deleted in
+// one run, while a referenced cache and an unclassified directory stay.
+func TestScheduledCycleQuarantinesAndExpiresWithoutOperator(t *testing.T) {
+	f := newFixture(t)
+	root := filepath.Join(f.home, "workspace")
+	cache := filepath.Join(root, "build-cache")
+	inUse := filepath.Join(root, "service-cache")
+	mystery := filepath.Join(root, "mystery")
+	proc := filepath.Join(f.home, "empty-proc")
+	units := filepath.Join(f.home, "systemd")
+	for _, path := range []string{cache, inUse, mystery, proc, units} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, dir := range []string{cache, inUse, mystery} {
+		if err := os.WriteFile(filepath.Join(dir, "payload"), []byte("fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(units, "live.service"), []byte("[Service]\nWorkingDirectory="+inUse+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: true\n  proc_root: "+proc+"\n  systemd_dirs:\n    - "+units+"\n  cron_paths: []\n  pm2_dumps: []\n"+
+		"caches:\n  - name: build\n    path: "+cache+"\n    action: quarantine\n    retention: none\n  - name: service\n    path: "+inUse+"\n    action: quarantine\n    retention: none\n"+
+		"retention:\n  delete_enabled: true\nprevention:\n  auto_quarantine: true\n  auto_expire: true\n  min_free_percent: 0\n")
+
+	out, stderr, code := f.run(t, "cycle")
+	if code != ExitOK {
+		t.Fatalf("cycle: %d %s %s", code, stderr, out)
+	}
+	var cycle cycleReport
+	if err := json.Unmarshal([]byte(out), &cycle); err != nil || cycle.Quarantine != "applied" || cycle.Expiry != "checked" {
+		t.Fatalf("cycle report = %+v %v %q", cycle, err, out)
+	}
+	if _, err := os.Lstat(cache); !os.IsNotExist(err) {
+		t.Fatalf("regenerable cache was not removed: %v", err)
+	}
+	for _, kept := range []string{inUse, mystery} {
+		if raw, err := os.ReadFile(filepath.Join(kept, "payload")); err != nil || string(raw) != "fixture" {
+			t.Fatalf("%s was touched: %q %v", kept, raw, err)
+		}
+	}
+	paths, err := config.ResolvePaths(config.MapLookup(f.env), config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(paths.QuarantineDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, batch := range entries {
+		items, _ := filepath.Glob(filepath.Join(paths.QuarantineDir, batch.Name(), "*", "item"))
+		if len(items) != 0 {
+			t.Fatalf("deleted cache left quarantined objects: %v", items)
+		}
+	}
+
+	// Without the opt-in the cycle stays read-only.
+	if err := os.MkdirAll(cache, 0700); err != nil {
+		t.Fatal(err)
+	}
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: false\n"+
+		"caches:\n  - name: build\n    path: "+cache+"\n    action: quarantine\n    retention: none\n"+
+		"retention:\n  delete_enabled: true\nprevention:\n  auto_expire: true\n  min_free_percent: 0\n")
+	out, stderr, code = f.run(t, "cycle")
+	if code != ExitOK || json.Unmarshal([]byte(out), &cycle) != nil || cycle.Quarantine != "disabled" {
+		t.Fatalf("cycle without auto_quarantine: %d %s %s", code, stderr, out)
+	}
+	if _, err := os.Stat(cache); err != nil {
+		t.Fatalf("cycle without auto_quarantine moved the cache: %v", err)
+	}
+}

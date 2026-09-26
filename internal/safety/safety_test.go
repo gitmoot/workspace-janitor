@@ -108,19 +108,19 @@ func protectionCases() []protectionCase {
 		{
 			name: "dirty repository", guard: "git_state", kind: core.ProtectDirtyRepository,
 			setup: func(in *Input) {
-				in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, DirtyFiles: 3}
+				in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, PublicationKnown: true, DirtyFiles: 3}
 			},
 		},
 		{
 			name: "stashed work", guard: "git_state", kind: core.ProtectStashedWork,
 			setup: func(in *Input) {
-				in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, Stashes: 1}
+				in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, PublicationKnown: true, Stashes: 1}
 			},
 		},
 		{
 			name: "unpublished commits", guard: "git_state", kind: core.ProtectUnpublishedCommits,
 			setup: func(in *Input) {
-				in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, UnpublishedCommits: 2}
+				in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, PublicationKnown: true, UnpublishedCommits: 2}
 			},
 		},
 		{
@@ -132,13 +132,13 @@ func protectionCases() []protectionCase {
 		{
 			name: "broken git metadata", guard: "git_state", kind: core.ProtectBrokenGitMetadata,
 			setup: func(in *Input) {
-				in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, Degraded: true, DegradedReason: "gitfile points nowhere"}
+				in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, PublicationKnown: true, Degraded: true, DegradedReason: "gitfile points nowhere"}
 			},
 		},
 		{
 			name: "worktree lock held", guard: "git_state", kind: core.ProtectLockHeld,
 			setup: func(in *Input) {
-				in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, Locked: true}
+				in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, PublicationKnown: true, Locked: true}
 			},
 		},
 		{
@@ -396,7 +396,7 @@ func TestPolicyCannotDisableCoreInvariants(t *testing.T) {
 	// The emptiest possible policy: no protected paths, no patterns, no
 	// headroom, cross-filesystem copies allowed.
 	in.Policy = Policy{AllowCrossFilesystemCopy: true}
-	in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, DirtyFiles: 1}
+	in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, PublicationKnown: true, DirtyFiles: 1}
 	in.Entry.Protections = []core.Protection{{
 		Kind: core.ProtectActiveProcess, Reason: "pid 42 (node) working directory",
 		Source: core.SourceProcess, Blocking: true,
@@ -416,7 +416,7 @@ func TestPolicyCannotDisableCoreInvariants(t *testing.T) {
 // A model may propose anything; it may not weaken a protection.
 func TestModelRecommendationCannotWeakenAProtection(t *testing.T) {
 	in := baseInput()
-	in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, DirtyFiles: 2}
+	in.Entry.Git = &core.GitState{RepoRoot: in.Entry.Path, UpstreamKnown: true, PublicationKnown: true, DirtyFiles: 2}
 	verdict := Evaluate(in)
 
 	confident := core.Recommendation{

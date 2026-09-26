@@ -134,7 +134,7 @@ func TestGitStateCleanRequiresCompleteCollection(t *testing.T) {
 	if dirty.Clean() {
 		t.Error("unpublished commits must not report clean")
 	}
-	clean := &GitState{RepoRoot: "/repos/app", UpstreamKnown: true}
+	clean := &GitState{RepoRoot: "/repos/app", UpstreamKnown: true, PublicationKnown: true}
 	if !clean.Clean() {
 		t.Error("a fully collected, unmodified tree must report clean")
 	}

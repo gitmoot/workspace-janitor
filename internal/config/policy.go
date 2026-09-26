@@ -249,6 +249,10 @@ type Prevention struct {
 	MinFreePercent int      `yaml:"min_free_percent" json:"min_free_percent"`
 	AlertInterval  Duration `yaml:"alert_interval" json:"alert_interval"`
 	AutoExpire     bool     `yaml:"auto_expire" json:"auto_expire"`
+	// AutoQuarantine lets the daily cycle plan from rules alone and move
+	// every quarantine action the safety engine allows, without an operator
+	// approving each one. Quarantine stays restorable until expiry.
+	AutoQuarantine bool `yaml:"auto_quarantine" json:"auto_quarantine"`
 }
 
 // Policy is the validated policy document.

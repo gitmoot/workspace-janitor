@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/gitmoot/workspace-janitor/internal/collect"
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -19,39 +20,9 @@ func (e *Engine) recollect(ctx context.Context, path string) (core.Entry, error)
 }
 
 func (e *Engine) recollectWithSize(ctx context.Context, path string, deep bool) (core.Entry, error) {
-	opts := e.Collect
-	opts.DeepSize = deep
-	// Resolve a live source symlink only to check containment; quarantine
-	// snapshots never follow links because a relative target may be absent
-	// until restore. In both cases the filesystem move operates on the link.
-	opts.Roots = []collect.RootSpec{{Path: filepath.Dir(path), MaxDepth: 1, FollowSymlinks: !within(path, e.QuarantineDir)}}
-	opts.Prior, opts.PriorScanID = nil, ""
-	result, err := collect.Run(ctx, opts)
+	result, err := e.observeAround(ctx, path, deep)
 	if err != nil {
 		return core.Entry{}, err
-	}
-	for _, report := range result.Reports {
-		switch report.Name {
-		case collect.CollectorFilesystem, collect.CollectorProcesses, collect.CollectorServices:
-			if report.Status != core.CollectorRan {
-				return core.Entry{}, fmt.Errorf("%s evidence incomplete: %s: %s", path, report.Name, report.Detail)
-			}
-		case collect.CollectorGit:
-			// Git's aggregate report becomes partial when any sibling repo is
-			// unknown. The target's own unknown Git state is represented in
-			// its entry and blocked by the safety engine.
-			if report.Status != core.CollectorRan && report.Status != core.CollectorPartial {
-				return core.Entry{}, fmt.Errorf("%s Git evidence incomplete: %s", path, report.Detail)
-			}
-		case collect.CollectorGitmoot:
-			if report.Status != core.CollectorRan && report.Status != core.CollectorSkipped {
-				return core.Entry{}, fmt.Errorf("%s Gitmoot evidence incomplete: %s", path, report.Detail)
-			}
-		case collect.CollectorAgents:
-			if len(opts.AgentSources) != 0 && report.Status != core.CollectorRan {
-				return core.Entry{}, fmt.Errorf("%s agent evidence incomplete: %s", path, report.Detail)
-			}
-		}
 	}
 	for _, entry := range result.Entries {
 		if entry.Path == path {
@@ -61,21 +32,69 @@ func (e *Engine) recollectWithSize(ctx context.Context, path string, deep bool) 
 	return core.Entry{}, fmt.Errorf("%s not found in fresh collection", path)
 }
 
-// originalReferences re-checks the missing source's parent, because services
-// or jobs can begin referring to an absent path after the quarantine move.
-// Attaching to the parent is deliberately conservative: any descendant
-// reference blocks deletion rather than silently losing a source-path claim.
-func (e *Engine) originalReferences(ctx context.Context, source string) error {
-	if err := absent(source); err != nil {
-		return err
+// observeAround collects path's directory one level deep and refuses a
+// result whose reference collectors did not all complete.
+func (e *Engine) observeAround(ctx context.Context, path string, deep bool) (collect.Result, error) {
+	opts := e.Collect
+	opts.DeepSize = deep
+	// Resolve a live source symlink only to check containment; quarantine
+	// snapshots never follow links because a relative target may be absent
+	// until restore. In both cases the filesystem move operates on the link.
+	opts.Roots = []collect.RootSpec{{Path: filepath.Dir(path), MaxDepth: 1, FollowSymlinks: !within(path, e.QuarantineDir)}}
+	opts.Prior, opts.PriorScanID = nil, ""
+	result, err := collect.Run(ctx, opts)
+	if err != nil {
+		return collect.Result{}, err
 	}
-	parent, err := e.recollect(ctx, filepath.Dir(source))
+	for _, report := range result.Reports {
+		switch report.Name {
+		case collect.CollectorFilesystem, collect.CollectorProcesses, collect.CollectorServices:
+			if report.Status != core.CollectorRan {
+				return collect.Result{}, fmt.Errorf("%s evidence incomplete: %s: %s", path, report.Name, report.Detail)
+			}
+		case collect.CollectorGit:
+			// Git's aggregate report becomes partial when any sibling repo is
+			// unknown. The target's own unknown Git state is represented in
+			// its entry and blocked by the safety engine.
+			if report.Status != core.CollectorRan && report.Status != core.CollectorPartial {
+				return collect.Result{}, fmt.Errorf("%s Git evidence incomplete: %s", path, report.Detail)
+			}
+		case collect.CollectorGitmoot:
+			if report.Status != core.CollectorRan && report.Status != core.CollectorSkipped {
+				return collect.Result{}, fmt.Errorf("%s Gitmoot evidence incomplete: %s", path, report.Detail)
+			}
+		case collect.CollectorAgents:
+			if len(opts.AgentSources) != 0 && report.Status != core.CollectorRan {
+				return collect.Result{}, fmt.Errorf("%s agent evidence incomplete: %s", path, report.Detail)
+			}
+		}
+	}
+	return result, nil
+}
+
+// originalReferences re-checks the original pathname, because services or
+// jobs can begin referring to it after the quarantine move. Only references
+// at or under the source count: its siblings say nothing about this item,
+// and a home directory's parent always has some live reference.
+//
+// Something may have recreated the source since, such as a service
+// regenerating its cache directory. That new object is not the quarantined
+// one and expiry never touches it, so occupancy alone does not block; a
+// reference into it still does, because it may be waiting for the
+// original content.
+func (e *Engine) originalReferences(ctx context.Context, source string) error {
+	result, err := e.observeAround(ctx, source, false)
 	if err != nil {
 		return err
 	}
-	verdict := safety.Evaluate(safety.Input{Entry: parent, Policy: e.Policy, Now: e.now()})
-	if verdict.Refused() {
-		return fmt.Errorf("original source has new protected references: %s", verdict.Summary())
+	var found []string
+	for _, ref := range result.References {
+		if core.PathWithin(ref.Path, source) {
+			found = append(found, fmt.Sprintf("%s (%s)", ref.Protection, ref.Detail))
+		}
+	}
+	if len(found) > 0 {
+		return fmt.Errorf("original source has new protected references: %s", strings.Join(found, "; "))
 	}
 	return nil
 }

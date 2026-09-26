@@ -5,10 +5,16 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
+
+// WorktreeIdle is how long a clean linked worktree must go without a
+// checkout, commit, staging, or top-level change before it is proposed for
+// quarantine.
+const WorktreeIdle = 7 * 24 * time.Hour
 
 // Tier is a rule's precedence band. A proposal from a lower tier is
 // considered before any from a higher one, and a decision made in a lower
@@ -195,6 +201,9 @@ func boundedCacheAction(entry core.Entry, rule config.CacheRule) (core.ActionKin
 	if rule.TTL > 0 && (modified.IsZero() || entry.ObservedAt.IsZero() || modified.After(entry.ObservedAt)) {
 		return core.ActionInvestigate, "complete latest modification time and observation time are required for ttl"
 	}
+	if rule.MaxBytes > 0 && entry.SizeIsLowerBound && entry.SizeBytes <= rule.MaxBytes {
+		return core.ActionInvestigate, fmt.Sprintf("size is at least %d bytes, which cannot show whether max_bytes %d is exceeded", entry.SizeBytes, rule.MaxBytes)
+	}
 	if rule.MaxBytes > 0 && entry.SizeBytes <= rule.MaxBytes {
 		return core.ActionKeep, fmt.Sprintf("size %d bytes is at or below max_bytes %d", entry.SizeBytes, rule.MaxBytes)
 	}
@@ -226,13 +235,34 @@ func builtinProposal(entry core.Entry, class Classification, policy config.Polic
 		base.Rule, base.Kind = "builtin.backup", core.ActionKeep
 	case core.ClassTaskWorktree:
 		base.Rule, base.Kind = "builtin.task_worktree", core.ActionInvestigate
+		switch {
+		case !entry.Git.Clean():
+		case entry.Git.LastActivity.IsZero() || entry.ObservedAt.IsZero():
+			base.Reason += "; clean, but when it was last used is unknown"
+		case entry.ObservedAt.Sub(entry.Git.LastActivity) < WorktreeIdle:
+			// A clean worktree can still be someone's current workspace
+			// between commits; only an idle one is left behind.
+			base.Reason += fmt.Sprintf("; clean, but used within %s", WorktreeIdle)
+		default:
+			// Everything an idle clean linked worktree holds is committed
+			// and on a remote, and its branches live on in the shared
+			// repository.
+			base.Kind, base.Retention = core.ActionQuarantine, policy.Retention.Default
+			base.Reason += fmt.Sprintf("; clean, every commit on a remote-tracking branch, and idle for over %s", WorktreeIdle)
+		}
 	case core.ClassGeneratedArtifact:
 		base.Rule, base.Kind = "builtin.generated_artifact", core.ActionQuarantine
 		base.Retention = policy.Retention.Default
 	case core.ClassCache:
 		base.Rule, base.Kind = "builtin.cache", core.ActionQuarantine
 		base.Retention = policy.Retention.Default
-		if strings.HasPrefix(class.Rule, "classify.adapter:") {
+		if filepath.Base(entry.Path) == ".cache" {
+			// A home cache directory is many tools' caches, and some hold
+			// live installs such as browsers. It is not one disposable cache.
+			base.Kind = core.ActionInvestigate
+			base.Retention = core.RetentionNone
+			base.Reason += "; a home cache directory holds many tools' caches, so select them with per-tool cache rules"
+		} else if strings.HasPrefix(class.Rule, "classify.adapter:") {
 			// Shared provider stores are not equivalent to an isolated
 			// project output. The operator must select and bound one.
 			base.Kind = core.ActionInvestigate

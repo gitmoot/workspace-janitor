@@ -728,3 +728,81 @@ func TestInvestigatedReceiptRechecksBeforeExpiryRetry(t *testing.T) {
 		t.Fatalf("revalidated expiry did not delete: %+v %v", item, err)
 	}
 }
+
+// The source's parent is usually a home directory that live services and
+// processes always reference. Expiry judges only references at or under the
+// source, and a directory a service recreated at the source path is a new
+// object that neither blocks deletion nor is touched by it.
+func TestExpiryIgnoresParentAndSiblingReferencesAndRecreatedSource(t *testing.T) {
+	e, root, clock := fixtureEngine(t)
+	ctx := context.Background()
+	source := filepath.Join(root, "cache")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "blob"), []byte("regenerable"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	item := prepareFixture(t, e, source, core.Retention30Days)
+	item, err := e.Quarantine(ctx, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*clock = clock.Add(31 * 24 * time.Hour)
+	sibling := filepath.Join(root, "service-home")
+	if err := os.Mkdir(sibling, 0700); err != nil {
+		t.Fatal(err)
+	}
+	units := e.Collect.ServiceSources.SystemdDirs[0]
+	for name, dir := range map[string]string{"parent.service": root, "sibling.service": sibling} {
+		unit := "[Service]\nWorkingDirectory=" + dir + "\nExecStart=/bin/true\n"
+		if err := os.WriteFile(filepath.Join(units, name), []byte(unit), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "fresh"), []byte("new"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	item, err = e.Delete(ctx, item)
+	if err != nil || item.State != core.CleanupDeleted {
+		t.Fatalf("expiry blocked by references outside the source: %+v %v", item, err)
+	}
+	if _, err := os.Lstat(item.Destination); !os.IsNotExist(err) {
+		t.Fatalf("quarantined object still exists: %v", err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(source, "fresh")); err != nil || string(raw) != "new" {
+		t.Fatalf("recreated source was touched: %q %v", raw, err)
+	}
+}
+
+// A reference into a recreated source may be waiting for the original
+// content, so it still blocks deletion.
+func TestExpiryRefusesReferenceBelowRecreatedSource(t *testing.T) {
+	e, root, clock := fixtureEngine(t)
+	ctx := context.Background()
+	source := filepath.Join(root, "cache")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	item := prepareFixture(t, e, source, core.Retention30Days)
+	item, err := e.Quarantine(ctx, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*clock = clock.Add(31 * 24 * time.Hour)
+	inner := filepath.Join(source, "tool")
+	if err := os.MkdirAll(inner, 0700); err != nil {
+		t.Fatal(err)
+	}
+	unit := "[Service]\nWorkingDirectory=" + inner + "\nExecStart=/bin/true\n"
+	if err := os.WriteFile(filepath.Join(e.Collect.ServiceSources.SystemdDirs[0], "inner.service"), []byte(unit), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Eligible(ctx, item); err == nil || !strings.Contains(err.Error(), "reference") {
+		t.Fatalf("reference below the source did not block expiry: %v", err)
+	}
+}

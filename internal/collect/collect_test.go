@@ -344,11 +344,19 @@ func TestDeepSizeIsOptionalAndBounded(t *testing.T) {
 	bounded.Limits.DeepSizeMaxDepth = 1
 	boundedResult := run(t, bounded)
 	boundedEntry := entryFor(t, boundedResult, project)
-	if !hasSignal(boundedEntry, "unknown:deep_size_partial") {
-		t.Errorf("a bounded size must be reported as partial, not as a measured total: %+v", boundedEntry.Evidence)
+	if !hasSignal(boundedEntry, "deep_size_lower_bound") || hasSignal(boundedEntry, "deep_size") {
+		t.Errorf("a bounded size must be reported as a lower bound, not as a measured total: %+v", boundedEntry.Evidence)
 	}
-	if report := reportFor(t, boundedResult, CollectorDeepSize); report.Status != core.CollectorPartial {
-		t.Errorf("deep size status = %q, want partial", report.Status)
+	// A count cut short by a budget hides nothing that matters for safety,
+	// so it must not look like an unobserved path, which blocks cleanup.
+	if hasSignal(boundedEntry, "unknown:deep_size_partial") {
+		t.Errorf("a budget-bounded size must not be an unknown: %+v", boundedEntry.Evidence)
+	}
+	if !boundedEntry.LatestModifiedAt.IsZero() {
+		t.Errorf("a bounded walk must not claim the newest modification time")
+	}
+	if report := reportFor(t, boundedResult, CollectorDeepSize); report.Status != core.CollectorRan || report.Unknowns != 0 {
+		t.Errorf("deep size report = %+v, want ran with no unknowns", report)
 	}
 }
 
@@ -501,7 +509,7 @@ func TestPathWithin(t *testing.T) {
 }
 
 // Git facts that decide protections must be part of the fingerprint.
-// Gaining an upstream at the same HEAD removes the unknown-publication
+// Measuring publication at the same HEAD removes the unknown-publication
 // protection, so it must not compare as unchanged.
 func TestFingerprintCoversGitFactsThatDecideProtections(t *testing.T) {
 	base := core.Entry{
@@ -517,6 +525,7 @@ func TestFingerprintCoversGitFactsThatDecideProtections(t *testing.T) {
 	stable := Fingerprint(base)
 	for name, mutate := range map[string]func(*core.GitState){
 		"upstream became known":  func(g *core.GitState) { g.UpstreamKnown = true },
+		"publication measured":   func(g *core.GitState) { g.PublicationKnown = true },
 		"repository became bare": func(g *core.GitState) { g.Bare = true },
 		"worktree owner changed": func(g *core.GitState) { g.WorktreeOf = "/repos/origin" },
 		"remote changed":         func(g *core.GitState) { g.Remote = "git@example.invalid:app.git" },

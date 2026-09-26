@@ -28,7 +28,7 @@ func newPlanFixture(t *testing.T) *planFixture {
 		filepath.Join(repos, "app"),
 		filepath.Join(root, "scratch-clone"),
 		filepath.Join(root, "node_modules"),
-		filepath.Join(root, ".cache"),
+		filepath.Join(root, ".pytest_cache"),
 		filepath.Join(root, "backups"),
 		filepath.Join(root, "mystery"),
 	} {
@@ -120,10 +120,10 @@ func TestPlanProducesTypedActionsBoundToTheScan(t *testing.T) {
 	}
 
 	for path, want := range map[string]core.ActionKind{
-		filepath.Join(f.root, "node_modules"): core.ActionQuarantine,
-		filepath.Join(f.root, ".cache"):       core.ActionQuarantine,
-		filepath.Join(f.root, "backups"):      core.ActionKeep,
-		filepath.Join(f.root, "mystery"):      core.ActionInvestigate,
+		filepath.Join(f.root, "node_modules"):  core.ActionQuarantine,
+		filepath.Join(f.root, ".pytest_cache"): core.ActionQuarantine,
+		filepath.Join(f.root, "backups"):       core.ActionKeep,
+		filepath.Join(f.root, "mystery"):       core.ActionInvestigate,
 	} {
 		action := f.action(t, doc, path)
 		if action.Kind != want {
@@ -151,7 +151,7 @@ func TestPlanApprovalSelectsWithoutEditingThePlan(t *testing.T) {
 	f := newPlanFixture(t)
 	f.scan(t)
 	first := f.planJSON(t)
-	target := filepath.Join(f.root, ".cache")
+	target := filepath.Join(f.root, ".pytest_cache")
 	action := f.action(t, first, target)
 
 	approved := f.planJSON(t, "--approve", action.ID, "--approver", "reviewer", "--note", "checked")
@@ -200,7 +200,7 @@ func TestPlanSurvivesRestartAndStaysImmutable(t *testing.T) {
 	f := newPlanFixture(t)
 	f.scan(t)
 	created := f.planJSON(t)
-	action := f.action(t, created, filepath.Join(f.root, ".cache"))
+	action := f.action(t, created, filepath.Join(f.root, ".pytest_cache"))
 	f.planJSON(t, "--approve", action.ID)
 
 	// A new process, reading only what is on disk.
@@ -251,11 +251,11 @@ func TestPlanReportsRuleConflictsResolvedToTheSaferAction(t *testing.T) {
 		"  services: false",
 		"caches:",
 		"  - name: aggressive",
-		"    path: " + filepath.Join(f.root, ".cache"),
+		"    path: " + filepath.Join(f.root, ".pytest_cache"),
 		"    action: delete_candidate",
 		"    retention: none",
 		"  - name: cautious",
-		"    path: " + filepath.Join(f.root, ".cache"),
+		"    path: " + filepath.Join(f.root, ".pytest_cache"),
 		"    action: investigate",
 		"    retention: none",
 		"",
@@ -263,7 +263,7 @@ func TestPlanReportsRuleConflictsResolvedToTheSaferAction(t *testing.T) {
 	f.scan(t)
 	doc := f.planJSON(t)
 
-	action := f.action(t, doc, filepath.Join(f.root, ".cache"))
+	action := f.action(t, doc, filepath.Join(f.root, ".pytest_cache"))
 	if action.Kind != core.ActionInvestigate {
 		t.Fatalf("action = %q, want the safer investigate", action.Kind)
 	}
@@ -316,7 +316,7 @@ func TestExplainTracesTheDecision(t *testing.T) {
 	f := newPlanFixture(t)
 	f.scan(t)
 	doc := f.planJSON(t)
-	target := filepath.Join(f.root, ".cache")
+	target := filepath.Join(f.root, ".pytest_cache")
 	action := f.action(t, doc, target)
 
 	stdout, stderr, code := f.run(t, "explain", target)
@@ -378,11 +378,11 @@ func TestExplainShowsRejectedAlternatives(t *testing.T) {
 		"  services: false",
 		"caches:",
 		"  - name: aggressive",
-		"    path: " + filepath.Join(f.root, ".cache"),
+		"    path: " + filepath.Join(f.root, ".pytest_cache"),
 		"    action: quarantine",
 		"    retention: 30d",
 		"  - name: cautious",
-		"    path: " + filepath.Join(f.root, ".cache"),
+		"    path: " + filepath.Join(f.root, ".pytest_cache"),
 		"    action: keep",
 		"    retention: none",
 		"",
@@ -390,7 +390,7 @@ func TestExplainShowsRejectedAlternatives(t *testing.T) {
 	f.scan(t)
 	f.planJSON(t)
 
-	stdout, _, code := f.run(t, "explain", filepath.Join(f.root, ".cache"))
+	stdout, _, code := f.run(t, "explain", filepath.Join(f.root, ".pytest_cache"))
 	if code != ExitOK {
 		t.Fatalf("exit = %d", code)
 	}
@@ -451,7 +451,7 @@ func TestPlanWithUnknownScanFailsClearly(t *testing.T) {
 // explain pairs each rule with its own reason.
 func TestExplainPairsRulesWithTheirOwnReasons(t *testing.T) {
 	f := newPlanFixture(t)
-	target := filepath.Join(f.root, ".cache")
+	target := filepath.Join(f.root, ".pytest_cache")
 	f.writePolicy(t, strings.Join([]string{
 		"roots:",
 		"  - path: " + f.root,
