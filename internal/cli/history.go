@@ -44,7 +44,7 @@ func runHistory(ctx context.Context, e *env, args []string, confirm bool) error 
 		Note: "SQLite file bytes are not reclaimed until separately verified offline compaction"}
 	if confirm {
 		err = db.Write(ctx, func(tx *store.Tx) error {
-			report.Eligible, err = tx.TrimScanHistory(ctx)
+			report.Eligible, err = tx.TrimScanHistory(ctx, "")
 			return err
 		})
 	} else {

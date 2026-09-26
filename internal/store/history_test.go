@@ -36,7 +36,11 @@ func TestScanHistoryKeepsAuditReferencesAndLastDeep(t *testing.T) {
 				return err
 			}
 			if i < 8 {
-				if err := tx.PutEntry(ctx, id(i), fixtureEntry(fmt.Sprintf("/repos/old-%d", i), at)); err != nil {
+				path := fmt.Sprintf("/repos/old-%d", i)
+				if i == 7 {
+					path = "/repos/café"
+				}
+				if err := tx.PutEntry(ctx, id(i), fixtureEntry(path, at)); err != nil {
 					return err
 				}
 			}
@@ -61,19 +65,23 @@ func TestScanHistoryKeepsAuditReferencesAndLastDeep(t *testing.T) {
 		t.Fatal(err)
 	}
 	var preview, trimmed ScanHistoryReduction
+	var document string
 	if err := db.Read(ctx, func(tx *Tx) error {
+		if err := tx.tx.QueryRowContext(ctx, `SELECT document FROM inventories WHERE scan_id = ?`, id(7)).Scan(&document); err != nil {
+			return err
+		}
 		var err error
 		preview, err = tx.ScanHistoryPreview(ctx)
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if preview.Scans != 1 || preview.Entries != 1 || preview.Documents == 0 {
-		t.Fatalf("old unreferenced snapshot not isolated: %+v", preview)
+	if preview.Scans != 1 || preview.Entries != 1 || preview.Documents != int64(len(document)) {
+		t.Fatalf("old unreferenced snapshot or UTF-8 byte count wrong: %+v, want %d bytes", preview, len(document))
 	}
 	if err := db.Write(ctx, func(tx *Tx) error {
 		var err error
-		trimmed, err = tx.TrimScanHistory(ctx)
+		trimmed, err = tx.TrimScanHistory(ctx, "")
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -108,6 +116,105 @@ func TestScanHistoryKeepsAuditReferencesAndLastDeep(t *testing.T) {
 			return fmt.Errorf("trim left eligible snapshots: %+v", again)
 		}
 		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScanHistoryOrdersSubsecondBoundaries(t *testing.T) {
+	ctx := context.Background()
+	db := openFixture(t)
+	base := time.Date(2026, 9, 24, 0, 0, 0, 0, time.UTC)
+	if err := db.Write(ctx, func(tx *Tx) error {
+		for i := 0; i < RecentScanLimit+1; i++ {
+			at := base.Add(time.Duration(i) * time.Second)
+			if i == 1 {
+				at = base.Add(500 * time.Millisecond)
+			}
+			scan := fixtureScan(fmt.Sprintf("scan-%03d", i), at)
+			scan.Status, scan.FinishedAt = core.ScanCompleted, &at
+			if i < 2 {
+				scan.Collectors = []core.CollectorReport{{Name: "deep_size", Status: core.CollectorRan}}
+				finished := base.Add(10 * time.Hour)
+				if i == 1 {
+					finished = finished.Add(500 * time.Millisecond)
+				}
+				scan.FinishedAt = &finished
+			}
+			if err := tx.CreateScan(ctx, scan); err != nil {
+				return err
+			}
+		}
+		_, err := tx.TrimScanHistory(ctx, "")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Read(ctx, func(tx *Tx) error {
+		if _, err := tx.Scan(ctx, "scan-000"); !errors.Is(err, ErrNotFound) {
+			return fmt.Errorf("older whole-second scan must trim: %v", err)
+		}
+		_, err := tx.Scan(ctx, "scan-001")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScanHistoryRetainsMalformedCollectorWithoutBlockingTrim(t *testing.T) {
+	ctx := context.Background()
+	db := openFixture(t)
+	base := time.Date(2026, 9, 24, 0, 0, 0, 0, time.UTC)
+	if err := db.Write(ctx, func(tx *Tx) error {
+		for i := 0; i < RecentScanLimit+3; i++ {
+			at := base.Add(time.Duration(i) * time.Minute)
+			scan := fixtureScan(fmt.Sprintf("scan-%03d", i), at)
+			scan.Status, scan.FinishedAt = core.ScanCompleted, &at
+			if err := tx.CreateScan(ctx, scan); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.tx.ExecContext(ctx, `UPDATE scans SET collectors = '{broken' WHERE id = 'scan-000'`); err != nil {
+			return err
+		}
+		_, err := tx.tx.ExecContext(ctx, `UPDATE scans SET collectors = '["unexpected"]' WHERE id = 'scan-001'`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Write(ctx, func(tx *Tx) error {
+		reduction, err := tx.TrimScanHistory(ctx, "")
+		if err != nil {
+			return err
+		}
+		if reduction.Scans != 1 {
+			return fmt.Errorf("expected only the safe old scan trimmed, got %+v", reduction)
+		}
+		at := base.Add(-time.Hour)
+		scan := fixtureScan("new-clock-skewed", at)
+		scan.Status, scan.FinishedAt = core.ScanCompleted, &at
+		if err := tx.CreateScan(ctx, scan); err != nil {
+			return err
+		}
+		_, err = tx.TrimScanHistory(ctx, scan.ID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Read(ctx, func(tx *Tx) error {
+		var count int
+		if err := tx.tx.QueryRowContext(ctx,
+			`SELECT count(*) FROM scans WHERE id IN ('scan-000', 'scan-001')`).Scan(&count); err != nil {
+			return err
+		}
+		if count != 2 {
+			return fmt.Errorf("invalid old collector documents were discarded")
+		}
+		if _, err := tx.Scan(ctx, "scan-002"); !errors.Is(err, ErrNotFound) {
+			return fmt.Errorf("safe old scan survived: %v", err)
+		}
+		_, err := tx.Scan(ctx, "new-clock-skewed")
+		return err
 	}); err != nil {
 		t.Fatal(err)
 	}

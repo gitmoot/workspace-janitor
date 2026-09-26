@@ -321,6 +321,14 @@ with every writer stopped. Neither history trimming nor compaction changes
 filesystem cleanup policy. Overflow and real changes can still make the
 watcher expensive; monitor its scan rate and disk use.
 
+On first upgrade, a large backlog trim can hold SQLite's write lock longer
+than its five-second busy timeout. Stop watch and cycle writers, take and
+read back a durable backup, then run `janitor history --confirm` before
+restarting them; otherwise a competing scan can fail. Invalid collector
+documents remain pinned for investigation rather than blocking every new
+scan or being silently discarded. A newly persisted scan is also pinned
+during its own trim if host time moves backwards.
+
 `janitor cycle` is a one-shot timer target: each invocation records a metadata
 scan, or a deep scan if `prevention.deep_interval` has elapsed since the last
 successful scheduled deep scan (default seven days). `collectors.deep_size`

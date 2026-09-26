@@ -124,3 +124,57 @@ func TestHistoryPreviewAndConfirmedTrim(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestScanPersistsWhenClockFallsBehindHistory(t *testing.T) {
+	f := newFixture(t)
+	paths, err := config.ResolvePaths(config.MapLookup(f.env), config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	db, err := store.Open(ctx, paths.DatabaseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().UTC().Add(24 * time.Hour)
+	if err := db.Write(ctx, func(tx *store.Tx) error {
+		for i := 0; i < store.RecentScanLimit; i++ {
+			at := future.Add(time.Duration(i) * time.Minute)
+			scan := core.Scan{ID: fmt.Sprintf("future-%03d", i), Roots: []string{f.home},
+				Status: core.ScanCompleted, StartedAt: at, FinishedAt: &at}
+			if err := tx.CreateScan(ctx, scan); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, code := f.run(t, "--format", "json", "scan", "--no-git", "--no-processes", "--no-services")
+	if code != ExitOK {
+		t.Fatalf("scan: exit=%d stderr=%s", code, stderr)
+	}
+	var doc struct {
+		Data scanReport `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("scan result: %v", err)
+	}
+	if !doc.Data.Persisted || doc.Data.Scan.ID == "" {
+		t.Fatalf("scan did not report a persisted ID: %+v", doc.Data)
+	}
+	db, err = store.OpenExisting(ctx, paths.DatabaseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Read(ctx, func(tx *store.Tx) error {
+		_, err := tx.Scan(ctx, doc.Data.Scan.ID)
+		return err
+	}); err != nil {
+		t.Fatalf("new scan self-trimmed under clock skew: %v", err)
+	}
+}
