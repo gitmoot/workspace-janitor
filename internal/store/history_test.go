@@ -121,7 +121,7 @@ func TestScanHistoryKeepsAuditReferencesAndLastDeep(t *testing.T) {
 	}
 }
 
-func TestScanHistoryOrdersSubsecondBoundaries(t *testing.T) {
+func TestScanHistoryOrdersSubsecondRecentScans(t *testing.T) {
 	ctx := context.Background()
 	db := openFixture(t)
 	base := time.Date(2026, 9, 24, 0, 0, 0, 0, time.UTC)
@@ -131,6 +131,35 @@ func TestScanHistoryOrdersSubsecondBoundaries(t *testing.T) {
 			if i == 1 {
 				at = base.Add(500 * time.Millisecond)
 			}
+			scan := fixtureScan(fmt.Sprintf("scan-%03d", i), at)
+			scan.Status, scan.FinishedAt = core.ScanCompleted, &at
+			if err := tx.CreateScan(ctx, scan); err != nil {
+				return err
+			}
+		}
+		_, err := tx.TrimScanHistory(ctx, "")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Read(ctx, func(tx *Tx) error {
+		if _, err := tx.Scan(ctx, "scan-000"); !errors.Is(err, ErrNotFound) {
+			return fmt.Errorf("older whole-second scan must trim: %v", err)
+		}
+		_, err := tx.Scan(ctx, "scan-001")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScanHistoryPinsSubsecondDeepCompletion(t *testing.T) {
+	ctx := context.Background()
+	db := openFixture(t)
+	base := time.Date(2026, 9, 24, 0, 0, 0, 0, time.UTC)
+	if err := db.Write(ctx, func(tx *Tx) error {
+		for i := 0; i < RecentScanLimit+2; i++ {
+			at := base.Add(time.Duration(i) * time.Minute)
 			scan := fixtureScan(fmt.Sprintf("scan-%03d", i), at)
 			scan.Status, scan.FinishedAt = core.ScanCompleted, &at
 			if i < 2 {
@@ -152,7 +181,7 @@ func TestScanHistoryOrdersSubsecondBoundaries(t *testing.T) {
 	}
 	if err := db.Read(ctx, func(tx *Tx) error {
 		if _, err := tx.Scan(ctx, "scan-000"); !errors.Is(err, ErrNotFound) {
-			return fmt.Errorf("older whole-second scan must trim: %v", err)
+			return fmt.Errorf("earlier deep completion must trim: %v", err)
 		}
 		_, err := tx.Scan(ctx, "scan-001")
 		return err
