@@ -330,7 +330,8 @@ func persistScan(ctx context.Context, db *store.Store, scan core.Scan, entries [
 				return err
 			}
 		}
-		return nil
+		_, err := tx.TrimScanHistory(ctx)
+		return err
 	})
 }
 

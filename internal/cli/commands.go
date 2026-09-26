@@ -21,6 +21,7 @@ func rootCommand() *command {
 			advisoryCommand(),
 			serviceCommand(),
 			scanCommand(),
+			historyCommand(),
 			planCommand(),
 			explainCommand(),
 			applyCommand(),
@@ -57,6 +58,21 @@ func scanCommand() *command {
 			fs.BoolVar(&opts.noPriorScan, "no-compare", false, "skip fingerprint comparison with the previous scan")
 			return func(ctx context.Context, e *env, args []string) error {
 				return runScan(ctx, e, args, opts)
+			}
+		},
+	}
+}
+
+func historyCommand() *command {
+	return &command{
+		name:    "history",
+		usage:   "janitor history [--confirm]",
+		summary: "Preview or trim unreferenced old scan snapshots",
+		long:    "Keep the newest 256 scans, all referenced audit scans, any running scan, and the latest completed deep scan. Preview by default; --confirm trims eligible rows transactionally. SQLite file bytes require separate verified offline compaction.",
+		register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
+			confirm := fs.Bool("confirm", false, "discard only eligible old snapshots (does not compact the database file)")
+			return func(ctx context.Context, e *env, args []string) error {
+				return runHistory(ctx, e, args, *confirm)
 			}
 		},
 	}
