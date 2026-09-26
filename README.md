@@ -26,6 +26,7 @@ default.
 | Command | State |
 | --- | --- |
 | `janitor scan` | implemented (reports safety verdicts) |
+| `janitor history [--confirm]` | preview/trim unreferenced old scan snapshots; no SQLite file compaction |
 | `janitor watch` | Linux top-level watcher; inventory and guidance only |
 | `janitor cycle` | Linux daily one-shot metadata scan, weekly deep scan when due, disk alerts; expiry opt-in |
 | `janitor service generate` | writes user service/timer files to an explicit directory; never installs them |
@@ -163,6 +164,8 @@ janitor scan                   # inventory the configured roots
 janitor scan /repos --deep-size    # one root, with bounded recursive sizes
 janitor scan --no-git --no-processes --no-services   # filesystem metadata only
 janitor --format json scan     # machine-readable inventory and collector reports
+janitor history              # read-only count of old, unreferenced scan snapshots
+janitor history --confirm    # discard only those snapshots; does not shrink SQLite file
 ```
 
 ### Exit codes
@@ -307,9 +310,24 @@ Startup, inotify overflow, and two-second settling still reconcile. The
 hourly bound applies to protected-directory churn alone: overflow or real
 changes can require more scans. Protected metadata may be up to one hour
 stale between scans; safety protections remain in force, and the daily cycle
-does its own full scan. This limits the growth rate, not total database size;
-operators must monitor disk use and retain the watcher off after an incident
-until a read-only preflight establishes a safe rate.
+does its own full scan. Completed scans keep a bounded recent history (256)
+plus scans pinned by audit records or the latest deep-size scan. The
+`janitor history` command previews eligible scan and inventory row counts;
+trimming runs in a transaction and never deletes a referenced plan/action,
+cycle, advisory attempt, model usage or cleanup receipt. Row deletion leaves
+SQLite pages allocated; freeing filesystem bytes requires a separately
+coordinated offline compaction after a durable read-back-verified backup and
+with every writer stopped. Neither history trimming nor compaction changes
+filesystem cleanup policy. Overflow and real changes can still make the
+watcher expensive; monitor its scan rate and disk use.
+
+On first upgrade, a large backlog trim can hold SQLite's write lock longer
+than its five-second busy timeout. Stop watch and cycle writers, take and
+read back a durable backup, then run `janitor history --confirm` before
+restarting them; otherwise a competing scan can fail. Invalid collector
+documents remain pinned for investigation rather than blocking every new
+scan or being silently discarded. A newly persisted scan is also pinned
+during its own trim if host time moves backwards.
 
 `janitor cycle` is a one-shot timer target: each invocation records a metadata
 scan, or a deep scan if `prevention.deep_interval` has elapsed since the last
