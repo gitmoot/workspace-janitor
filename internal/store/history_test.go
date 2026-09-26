@@ -23,8 +23,14 @@ func TestScanHistoryKeepsAuditReferencesAndLastDeep(t *testing.T) {
 				scan.Status = core.ScanCompleted
 				scan.FinishedAt = &at
 			}
-			if i == 5 {
+			if i == 5 || i == 7 {
 				scan.Collectors = []core.CollectorReport{{Name: "deep_size", Status: core.CollectorRan}}
+			}
+			if i == 5 {
+				// Its later completion advanced the deep clock even though
+				// another deep scan started afterwards.
+				completed := base.Add(10 * time.Hour)
+				scan.FinishedAt = &completed
 			}
 			if err := tx.CreateScan(ctx, scan); err != nil {
 				return err

@@ -28,7 +28,7 @@ const historyCandidates = `WITH recent AS (
       AND EXISTS (SELECT 1 FROM json_each(s.collectors) c
         WHERE json_extract(c.value, '$.name') = 'deep_size'
           AND json_extract(c.value, '$.status') = 'ran')
-    ORDER BY s.started_at DESC, s.id DESC LIMIT 1
+    ORDER BY s.finished_at DESC, s.id DESC LIMIT 1
 ), candidates AS (
     SELECT s.id FROM scans s
     WHERE s.status != 'running'
