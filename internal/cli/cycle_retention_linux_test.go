@@ -180,3 +180,44 @@ func TestScheduledCycleQuarantinesAndExpiresWithoutOperator(t *testing.T) {
 		t.Fatalf("cycle without auto_quarantine moved the cache: %v", err)
 	}
 }
+
+// A tool can recreate a directory whose earlier copy is still in quarantine.
+// The next cycle must leave the new directory alone and still succeed,
+// rather than fail on a second receipt for the same source.
+func TestScheduledCycleSkipsSourceWithActiveReceipt(t *testing.T) {
+	f := newFixture(t)
+	root := filepath.Join(f.home, "workspace")
+	cache := filepath.Join(root, "tool-cache")
+	if err := os.MkdirAll(cache, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cache, "payload"), []byte("first"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: false\n"+
+		"caches:\n  - name: tool\n    path: "+cache+"\n    action: quarantine\n    retention: 7d\n"+
+		"retention:\n  delete_enabled: true\nprevention:\n  auto_quarantine: true\n  auto_expire: true\n  min_free_percent: 0\n")
+
+	var cycle cycleReport
+	out, stderr, code := f.run(t, "cycle")
+	if code != ExitOK || json.Unmarshal([]byte(out), &cycle) != nil || cycle.Quarantine != "applied" {
+		t.Fatalf("first cycle: %d %s %s", code, stderr, out)
+	}
+	if _, err := os.Lstat(cache); !os.IsNotExist(err) {
+		t.Fatalf("first cycle did not quarantine the cache: %v", err)
+	}
+
+	if err := os.MkdirAll(cache, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cache, "payload"), []byte("second"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, code = f.run(t, "cycle")
+	if code != ExitOK || json.Unmarshal([]byte(out), &cycle) != nil || cycle.Quarantine != "none" {
+		t.Fatalf("cycle with the source's receipt still active: %d %s %s", code, stderr, out)
+	}
+	if raw, err := os.ReadFile(filepath.Join(cache, "payload")); err != nil || string(raw) != "second" {
+		t.Fatalf("recreated source was touched: %q %v", raw, err)
+	}
+}
