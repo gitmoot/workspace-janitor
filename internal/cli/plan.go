@@ -276,6 +276,11 @@ func applyApprovals(ctx context.Context, db *store.Store, built core.Plan, opts 
 	if err != nil {
 		return nil, err
 	}
+	if opts.approveQuarantine && len(selected) > 0 {
+		if selected, err = withoutActiveSources(ctx, db, selected); err != nil {
+			return nil, err
+		}
+	}
 	if len(selected) > 0 {
 		if opts.noPersist {
 			return nil, &usageError{msg: "--no-store cannot be combined with an approval: an approval must be recorded"}
@@ -366,7 +371,6 @@ func selectedActions(built core.Plan, opts planOptions) ([]core.Action, error) {
 	return out, nil
 }
 
-// loadStoredPlan fetches a plan by id.
 // quarantineActions selects the plan's quarantine actions, leaving out any
 // that overlaps another: apply refuses an overlapping batch as a whole, and
 // which of two nested paths should move is not a decision to make silently.
@@ -393,6 +397,31 @@ func quarantineActions(built core.Plan) []core.Action {
 	return out
 }
 
+// withoutActiveSources drops actions whose path still has an active cleanup
+// receipt. A tool can recreate a directory that sits in quarantine; a second
+// receipt for the same source would collide on apply. The path becomes
+// eligible again once the earlier receipt expires or is restored.
+func withoutActiveSources(ctx context.Context, db *store.Store, actions []core.Action) ([]core.Action, error) {
+	active := make(map[string]bool)
+	if err := db.Read(ctx, func(tx *store.Tx) error {
+		items, err := tx.PendingCleanupItems(ctx)
+		for _, item := range items {
+			active[item.Source] = true
+		}
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	out := actions[:0:0]
+	for _, action := range actions {
+		if !active[action.Path] {
+			out = append(out, action)
+		}
+	}
+	return out, nil
+}
+
+// loadStoredPlan fetches a plan by id.
 func loadStoredPlan(ctx context.Context, db *store.Store, id string) (core.Plan, error) {
 	var stored core.Plan
 	err := db.Read(ctx, func(tx *store.Tx) error {
