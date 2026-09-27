@@ -188,13 +188,19 @@ func TestScheduledCycleSkipsSourceWithActiveReceipt(t *testing.T) {
 	f := newFixture(t)
 	root := filepath.Join(f.home, "workspace")
 	cache := filepath.Join(root, "tool-cache")
-	if err := os.MkdirAll(cache, 0700); err != nil {
-		t.Fatal(err)
+	// Apply always re-observes processes and services; point them at empty
+	// fixtures so the host's /proc and units cannot affect the outcome.
+	proc := filepath.Join(f.home, "empty-proc")
+	units := filepath.Join(f.home, "systemd")
+	for _, path := range []string{cache, proc, units} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.WriteFile(filepath.Join(cache, "payload"), []byte("first"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: false\n"+
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: true\n  proc_root: "+proc+"\n  systemd_dirs:\n    - "+units+"\n  cron_paths: []\n  pm2_dumps: []\n"+
 		"caches:\n  - name: tool\n    path: "+cache+"\n    action: quarantine\n    retention: 7d\n"+
 		"retention:\n  delete_enabled: true\nprevention:\n  auto_quarantine: true\n  auto_expire: true\n  min_free_percent: 0\n")
 
