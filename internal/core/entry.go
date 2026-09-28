@@ -154,8 +154,10 @@ type GitState struct {
 	LastActivity time.Time `json:"last_activity,omitempty"`
 	// PublicationKnown records that UnpublishedCommits was measured against
 	// every remote-tracking branch. Without it publication is unknown.
-	PublicationKnown   bool   `json:"publication_known"`
-	DirtyFiles         int    `json:"dirty_files"`
+	PublicationKnown bool `json:"publication_known"`
+	DirtyFiles       int  `json:"dirty_files"`
+	// Stashes counts stash entries removing this checkout would lose. A
+	// linked worktree shares its repository's stashes, so it records zero.
 	Stashes            int    `json:"stashes"`
 	UnpublishedCommits int    `json:"unpublished_commits"`
 	Locked             bool   `json:"locked"`

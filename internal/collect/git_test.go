@@ -416,3 +416,27 @@ func TestLinkedWorktreeRecordsLastGitActivity(t *testing.T) {
 		t.Fatalf("staging in the worktree did not count as activity: %v", entry.Git.LastActivity)
 	}
 }
+
+// Stashes live in the shared repository. They protect the primary checkout,
+// which takes them along if removed, but not a linked worktree, whose
+// removal leaves them intact.
+func TestStashesProtectOnlyThePrimaryCheckout(t *testing.T) {
+	requireGit(t)
+	home := t.TempDir()
+	root := t.TempDir()
+	repo := pushedRepo(t, home, root, "app")
+	wt := filepath.Join(root, "app-wt")
+	git(t, home, repo, "worktree", "add", wt, "--detach")
+	mustWrite(t, filepath.Join(repo, "README.md"), "stashed change\n")
+	git(t, home, repo, "stash", "push", "-m", "work in progress")
+
+	result := run(t, gitOptions(root))
+	primary := entryFor(t, result, repo)
+	if primary.Git.Stashes != 1 || !hasProtection(primary, core.ProtectStashedWork) {
+		t.Errorf("primary checkout with a stash: state %+v protections %+v, want protected", primary.Git, primary.Protections)
+	}
+	linked := entryFor(t, result, wt)
+	if linked.Git.Stashes != 0 || hasProtection(linked, core.ProtectStashedWork) || !linked.Git.Clean() {
+		t.Errorf("linked worktree of a repository with a stash: state %+v protections %+v, want clean", linked.Git, linked.Protections)
+	}
+}
