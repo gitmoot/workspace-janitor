@@ -235,10 +235,15 @@ func collectRepository(ctx context.Context, runner gitRunner, entry *core.Entry,
 	}
 	parseStatus(status, state)
 
-	if stashes, err := runner.run(ctx, entry.Path, "stash", "list"); err != nil {
-		return degrade(err.Error(), degradeKind(err), "git_stash_failed")
-	} else {
-		state.Stashes = countLines(stashes)
+	// Stashes live in the shared repository, like branches: removing a
+	// linked worktree leaves them intact, so only a primary checkout
+	// counts them as work it would take with it.
+	if kind != gitMarkerFile {
+		if stashes, err := runner.run(ctx, entry.Path, "stash", "list"); err != nil {
+			return degrade(err.Error(), degradeKind(err), "git_stash_failed")
+		} else {
+			state.Stashes = countLines(stashes)
+		}
 	}
 
 	if !state.Bare {
