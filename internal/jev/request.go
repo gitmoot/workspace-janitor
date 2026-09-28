@@ -97,6 +97,7 @@ var actionCriteria = map[string]string{
 // retentionCriteria are the retention periods a model may choose.
 var retentionCriteria = map[string]string{
 	string(core.RetentionNone):      "Not applicable, or delete as soon as retention allows",
+	string(core.Retention3Days):     "Keep a quarantined copy for three days",
 	string(core.Retention7Days):     "Keep a quarantined copy for a week",
 	string(core.Retention30Days):    "Keep a quarantined copy for a month",
 	string(core.Retention90Days):    "Keep a quarantined copy for three months",

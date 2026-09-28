@@ -33,7 +33,7 @@ protect:
     - "*.backup"
 
 retention:
-  # How long quarantined items are kept: none, 7d, 30d, 90d, or permanent.
+  # How long quarantined items are kept: none, 3d, 7d, 30d, 90d, or permanent.
   # Expiry alone never deletes anything; a second safety evaluation must pass.
   default: 30d
   # Defaults to <state-dir>/quarantine. Wherever it points, it is added to
