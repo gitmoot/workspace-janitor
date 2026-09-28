@@ -9,13 +9,14 @@ type Retention string
 
 const (
 	RetentionNone      Retention = "none"
+	Retention3Days     Retention = "3d"
 	Retention7Days     Retention = "7d"
 	Retention30Days    Retention = "30d"
 	Retention90Days    Retention = "90d"
 	RetentionPermanent Retention = "permanent"
 )
 
-var retentions = []Retention{RetentionNone, Retention7Days, Retention30Days, Retention90Days, RetentionPermanent}
+var retentions = []Retention{RetentionNone, Retention3Days, Retention7Days, Retention30Days, Retention90Days, RetentionPermanent}
 
 // Retentions returns every valid retention period.
 func Retentions() []Retention { return copyEnum(retentions) }
@@ -32,6 +33,8 @@ func (r Retention) Window() (d time.Duration, ok bool) {
 	switch r {
 	case RetentionNone:
 		return 0, true
+	case Retention3Days:
+		return 3 * 24 * time.Hour, true
 	case Retention7Days:
 		return 7 * 24 * time.Hour, true
 	case Retention30Days:

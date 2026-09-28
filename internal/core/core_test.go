@@ -25,6 +25,8 @@ func TestRetentionWindowAndExpiry(t *testing.T) {
 		isExpired bool
 	}{
 		{RetentionNone, 0, true, base, true},
+		{Retention3Days, 3 * 24 * time.Hour, true, base.Add(3*24*time.Hour - time.Second), false},
+		{Retention3Days, 3 * 24 * time.Hour, true, base.Add(3 * 24 * time.Hour), true},
 		{Retention7Days, 7 * 24 * time.Hour, true, base.Add(7*24*time.Hour - time.Second), false},
 		{Retention30Days, 30 * 24 * time.Hour, true, base.Add(30 * 24 * time.Hour), true},
 		{RetentionPermanent, 0, false, base.Add(100000 * time.Hour), false},
