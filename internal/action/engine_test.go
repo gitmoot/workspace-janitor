@@ -824,6 +824,10 @@ func TestExpiryRecordsAnAlreadyRemovedObjectAsDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	*clock = clock.Add(31 * 24 * time.Hour)
+	// Expiry records its intent, then is interrupted after deleting.
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.RemoveAll(item.Destination); err != nil {
 		t.Fatal(err)
 	}
@@ -848,6 +852,10 @@ func TestExpiryRetrySettlesAnInvestigatedReceiptWhoseObjectIsGone(t *testing.T) 
 		t.Fatal(err)
 	}
 	*clock = clock.Add(31 * 24 * time.Hour)
+	// Expiry records its intent, then is interrupted after deleting.
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.RemoveAll(item.Destination); err != nil {
 		t.Fatal(err)
 	}
@@ -887,5 +895,184 @@ func TestExpiryTreatsAnUnjournaledRestoreAsRestoredNotDeleted(t *testing.T) {
 	}
 	if _, err := os.Stat(source); err != nil {
 		t.Fatalf("restored object is gone: %v", err)
+	}
+}
+
+// expiredGoneFixture quarantines a directory, expires it, and returns the
+// receipt with its object removed from quarantine.
+func expiredGoneFixture(t *testing.T) (*Engine, core.CleanupItem, string) {
+	t.Helper()
+	e, root, clock := fixtureEngine(t)
+	source := filepath.Join(root, "candidate")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	item := prepareFixture(t, e, source, core.Retention30Days)
+	item, err := e.Quarantine(context.Background(), item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*clock = clock.Add(31 * 24 * time.Hour)
+	return e, item, source
+}
+
+// A missing object alone is not proof of deletion: if the whole receipt
+// directory was moved, the object may have moved with it. Expiry must keep
+// the receipt investigable instead of journaling it as deleted.
+func TestExpiryDoesNotRecordDeletedWhenTheReceiptDirectoryMoved(t *testing.T) {
+	e, item, _ := expiredGoneFixture(t)
+	receipt := filepath.Dir(item.Destination)
+	if err := os.Rename(receipt, receipt+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	item, _ = e.Delete(context.Background(), item)
+	if item.State == core.CleanupDeleted {
+		t.Fatal("receipt recorded as deleted while its object may have moved with the receipt directory")
+	}
+	if _, err := os.Stat(filepath.Join(receipt+".moved", "item")); err != nil {
+		t.Fatalf("moved object was touched: %v", err)
+	}
+}
+
+// If the source cannot be inspected, a restore that stopped short cannot be
+// ruled out, so the receipt must not be recorded as deleted.
+func TestExpiryDoesNotRecordDeletedWhenTheSourceCannotBeInspected(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+	e, item, source := expiredGoneFixture(t)
+	// Expiry records its intent, then is interrupted after deleting.
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(item.Destination); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Dir(source)
+	if err := os.Chmod(parent, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(parent, 0o700)
+	item, _ = e.Delete(context.Background(), item)
+	if item.State == core.CleanupDeleted {
+		t.Fatal("receipt recorded as deleted although the source could not be inspected")
+	}
+}
+
+// The preview must report what the confirmed run will do: an absent object
+// is settled, not a refusal.
+func TestExpiryPreviewAcceptsAnAbsentObject(t *testing.T) {
+	e, item, _ := expiredGoneFixture(t)
+	// Expiry records its intent, then is interrupted after deleting.
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(item.Destination); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ExpiryPreview(context.Background(), item); err != nil {
+		t.Fatalf("preview refused a receipt the confirmed expiry settles: %v", err)
+	}
+	item, err := e.Delete(context.Background(), item)
+	if err != nil || item.State != core.CleanupDeleted {
+		t.Fatalf("confirmed expiry: %+v %v, want deleted", item.State, err)
+	}
+}
+
+// A receipt directory replaced by one that still holds a manifest is not
+// proof that expiry deleted the object: without this receipt's deletion
+// marker, the object may still exist in the moved original directory.
+func TestExpiryDoesNotRecordDeletedWhenTheReceiptDirectoryWasReplaced(t *testing.T) {
+	e, item, _ := expiredGoneFixture(t)
+	receipt := filepath.Dir(item.Destination)
+	manifest, err := os.ReadFile(filepath.Join(receipt, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(receipt, receipt+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(receipt, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(receipt, "manifest.json"), manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	item, _ = e.Delete(context.Background(), item)
+	if item.State == core.CleanupDeleted {
+		t.Fatal("receipt recorded as deleted while its object still exists in the moved receipt directory")
+	}
+	if _, err := os.Stat(filepath.Join(receipt+".moved", "item")); err != nil {
+		t.Fatalf("moved object was touched: %v", err)
+	}
+}
+
+// An investigated receipt's preview must apply retention like the confirmed
+// retry does, even when its object is already gone: an unexpired receipt is
+// not previewed as deletable.
+func TestRetryPreviewAppliesRetention(t *testing.T) {
+	e, root, clock := fixtureEngine(t)
+	ctx := context.Background()
+	source := filepath.Join(root, "candidate")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	item := prepareFixture(t, e, source, core.Retention30Days)
+	item, err := e.Quarantine(ctx, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, _ = e.investigate(ctx, item, "fixture")
+	// With the object gone, settling skips the expiry guards, which is where
+	// retention used to be checked.
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(item.Destination); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RetryPreview(ctx, item); err == nil {
+		t.Fatal("preview accepted an investigated receipt whose retention has not expired")
+	}
+	*clock = clock.Add(31 * 24 * time.Hour)
+	if err := e.RetryPreview(ctx, item); err != nil {
+		t.Fatalf("preview refused an expired receipt whose object expiry already deleted: %v", err)
+	}
+}
+
+// Re-review of #60: a receipt directory swapped between eligibility and the
+// marker write. The marker is written through the directory that actually
+// holds the object, so it is refused in a replacement directory, and a
+// marker copied into one does not match that directory's identity.
+func TestDeletionMarkerIsBoundToTheOriginalReceiptDirectory(t *testing.T) {
+	e, item, _ := expiredGoneFixture(t)
+	receipt := filepath.Dir(item.Destination)
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(receipt, receipt+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(receipt, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDeletionMarker(item); err == nil {
+		t.Fatal("marker written into a replacement directory that does not hold the object")
+	}
+	for _, name := range []string{"manifest.json", "deleting"} {
+		raw, err := os.ReadFile(filepath.Join(receipt+".moved", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(receipt, name), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	item, _ = e.Delete(context.Background(), item)
+	if item.State == core.CleanupDeleted {
+		t.Fatal("receipt recorded as deleted from a replacement directory with a copied marker")
+	}
+	if _, err := os.Stat(filepath.Join(receipt+".moved", "item")); err != nil {
+		t.Fatalf("moved object was touched: %v", err)
 	}
 }
