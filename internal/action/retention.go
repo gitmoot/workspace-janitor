@@ -172,6 +172,23 @@ func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.Cleanu
 	if item.State != core.CleanupQuarantined || item.MovedAt == nil || !item.Action.Retention.Expired(*item.MovedAt, e.now()) {
 		return item, errors.New("retention has not expired or item is not quarantined")
 	}
+	// Deleting comes before journaling it, so a crash or a failed journal
+	// write in between leaves an expired receipt whose object is already
+	// gone. There is nothing left to protect, so record what happened instead
+	// of flagging the receipt for investigation on every later run. The
+	// original object back at the source instead means a restore stopped
+	// before its journal write; Reconcile records that as restored.
+	if objectGone(item) {
+		if src, err := os.Lstat(item.Source); err == nil && identityMatches(src, item.Entry.FilesystemID) {
+			return e.Reconcile(ctx, item)
+		}
+		item.State, item.UpdatedAt = core.CleanupDeleted, e.now()
+		item.Reason = "quarantined object was already absent at expiry; recorded as deleted"
+		if err := e.update(ctx, item, core.CleanupQuarantined); err != nil {
+			return item, err
+		}
+		return item, nil
+	}
 	if err := e.Eligible(ctx, item); err != nil {
 		return e.investigate(ctx, item, err.Error())
 	}
@@ -183,6 +200,12 @@ func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.Cleanu
 		return item, err
 	}
 	return item, nil
+}
+
+// objectGone reports that the quarantined object no longer exists at all.
+func objectGone(item core.CleanupItem) bool {
+	_, err := os.Lstat(item.Destination)
+	return errors.Is(err, os.ErrNotExist)
 }
 
 func filesystemID(info os.FileInfo) core.FilesystemID {
