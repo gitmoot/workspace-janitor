@@ -824,6 +824,10 @@ func TestExpiryRecordsAnAlreadyRemovedObjectAsDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	*clock = clock.Add(31 * 24 * time.Hour)
+	// Expiry records its intent, then is interrupted after deleting.
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.RemoveAll(item.Destination); err != nil {
 		t.Fatal(err)
 	}
@@ -848,6 +852,10 @@ func TestExpiryRetrySettlesAnInvestigatedReceiptWhoseObjectIsGone(t *testing.T) 
 		t.Fatal(err)
 	}
 	*clock = clock.Add(31 * 24 * time.Hour)
+	// Expiry records its intent, then is interrupted after deleting.
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.RemoveAll(item.Destination); err != nil {
 		t.Fatal(err)
 	}
@@ -933,6 +941,10 @@ func TestExpiryDoesNotRecordDeletedWhenTheSourceCannotBeInspected(t *testing.T) 
 		t.Skip("root bypasses directory permissions")
 	}
 	e, item, source := expiredGoneFixture(t)
+	// Expiry records its intent, then is interrupted after deleting.
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.RemoveAll(item.Destination); err != nil {
 		t.Fatal(err)
 	}
@@ -951,6 +963,10 @@ func TestExpiryDoesNotRecordDeletedWhenTheSourceCannotBeInspected(t *testing.T) 
 // is settled, not a refusal.
 func TestExpiryPreviewAcceptsAnAbsentObject(t *testing.T) {
 	e, item, _ := expiredGoneFixture(t)
+	// Expiry records its intent, then is interrupted after deleting.
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.RemoveAll(item.Destination); err != nil {
 		t.Fatal(err)
 	}
@@ -960,5 +976,66 @@ func TestExpiryPreviewAcceptsAnAbsentObject(t *testing.T) {
 	item, err := e.Delete(context.Background(), item)
 	if err != nil || item.State != core.CleanupDeleted {
 		t.Fatalf("confirmed expiry: %+v %v, want deleted", item.State, err)
+	}
+}
+
+// A receipt directory replaced by one that still holds a manifest is not
+// proof that expiry deleted the object: without this receipt's deletion
+// marker, the object may still exist in the moved original directory.
+func TestExpiryDoesNotRecordDeletedWhenTheReceiptDirectoryWasReplaced(t *testing.T) {
+	e, item, _ := expiredGoneFixture(t)
+	receipt := filepath.Dir(item.Destination)
+	manifest, err := os.ReadFile(filepath.Join(receipt, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(receipt, receipt+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(receipt, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(receipt, "manifest.json"), manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	item, _ = e.Delete(context.Background(), item)
+	if item.State == core.CleanupDeleted {
+		t.Fatal("receipt recorded as deleted while its object still exists in the moved receipt directory")
+	}
+	if _, err := os.Stat(filepath.Join(receipt+".moved", "item")); err != nil {
+		t.Fatalf("moved object was touched: %v", err)
+	}
+}
+
+// An investigated receipt's preview must apply retention like the confirmed
+// retry does, even when its object is already gone: an unexpired receipt is
+// not previewed as deletable.
+func TestRetryPreviewAppliesRetention(t *testing.T) {
+	e, root, clock := fixtureEngine(t)
+	ctx := context.Background()
+	source := filepath.Join(root, "candidate")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	item := prepareFixture(t, e, source, core.Retention30Days)
+	item, err := e.Quarantine(ctx, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, _ = e.investigate(ctx, item, "fixture")
+	// With the object gone, settling skips the expiry guards, which is where
+	// retention used to be checked.
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(item.Destination); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RetryPreview(ctx, item); err == nil {
+		t.Fatal("preview accepted an investigated receipt whose retention has not expired")
+	}
+	*clock = clock.Add(31 * 24 * time.Hour)
+	if err := e.RetryPreview(ctx, item); err != nil {
+		t.Fatalf("preview refused an expired receipt whose object expiry already deleted: %v", err)
 	}
 }

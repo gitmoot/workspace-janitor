@@ -187,6 +187,23 @@ func (e *Engine) finishMove(ctx context.Context, item core.CleanupItem) (core.Cl
 	return item, nil
 }
 
+// RetryPreview reports, without changing anything, what a confirmed expiry
+// would do with an investigated receipt: Reconcile's guard returns it to
+// quarantine, then Delete applies retention and the expiry guards.
+func (e *Engine) RetryPreview(ctx context.Context, item core.CleanupItem) error {
+	candidate := item
+	candidate.State = core.CleanupQuarantined
+	if e.settleAbsent(item) == absentUnproven {
+		if err := e.Eligible(ctx, candidate); err != nil {
+			return err
+		}
+	}
+	if candidate.MovedAt == nil || !candidate.Action.Retention.Expired(*candidate.MovedAt, e.now()) {
+		return errors.New("retention has not expired")
+	}
+	return e.ExpiryPreview(ctx, candidate)
+}
+
 // Reconcile resolves a crash between durable journal writes and either rename.
 // It never guesses when both names exist, identity differs, or the Git
 // registration cannot be verified.

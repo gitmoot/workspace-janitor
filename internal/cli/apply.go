@@ -329,9 +329,8 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 	for _, item := range items {
 		if item.State == core.CleanupInvestigate {
 			if opts.dryRun {
-				probe := item
-				probe.State = core.CleanupQuarantined
-				err = engine.ExpiryPreview(ctx, probe)
+				// Mirror the confirmed path: Reconcile's guard, then retention.
+				err = engine.RetryPreview(ctx, item)
 				if err != nil {
 					report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", item.Source, err))
 				}
