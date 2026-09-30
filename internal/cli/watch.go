@@ -267,7 +267,15 @@ func reconcileWatch(ctx context.Context, e *env, paths config.Paths, policy conf
 	// Background inventory is local and rules-only; neither planning nor
 	// Jev nor an action engine is invoked by this path.
 	var scanID string
-	if err := runScan(ctx, &quiet, nil, scanOptions{noDeepSize: true, recordScanID: &scanID}); err != nil {
+	// A scheduled cycle holds this lock from its scan through its quarantine
+	// apply; scanning in between would make that apply refuse its plan.
+	unlockScan, err := lockScan(ctx, paths.StateDir)
+	if err != nil {
+		return err
+	}
+	err = runScan(ctx, &quiet, nil, scanOptions{noDeepSize: true, recordScanID: &scanID})
+	unlockScan()
+	if err != nil {
 		return err
 	}
 	db, err := store.OpenReadOnly(ctx, paths.DatabaseFile)

@@ -47,6 +47,20 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Hold the scan lock from this scan through the quarantine apply, so no
+	// watcher scan lands between the plan and the apply's binding check.
+	unlockScan, err := lockScan(ctx, paths.StateDir)
+	if err != nil {
+		return err
+	}
+	scanLocked := true
+	releaseScan := func() {
+		if scanLocked {
+			scanLocked = false
+			unlockScan()
+		}
+	}
+	defer releaseScan()
 	quiet := *e
 	quiet.stdout = io.Discard
 	var scanID string
@@ -67,6 +81,8 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	if policy.Prevention.AutoQuarantine {
 		report.Quarantine, report.QuarantineReport, quarantineErr = autoQuarantine(ctx, e, scanID)
 	}
+	// Expiry does not depend on the latest scan; the watcher may resume.
+	releaseScan()
 	if policy.Prevention.AutoExpire {
 		// Reuse the interactive path and retain its item-level outcome.
 		var expiryOutput bytes.Buffer

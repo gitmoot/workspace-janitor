@@ -2,7 +2,10 @@
 
 package cli
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 func lockApply(string) (func(), error) {
 	return nil, errors.New("confirmed apply requires Linux process locking")
@@ -11,3 +14,6 @@ func lockApply(string) (func(), error) {
 // Confirmed restore worked before Linux-only process locking was introduced.
 // Preserve that path; confirmed apply still fails closed on this platform.
 func lockRestore(string) (func(), error) { return func() {}, nil }
+
+// Watching is Linux-only; elsewhere there is no concurrent scanner to wait for.
+func lockScan(context.Context, string) (func(), error) { return func() {}, nil }
