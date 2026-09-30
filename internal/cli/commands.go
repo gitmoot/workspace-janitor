@@ -57,6 +57,21 @@ func scanCommand() *command {
 			fs.BoolVar(&opts.noPersist, "no-store", false, "report the inventory without writing it to the database")
 			fs.BoolVar(&opts.noPriorScan, "no-compare", false, "skip fingerprint comparison with the previous scan")
 			return func(ctx context.Context, e *env, args []string) error {
+				if opts.noPersist {
+					return runScan(ctx, e, args, opts)
+				}
+				// A stored scan becomes the latest one, which a scheduled
+				// cycle's apply checks its plan against; wait for any cycle
+				// that is between its scan and its apply.
+				paths, err := e.resolvePaths()
+				if err != nil {
+					return err
+				}
+				unlock, err := lockScan(ctx, paths.StateDir)
+				if err != nil {
+					return err
+				}
+				defer unlock()
 				return runScan(ctx, e, args, opts)
 			}
 		},

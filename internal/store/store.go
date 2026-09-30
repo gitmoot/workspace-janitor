@@ -271,6 +271,11 @@ func dsn(path string) string {
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", "journal_mode(wal)")
 	q.Add("_pragma", "synchronous(full)")
+	// Write transactions take the write lock when they begin. A deferred
+	// transaction that reads first cannot upgrade while another process
+	// writes: SQLite returns SQLITE_BUSY at once instead of honouring
+	// busy_timeout. Read-only transactions are unaffected.
+	q.Add("_txlock", "immediate")
 	u.RawQuery = q.Encode()
 	return u.String()
 }
