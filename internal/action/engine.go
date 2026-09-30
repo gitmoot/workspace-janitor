@@ -199,7 +199,7 @@ func (e *Engine) Reconcile(ctx context.Context, item core.CleanupItem) (core.Cle
 		candidate.State = core.CleanupQuarantined
 		// With the object gone there is nothing for the guards to protect;
 		// Delete records the outcome, or a restore that stopped short.
-		if !objectGone(item) {
+		if e.settleAbsent(item) == absentUnproven {
 			if err := e.Eligible(ctx, candidate); err != nil {
 				return item, err
 			}

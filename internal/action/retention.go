@@ -175,19 +175,19 @@ func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.Cleanu
 	// Deleting comes before journaling it, so a crash or a failed journal
 	// write in between leaves an expired receipt whose object is already
 	// gone. There is nothing left to protect, so record what happened instead
-	// of flagging the receipt for investigation on every later run. The
-	// original object back at the source instead means a restore stopped
-	// before its journal write; Reconcile records that as restored.
-	if objectGone(item) {
-		if src, err := os.Lstat(item.Source); err == nil && identityMatches(src, item.Entry.FilesystemID) {
-			return e.Reconcile(ctx, item)
-		}
+	// of flagging the receipt for investigation on every later run. An object
+	// back at its source means a restore stopped before its journal write;
+	// Reconcile records that as restored.
+	switch e.settleAbsent(item) {
+	case absentDeleted:
 		item.State, item.UpdatedAt = core.CleanupDeleted, e.now()
 		item.Reason = "quarantined object was already absent at expiry; recorded as deleted"
 		if err := e.update(ctx, item, core.CleanupQuarantined); err != nil {
 			return item, err
 		}
 		return item, nil
+	case absentRestored:
+		return e.Reconcile(ctx, item)
 	}
 	if err := e.Eligible(ctx, item); err != nil {
 		return e.investigate(ctx, item, err.Error())
@@ -202,10 +202,51 @@ func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.Cleanu
 	return item, nil
 }
 
-// objectGone reports that the quarantined object no longer exists at all.
-func objectGone(item core.CleanupItem) bool {
-	_, err := os.Lstat(item.Destination)
-	return errors.Is(err, os.ErrNotExist)
+// absentOutcome is what an expired receipt's missing object turned out to be.
+type absentOutcome int
+
+const (
+	// absentUnproven: the object may still exist, or its fate is unknown.
+	// The normal guarded path runs and investigates if it cannot proceed.
+	absentUnproven absentOutcome = iota
+	// absentDeleted: the object is gone and nowhere else to be found.
+	absentDeleted
+	// absentRestored: the object is back at its source with its identity.
+	absentRestored
+)
+
+// settleAbsent decides, without guessing, whether a receipt's object is gone.
+// Only an ENOENT on the object inside an intact receipt directory counts: a
+// missing or replaced receipt directory (still holding its manifest is the
+// check) could mean the object moved with it. The source must also be
+// provably not the object: an ENOENT, or an entry of a different identity.
+// Any other error on either path leaves the outcome unproven.
+func (e *Engine) settleAbsent(item core.CleanupItem) absentOutcome {
+	if _, err := os.Lstat(item.Destination); !errors.Is(err, os.ErrNotExist) {
+		return absentUnproven
+	}
+	receiptDir := filepath.Dir(item.Destination)
+	if info, err := os.Lstat(filepath.Join(receiptDir, "manifest.json")); err != nil || !info.Mode().IsRegular() {
+		return absentUnproven
+	}
+	src, err := os.Lstat(item.Source)
+	switch {
+	case err == nil && identityMatches(src, item.Entry.FilesystemID):
+		return absentRestored
+	case err == nil, errors.Is(err, os.ErrNotExist):
+		return absentDeleted
+	default:
+		return absentUnproven
+	}
+}
+
+// ExpiryPreview reports what a confirmed expiry would do with a receipt,
+// without changing anything: an absent object is settled, not refused.
+func (e *Engine) ExpiryPreview(ctx context.Context, item core.CleanupItem) error {
+	if e.settleAbsent(item) != absentUnproven {
+		return nil
+	}
+	return e.Eligible(ctx, item)
 }
 
 func filesystemID(info os.FileInfo) core.FilesystemID {
