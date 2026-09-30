@@ -100,3 +100,24 @@ func TestWatcherScanWaitsForTheScanLock(t *testing.T) {
 		t.Fatalf("watcher scan failed after the lock was released: %v", err)
 	}
 }
+
+// A stored ad-hoc scan also becomes the latest scan, so it waits too; a
+// --no-store scan changes nothing a cycle depends on and does not wait.
+func TestStoredScanWaitsForTheScanLockButNoStoreDoesNot(t *testing.T) {
+	f, stateDir := scanLockFixture(t)
+	scan := func(args ...string) func() error {
+		return func() error {
+			_, errOut, code := f.run(t, append([]string{"scan"}, args...)...)
+			if code != ExitOK {
+				return &usageError{msg: errOut}
+			}
+			return nil
+		}
+	}
+	if early, err := runsHeld(t, stateDir, scan()); early || err != nil {
+		t.Fatalf("stored scan: finished while locked=%v err=%v, want it to wait and then succeed", early, err)
+	}
+	if early, err := runsHeld(t, stateDir, scan("--no-store")); !early || err != nil {
+		t.Fatalf("--no-store scan: finished while locked=%v err=%v, want it not to wait", early, err)
+	}
+}
