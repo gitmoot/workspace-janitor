@@ -197,8 +197,12 @@ func (e *Engine) Reconcile(ctx context.Context, item core.CleanupItem) (core.Cle
 		// reason (new reference, changed bytes, unknown collector) stays put.
 		candidate := item
 		candidate.State = core.CleanupQuarantined
-		if err := e.Eligible(ctx, candidate); err != nil {
-			return item, err
+		// With the object gone there is nothing for the guards to protect;
+		// Delete records the outcome, or a restore that stopped short.
+		if !objectGone(item) {
+			if err := e.Eligible(ctx, candidate); err != nil {
+				return item, err
+			}
 		}
 		item.State, item.UpdatedAt, item.Reason = core.CleanupQuarantined, e.now(), ""
 		if err := e.update(ctx, item, core.CleanupInvestigate); err != nil {

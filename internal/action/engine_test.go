@@ -806,3 +806,86 @@ func TestExpiryRefusesReferenceBelowRecreatedSource(t *testing.T) {
 		t.Fatalf("reference below the source did not block expiry: %v", err)
 	}
 }
+
+// Expiry deletes the object before it journals the deletion. If that journal
+// write fails (production: SQLITE_BUSY, #53) or the process dies in between,
+// the receipt still says quarantined with nothing left to protect. Expiry
+// records it as deleted rather than flagging it for investigation forever.
+func TestExpiryRecordsAnAlreadyRemovedObjectAsDeleted(t *testing.T) {
+	e, root, clock := fixtureEngine(t)
+	ctx := context.Background()
+	source := filepath.Join(root, "candidate")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	item := prepareFixture(t, e, source, core.Retention30Days)
+	item, err := e.Quarantine(ctx, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*clock = clock.Add(31 * 24 * time.Hour)
+	if err := os.RemoveAll(item.Destination); err != nil {
+		t.Fatal(err)
+	}
+	item, err = e.Delete(ctx, item)
+	if err != nil || item.State != core.CleanupDeleted {
+		t.Fatalf("expired receipt with its object already gone: %+v %v, want deleted", item.State, err)
+	}
+}
+
+// The same receipt may already have been moved to investigate by a run
+// before the fix; the retried expiry must settle it too.
+func TestExpiryRetrySettlesAnInvestigatedReceiptWhoseObjectIsGone(t *testing.T) {
+	e, root, clock := fixtureEngine(t)
+	ctx := context.Background()
+	source := filepath.Join(root, "candidate")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	item := prepareFixture(t, e, source, core.Retention30Days)
+	item, err := e.Quarantine(ctx, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*clock = clock.Add(31 * 24 * time.Hour)
+	if err := os.RemoveAll(item.Destination); err != nil {
+		t.Fatal(err)
+	}
+	item, _ = e.investigate(ctx, item, "open quarantined object: no such file or directory")
+	item, err = e.Reconcile(ctx, item)
+	if err != nil || item.State != core.CleanupQuarantined {
+		t.Fatalf("retry of investigated receipt: %+v %v, want quarantined", item.State, err)
+	}
+	item, err = e.Delete(ctx, item)
+	if err != nil || item.State != core.CleanupDeleted {
+		t.Fatalf("expiry after retry: %+v %v, want deleted", item.State, err)
+	}
+}
+
+// A restore renames the object back and then journals it. Stopping between
+// the two leaves the destination empty too, but the object is alive at its
+// original path: that is a restore, never a deletion.
+func TestExpiryTreatsAnUnjournaledRestoreAsRestoredNotDeleted(t *testing.T) {
+	e, root, clock := fixtureEngine(t)
+	ctx := context.Background()
+	source := filepath.Join(root, "candidate")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	item := prepareFixture(t, e, source, core.Retention30Days)
+	item, err := e.Quarantine(ctx, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*clock = clock.Add(31 * 24 * time.Hour)
+	if err := os.Rename(item.Destination, source); err != nil {
+		t.Fatal(err)
+	}
+	item, err = e.Delete(ctx, item)
+	if err != nil || item.State != core.CleanupRestored {
+		t.Fatalf("unjournaled restore: %+v %v, want restored", item.State, err)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("restored object is gone: %v", err)
+	}
+}
