@@ -1039,3 +1039,40 @@ func TestRetryPreviewAppliesRetention(t *testing.T) {
 		t.Fatalf("preview refused an expired receipt whose object expiry already deleted: %v", err)
 	}
 }
+
+// Re-review of #60: a receipt directory swapped between eligibility and the
+// marker write. The marker is written through the directory that actually
+// holds the object, so it is refused in a replacement directory, and a
+// marker copied into one does not match that directory's identity.
+func TestDeletionMarkerIsBoundToTheOriginalReceiptDirectory(t *testing.T) {
+	e, item, _ := expiredGoneFixture(t)
+	receipt := filepath.Dir(item.Destination)
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(receipt, receipt+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(receipt, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDeletionMarker(item); err == nil {
+		t.Fatal("marker written into a replacement directory that does not hold the object")
+	}
+	for _, name := range []string{"manifest.json", "deleting"} {
+		raw, err := os.ReadFile(filepath.Join(receipt+".moved", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(receipt, name), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	item, _ = e.Delete(context.Background(), item)
+	if item.State == core.CleanupDeleted {
+		t.Fatal("receipt recorded as deleted from a replacement directory with a copied marker")
+	}
+	if _, err := os.Stat(filepath.Join(receipt+".moved", "item")); err != nil {
+		t.Fatalf("moved object was touched: %v", err)
+	}
+}

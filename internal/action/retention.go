@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/gitmoot/workspace-janitor/internal/collect"
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -204,47 +203,6 @@ func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.Cleanu
 		return item, err
 	}
 	return item, nil
-}
-
-// deletionMarker names the file Delete writes into a receipt directory,
-// durably, just before it deletes the quarantined object. Its content binds
-// it to this receipt's action and object identity.
-func deletionMarker(item core.CleanupItem) (string, []byte) {
-	id := item.Entry.FilesystemID
-	return filepath.Join(filepath.Dir(item.Destination), "deleting"),
-		[]byte(fmt.Sprintf("%s %d:%d\n", item.ActionID, id.Device, id.Inode))
-}
-
-func writeDeletionMarker(item core.CleanupItem) error {
-	path, content := deletionMarker(item)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := file.Write(content); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	return syncDir(filepath.Dir(path))
-}
-
-// hasDeletionMarker reports whether Delete itself started deleting this exact
-// object: the marker must be a regular file with this receipt's content.
-func hasDeletionMarker(item core.CleanupItem) bool {
-	path, want := deletionMarker(item)
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(len(want)) {
-		return false
-	}
-	got, err := os.ReadFile(path)
-	return err == nil && string(got) == string(want)
 }
 
 // absentOutcome is what an expired receipt's missing object turned out to be.
