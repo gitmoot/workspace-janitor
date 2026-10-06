@@ -63,3 +63,48 @@ jev:
 ```
 
 The cache rule only proposes quarantine when the logical-size bound is met; a directory needs a **complete deep-size scan** to satisfy that bound. Unknown/partial evidence leads to investigation, not approval. Even a matching rule requires a safe verdict, a stored approved action, and explicit confirmed apply. Keep the state directory outside discovery roots in a real configuration; this fixture path is separate from the cache root. Avoid reusing any fixture path that points into a real home, provider cache or Gitmoot tree.
+
+## Ignored contents inside whole worktrees
+
+Git-clean and published does not prove that ignored files can be recreated.
+Before whole-worktree quarantine or expiry, Janitor walks descendants without
+following links and compares each file with the Git index. Every untracked
+file, including ignored credentials, evidence and lockfiles, preserves the
+whole object unless a current explicit `caches` rule proves its location
+regenerable. Directory names such as `node_modules` are not proof.
+
+An approval must name a canonical path strictly **inside** the original
+worktree and explicitly use `action: quarantine` or `action: delete_candidate`.
+It must have neither `max_bytes` nor `ttl`: a bound-induced KEEP must not turn
+into permission to delete the enclosing worktree. Rules for the worktree
+itself, its parents or its quarantine destination do not approve descendants.
+Overlapping preserving/bounded cache rules, report-only roots, protected paths
+and credential/evidence name patterns take precedence, including inside an
+otherwise approved cache. An ignored symlink, nested Git repository, gitlink,
+special file or filesystem crossing refuses cleanup.
+The existing potentially-live database extension veto also applies to regular
+descendant files, even tracked files or files inside an approved cache.
+
+For example, only after independently establishing that **all** contents of a
+synthetic build directory are disposable, an isolated fixture policy may use:
+
+```yaml
+caches:
+  - name: explicitly-disposable-fixture-build
+    path: /tmp/janitor-fixture/repos/app/build
+    action: quarantine
+    retention: 7d
+```
+
+Do not copy that assertion onto a real cache without establishing its contents
+are regenerable. Unapproved content elsewhere in the tree still preserves it.
+This does not change normal cache scheduling or enable deletion by itself.
+
+The proof is bounded to 100,000 index records and traversed entries, depth 64,
+16 MiB of Git output, and the configured Git timeout. Errors, unreadable
+directories, cancellation and exceeded bounds preserve the object; no content
+secret scanning occurs. Old inventories without a successful proof are
+unknown. Actual quarantine and expiry always recompute under current policy,
+including receipts created by older binaries. Receipt descendants retain their
+original policy paths after Git-aware relocation; removing a cache approval
+revokes expiry permission. Restore remains available after a proof refusal.

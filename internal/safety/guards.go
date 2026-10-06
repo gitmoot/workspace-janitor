@@ -8,12 +8,6 @@ import (
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
 
-// databaseExtensions are file types that may be an open database. Moving a
-// live database file out from under its writer corrupts it.
-var databaseExtensions = map[string]struct{}{
-	".db": {}, ".db3": {}, ".sqlite": {}, ".sqlite3": {}, ".mdb": {}, ".ldb": {},
-}
-
 // guardCollectedProtections carries forward every blocking protection the
 // collectors recorded. The engine re-derives what it can from evidence, but
 // a collector-observed protection is authoritative on its own.
@@ -73,6 +67,10 @@ func guardGitState(in Input) []core.Protection {
 			reason = "Git state could not be collected"
 		}
 		out = append(out, protect(core.ProtectBrokenGitMetadata, core.SourceGit, reason))
+	}
+	if !state.Bare && !state.ContentsKnown {
+		out = append(out, protect(core.ProtectCollectorFailure, core.SourceGit,
+			"worktree ignored contents have not been proven reconstructible"))
 	}
 	if state.DirtyFiles > 0 {
 		out = append(out, protect(core.ProtectDirtyRepository, core.SourceGit,
@@ -173,8 +171,7 @@ func guardLiveDatabases(in Input) []core.Protection {
 	if in.Entry.Kind != core.EntryKindFile {
 		return nil
 	}
-	ext := strings.ToLower(filepath.Ext(in.Entry.Path))
-	if _, ok := databaseExtensions[ext]; !ok {
+	if !core.IsDatabasePath(in.Entry.Path) {
 		return nil
 	}
 	return []core.Protection{protect(core.ProtectLiveDatabase, core.SourceFilesystem,

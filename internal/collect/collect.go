@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
 
@@ -84,6 +85,11 @@ type AgentSource interface {
 type Options struct {
 	Roots  []RootSpec
 	Limits Limits
+	// WorktreePolicy is the current operator policy, not a cached disposition.
+	WorktreePolicy *config.Policy
+	// WorktreeOrigins maps an exact quarantined pathname to its receipt source
+	// for policy matching only. Git and filesystem inspection use the real path.
+	WorktreeOrigins map[string]string
 
 	DeepSize  bool
 	Git       bool

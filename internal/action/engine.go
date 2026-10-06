@@ -163,7 +163,7 @@ func (e *Engine) finishMove(ctx context.Context, item core.CleanupItem) (core.Cl
 	if err := absent(item.Source); err != nil {
 		return item, fmt.Errorf("source reappeared after move: %w", err)
 	}
-	fresh, err := e.recollect(ctx, item.Destination)
+	fresh, err := e.recollectReceipt(ctx, item.Destination, item.Source)
 	if err != nil {
 		return item, fmt.Errorf("moved object requires investigation: %w", err)
 	}

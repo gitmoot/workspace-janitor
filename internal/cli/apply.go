@@ -48,7 +48,8 @@ func cleanupEngine(e *env, db *store.Store, paths config.Paths, policy config.Po
 		Policy: enginePolicy(paths, policy),
 		Collect: collect.Options{
 			Limits: collectLimits(policy, scanOptions{}), Git: true, Processes: true, Services: true,
-			GitmootHome: policy.Gitmoot.Home, GitmootDatabase: policy.Gitmoot.Database,
+			WorktreePolicy: &policy,
+			GitmootHome:    policy.Gitmoot.Home, GitmootDatabase: policy.Gitmoot.Database,
 			ProcRoot: policy.Collectors.ProcRoot, ProjectMarkers: policy.Classification.ProjectMarkers,
 			ServiceSources: collect.ServiceSources{
 				SystemdDirs: policy.Collectors.SystemdDirs, CronPaths: policy.Collectors.CronPaths, PM2Dumps: policy.Collectors.PM2Dumps,

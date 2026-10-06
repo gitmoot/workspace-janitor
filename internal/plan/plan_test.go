@@ -61,7 +61,10 @@ func entryAt(path string, options ...func(*core.Entry)) core.Entry {
 }
 
 func withGit(state *core.GitState) func(*core.Entry) {
-	return func(e *core.Entry) { e.Git = state }
+	return func(e *core.Entry) {
+		state.ContentsKnown = true
+		e.Git = state
+	}
 }
 
 func withClass(class core.ArtifactClass) func(*core.Entry) {
