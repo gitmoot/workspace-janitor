@@ -140,6 +140,7 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 	result, err := collect.Run(ctx, collect.Options{
 		Roots:           roots,
 		Limits:          collectLimits(policy, opts),
+		WorktreePolicy:  &policy,
 		DeepSize:        !opts.noDeepSize && (opts.deepSize || policy.Collectors.DeepSize),
 		Git:             policy.Collectors.Git && !opts.noGit,
 		Processes:       policy.Collectors.Processes && !opts.noProcesses,

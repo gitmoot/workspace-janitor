@@ -74,6 +74,10 @@ func guardGitState(in Input) []core.Protection {
 		}
 		out = append(out, protect(core.ProtectBrokenGitMetadata, core.SourceGit, reason))
 	}
+	if !state.Bare && !state.ContentsKnown {
+		out = append(out, protect(core.ProtectCollectorFailure, core.SourceGit,
+			"worktree ignored contents have not been proven reconstructible"))
+	}
 	if state.DirtyFiles > 0 {
 		out = append(out, protect(core.ProtectDirtyRepository, core.SourceGit,
 			fmt.Sprintf("%d uncommitted change(s)", state.DirtyFiles)))

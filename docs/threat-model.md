@@ -23,3 +23,16 @@ The local account, kernel, SQLite state and journal, configured filesystem, and 
 | Partial failures | Per-action durable SQLite transitions and quarantine manifests record moves. Repeating a confirmed apply can reconcile an interrupted batch; restore can recover completed moves or cancel an unmoved prepared receipt. | A disk failure, corrupt DB/manifest, tampered tree, or crash still needs manual investigation and backups. Never delete a questionable quarantine object to clear an error; follow [recovery](recovery.md). |
 
 Automatic expiry requires both `retention.delete_enabled` and `prevention.auto_expire`, and invokes the guarded expiry path; a timer is not installed or started by the policy file. These controls reduce accidental damage, but do not establish safety against a hostile administrator, compromised kernel, remote filesystem semantics, or all same-user adversaries.
+
+Whole-worktree cleanup additionally requires a bounded metadata/index proof
+that each descendant file is tracked or covered by an explicit current
+regenerable-cache disposition. Ignored files are not assumed disposable.
+Credential/evidence names, preserving policies, unknown content, unsupported
+objects and incomplete traversal preserve the entire tree; see
+[policy reference](policy-reference.md#ignored-contents-inside-whole-worktrees).
+Quarantined receipts are rechecked under their original policy pathname, not
+granted an exception because they are already in quarantine. No descendant
+file contents are inspected. The root `.git` administrative marker remains
+handled by existing Git metadata guards. The existing Git status treatment of
+`assume-unchanged`/`skip-worktree` entries is not strengthened here; nor is the
+metadata proof an atomic snapshot against arbitrary concurrent same-user writes.

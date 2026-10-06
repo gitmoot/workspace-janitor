@@ -32,6 +32,7 @@ var gitReadOnlyVerbs = map[string]struct{}{
 	"stash":     {},
 	"config":    {},
 	"worktree":  {},
+	"ls-files":  {},
 }
 
 // errGitVerbNotAllowed reports an attempt to run a non-allowlisted command.
@@ -53,6 +54,10 @@ func newGitRunner(opts *Options) gitRunner {
 
 // run executes one git command in dir under the configured timeout.
 func (g gitRunner) run(ctx context.Context, dir string, args ...string) (string, error) {
+	return g.runOutput(ctx, dir, 0, args...)
+}
+
+func (g gitRunner) runOutput(ctx context.Context, dir string, limit int, args ...string) (string, error) {
 	if len(args) == 0 {
 		return "", errGitVerbNotAllowed
 	}
@@ -79,14 +84,18 @@ func (g gitRunner) run(ctx context.Context, dir string, args ...string) (string,
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"LC_ALL=C",
 	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	var stdout, stderr limitedGitOutput
+	stdout.limit, stderr.limit = limit, limit
+	stdout.cancel, stderr.cancel = cancel, cancel
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	configureProcessGroup(cmd)
 	// Backstop for a grandchild that survives the group kill: Wait returns
 	// shortly after the deadline instead of blocking on an inherited pipe.
 	cmd.WaitDelay = time.Second
 	err := cmd.Run()
+	if stdout.exceeded || stderr.exceeded {
+		return "", errors.New("Git contents proof exceeded its output bound")
+	}
 	if ctxErr := ctx.Err(); errors.Is(ctxErr, context.DeadlineExceeded) {
 		return "", fmt.Errorf("git %s timed out after %s", args[0], g.timeout)
 	}
@@ -99,6 +108,24 @@ func (g gitRunner) run(ctx context.Context, dir string, args ...string) (string,
 	}
 	return strings.TrimRight(stdout.String(), "\n"), nil
 }
+
+type limitedGitOutput struct {
+	buffer   bytes.Buffer
+	limit    int
+	exceeded bool
+	cancel   context.CancelFunc
+}
+
+func (b *limitedGitOutput) Write(p []byte) (int, error) {
+	if b.limit > 0 && len(p) > b.limit-b.buffer.Len() {
+		b.exceeded = true
+		b.cancel()
+		return 0, errors.New("Git output bound exceeded")
+	}
+	return b.buffer.Write(p)
+}
+
+func (b *limitedGitOutput) String() string { return b.buffer.String() }
 
 // collectGit enriches directory entries that are Git working trees.
 //
@@ -132,6 +159,18 @@ func collectGit(ctx context.Context, opts *Options, entries []core.Entry, now ti
 			report.Status = core.CollectorPartial
 		}
 		report.Recorded++
+		if entry.Git != nil && !entry.Git.Bare && !entry.Git.Degraded && entry.Git.DirtyFiles == 0 {
+			if err := proveWorktreeContents(ctx, runner, entry.Path, opts); err != nil {
+				entry.Git.Degraded = true
+				entry.Git.DegradedReason = err.Error()
+				addUnknown(entry, core.SourceGit, core.ProtectCollectorFailure,
+					"worktree_contents_unknown", err.Error(), now)
+				report.Unknowns++
+				report.Status = core.CollectorPartial
+			} else {
+				entry.Git.ContentsKnown = true
+			}
+		}
 	}
 
 	if report.Detail == "" {

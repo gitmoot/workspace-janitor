@@ -645,3 +645,16 @@ func TestRootDirectoryContainmentIsNotFailOpen(t *testing.T) {
 		t.Errorf("a symlink inside a root of \"/\" was reported as escaping: %+v", verdict.Protections)
 	}
 }
+
+func TestLegacyInventoryWithoutContentsProofPreservesWorktree(t *testing.T) {
+	in := baseInput()
+	// This is the pre-fix serialized Git state: clean and fully published,
+	// but no observation of ignored descendants.
+	in.Entry.Git = &core.GitState{
+		RepoRoot: in.Entry.Path, UpstreamKnown: true, PublicationKnown: true,
+	}
+	verdict := Evaluate(in)
+	if verdict.Allows(core.ActionQuarantine) || verdict.Allows(core.ActionDeleteCandidate) {
+		t.Fatal("legacy inventory authorized whole-worktree cleanup without contents proof")
+	}
+}

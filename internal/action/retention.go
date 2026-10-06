@@ -19,6 +19,14 @@ func (e *Engine) recollect(ctx context.Context, path string) (core.Entry, error)
 	return e.recollectWithSize(ctx, path, false)
 }
 
+// Reinspect the actual receipt location while matching descendant policy at
+// its original pathname. This never grants a quarantine-root cache approval.
+func (e *Engine) recollectReceipt(ctx context.Context, path, source string) (core.Entry, error) {
+	copy := *e
+	copy.Collect.WorktreeOrigins = map[string]string{path: source}
+	return copy.recollect(ctx, path)
+}
+
 func (e *Engine) recollectWithSize(ctx context.Context, path string, deep bool) (core.Entry, error) {
 	result, err := e.observeAround(ctx, path, deep)
 	if err != nil {
@@ -135,7 +143,7 @@ func (e *Engine) Eligible(ctx context.Context, item core.CleanupItem) error {
 	planned.Root = item.Entry.Root // symlink containment is judged against its original discovery root
 	var observed core.Entry
 	probe := func(ctx context.Context, path string) (core.Entry, error) {
-		fresh, err := e.recollect(ctx, path)
+		fresh, err := e.recollectReceipt(ctx, path, item.Source)
 		fresh.Root = item.Entry.Root
 		observed = fresh
 		return fresh, err
