@@ -199,6 +199,9 @@ func walkWorktreeContents(ctx context.Context, dir *os.File, relative, origin st
 			}
 			switch stat.Mode & unix.S_IFMT {
 			case unix.S_IFREG, unix.S_IFLNK:
+				if stat.Mode&unix.S_IFMT == unix.S_IFREG && core.IsDatabasePath(rel) {
+					return errors.New("worktree descendant may be a live database")
+				}
 				mode, known := tracked[rel]
 				if known {
 					if (mode == "120000") != (stat.Mode&unix.S_IFMT == unix.S_IFLNK) {

@@ -13,7 +13,7 @@ import (
 )
 
 func TestCycleWholeWorktreeContentsPolicy(t *testing.T) {
-	for _, scenario := range []string{"clean", "tracked_symlink", "approved", "approved_linked", "revoked", "revoked_linked", "unknown", "credential", "evidence", "keep_overlap", "root_keep", "bounded_cache", "report_only", "protected", "symlink"} {
+	for _, scenario := range []string{"clean", "tracked_symlink", "approved", "approved_linked", "revoked", "revoked_linked", "unknown", "credential", "evidence", "database", "keep_overlap", "root_keep", "bounded_cache", "report_only", "protected", "symlink"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newFixture(t)
 			root := filepath.Join(f.home, "workspace")
@@ -59,6 +59,9 @@ func TestCycleWholeWorktreeContentsPolicy(t *testing.T) {
 			name := "artifact"
 			if scenario == "credential" {
 				name = "nested/.env"
+			}
+			if scenario == "database" {
+				name = "nested/data.sqlite3"
 			}
 			if scenario == "evidence" {
 				name = "nested/evidence/result"

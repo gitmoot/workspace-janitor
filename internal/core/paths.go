@@ -43,3 +43,14 @@ func PathWithin(path, target string) bool {
 // either direction: a parent that contains the protected path, and a
 // protected parent that contains the entry.
 func PathsOverlap(a, b string) bool { return PathWithin(a, b) || PathWithin(b, a) }
+
+// IsDatabasePath identifies the existing conservative live-writer veto, shared
+// by standalone-file guards and whole-worktree descendant proofs.
+func IsDatabasePath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".db", ".db3", ".sqlite", ".sqlite3", ".mdb", ".ldb":
+		return true
+	default:
+		return false
+	}
+}

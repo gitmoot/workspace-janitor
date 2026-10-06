@@ -82,6 +82,8 @@ Overlapping preserving/bounded cache rules, report-only roots, protected paths
 and credential/evidence name patterns take precedence, including inside an
 otherwise approved cache. An ignored symlink, nested Git repository, gitlink,
 special file or filesystem crossing refuses cleanup.
+The existing potentially-live database extension veto also applies to regular
+descendant files, even tracked files or files inside an approved cache.
 
 For example, only after independently establishing that **all** contents of a
 synthetic build directory are disposable, an isolated fixture policy may use:
