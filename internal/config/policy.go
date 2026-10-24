@@ -252,7 +252,18 @@ type Prevention struct {
 	// AutoQuarantine lets the daily cycle plan from rules alone and move
 	// every quarantine action the safety engine allows, without an operator
 	// approving each one. Quarantine stays restorable until expiry.
-	AutoQuarantine bool `yaml:"auto_quarantine" json:"auto_quarantine"`
+	AutoQuarantine   bool             `yaml:"auto_quarantine" json:"auto_quarantine"`
+	CapacityInterval Duration         `yaml:"capacity_interval" json:"capacity_interval"`
+	Targets          []CapacityTarget `yaml:"targets" json:"targets"`
+}
+
+// CapacityTarget names an inventory root whose filesystem needs headroom.
+// Roots sharing a device use the strongest configured thresholds once.
+type CapacityTarget struct {
+	Path                string `yaml:"path" json:"path"`
+	TargetFreeBytes     int64  `yaml:"target_free_bytes" json:"target_free_bytes"`
+	ReserveFreeBytes    int64  `yaml:"reserve_free_bytes" json:"reserve_free_bytes"`
+	RecoveryMarginBytes int64  `yaml:"recovery_margin_bytes" json:"recovery_margin_bytes"`
 }
 
 // Policy is the validated policy document.
@@ -358,9 +369,10 @@ func DefaultPolicy(p Paths) Policy {
 			DeepSizeMaxDepth:   16,
 		},
 		Prevention: Prevention{
-			DeepInterval:   Duration(7 * 24 * time.Hour),
-			MinFreePercent: 10,
-			AlertInterval:  Duration(24 * time.Hour),
+			DeepInterval:     Duration(7 * 24 * time.Hour),
+			MinFreePercent:   10,
+			AlertInterval:    Duration(24 * time.Hour),
+			CapacityInterval: Duration(time.Minute),
 		},
 		Source:   "built-in defaults",
 		FromFile: false,
@@ -397,6 +409,7 @@ func (p Policy) clone() Policy {
 	out.Protect.Paths = append([]string(nil), p.Protect.Paths...)
 	out.Protect.NamePatterns = append([]string(nil), p.Protect.NamePatterns...)
 	out.Caches = append([]CacheRule(nil), p.Caches...)
+	out.Prevention.Targets = append([]CapacityTarget(nil), p.Prevention.Targets...)
 	out.Gitmoot = p.Gitmoot
 	out.Jev.RedactSegments = append([]string(nil), p.Jev.RedactSegments...)
 	out.Collectors.SystemdDirs = append([]string(nil), p.Collectors.SystemdDirs...)
@@ -425,6 +438,9 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	}
 	for i := range p.Roots {
 		p.Roots[i].Path = expand(fmt.Sprintf("roots[%d].path", i), p.Roots[i].Path)
+	}
+	for i := range p.Prevention.Targets {
+		p.Prevention.Targets[i].Path = expand(fmt.Sprintf("prevention.targets[%d].path", i), p.Prevention.Targets[i].Path)
 	}
 	for i := range p.Protect.Paths {
 		p.Protect.Paths[i] = expand(fmt.Sprintf("protect.paths[%d]", i), p.Protect.Paths[i])
@@ -624,6 +640,30 @@ func (p *Policy) Validate() core.FieldErrors {
 	}
 	if p.Prevention.AlertInterval.Duration() <= 0 {
 		errs.Add("prevention.alert_interval", "must be greater than zero")
+	}
+	if p.Prevention.CapacityInterval.Duration() < time.Second || p.Prevention.CapacityInterval.Duration() > time.Hour {
+		errs.Add("prevention.capacity_interval", "must be between 1s and 1h")
+	}
+	if len(p.Prevention.Targets) > 64 {
+		errs.Add("prevention.targets", "at most 64 roots may have capacity targets")
+	}
+	targetPaths := make(map[string]bool, len(p.Prevention.Targets))
+	for i, target := range p.Prevention.Targets {
+		field := fmt.Sprintf("prevention.targets[%d]", i)
+		found := false
+		for _, root := range p.Roots {
+			found = found || target.Path == root.Path
+		}
+		if !found || targetPaths[target.Path] {
+			errs.Add(field+".path", "must name a configured root exactly once")
+		}
+		targetPaths[target.Path] = true
+		if target.TargetFreeBytes <= 0 || target.ReserveFreeBytes < 0 || target.ReserveFreeBytes > target.TargetFreeBytes {
+			errs.Add(field, "target_free_bytes must be positive and reserve_free_bytes between zero and target")
+		}
+		if target.RecoveryMarginBytes <= 0 || target.TargetFreeBytes > int64(^uint64(0)>>1)-target.RecoveryMarginBytes {
+			errs.Add(field+".recovery_margin_bytes", "must be positive and target plus margin must fit in int64")
+		}
 	}
 
 	if p.Jev.Enabled && p.Jev.Model == "" {

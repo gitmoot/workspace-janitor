@@ -350,6 +350,14 @@ bounded or uncertain estimate is **unmeasured**, not zero. Alerts are
 deduplicated per filesystem by a durable SQLite cooldown, default 24 hours.
 Only configured inventory roots are measured.
 
+Optional `prevention.targets` adds persisted per-filesystem pressure state;
+see [capacity target fields](docs/policy-reference.md#capacity-targets). `scan`,
+`cycle`, and the watcher's independent timer share a bounded sample and durable
+hysteresis. `janitor --format json status` exposes `data.capacity` without sampling.
+Missing, stale, failed, or policy-mismatched observations are unknown and hold
+admission rather than reporting health. This contract is advisory: it does not
+yet pause jobs, authorize cleanup, or replace the independent dispatch disk guard.
+
 Automatic expiry is **off** by default. To opt in, set both
 `retention.delete_enabled: true` and `prevention.auto_expire: true`. The cycle
 then calls the same confirmed `apply --expire` path as an operator: process

@@ -11,13 +11,48 @@ The policy defaults to `<config-dir>/policy.yaml`; `--policy` overrides `JANITOR
 | `roots` | Discovery paths, `max_depth`, symlink and filesystem traversal, `report_only` (no mutations under that root). |
 | `protect` | Additive protected paths and basename patterns; built-in credential names, Gitmoot home, state and effective quarantine remain protected. |
 | `retention` | Default quarantine period (`none`, `3d`, `7d`, `30d`, `90d`, `permanent`), quarantine directory, and separate deletion opt-in. |
-| `prevention` | Deep-scan interval, disk alert thresholds/cooldown, and opt-in automatic quarantine and expiry; a policy never installs a timer. |
+| `prevention` | Deep-scan interval, disk alert thresholds/cooldown, per-filesystem capacity targets, and opt-in automatic quarantine and expiry; a policy never installs a timer. |
 | `canonical_roots`, `classification`, `ownership`, `gitmoot` | Canonical project locations, literal project markers and name signals, foreign ownership checks, and read-only Gitmoot ledger location. |
 | `caches` | Exact declared cache roots; `action` is `keep`, `quarantine`, `delete_candidate`, or `investigate`. Omitted action means `investigate`; TTL/size bounds need complete evidence for directories. Dedicated irreversible prune has further restrictions. |
 | `jev` | Disabled by default; model, endpoint, key **environment variable name**, request bounds, thresholds, caching and redaction. See [privacy](privacy.md). |
 | `collectors`, `limits`, `safety` | Explicit collector sources, bounded work/timeouts, and destination headroom. `allow_cross_filesystem_quarantine` does not enable a copy path: the Linux action engine still refuses cross-filesystem quarantine. |
 
 Safety is a first-precedence veto. Protected paths/canonical roots precede explicit cache rules, then built-in classification and investigate fallback. Within a tier, safer action wins, independently of YAML order. No policy field waives a core protection or enables generic direct deletion. `follow_symlinks` changes discovery, not symlink-containment safety. `delete_candidate` needs an exact cache rule and, for official pruning, a dedicated owned/idle cache plus an approved action, configured absolute supported executable, and a distinct confirmed `apply --prune` call. `retention.delete_enabled` alone never expires an item; a confirmed expiry also needs elapsed retention and fresh complete checks.
+
+## Capacity targets
+
+`prevention.targets` is empty by default. Each target names an existing configured
+inventory root exactly once; at most 64 targets are accepted. Targets on one
+filesystem combine the strongest thresholds, not their sum.
+
+| Field | Meaning |
+| --- | --- |
+| `path` | Root path, expanded using the same home/path rules as `roots`. |
+| `target_free_bytes` | Positive desired available bytes. For this host's planned 50 GiB target: `53687091200`; configuration does not establish achievement. |
+| `reserve_free_bytes` | Nonnegative critical reserve, no greater than the configured target. Effective reserve is at least 5% of filesystem capacity; effective target is at least the reserve. |
+| `recovery_margin_bytes` | Positive hysteresis margin above the effective target; target plus margin must fit a signed 64-bit byte count. |
+
+`prevention.capacity_interval` defaults to `1m` and accepts `1s` through `1h`.
+Persisted scans, cycles, and watcher timer ticks share a serialized due check and
+sample. `scan --no-store` does not sample or update pressure. The snapshot uses
+one SQLite row, survives restart, and expires after twice the interval.
+The watcher samples even without directory events; restart it after policy changes.
+
+States are `target_recovered`, `cleanup_needed`, `critical`, and
+`measurement_unknown`. Below reserve is critical. Below target requests cleanup;
+once pressure begins, recovery requires target plus margin. Critical or unknown
+state sets `admission_hold`; that hold remains until verified hysteresis recovery.
+`available_bytes` excludes filesystem-reserved blocks. Unreadable roots,
+inconsistent volume observations, stale snapshots, and backward clocks cannot
+report healthy capacity. Unknown byte values are JSON `null`, never zero.
+
+`janitor --format json status` returns `data.capacity` with `sampled_at`,
+`valid_until`, `policy_hash`, and `volumes`; each volume includes its device/root
+identity, thresholds, state, `admission_hold`, and reason. Status is read-only;
+missing data or a changed policy returns unknown until a fresh sample exists.
+`cycle`, stored `scan`, and watcher reports also include the snapshot. This is
+an advisory contract, not deletion authority or an enforced job admission gate.
+No target relaxes the existing independent 5% dispatch floor.
 
 ## Worked fixture-only policies
 

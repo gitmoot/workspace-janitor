@@ -46,11 +46,12 @@ type scanReport struct {
 	Entries         []core.Entry `json:"entries"`
 	// Verdicts is the safety engine's typed answer per entry, ordered by
 	// path. A refusal here cannot be overridden by any later stage.
-	Verdicts   []core.Verdict `json:"verdicts"`
-	Guards     []string       `json:"guards"`
-	Target     safetyTarget   `json:"quarantine_target"`
-	EntryLimit int            `json:"entry_limit"`
-	Roots      []scanRootRef  `json:"roots"`
+	Verdicts   []core.Verdict         `json:"verdicts"`
+	Guards     []string               `json:"guards"`
+	Target     safetyTarget           `json:"quarantine_target"`
+	EntryLimit int                    `json:"entry_limit"`
+	Roots      []scanRootRef          `json:"roots"`
+	Capacity   *core.CapacitySnapshot `json:"capacity,omitempty"`
 }
 
 // safetyTarget reports what the engine learned about the quarantine
@@ -99,12 +100,17 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 	// when this scan will actually write; a comparison-only run opens an
 	// existing database and tolerates its absence.
 	var db *store.Store
+	var capacity *core.CapacitySnapshot
 	if !opts.noPersist {
 		db, err = store.Open(ctx, paths.DatabaseFile)
 		if err != nil {
 			return err
 		}
 		defer db.Close()
+		capacity, err = sampleCapacity(ctx, policy, paths, time.Now().UTC())
+		if err != nil {
+			return err
+		}
 	}
 
 	comparisonNote := ""
@@ -190,6 +196,7 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 		},
 		EntryLimit: policy.Limits.MaxEntries,
 		Roots:      rootRefs(roots),
+		Capacity:   capacity,
 	}
 	for _, entry := range result.Entries {
 		if entry.Protected() {

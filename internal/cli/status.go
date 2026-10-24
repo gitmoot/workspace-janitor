@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/buildinfo"
 	"github.com/gitmoot/workspace-janitor/internal/config"
@@ -36,11 +37,12 @@ type storeStatus struct {
 
 // statusReport is the `status` result contract.
 type statusReport struct {
-	Build           buildinfo.Info `json:"build"`
-	ContractVersion int            `json:"contract_version"`
-	Paths           config.Paths   `json:"paths"`
-	Policy          policyStatus   `json:"policy"`
-	Store           storeStatus    `json:"store"`
+	Build           buildinfo.Info         `json:"build"`
+	ContractVersion int                    `json:"contract_version"`
+	Paths           config.Paths           `json:"paths"`
+	Policy          policyStatus           `json:"policy"`
+	Store           storeStatus            `json:"store"`
+	Capacity        *core.CapacitySnapshot `json:"capacity,omitempty"`
 }
 
 func runStatus(ctx context.Context, e *env) error {
@@ -57,6 +59,7 @@ func runStatus(ctx context.Context, e *env) error {
 		return err
 	}
 	report := statusReport{
+		Capacity:        unknownCapacity(policy, "no capacity sample exists; run cycle or start watch"),
 		Build:           e.buildRef,
 		ContractVersion: core.ContractVersion,
 		Paths:           paths,
@@ -97,6 +100,20 @@ func runStatus(ctx context.Context, e *env) error {
 		report.Store.Initialized = true
 		report.Store.Stats = &stats
 		report.Store.ModelUsage = &usage
+		if len(policy.Prevention.Targets) > 0 && stats.SchemaVersion == store.SchemaVersion() {
+			var snapshot core.CapacitySnapshot
+			if err := db.Read(ctx, func(tx *store.Tx) error {
+				var err error
+				snapshot, err = tx.CapacitySnapshot(ctx)
+				return err
+			}); err != nil {
+				return err
+			}
+			if snapshot.PolicyHash == capacityPolicyHash(policy) {
+				snapshot = snapshot.Expire(time.Now().UTC())
+				report.Capacity = &snapshot
+			}
+		}
 	}
 
 	if format == output.FormatJSON {
@@ -113,6 +130,11 @@ func writeStatusText(e *env, report statusReport) error {
 		{Key: "state dir:", Value: fmt.Sprintf("%s (%s)", report.Paths.StateDir, report.Paths.Origins.StateDir)},
 		{Key: "cache dir:", Value: fmt.Sprintf("%s (%s)", report.Paths.CacheDir, report.Paths.Origins.CacheDir)},
 		{Key: "policy:", Value: fmt.Sprintf("%s (%d root(s), %d cache rule(s), jev=%t)", report.Policy.Source, report.Policy.Roots, report.Policy.Caches, report.Policy.JevOn)},
+	}
+	if report.Capacity != nil {
+		for _, volume := range report.Capacity.Volumes {
+			fields = append(fields, output.Field{Key: volume.Key + ":", Value: fmt.Sprintf("%s hold=%t target=%d reserve=%d recovery=%d (%s)", volume.State, volume.AdmissionHold, volume.TargetBytes, volume.ReserveBytes, volume.RecoveryBytes, volume.Reason)})
+		}
 	}
 	if report.Store.Stats == nil {
 		fields = append(fields, output.Field{

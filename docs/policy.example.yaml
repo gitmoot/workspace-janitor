@@ -55,6 +55,15 @@ prevention:
   min_free_bytes: 0
   min_free_percent: 10
   alert_interval: 24h
+  # Read-only capacity sampling; empty targets disables it.
+  capacity_interval: 1m
+  targets: []
+  # Example desired headroom, NOT a claim that 50 GiB is available:
+  # targets:
+  #   - path: ~/repos         # must exactly match a configured inventory root
+  #     target_free_bytes: 53687091200
+  #     reserve_free_bytes: 10737418240
+  #     recovery_margin_bytes: 2147483648
   # Requires retention.delete_enabled too. Expiry still uses the confirmed
   # apply path and a fresh, complete second safety observation.
   auto_expire: false

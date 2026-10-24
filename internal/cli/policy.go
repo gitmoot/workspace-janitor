@@ -86,6 +86,16 @@ func writePolicyText(e *env, report policyCheckReport) error {
 			return err
 		}
 	}
+	if len(report.Effective.Prevention.Targets) > 0 {
+		if _, err := fmt.Fprintf(e.stdout, "\nCapacity targets (sample interval %s):\n", report.Effective.Prevention.CapacityInterval); err != nil {
+			return err
+		}
+		for _, target := range report.Effective.Prevention.Targets {
+			if _, err := fmt.Fprintf(e.stdout, "  %s target=%d reserve=%d recovery-margin=%d bytes\n", target.Path, target.TargetFreeBytes, target.ReserveFreeBytes, target.RecoveryMarginBytes); err != nil {
+				return err
+			}
+		}
+	}
 	_, err := fmt.Fprintln(e.stdout, "\npolicy is valid")
 	return err
 }
