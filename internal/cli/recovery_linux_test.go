@@ -242,10 +242,14 @@ func TestCapacityRecoveryPreservesBusyProviderOutsideCache(t *testing.T) {
 	if err := os.Mkdir(pid, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(pid, "comm"), []byte("compile\n"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(pid, "comm"), []byte("gopls\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(r.home, filepath.Join(pid, "cwd")); err != nil {
+	elsewhere := filepath.Join(r.home, "unrelated-project")
+	if err := os.Mkdir(elsewhere, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(pid, "cwd")); err != nil {
 		t.Fatal(err)
 	}
 	r.policy(t, 1048576)

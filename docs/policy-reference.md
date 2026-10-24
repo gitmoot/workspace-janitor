@@ -96,6 +96,8 @@ reaching the recovery threshold stops the pass.
 Process arguments and environments remain unread. As a conservative substitute
 for unavailable per-cache producer leases, any running matching provider holds
 its automatic recovery caches, even when its working directory is elsewhere.
+Go holds include `gopls` and auxiliary tool processes, not only the `go` driver
+or compiler; a long-lived language server can conservatively keep a cache held.
 Any nonterminal Gitmoot job/task or an unreadable existing ledger also holds
 automatic recovery caches: completion cannot be guessed from an unmatched
 worktree path. A narrower producer-owned release contract is required before

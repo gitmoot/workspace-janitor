@@ -121,7 +121,7 @@ func cacheProducerMayBeRunning(provider, name string) bool {
 	switch provider {
 	case "go":
 		switch name {
-		case "go", "compile", "link", "asm", "cgo":
+		case "go", "compile", "link", "asm", "cgo", "gopls", "vet", "cover", "pack", "gofmt":
 			return true
 		}
 	case "uv":
