@@ -6,7 +6,7 @@ import (
 )
 
 // RecentScanLimit bounds unreferenced inventory history. Audited scans and the
-// latest completed deep-size scan are retained outside this count.
+// latest two completed deep-size scans are retained outside this count.
 const RecentScanLimit = 256
 
 // ScanHistoryReduction describes rows that can be discarded without removing
@@ -42,7 +42,7 @@ const historyCandidates = `WITH recent AS (
       ELSE 0 END
     ORDER BY substr(s.finished_at, 1, 19) DESC,
       substr(replace(substr(s.finished_at, 21, 9), 'Z', '') || '000000000', 1, 9) DESC,
-      s.id DESC LIMIT 1
+      s.id DESC LIMIT 2
 ), candidates AS (
     SELECT s.id FROM scans s
     WHERE s.status != 'running' AND s.id != ?

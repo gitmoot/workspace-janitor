@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/output"
 	"github.com/gitmoot/workspace-janitor/internal/store"
@@ -13,6 +14,7 @@ type historyReport struct {
 	RecentLimit int                        `json:"recent_limit"`
 	Eligible    store.ScanHistoryReduction `json:"eligible"`
 	Note        string                     `json:"note"`
+	Inventory   *inventoryReport           `json:"inventory_report"`
 }
 
 // runHistory previews by default. Confirmed trimming removes only old,
@@ -27,6 +29,10 @@ func runHistory(ctx context.Context, e *env, args []string, confirm bool) error 
 		return err
 	}
 	format, err := e.format()
+	if err != nil {
+		return err
+	}
+	policy, err := e.loadPolicy()
 	if err != nil {
 		return err
 	}
@@ -56,10 +62,20 @@ func runHistory(ctx context.Context, e *env, args []string, confirm bool) error 
 	if err != nil {
 		return err
 	}
+	if err := db.Read(ctx, func(tx *store.Tx) error {
+		inventory, err := buildInventoryReport(ctx, tx, policy, time.Now().UTC())
+		report.Inventory = &inventory
+		return err
+	}); err != nil {
+		return err
+	}
 	if format == output.FormatJSON {
 		return output.WriteJSON(e.stdout, "history", report)
 	}
 	_, err = fmt.Fprintf(e.stdout, "dry run: %t\nrecent scan limit: %d\neligible scans: %d\neligible inventory rows: %d\nsource document bytes: %d\n%s\n",
 		report.DryRun, report.RecentLimit, report.Eligible.Scans, report.Eligible.Entries, report.Eligible.Documents, report.Note)
+	if err == nil {
+		err = output.WriteFields(e.stdout, appendInventoryFields(nil, report.Inventory))
+	}
 	return err
 }

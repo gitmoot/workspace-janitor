@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -17,23 +16,24 @@ import (
 )
 
 type pruneReport struct {
-	Mode                 string    `json:"mode"`
-	DryRun               bool      `json:"dry_run"`
-	PlanID               string    `json:"plan_id"`
-	ActionID             string    `json:"action_id"`
-	Path                 string    `json:"path"`
-	Provider             string    `json:"provider"`
-	Argv                 []string  `json:"argv"`
-	Timeout              string    `json:"timeout"`
-	Status               string    `json:"status"`
-	Timestamp            time.Time `json:"timestamp"`
-	StoreBeforeBytes     *int64    `json:"store_before_bytes,omitempty"`
-	StoreAfterBytes      *int64    `json:"store_after_bytes,omitempty"`
-	AvailableBeforeBytes *uint64   `json:"available_before_bytes,omitempty"`
-	AvailableAfterBytes  *uint64   `json:"available_after_bytes,omitempty"`
-	AvailableChangeBytes *int64    `json:"available_change_bytes,omitempty"`
-	MeasurementError     string    `json:"measurement_error,omitempty"`
-	Attribution          string    `json:"attribution,omitempty"`
+	Mode                 string                 `json:"mode"`
+	DryRun               bool                   `json:"dry_run"`
+	PlanID               string                 `json:"plan_id"`
+	ActionID             string                 `json:"action_id"`
+	Path                 string                 `json:"path"`
+	Provider             string                 `json:"provider"`
+	Argv                 []string               `json:"argv"`
+	Timeout              string                 `json:"timeout"`
+	Status               string                 `json:"status"`
+	Timestamp            time.Time              `json:"timestamp"`
+	StoreBeforeBytes     *int64                 `json:"store_before_bytes,omitempty"`
+	StoreAfterBytes      *int64                 `json:"store_after_bytes,omitempty"`
+	AvailableBeforeBytes *uint64                `json:"available_before_bytes,omitempty"`
+	AvailableAfterBytes  *uint64                `json:"available_after_bytes,omitempty"`
+	AvailableChangeBytes *int64                 `json:"available_change_bytes,omitempty"`
+	MeasurementError     string                 `json:"measurement_error,omitempty"`
+	Attribution          string                 `json:"attribution,omitempty"`
+	Activity             *core.CapacityActivity `json:"activity,omitempty"`
 }
 
 // runOfficialPrune is deliberately narrower than generic quarantine. Only a
@@ -95,55 +95,54 @@ func runOfficialPrune(ctx context.Context, e *env, format output.Format, stateDi
 	if err := engine.PreflightOfficial(ctx, entry, selected); err != nil {
 		return err
 	}
+	estimate, estimateErr := action.EstimateReclaim(ctx, []core.Entry{entry}, policy.Limits.DeepSizeMaxEntries)
 	if opts.pruneLimitBytes > 0 {
-		estimate, err := action.EstimateReclaim(ctx, []core.Entry{entry}, policy.Limits.DeepSizeMaxEntries)
-		if err != nil {
-			return fmt.Errorf("recovery budget measurement: %w", err)
+		if estimateErr != nil {
+			return fmt.Errorf("recovery budget measurement: %w", estimateErr)
 		}
 		if estimate.Bytes < 0 || estimate.SharedInodes != 0 || uint64(estimate.Bytes) > opts.pruneLimitBytes {
 			return fmt.Errorf("cache exceeds remaining recovery budget or has shared inodes")
 		}
+	}
+	if estimateErr == nil && estimate.SharedInodes == 0 && estimate.Bytes >= 0 {
 		report.StoreBeforeBytes = &estimate.Bytes
 	}
-	before, measureErr := measureDisk(entry.Path)
-	if measureErr == nil && before.Device != entry.FilesystemID.Device {
-		measureErr = fmt.Errorf("cache filesystem identity changed")
+	monitor, err := startCapacityActivity(ctx, engine.DB, "official_prune", selected.ID, entry.Path, rule.Recovery.Owner, entry.Path)
+	if err != nil {
+		return fmt.Errorf("cannot record prune start: %w", err)
 	}
-	if measureErr != nil {
-		if opts.pruneLimitBytes > 0 {
-			return fmt.Errorf("before-prune capacity measurement: %w", measureErr)
-		}
-		report.MeasurementError = measureErr.Error()
-	} else {
-		report.AvailableBeforeBytes = &before.FreeBytes
+	report.Activity = &monitor.activity
+	if monitor.activity.AvailableBeforeBytes != nil && monitor.activity.Device != entry.FilesystemID.Device {
+		monitor.activity.AvailableBeforeBytes = nil
+		monitor.activity.MeasurementError = "cache filesystem identity changed"
 	}
+	if opts.pruneLimitBytes > 0 && monitor.activity.AvailableBeforeBytes == nil {
+		return monitor.finish(ctx, fmt.Errorf("before-prune capacity measurement: %s", monitor.activity.MeasurementError))
+	}
+	report.AvailableBeforeBytes = monitor.activity.AvailableBeforeBytes
+	monitor.activity.StoreBeforeBytes = report.StoreBeforeBytes
 	report.Status, report.Timestamp = "starting", time.Now().UTC()
 	if err := recordOfficialPrune(stateDir, report); err != nil {
-		return fmt.Errorf("cannot journal official prune: %w", err)
+		return monitor.finish(ctx, fmt.Errorf("cannot journal official prune: %w", err))
 	}
+	monitor.activity.Attempted = 1
 	runErr := executeOfficialPrune(ctx, argv, policy.Limits.CommandTimeout.Duration())
 	report.Timestamp = time.Now().UTC()
-	after, measureErr := measureDisk(entry.Path)
-	if measureErr != nil {
-		report.MeasurementError = measureErr.Error()
-	} else if report.AvailableBeforeBytes != nil && after.Device == before.Device {
-		report.AvailableAfterBytes = &after.FreeBytes
-		if before.FreeBytes <= math.MaxInt64 && after.FreeBytes <= math.MaxInt64 {
-			change := int64(after.FreeBytes) - int64(before.FreeBytes)
-			report.AvailableChangeBytes = &change
-		}
-		report.Attribution = "net filesystem change; concurrent writers may contribute"
+	afterEstimate, afterErr := action.EstimateReclaim(ctx, []core.Entry{entry}, policy.Limits.DeepSizeMaxEntries)
+	if afterErr != nil || afterEstimate.SharedInodes != 0 || afterEstimate.Bytes < 0 {
+		monitor.activity.MeasurementError = "post-prune store accounting is incomplete or shared"
 	} else {
-		report.MeasurementError = "before/after filesystem observations are not comparable"
+		report.StoreAfterBytes = &afterEstimate.Bytes
+		monitor.activity.StoreAfterBytes = report.StoreAfterBytes
 	}
-	if opts.pruneLimitBytes > 0 {
-		estimate, err := action.EstimateReclaim(ctx, []core.Entry{entry}, policy.Limits.DeepSizeMaxEntries)
-		if err != nil || estimate.SharedInodes != 0 || estimate.Bytes < 0 {
-			report.MeasurementError = "post-prune store accounting is incomplete or shared"
-		} else {
-			report.StoreAfterBytes = &estimate.Bytes
-		}
+	if runErr == nil {
+		monitor.activity.Completed = 1
 	}
+	outcomeErr := monitor.finish(ctx, runErr)
+	report.AvailableAfterBytes = monitor.activity.AvailableAfterBytes
+	report.AvailableChangeBytes = monitor.activity.AvailableChangeBytes
+	report.MeasurementError = monitor.activity.MeasurementError
+	report.Attribution = monitor.activity.Attribution
 	if runErr != nil {
 		report.Status = "failed: " + runErr.Error()
 	} else {
@@ -152,8 +151,8 @@ func runOfficialPrune(ctx context.Context, e *env, format output.Format, stateDi
 	if err := recordOfficialPrune(stateDir, report); err != nil {
 		return fmt.Errorf("official command outcome uncertain; cannot journal result: %w", err)
 	}
-	if runErr != nil {
-		return runErr
+	if outcomeErr != nil {
+		return outcomeErr
 	}
 	return writePrune(e.stdout, format, report)
 }

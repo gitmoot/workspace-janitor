@@ -18,12 +18,6 @@ import (
 	"github.com/gitmoot/workspace-janitor/internal/store"
 )
 
-type recoverySkip struct {
-	Path   string `json:"path"`
-	Owner  string `json:"owner"`
-	Reason string `json:"reason"`
-}
-
 type recoveryAction struct {
 	Owner       string      `json:"owner"`
 	Approval    string      `json:"approval"`
@@ -41,7 +35,7 @@ type recoveryReport struct {
 	Before             *core.CapacitySnapshot `json:"before"`
 	After              *core.CapacitySnapshot `json:"after"`
 	Actions            []recoveryAction       `json:"actions"`
-	Skipped            []recoverySkip         `json:"skipped"`
+	Skipped            []core.CapacitySkip    `json:"skipped"`
 }
 
 // runCapacityRecovery is called only while cycle holds the scan lock. It never
@@ -53,7 +47,7 @@ func runCapacityRecovery(ctx context.Context, e *env, paths config.Paths, policy
 		return nil, capacity, nil
 	}
 	limits := policy.Prevention.Recovery
-	report := &recoveryReport{Stopped: "no_safe_candidates", BudgetBytes: uint64(limits.MaxBytes), Actions: []recoveryAction{}, Skipped: []recoverySkip{}}
+	report := &recoveryReport{Stopped: "no_safe_candidates", BudgetBytes: uint64(limits.MaxBytes), Actions: []recoveryAction{}, Skipped: []core.CapacitySkip{}}
 	capacity, err := sampleCapacity(ctx, policy, paths, time.Now().UTC(), true)
 	if err != nil {
 		return report, capacity, err
@@ -109,7 +103,7 @@ func runCapacityRecovery(ctx context.Context, e *env, paths config.Paths, policy
 		if owner == "" {
 			owner = "unknown"
 		}
-		report.Skipped = append(report.Skipped, recoverySkip{rule.Path, owner, reason})
+		report.Skipped = append(report.Skipped, core.CapacitySkip{Path: rule.Path, Owner: owner, Reason: reason})
 	}
 	for i := range policy.Caches {
 		rule := &policy.Caches[i]

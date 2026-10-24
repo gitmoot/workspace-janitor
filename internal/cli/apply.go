@@ -42,6 +42,7 @@ type cleanupReport struct {
 	Estimate      *action.ReclaimEstimate `json:"expected_reclaim,omitempty"`
 	EstimateError string                  `json:"estimate_unavailable,omitempty"`
 	Errors        []string                `json:"errors"`
+	Activity      *core.CapacityActivity  `json:"activity,omitempty"`
 }
 
 func cleanupEngine(e *env, db *store.Store, paths config.Paths, policy config.Policy) *action.Engine {
@@ -214,6 +215,14 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	if report.ID == "" {
 		report.ID = "cleanup-" + uuid.NewString()
 	}
+	var monitor *activityMonitor
+	if !opts.dryRun {
+		monitor, err = startCapacityActivity(ctx, db, "quarantine", report.ID, "", "", policy.Retention.QuarantineDir)
+		if err != nil {
+			return err
+		}
+		report.Activity = &monitor.activity
+	}
 	for _, a := range selected {
 		item, exists := byAction[a.ID]
 		if !exists {
@@ -224,6 +233,7 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 			report.Items = append(report.Items, item)
 			continue
 		}
+		monitor.activity.Attempted++
 		if !exists {
 			item, err = engine.Prepare(ctx, item)
 			if err != nil {
@@ -234,6 +244,11 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 		item, err = engine.Reconcile(ctx, item)
 		if err == nil && item.State == core.CleanupPrepared {
 			item, err = engine.Quarantine(ctx, item)
+			if err == nil {
+				monitor.activity.Completed++
+			}
+		} else if err == nil && item.State == core.CleanupQuarantined {
+			monitor.activity.Replayed++
 		}
 		if err == nil && item.State != core.CleanupQuarantined {
 			err = fmt.Errorf("cleanup remains %s; inspect receipt %s before retrying", item.State, report.ID)
@@ -252,8 +267,19 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 		}
 		addReclaimEstimate(ctx, &report, candidates, policy.Limits.DeepSizeMaxEntries)
 	}
+	var activityErr error
+	if monitor != nil {
+		var operationErr error
+		if len(report.Errors) > 0 {
+			operationErr = fmt.Errorf("%d cleanup refusals; first: %s", len(report.Errors), report.Errors[0])
+		}
+		activityErr = monitor.finish(ctx, operationErr)
+	}
 	if err := writeCleanup(e.stdout, format, report); err != nil {
 		return err
+	}
+	if activityErr != nil {
+		return activityErr
 	}
 	if len(report.Errors) != 0 {
 		return fmt.Errorf("%d cleanup action(s) need investigation", len(report.Errors))
@@ -329,6 +355,28 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 	}
 	report := cleanupReport{ID: opts.cleanupID, Mode: "expiry", DryRun: opts.dryRun, Items: []core.CleanupItem{}, Errors: []string{}}
 	eligible := make([]core.Entry, 0)
+	var monitor *activityMonitor
+	if !opts.dryRun {
+		monitor, err = startCapacityActivity(ctx, engine.DB, "expiry", opts.cleanupID, "", "", policy.Retention.QuarantineDir)
+		if err != nil {
+			return err
+		}
+		report.Activity = &monitor.activity
+		for _, item := range items {
+			if item.State == core.CleanupQuarantined && item.MovedAt != nil && item.Action.Retention.Expired(*item.MovedAt, time.Now().UTC()) {
+				entry := item.Entry
+				entry.Path = item.Destination
+				eligible = append(eligible, entry)
+			}
+		}
+		addReclaimEstimate(ctx, &report, eligible, policy.Limits.DeepSizeMaxEntries)
+		if report.Estimate != nil {
+			monitor.activity.EstimatedReclaimBytes = &report.Estimate.Bytes
+		}
+		if report.EstimateError != "" {
+			monitor.activity.MeasurementError = report.EstimateError
+		}
+	}
 	for _, item := range items {
 		if item.State == core.CleanupInvestigate {
 			if opts.dryRun {
@@ -348,6 +396,9 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 			}
 		}
 		if item.State != core.CleanupQuarantined {
+			if monitor != nil && opts.cleanupID != "" && item.State == core.CleanupDeleted {
+				monitor.activity.Replayed++
+			}
 			continue
 		}
 		if item.MovedAt == nil || !item.Action.Retention.Expired(*item.MovedAt, time.Now().UTC()) {
@@ -357,7 +408,11 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 		if opts.dryRun {
 			err = engine.ExpiryPreview(ctx, item)
 		} else {
+			monitor.activity.Attempted++
 			item, err = engine.Delete(ctx, item)
+			if err == nil && item.State == core.CleanupDeleted {
+				monitor.activity.Completed++
+			}
 		}
 		if err != nil {
 			report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", item.Source, err))
@@ -372,8 +427,19 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 	if opts.dryRun {
 		addReclaimEstimate(ctx, &report, eligible, policy.Limits.DeepSizeMaxEntries)
 	}
+	var activityErr error
+	if monitor != nil {
+		var operationErr error
+		if len(report.Errors) > 0 {
+			operationErr = fmt.Errorf("%d expiry refusals; first: %s", len(report.Errors), report.Errors[0])
+		}
+		activityErr = monitor.finish(ctx, operationErr)
+	}
 	if err := writeCleanup(out, format, report); err != nil {
 		return err
+	}
+	if activityErr != nil {
+		return activityErr
 	}
 	if len(report.Errors) != 0 {
 		return fmt.Errorf("%d expired item(s) refused revalidation", len(report.Errors))

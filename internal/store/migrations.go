@@ -282,6 +282,23 @@ var migrations = []migration{
 			)`,
 		},
 	},
+	{
+		version: 10,
+		name:    "capacity_reporting",
+		statements: []string{
+			`CREATE TABLE inventory_measurements (
+				scan_id TEXT PRIMARY KEY REFERENCES scans(id) ON DELETE CASCADE,
+				scope TEXT NOT NULL,
+				deep INTEGER NOT NULL CHECK (deep IN (0, 1))
+			)`,
+			`CREATE INDEX inventory_measurements_scope ON inventory_measurements(scope)`,
+			`CREATE TABLE capacity_activity (
+				sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+				id TEXT NOT NULL UNIQUE,
+				document TEXT NOT NULL CHECK (length(document) <= 65536)
+			)`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.
