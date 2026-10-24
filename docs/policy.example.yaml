@@ -137,6 +137,13 @@ caches:
   #   dedicated: true
   #   official_binary: /usr/bin/uv
 
+# Exact owner-confirmed credential-free exports only; no live path is enabled.
+# See policy-reference.md#exact-evidence-exports and recovery.md.
+# Archive roots need independent protect.paths coverage, an existing approved
+# destination/lifetime, and actual restore proof before local expiry is enabled.
+# Archive deletion is always disabled; raw stores/checkouts are not exports.
+evidence_exports: []
+
 # The Jev model classifier is optional and disabled by default: the tool must
 # be fully useful with no credentials and no network. When enabled, only
 # entries the rules left ambiguous are sent, as a redacted allowlisted

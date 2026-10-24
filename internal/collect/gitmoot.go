@@ -39,6 +39,14 @@ func collectGitmoot(ctx context.Context, opts *Options, entries []core.Entry, no
 				recoveryPaths[cache.Path] = true
 			}
 		}
+		for _, rule := range opts.WorktreePolicy.EvidenceExports {
+			recoveryPaths[rule.Path] = true
+		}
+		for actual, source := range opts.WorktreeOrigins {
+			if recoveryPaths[source] {
+				recoveryPaths[actual] = true
+			}
+		}
 	}
 	for i := range entries {
 		managed[i] = core.PathWithin(entries[i].Path, opts.GitmootHome)
@@ -100,9 +108,9 @@ func collectGitmoot(ctx context.Context, opts *Options, entries []core.Entry, no
 	}
 	if len(recoveryPaths) != 0 {
 		var pending bool
-		// The current producer ledger does not declare per-cache queued use.
-		// Until that contract exists, no nonterminal job/task is proof of an
-		// idle recovery cache, regardless of its worktree's exact pathname.
+		// The producer ledger has no per-cache/export release declaration.
+		// Until that contract exists, any nonterminal job/task holds these
+		// owned resources regardless of its worktree's exact pathname.
 		if err := tx.QueryRowContext(observeCtx, `SELECT
 			EXISTS(SELECT 1 FROM jobs WHERE state IS NULL OR state NOT IN ('succeeded','failed','cancelled'))
 			OR EXISTS(SELECT 1 FROM tasks WHERE state IS NULL OR state NOT IN ('merged','dismissed','superseded','stranded'))`).Scan(&pending); err != nil {
@@ -111,7 +119,7 @@ func collectGitmoot(ctx context.Context, opts *Options, entries []core.Entry, no
 		if pending || malformed != 0 {
 			for i := range entries {
 				if recoveryPaths[entries[i].Path] {
-					mark(&entries[i], "", "nonterminal producer work or incomplete job evidence; no cache-use release contract", true)
+					mark(&entries[i], "", "nonterminal producer work or incomplete job evidence; no cache/export-use release contract", true)
 				}
 			}
 		}

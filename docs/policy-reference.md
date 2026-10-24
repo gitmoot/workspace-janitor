@@ -205,3 +205,45 @@ unknown. Actual quarantine and expiry always recompute under current policy,
 including receipts created by older binaries. Receipt descendants retain their
 original policy paths after Git-aware relocation; removing a cache approval
 revokes expiry permission. Restore remains available after a proof refusal.
+
+## Exact evidence exports
+
+`evidence_exports` is empty by default. Each rule names one completed, inactive,
+owner-confirmed credential-free **regular export file**, not a directory,
+checkout, raw session store or database. Existing protections remain blocking;
+an export rule cannot release them. Unknown/live stores remain report-only.
+Credential-free is an owner's declaration, not an automatic secret detector.
+
+| Field | Contract |
+| --- | --- |
+| `name`, `class`, `path` | Unique name and canonical exact file inside an inventory root. Classes: `completed_report`, `review_evidence`, `session_export`, `evidence_export`. At most 64 rules. |
+| `owner`, `approval`, `completed_at`, `credential_free` | Explicit owner/decision, verified completion timestamp and positive credential-free declaration. A file modified after completion is held. |
+| `source_container`, `source_lifetime` | Exact containing directory and its disposal lifetime. Never infer these from an entire checkout or raw session tree. |
+| `local_retention`, `local_expiry_enabled` | Exactly `30d` from verified completion; expiry is independently opt-in. The normal quarantine grace period and separate deletion permissions still apply. |
+| `max_bytes` | Per-file ceiling; omitted/zero defaults to 1 GiB. Positive overrides may not exceed 1 GiB; oversized exports remain retained. |
+| `archive.directory`, `archive.owner`, `archive.approval`, `archive.lifetime` | An existing approved directory outside every export source container, with independent ownership/lifetime. Same-lifetime, cache/quarantine overlap, symlinks and ambiguous same-device mount aliases are refused. No storage is provisioned. |
+| `archive.retention`, `archive.delete_enabled` | `permanent` and `false`. Archive deletion is unsupported, regardless of local expiry permission. |
+| `archive.manifest`, `archive.manifest_sha256` | Exact immutable manifest path and hash returned by successful archival. Pin both in policy before local cleanup can become eligible. |
+
+The archive directory must also have an independent `protect.paths` entry;
+removing an export rule must not silently remove the archive's protection.
+The manifest records owner/lifetime decisions, source and compressed hashes,
+file metadata, allocation, and actual restore proof. Creation uses exclusive
+descriptor-anchored files, checks available space, restores and verifies a
+temporary copy, syncs the bundle and publishes without replacing anything.
+Unsupported extended metadata, special permissions, multiple hard links,
+incomplete archives and failed checks preserve the source.
+
+Active processes/open descriptors, queued producer work and unknown producer
+state hold the export. Mutation-time collection verifies source content and
+archive integrity again. The binding persists in quarantine snapshots: removing
+a rule, revoking expiry, changing the archive root or losing its payload cannot
+turn the local copy into ordinary disposable data. Ancestor cleanup rules cannot
+remove an export container wholesale.
+
+`janitor archive` copies only; `local_freed_bytes` is therefore zero. Archive
+allocation and shared-volume available-byte change are distinct observations,
+not attributable cleanup credit. `same_filesystem_at_archive_creation` describes
+the recorded creation topology, not an assertion about a later recovery host.
+See [the archive workflow](recovery.md#verified-export-archives) before enabling
+any local expiry.

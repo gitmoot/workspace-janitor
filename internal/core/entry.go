@@ -245,18 +245,19 @@ type Entry struct {
 	ModifiedAt       time.Time `json:"modified_at"`
 	// LatestModifiedAt is set only by a complete deep walk. A cache TTL
 	// cannot infer subtree age from the directory inode's mtime alone.
-	LatestModifiedAt time.Time       `json:"latest_modified_at,omitempty"`
-	AccessedAt       time.Time       `json:"accessed_at"`
-	SymlinkTarget    string          `json:"symlink_target,omitempty"`
-	CanonicalPath    string          `json:"canonical_path,omitempty"`
-	Destination      string          `json:"destination,omitempty"`
-	Fingerprint      string          `json:"fingerprint,omitempty"`
-	Class            ArtifactClass   `json:"class"`
-	Git              *GitState       `json:"git,omitempty"`
-	Evidence         []Evidence      `json:"evidence,omitempty"`
-	Protections      []Protection    `json:"protections,omitempty"`
-	Recommendation   *Recommendation `json:"recommendation,omitempty"`
-	ObservedAt       time.Time       `json:"observed_at"`
+	LatestModifiedAt time.Time             `json:"latest_modified_at,omitempty"`
+	AccessedAt       time.Time             `json:"accessed_at"`
+	SymlinkTarget    string                `json:"symlink_target,omitempty"`
+	CanonicalPath    string                `json:"canonical_path,omitempty"`
+	Destination      string                `json:"destination,omitempty"`
+	Fingerprint      string                `json:"fingerprint,omitempty"`
+	Class            ArtifactClass         `json:"class"`
+	Git              *GitState             `json:"git,omitempty"`
+	ExportArchive    *ExportArchiveBinding `json:"export_archive,omitempty"`
+	Evidence         []Evidence            `json:"evidence,omitempty"`
+	Protections      []Protection          `json:"protections,omitempty"`
+	Recommendation   *Recommendation       `json:"recommendation,omitempty"`
+	ObservedAt       time.Time             `json:"observed_at"`
 }
 
 // Protected reports whether any blocking protection applies. Callers must

@@ -159,6 +159,21 @@ func proposals(entry core.Entry, class Classification, policy config.Policy, ver
 			Reason: fmt.Sprintf("cache rule %q covers %s; %s", rule.Name, rule.Path, reason),
 		})
 	}
+	for _, rule := range policy.EvidenceExports {
+		if entry.Path != rule.Path {
+			continue
+		}
+		kind, reason := core.ActionKeep, "export remains retained until its approved local lifetime and verified archive permit expiry"
+		if rule.LocalExpiryEnabled && entry.ExportArchive != nil &&
+			rule.LocalRetention.Expired(rule.CompletedAt, entry.ObservedAt) {
+			kind, reason = core.ActionQuarantine, "exact completed export has a verified archive and its approved local lifetime has elapsed"
+		}
+		out = append(out, Proposal{
+			Rule: "policy.evidence_export:" + rule.Name, Tier: TierExplicit,
+			Kind: kind, Retention: policy.Retention.Default, Specificity: len(rule.Path),
+			Reason: reason,
+		})
+	}
 
 	if policy.Ownership.InvestigateForeignOwner && foreignOwner(entry, policy) {
 		out = append(out, Proposal{

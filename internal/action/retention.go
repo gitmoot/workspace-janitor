@@ -45,6 +45,7 @@ func (e *Engine) recollectWithSize(ctx context.Context, path string, deep bool) 
 func (e *Engine) observeAround(ctx context.Context, path string, deep bool) (collect.Result, error) {
 	opts := e.Collect
 	opts.DeepSize = deep
+	opts.VerifyArchiveContents = true
 	// Resolve a live source symlink only to check containment; quarantine
 	// snapshots never follow links because a relative target may be absent
 	// until restore. In both cases the filesystem move operates on the link.

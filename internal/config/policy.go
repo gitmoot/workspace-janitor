@@ -288,14 +288,15 @@ type RecoveryPolicy struct {
 
 // Policy is the validated policy document.
 type Policy struct {
-	Version    int             `yaml:"version" json:"version"`
-	Roots      []Root          `yaml:"roots" json:"roots"`
-	Protect    Protect         `yaml:"protect" json:"protect"`
-	Retention  RetentionPolicy `yaml:"retention" json:"retention"`
-	Caches     []CacheRule     `yaml:"caches" json:"caches"`
-	Gitmoot    GitmootPolicy   `yaml:"gitmoot" json:"gitmoot"`
-	Collectors Collectors      `yaml:"collectors" json:"collectors"`
-	Safety     Safety          `yaml:"safety" json:"safety"`
+	Version         int                  `yaml:"version" json:"version"`
+	Roots           []Root               `yaml:"roots" json:"roots"`
+	Protect         Protect              `yaml:"protect" json:"protect"`
+	Retention       RetentionPolicy      `yaml:"retention" json:"retention"`
+	Caches          []CacheRule          `yaml:"caches" json:"caches"`
+	EvidenceExports []EvidenceExportRule `yaml:"evidence_exports" json:"evidence_exports"`
+	Gitmoot         GitmootPolicy        `yaml:"gitmoot" json:"gitmoot"`
+	Collectors      Collectors           `yaml:"collectors" json:"collectors"`
+	Safety          Safety               `yaml:"safety" json:"safety"`
 
 	Prevention     Prevention      `yaml:"prevention" json:"prevention"`
 	CanonicalRoots []CanonicalRoot `yaml:"canonical_roots" json:"canonical_roots"`
@@ -430,6 +431,7 @@ func (p Policy) clone() Policy {
 	out.Protect.Paths = append([]string(nil), p.Protect.Paths...)
 	out.Protect.NamePatterns = append([]string(nil), p.Protect.NamePatterns...)
 	out.Caches = append([]CacheRule(nil), p.Caches...)
+	out.EvidenceExports = append([]EvidenceExportRule(nil), p.EvidenceExports...)
 	out.Prevention.Targets = append([]CapacityTarget(nil), p.Prevention.Targets...)
 	out.Gitmoot = p.Gitmoot
 	out.Jev.RedactSegments = append([]string(nil), p.Jev.RedactSegments...)
@@ -478,6 +480,7 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 			p.Caches[i].Retention = p.Retention.Default
 		}
 	}
+	p.normalizeEvidenceExports(expand)
 	if p.Gitmoot.Home != "" {
 		p.Gitmoot.Home = expand("gitmoot.home", p.Gitmoot.Home)
 	}
@@ -515,6 +518,9 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	}
 	if p.Caches == nil {
 		p.Caches = []CacheRule{}
+	}
+	if p.EvidenceExports == nil {
+		p.EvidenceExports = []EvidenceExportRule{}
 	}
 	if p.Roots == nil {
 		p.Roots = []Root{}
@@ -561,6 +567,7 @@ func mergeUnique(base, extra []string) []string {
 // Validate reports every field-level problem with the policy.
 func (p *Policy) Validate() core.FieldErrors {
 	var errs core.FieldErrors
+	p.validateEvidenceExports(&errs)
 	if p.Version != PolicyVersion {
 		errs.Add("version", "must be %d, got %d", PolicyVersion, p.Version)
 	}
