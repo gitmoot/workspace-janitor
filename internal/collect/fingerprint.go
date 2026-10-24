@@ -35,6 +35,9 @@ func Fingerprint(entry core.Entry) string {
 		write("latest_modified=%d", entry.LatestModifiedAt.UTC().UnixNano())
 	}
 	write("link=%s", entry.SymlinkTarget)
+	if entry.ExportArchive != nil {
+		write("export_archive=%s|%s", entry.ExportArchive.Manifest, entry.ExportArchive.ManifestSHA256)
+	}
 	if entry.Git == nil {
 		write("git=none")
 	} else {

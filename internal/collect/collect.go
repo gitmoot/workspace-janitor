@@ -35,6 +35,7 @@ const (
 	CollectorAgents     = "agents"
 	CollectorServices   = "services"
 	CollectorGitmoot    = "gitmoot"
+	CollectorExports    = "evidence_exports"
 )
 
 // RootSpec is one discovery root and the bounds that apply inside it.
@@ -90,6 +91,11 @@ type Options struct {
 	// WorktreeOrigins maps an exact quarantined pathname to its receipt source
 	// for policy matching only. Git and filesystem inspection use the real path.
 	WorktreeOrigins map[string]string
+	// ArchiveCreationPath relaxes only the missing archive/retention gate for
+	// this exact file while copying it; it never relaxes existing protections.
+	ArchiveCreationPath string
+	// VerifyArchiveContents is required for mutation-time recollection.
+	VerifyArchiveContents bool
 
 	DeepSize  bool
 	Git       bool
@@ -257,6 +263,9 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	})
 	attachGitmootObservations(entries, refs, &gitmootReport, opts.GitmootHome, now)
 	result.Reports = append(result.Reports, gitmootReport)
+	if opts.WorktreePolicy != nil && len(opts.WorktreePolicy.EvidenceExports) != 0 {
+		result.Reports = append(result.Reports, collectEvidenceExports(ctx, &opts, entries, now))
+	}
 
 	// Overlapping roots are valid policy input, so the same path can be
 	// reached twice. Merging keeps one entry per path with the union of its
@@ -306,11 +315,12 @@ func attachGitmootObservations(entries []core.Entry, refs []Reference, report *c
 
 // Reference is a path that something outside the filesystem points at.
 type Reference struct {
-	Path       string
-	Source     core.EvidenceSource
-	Protection core.ProtectionKind
-	Signal     string
-	Detail     string
+	Path          string
+	Source        core.EvidenceSource
+	Protection    core.ProtectionKind
+	Signal        string
+	Detail        string
+	ExportArchive *core.ExportArchiveBinding `json:"export_archive,omitempty"`
 }
 
 // attachReferences records each reference on every entry that contains it,

@@ -92,6 +92,24 @@ func (e *Engine) PreflightOfficial(ctx context.Context, entry core.Entry, action
 		entry.Kind != core.EntryKindDirectory || entry.Git != nil {
 		return fmt.Errorf("official prune requires an exact approved cache directory, not a repository")
 	}
+	return e.preflightEntry(ctx, entry, action, "official prune")
+}
+
+// PreflightExport reuses mutation-time reference, identity and policy guards
+// before copying an exact export. Only its missing-archive gate is deferred.
+func (e *Engine) PreflightExport(ctx context.Context, entry core.Entry, action core.Action) error {
+	if entry.Kind != core.EntryKindFile || entry.Git != nil || action.Path != entry.Path ||
+		action.Kind != core.ActionQuarantine || e.Collect.ArchiveCreationPath != entry.Path {
+		return errors.New("archive requires an exact owner-approved regular export")
+	}
+	initial := safety.Evaluate(safety.Input{Entry: entry, Policy: e.Policy, Now: e.now()})
+	if !initial.Allows(action.Kind) {
+		return fmt.Errorf("archive source remains protected: %s", initial.Summary())
+	}
+	return e.preflightEntry(ctx, entry, action, "export archive")
+}
+
+func (e *Engine) preflightEntry(ctx context.Context, entry core.Entry, action core.Action, label string) error {
 	handle, err := safety.Open(entry.Path)
 	if err != nil {
 		return err
@@ -105,7 +123,7 @@ func (e *Engine) PreflightOfficial(ctx context.Context, entry core.Entry, action
 		},
 	})
 	if !verdict.Allows(action.Kind) {
-		return fmt.Errorf("official prune refused %s: %s (%v)", entry.Path, verdict.Summary(), verdict.Protections)
+		return fmt.Errorf("%s refused %s: %s (%v)", label, entry.Path, verdict.Summary(), verdict.Protections)
 	}
 	return nil
 }

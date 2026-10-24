@@ -105,6 +105,12 @@ func gatherProcessReferences(ctx context.Context, opts *Options) ([]Reference, c
 				})
 			}
 		}
+		exportRefs, exportUnknown := exportProcessReferences(ctx, opts, name, procDir)
+		refs = append(refs, exportRefs...)
+		if exportUnknown {
+			report.Unknowns++
+			report.Status = core.CollectorPartial
+		}
 	}
 
 	if report.Detail == "" {

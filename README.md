@@ -40,6 +40,7 @@ default.
 | `janitor apply --prune --action <id>` | implemented for explicitly dedicated uv/npm caches (dry-run by default, Linux only) |
 | `janitor apply --expire` | implemented (deletion disabled by default) |
 | `janitor restore <cleanup-id>` | implemented (preview by default) |
+| `janitor archive --rule <name>` | Linux exact-file evidence archival, integrity verification and restore; no source/archive deletion |
 
 ## Inventory
 
@@ -51,23 +52,26 @@ no decisions and mutates nothing.
 | `filesystem` | `lstat` metadata for each root's children | per-root depth, per-directory entries, total entries |
 | `deep_size` | recursive directory sizes, opt-in via `--deep-size` | per-root entry/depth bounds; every incomplete size is a lower bound, and unreadable or unobserved content also carries unknown evidence |
 | `git` | common dir, remote, branch, HEAD, dirty count, stashes, commits on no remote-tracking branch, last activity, worktree metadata, locks | per-command timeout, read-only verbs only |
-| `processes` | `cwd` and `exe` links plus `comm` from procfs | directory-entry bound |
+| `processes` | `cwd` and `exe` links plus `comm` from procfs; descriptor link targets only when exact evidence exports are configured | directory-entry bound; no arguments, environments or descriptor contents |
 | `agents` | registered-agent directories from an adapter | command timeout per adapter |
 | `gitmoot` | read-only Gitmoot job, task, and cleanup-obligation ledger for exact paths | command timeout, entry bound; missing or uncertain state fails closed |
 | `services` | systemd `WorkingDirectory`/`Exec*`, cron command paths, PM2 `pm_cwd`/`pm_exec_path` | per-file byte bound, per-directory entries |
+| `evidence_exports` | approved manifest, exact export header/metadata and archive identity; full content verification before mutation | at most 64 rules, explicit byte ceiling, command timeout; existing protections stay blocking |
 
 Three properties hold across all of them:
 
 - **Filesystem discovery is top-level and metadata-only by default.** No
   discovered directory is walked recursively unless `--deep-size` asks for it.
-  Reference collectors may read local Gitmoot and service metadata.
+  Reference collectors may read local Gitmoot and service metadata. Explicit
+  evidence-export rules also inspect their approved manifests and file headers;
+  they never authorize a whole-directory archive.
 - **Unknown state fails closed.** A collector that cannot observe something
   records `unknown:` evidence and, where the safety contract requires it, a
   blocking protection. A Git command that times out protects the path; it
   never reports the repository clean. An unlistable directory protects its
   parent. A symlink the policy may not resolve is ambiguous, so it is
   protected.
-- **No secrets are read.** The process collector reads neither `cmdline` nor
+- **Process secrets remain unread.** The process collector reads neither `cmdline` nor
   `environ`; the service collectors skip `Environment`, `EnvironmentFile`,
   and crontab assignments; and no Git command may touch the network — the
   collector runs a fixed allowlist of local read-only subcommands.

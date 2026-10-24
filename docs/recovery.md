@@ -27,3 +27,36 @@ retry flags or manual database edits to bypass an unresolved receipt.
 Retention reaching its date alone never deletes an object. With `retention.delete_enabled: true`, `janitor apply --expire` previews eligible receipts; `janitor apply --expire --confirm --dry-run=false` separately requests deletion after fresh receipt, original-path, Git and live-reference checks. A changed or newly referenced item enters `investigate` and remains recoverable; address the evidence and re-run a separately confirmed evaluation, or restore it. Automatic expiry also requires `prevention.auto_expire: true` and an operator-installed timer; it uses the guarded path but is irreversible when it succeeds. `prevention.auto_quarantine: true` additionally lets that timer approve and move rule-based quarantine actions without an operator; restore them with `janitor restore <cleanup-id>` before their retention expires. Keep these switches off unless explicitly authorized.
 
 Official provider `apply --prune` is a separate irreversible command. It does not create a quarantined copy; restore does not undo it. Do not treat a provider-reported success or a cleanup receipt as a backup. In a partial failure, preserve evidence, do not retry an irreversible provider call blindly, and reconcile the provider's actual state before any new approval.
+
+## Verified export archives
+
+This workflow requires an owner-approved exact `evidence_exports` rule and an
+existing independently retained destination. It does not provision storage,
+approve a live path, disable protections or archive credentials. Raw session
+trees/databases and credential-bearing checkouts are not export inputs.
+
+1. Keep `local_expiry_enabled: false`. Check the policy and preview
+   `janitor archive --rule NAME`. Creation defaults to dry-run.
+2. Run `janitor archive --rule NAME --dry-run=false --confirm`. Success means
+   the new compressed bundle was actually restored and its hash, size, mode,
+   UID/GID and nanosecond modification time verified. The source is untouched.
+   Preserve the returned manifest path and SHA-256 outside the disposable
+   source container; pin them as `archive.manifest`/`archive.manifest_sha256`.
+3. Run `janitor archive --rule NAME --verify`. To recover independently, preview
+   `janitor archive --rule NAME --restore-to /approved/new/file`, then add
+   `--dry-run=false --confirm`. The destination must be vacant. Recovery needs
+   the approved rule, manifest and payload, not the original source container
+   or Janitor's old database. A changed archive-root identity blocks local
+   expiry but does not prevent hash-verified recovery into a new file.
+4. Only with the owner's separate local-removal permission, set
+   `local_expiry_enabled: true`. Re-scan, plan and approve the exact export's
+   quarantine action after its configured completion window (30 days by default).
+   Use the ordinary quarantine/expiry workflow above; its grace period and deletion gates remain.
+   Corrupt/unavailable archives, changed sources, live/queued users and revoked
+   rules preserve the local copy.
+
+Archives never expire through this feature. An interrupted creation may leave
+an unpublished `.partial-export-*` bundle for diagnosis; it grants no deletion
+permission. Retain the source and inspect the failure rather than treating a
+partial bundle as a backup. No archive rule or destination is enabled by the
+shipped example policy.
