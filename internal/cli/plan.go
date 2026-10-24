@@ -47,6 +47,7 @@ type planReport struct {
 	Reused    bool            `json:"reused"`
 	Traces    []plan.Trace    `json:"traces"`
 	Approvals []core.Approval `json:"approvals"`
+	Skipped   []skippedAction `json:"skipped,omitempty"`
 	// Conflicts lists actions where rules disagreed, resolved to the safer
 	// option. Reporting them is the difference between arbitration and a
 	// silent choice.
@@ -54,6 +55,11 @@ type planReport struct {
 	// Advisor reports what the optional model did: its mode, requests,
 	// cache hits, failures, and the usage and estimated cost it incurred.
 	Advisor jev.Report `json:"advisor"`
+}
+
+type skippedAction struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
 }
 
 // planConflict is one recorded disagreement between rules.
@@ -141,7 +147,7 @@ func runPlan(ctx context.Context, e *env, args []string, opts planOptions) error
 		return err
 	}
 
-	approvals, err := applyApprovals(ctx, db, report.Plan, opts)
+	approvals, err := applyApprovals(ctx, db, report.Plan, opts, &report.Skipped)
 	if err != nil {
 		return err
 	}
@@ -271,13 +277,13 @@ func buildOrLoadPlan(
 
 // applyApprovals records the operator's selection, if any, and returns the
 // approvals now on record for the plan.
-func applyApprovals(ctx context.Context, db *store.Store, built core.Plan, opts planOptions) ([]core.Approval, error) {
+func applyApprovals(ctx context.Context, db *store.Store, built core.Plan, opts planOptions, skipped *[]skippedAction) ([]core.Approval, error) {
 	selected, err := selectedActions(built, opts)
 	if err != nil {
 		return nil, err
 	}
 	if opts.approveQuarantine && len(selected) > 0 {
-		if selected, err = withoutActiveSources(ctx, db, selected); err != nil {
+		if selected, err = withoutActiveSources(ctx, db, selected, skipped); err != nil {
 			return nil, err
 		}
 	}
@@ -401,7 +407,7 @@ func quarantineActions(built core.Plan) []core.Action {
 // receipt. A tool can recreate a directory that sits in quarantine; a second
 // receipt for the same source would collide on apply. The path becomes
 // eligible again once the earlier receipt expires or is restored.
-func withoutActiveSources(ctx context.Context, db *store.Store, actions []core.Action) ([]core.Action, error) {
+func withoutActiveSources(ctx context.Context, db *store.Store, actions []core.Action, skipped *[]skippedAction) ([]core.Action, error) {
 	active := make(map[string]bool)
 	if err := db.Read(ctx, func(tx *store.Tx) error {
 		items, err := tx.PendingCleanupItems(ctx)
@@ -414,7 +420,15 @@ func withoutActiveSources(ctx context.Context, db *store.Store, actions []core.A
 	}
 	out := actions[:0:0]
 	for _, action := range actions {
-		if !active[action.Path] {
+		overlaps := false
+		for source := range active {
+			if core.PathsOverlap(action.Path, source) {
+				overlaps = true
+				*skipped = append(*skipped, skippedAction{Path: action.Path, Reason: "overlaps active cleanup receipt: " + source})
+				break
+			}
+		}
+		if !overlaps {
 			out = append(out, action)
 		}
 	}
@@ -488,6 +502,11 @@ func writePlanText(e *env, report planReport) error {
 	}
 	if err := output.WriteFields(e.stdout, fields); err != nil {
 		return err
+	}
+	for _, skipped := range report.Skipped {
+		if _, err := fmt.Fprintf(e.stdout, "skipped: %s (%s)\n", skipped.Path, skipped.Reason); err != nil {
+			return err
+		}
 	}
 	if err := writeAdvisorText(e, report.Advisor); err != nil {
 		return err

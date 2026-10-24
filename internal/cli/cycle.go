@@ -143,14 +143,25 @@ func autoQuarantine(ctx context.Context, e *env, scanID string) (string, string,
 	if err := json.Unmarshal(planned.Bytes(), &result); err != nil {
 		return "failed", "", fmt.Errorf("scheduled quarantine plan output: %w", err)
 	}
+	var skipped string
+	if len(result.Data.Skipped) > 0 {
+		data, err := json.Marshal(result.Data.Skipped)
+		if err != nil {
+			return "failed", "", err
+		}
+		skipped = "skipped active receipts: " + string(data)
+	}
 	if len(result.Data.Approvals) == 0 {
-		return "none", "", nil
+		return "none", skipped, nil
 	}
 	var applied bytes.Buffer
 	applyEnv := *e
 	applyEnv.stdout = &applied
 	err := runApply(ctx, &applyEnv, nil, applyOptions{planID: result.Data.Plan.ID, quarantine: true, confirm: true, dryRun: false})
 	out := strings.TrimSpace(applied.String())
+	if skipped != "" {
+		out = skipped + "\n" + out
+	}
 	if err != nil {
 		return "applied", out, fmt.Errorf("scheduled quarantine: %w; %s", err, out)
 	}

@@ -26,13 +26,15 @@ const maxGitFileBytes = 4096
 // enforceable rather than aspirational: adding a network verb requires
 // editing this list, and runGit refuses anything absent from it.
 var gitReadOnlyVerbs = map[string]struct{}{
-	"rev-parse": {},
-	"rev-list":  {},
-	"status":    {},
-	"stash":     {},
-	"config":    {},
-	"worktree":  {},
-	"ls-files":  {},
+	"rev-parse":    {},
+	"rev-list":     {},
+	"status":       {},
+	"stash":        {},
+	"config":       {},
+	"worktree":     {},
+	"ls-files":     {},
+	"for-each-ref": {},
+	"log":          {},
 }
 
 // errGitVerbNotAllowed reports an attempt to run a non-allowlisted command.
@@ -69,8 +71,8 @@ func (g gitRunner) runOutput(ctx context.Context, dir string, limit int, args ..
 
 	// Git's -c options override repository config even on versions that do
 	// not support GIT_CONFIG_COUNT. Status must never run an fsmonitor hook.
-	commandArgs := make([]string, 0, len(args)+4)
-	commandArgs = append(commandArgs, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+	commandArgs := make([]string, 0, len(args)+5)
+	commandArgs = append(commandArgs, "--no-replace-objects", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
 	commandArgs = append(commandArgs, args...)
 	cmd := exec.CommandContext(ctx, g.binary, commandArgs...)
 	cmd.Dir = dir
@@ -286,11 +288,17 @@ func collectRepository(ctx context.Context, runner gitRunner, entry *core.Entry,
 	}
 
 	if !state.Bare {
-		unpublished, err := unpublishedCommits(ctx, runner, entry.Path, state.Head != "", kind == gitMarkerFile)
+		unpublished, err := unpublishedCommits(ctx, runner, entry.Path, marker, state.Head != "", kind == gitMarkerFile)
 		if err != nil {
 			return degrade(err.Error(), degradeKind(err), "git_publication_unknown")
 		}
 		state.UnpublishedCommits, state.PublicationKnown = unpublished, true
+	}
+	if kind != gitMarkerFile {
+		budget := 256
+		if err := collectSubmoduleWork(ctx, runner, filepath.Join(commonDir, "modules"), state, &budget); err != nil {
+			return degrade(err.Error(), degradeKind(err), "git_submodule_publication_unknown")
+		}
 	}
 
 	state.Locked = gitLocked(commonDir, marker, kind)
@@ -359,13 +367,22 @@ func lastActivity(checkout time.Time, gitDir string) time.Time {
 // A linked worktree's branches live in the shared repository, which
 // survives the worktree, so only its HEAD is at risk. A primary repository
 // takes every local branch with it.
-func unpublishedCommits(ctx context.Context, runner gitRunner, dir string, hasHead, linked bool) (int, error) {
+func unpublishedCommits(ctx context.Context, runner gitRunner, dir, gitDir string, hasHead, linked bool) (int, error) {
 	args := []string{"rev-list", "--count"}
 	if hasHead {
 		args = append(args, "HEAD")
 	}
 	if !linked {
-		args = append(args, "--branches")
+		args = append(args, "--all")
+	}
+	// Pseudorefs are not included by --all. They can be the only remaining
+	// reference to interrupted work or a commit saved by reset.
+	for _, ref := range []string{"ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"} {
+		if _, err := os.Lstat(filepath.Join(gitDir, ref)); err == nil {
+			args = append(args, ref)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return 0, err
+		}
 	}
 	if len(args) == 2 {
 		// An unborn linked worktree has nothing of its own to lose.
@@ -380,6 +397,67 @@ func unpublishedCommits(ctx context.Context, runner gitRunner, dir string, hasHe
 		return 0, fmt.Errorf("git rev-list returned %q, not a commit count", out)
 	}
 	return count, nil
+}
+
+// Submodule object stores belong to the primary repository, including stores
+// for deinitialized submodules. Inspect only metadata namespaces, never objects.
+func collectSubmoduleWork(ctx context.Context, runner gitRunner, path string, state *core.GitState, budget *int) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("submodule metadata is not a real directory: %s", path)
+	}
+	names, err := readDirNamesBounded(path, *budget+1)
+	if err != nil {
+		return err
+	}
+	for _, name := range names.names {
+		*budget--
+		if *budget < 0 {
+			return fmt.Errorf("submodule metadata exceeds inspection budget")
+		}
+		child := filepath.Join(path, name)
+		info, err := os.Lstat(child)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("unexpected submodule metadata: %s", child)
+		}
+		if _, err := os.Lstat(filepath.Join(child, "HEAD")); errors.Is(err, os.ErrNotExist) {
+			if err := collectSubmoduleWork(ctx, runner, child, state, budget); err != nil {
+				return err
+			}
+			continue
+		} else if err != nil {
+			return err
+		}
+		stashRef, err := runner.run(ctx, child, "for-each-ref", "--format=%(objectname)", "refs/stash")
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(string(stashRef)) != "" {
+			stashes, err := runner.run(ctx, child, "log", "-g", "--format=%H", "refs/stash")
+			if err != nil {
+				return err
+			}
+			state.Stashes += countLines(stashes)
+		}
+		unpublished, err := unpublishedCommits(ctx, runner, child, child, true, false)
+		if err != nil {
+			return err
+		}
+		state.UnpublishedCommits += unpublished
+		if err := collectSubmoduleWork(ctx, runner, filepath.Join(child, "modules"), state, budget); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // degradeKind maps a Git failure onto the protection that describes it.

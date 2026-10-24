@@ -47,6 +47,7 @@ func Fingerprint(entry core.Entry) string {
 			entry.Git.Head, entry.Git.Branch, entry.Git.DirtyFiles, entry.Git.Stashes,
 			entry.Git.UnpublishedCommits, entry.Git.Locked, entry.Git.Degraded,
 			entry.Git.UpstreamKnown, entry.Git.PublicationKnown, entry.Git.Bare, entry.Git.WorktreeOf, entry.Git.Remote)
+		write("git_activity=%d", entry.Git.LastActivity.UTC().UnixNano())
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
