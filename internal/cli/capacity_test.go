@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,7 +26,7 @@ func TestCapacityPersistsHysteresisAcrossCLIInvocations(t *testing.T) {
 		f.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  git: false\n  processes: false\n  services: false\nprevention:\n  min_free_bytes: 0\n  min_free_percent: 0\n  capacity_interval: 1h\n  targets:\n    - path: %s\n      target_free_bytes: %d\n      reserve_free_bytes: %d\n      recovery_margin_bytes: %d\n", root, root, target, reserve, margin))
 	}
 	assertState := func(command, want string, hold bool) string {
-		out, stderr, code := f.run(t, command)
+		out, stderr, code := f.run(t, "--format", "json", command)
 		if code != ExitOK {
 			t.Fatalf("%s: %d %s %s", command, code, out, stderr)
 		}
@@ -105,7 +106,7 @@ func TestCapacityMissingSampleIsUnknown(t *testing.T) {
 	f := newFixture(t)
 	root := filepath.Join(f.home, "missing")
 	f.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\nprevention:\n  targets:\n    - path: %s\n      target_free_bytes: 100\n      recovery_margin_bytes: 10\n", root, root))
-	out, stderr, code := f.run(t, "status")
+	out, stderr, code := f.run(t, "--format", "json", "status")
 	if code != ExitOK {
 		t.Fatalf("status: %d %s %s", code, out, stderr)
 	}
@@ -129,5 +130,60 @@ func TestCapacityMissingSampleIsUnknown(t *testing.T) {
 	volume := report.Data.Capacity.Volumes[0]
 	if volume.State != "measurement_unknown" || !volume.Hold || volume.Available != nil {
 		t.Fatalf("missing measurement looks healthy: %s", out)
+	}
+}
+
+func TestCapacityMeasurementFailurePersistsUnknown(t *testing.T) {
+	f := newFixture(t)
+	root := filepath.Join(f.home, "workspace")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	f.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  git: false\n  processes: false\n  services: false\nprevention:\n  min_free_percent: 0\n  targets:\n    - path: %s\n      target_free_bytes: 1\n      recovery_margin_bytes: 1\n", root, root))
+	if out, stderr, code := f.run(t, "scan"); code != ExitOK {
+		t.Fatalf("seed capacity: %s %s", out, stderr)
+	}
+	dbPath := filepath.Join(f.home, ".local", "state", "workspace-janitor", "janitor.db")
+	db, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE capacity_snapshot SET snapshot = json_set(snapshot,
+		'$.sampled_at', '2000-01-01T00:00:00Z', '$.valid_until', '2000-01-01T00:01:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	// The inventory may fail too; the independently measured pressure must
+	// already have persisted a fresh unknown observation, not stale health.
+	f.run(t, "scan")
+	out, stderr, code := f.run(t, "--format", "json", "status")
+	if code != ExitOK {
+		t.Fatalf("status after measurement failure: %s %s", out, stderr)
+	}
+	var report struct {
+		Data struct {
+			Capacity struct {
+				SampledAt string `json:"sampled_at"`
+				Volumes   []struct {
+					State     string  `json:"state"`
+					Hold      bool    `json:"admission_hold"`
+					Available *uint64 `json:"available_bytes"`
+				} `json:"volumes"`
+			} `json:"capacity"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := report.Data.Capacity
+	if snapshot.SampledAt == "2000-01-01T00:00:00Z" || len(snapshot.Volumes) != 1 {
+		t.Fatalf("failed measurement was not persisted: %s", out)
+	}
+	volume := snapshot.Volumes[0]
+	if volume.State != "measurement_unknown" || !volume.Hold || volume.Available != nil {
+		t.Fatalf("failed measurement looked healthy: %s", out)
 	}
 }
