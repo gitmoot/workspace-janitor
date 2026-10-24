@@ -134,7 +134,7 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 			return err
 		}
 		if err = plan.VerifyBinding(stored, current.ID, entries, policy); err != nil {
-			return err
+			return fmt.Errorf("%w; no cleanup performed: rebuild and approve a plan from the current scan; scheduled cleanup should use cycle, which holds the scan lock through apply", err)
 		}
 		approvals, err = tx.Approvals(ctx, stored.ID)
 		return err

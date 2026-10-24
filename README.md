@@ -49,7 +49,7 @@ no decisions and mutates nothing.
 | Collector | What it reads | Bounds |
 | --- | --- | --- |
 | `filesystem` | `lstat` metadata for each root's children | per-root depth, per-directory entries, total entries |
-| `deep_size` | recursive directory sizes, opt-in via `--deep-size` | per-root entry budget and depth (a size cut short is a lower bound, not an unknown), stays on the filesystem |
+| `deep_size` | recursive directory sizes, opt-in via `--deep-size` | per-root entry/depth bounds; every incomplete size is a lower bound, and unreadable or unobserved content also carries unknown evidence |
 | `git` | common dir, remote, branch, HEAD, dirty count, stashes, commits on no remote-tracking branch, last activity, worktree metadata, locks | per-command timeout, read-only verbs only |
 | `processes` | `cwd` and `exe` links plus `comm` from procfs | directory-entry bound |
 | `agents` | registered-agent directories from an adapter | command timeout per adapter |
@@ -71,6 +71,12 @@ Three properties hold across all of them:
   `environ`; the service collectors skip `Environment`, `EnvironmentFile`,
   and crontab assignments; and no Git command may touch the network — the
   collector runs a fixed allowlist of local read-only subcommands.
+
+Publication checks ignore Git replacement graphs. Primary repositories include
+all local refs and saved operation heads; retained submodule metadata is checked
+for stashes and unpublished commits, including deinitialized submodules. An
+unreadable or oversized metadata namespace stays protected. Apply fingerprints
+include Git last activity, so an index/reflog-only change invalidates an old plan.
 
 `--no-store` makes a scan reporting-only: it creates no database, and when
 one already exists it is opened strictly read-only — no migration, no
@@ -111,6 +117,8 @@ is a rename and consumes none. A cross-filesystem copy needs a real size, so
 a directory whose size was never measured — the default, since deep sizing
 is opt-in — is refused rather than approved against its four-kilobyte
 directory entry.
+Same-filesystem quarantine also frees no payload space: the bytes remain on that
+filesystem until an independently authorized expiry removes them.
 
 Four properties hold:
 
@@ -367,6 +375,11 @@ quarantine only for caches, generated artifacts, and linked worktrees that
 are clean, have every commit on a remote-tracking branch, and have had no
 checkout, staging, commit, or top-level change for seven days. A home
 `.cache` directory is never one cache; select its tools with cache rules.
+The cycle holds the scan lock across scan, plan, and quarantine, preventing a
+watcher scan from invalidating that transaction. A stale manual plan still fails
+closed and must be rebuilt and approved from the current scan. Automatic approval
+skips paths overlapping an active cleanup receipt, including parents and children;
+`plan.skipped` and the cycle's `quarantine_report` explain those skips.
 
 `janitor service generate --output /absolute/private/directory --binary
 /absolute/janitor` writes units without installing or enabling them: the

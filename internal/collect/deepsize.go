@@ -62,7 +62,7 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 			entry.LatestModifiedAt = sum.newest
 		}
 		entry.SizeIsDeep = true
-		entry.SizeIsLowerBound = sum.limited
+		entry.SizeIsLowerBound = sum.partial()
 		detail := fmt.Sprintf("%d byte(s) across %d entrie(s)", sum.bytes, sum.visited)
 		switch {
 		case sum.unknown():

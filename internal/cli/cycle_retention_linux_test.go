@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
@@ -222,6 +223,9 @@ func TestScheduledCycleSkipsSourceWithActiveReceipt(t *testing.T) {
 	out, stderr, code = f.run(t, "cycle")
 	if code != ExitOK || json.Unmarshal([]byte(out), &cycle) != nil || cycle.Quarantine != "none" {
 		t.Fatalf("cycle with the source's receipt still active: %d %s %s", code, stderr, out)
+	}
+	if !strings.Contains(cycle.QuarantineReport, cache) || !strings.Contains(cycle.QuarantineReport, "active cleanup receipt") {
+		t.Fatalf("active receipt skip was not explained: %+v", cycle)
 	}
 	if raw, err := os.ReadFile(filepath.Join(cache, "payload")); err != nil || string(raw) != "second" {
 		t.Fatalf("recreated source was touched: %q %v", raw, err)
