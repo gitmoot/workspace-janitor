@@ -26,6 +26,7 @@ type cycleReport struct {
 	ExpiryReport     string                 `json:"expiry_report,omitempty"`
 	Capacity         *core.CapacitySnapshot `json:"capacity,omitempty"`
 	Recovery         *recoveryReport        `json:"recovery,omitempty"`
+	Inventory        *inventoryReport       `json:"inventory_report"`
 }
 
 // runCycle is the one-shot daily timer target. A deep scan subsumes that day's
@@ -85,7 +86,32 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	}
 	report := cycleReport{ScanID: scanID, Deep: deep, Quarantine: "disabled", Expiry: "disabled", DiskAlerts: alerts}
 	report.Capacity = capacity
+	reportDB, err := store.OpenExisting(ctx, paths.DatabaseFile)
+	if err != nil {
+		return err
+	}
+	err = reportDB.Read(ctx, func(tx *store.Tx) error {
+		inventory, err := buildInventoryReport(ctx, tx, policy, time.Now().UTC())
+		report.Inventory = &inventory
+		return err
+	})
+	defer reportDB.Close()
+	if err != nil {
+		return err
+	}
+	recoveryStarted := time.Now().UTC()
 	report.Recovery, report.Capacity, err = runCapacityRecovery(ctx, e, paths, policy, scanID, capacity)
+	if report.Recovery != nil {
+		err = errors.Join(err, recordRecoveryDecision(ctx, reportDB, report.Recovery, recoveryStarted, err))
+		// Include the decision and any provider outcomes even when recovery
+		// returns an error before the normal end-of-cycle refresh.
+		refreshErr := reportDB.Read(ctx, func(tx *store.Tx) error {
+			var err error
+			report.Inventory.Activities, err = tx.CapacityActivities(ctx)
+			return err
+		})
+		err = errors.Join(err, refreshErr)
+	}
 	if err != nil {
 		return errors.Join(fmt.Errorf("scheduled capacity recovery: %w", err), writeCycleReport(e.stdout, report))
 	}
@@ -129,6 +155,13 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	err = db.Write(ctx, func(tx *store.Tx) error {
 		return tx.RecordCompletedCycle(ctx, scanID, time.Now().UTC())
 	})
+	if err == nil {
+		err = db.Read(ctx, func(tx *store.Tx) error {
+			var err error
+			report.Inventory.Activities, err = tx.CapacityActivities(ctx)
+			return err
+		})
+	}
 	closeErr := db.Close()
 	if err != nil {
 		return err

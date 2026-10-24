@@ -136,6 +136,11 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 	}
 
 	now := time.Now().UTC()
+	deep := !opts.noDeepSize && (opts.deepSize || policy.Collectors.DeepSize)
+	scope, err := inventoryScope(roots, collectLimits(policy, opts), deep)
+	if err != nil {
+		return err
+	}
 	scan := core.Scan{
 		ID:        newScanID(now),
 		Roots:     rootPaths(roots),
@@ -147,7 +152,7 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 		Roots:           roots,
 		Limits:          collectLimits(policy, opts),
 		WorktreePolicy:  &policy,
-		DeepSize:        !opts.noDeepSize && (opts.deepSize || policy.Collectors.DeepSize),
+		DeepSize:        deep,
 		Git:             policy.Collectors.Git && !opts.noGit,
 		Processes:       policy.Collectors.Processes && !opts.noProcesses,
 		Services:        policy.Collectors.Services && !opts.noServices,
@@ -220,7 +225,7 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 	}
 
 	if !opts.noPersist {
-		if err := persistScan(ctx, db, scan, result.Entries); err != nil {
+		if err := persistScan(ctx, db, scan, result.Entries, scope, deep); err != nil {
 			return err
 		}
 		report.Persisted = true
@@ -328,9 +333,12 @@ func priorInventory(ctx context.Context, db *store.Store, opts scanOptions) ([]c
 	return entries, scanID, nil
 }
 
-func persistScan(ctx context.Context, db *store.Store, scan core.Scan, entries []core.Entry) error {
+func persistScan(ctx context.Context, db *store.Store, scan core.Scan, entries []core.Entry, scope string, deep bool) error {
 	return db.Write(ctx, func(tx *store.Tx) error {
 		if err := tx.CreateScan(ctx, scan); err != nil {
+			return err
+		}
+		if err := tx.RecordInventoryMeasurement(ctx, scan.ID, scope, deep); err != nil {
 			return err
 		}
 		for _, entry := range entries {

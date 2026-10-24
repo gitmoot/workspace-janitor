@@ -12,6 +12,7 @@ import (
 	"github.com/gitmoot/workspace-janitor/internal/exportarchive"
 	"github.com/gitmoot/workspace-janitor/internal/output"
 	"github.com/gitmoot/workspace-janitor/internal/plan"
+	"github.com/gitmoot/workspace-janitor/internal/store"
 )
 
 type archiveOptions struct {
@@ -33,6 +34,7 @@ type archiveReport struct {
 	AvailableAfterBytes  *uint64                    `json:"available_after_bytes,omitempty"`
 	AvailableChangeBytes *int64                     `json:"available_change_bytes,omitempty"`
 	Attribution          string                     `json:"attribution"`
+	Activity             *core.CapacityActivity     `json:"activity,omitempty"`
 }
 
 func archiveCommand() *command {
@@ -111,7 +113,22 @@ func runArchive(ctx context.Context, e *env, args []string, opts archiveOptions)
 					return err
 				}
 				defer unlock()
-				if _, err = exportarchive.Restore(bounded, *rule, opts.restoreTo); err != nil {
+				db, err := store.Open(ctx, paths.DatabaseFile)
+				if err != nil {
+					return err
+				}
+				defer db.Close()
+				monitor, err := startCapacityActivity(ctx, db, "archive_restore", rule.Name, opts.restoreTo, rule.Owner, filepath.Dir(opts.restoreTo), activityVolume)
+				if err != nil {
+					return err
+				}
+				report.Activity = &monitor.activity
+				monitor.activity.Attempted = 1
+				_, err = exportarchive.Restore(bounded, *rule, opts.restoreTo)
+				if err == nil {
+					monitor.activity.Completed = 1
+				}
+				if err := monitor.finish(ctx, err); err != nil {
 					return err
 				}
 				report.Status = "restored"
@@ -153,22 +170,28 @@ func runArchive(ctx context.Context, e *env, args []string, opts archiveOptions)
 	if opts.dryRun {
 		return emit()
 	}
-	before, beforeErr := measureDisk(rule.Archive.Directory)
-	m, binding, err := exportarchive.Create(bounded, *rule, *entry, preflight)
+	db, err := store.Open(ctx, paths.DatabaseFile)
 	if err != nil {
+		return err
+	}
+	defer db.Close()
+	monitor, err := startCapacityActivity(ctx, db, "verified_archive", rule.Name, rule.Path, rule.Owner, rule.Archive.Directory, activityVolume)
+	if err != nil {
+		return err
+	}
+	report.Activity = &monitor.activity
+	monitor.activity.Attempted = 1
+	m, binding, err := exportarchive.Create(bounded, *rule, *entry, preflight)
+	if err == nil {
+		monitor.activity.Completed = 1
+	}
+	if err := monitor.finish(ctx, err); err != nil {
 		return err
 	}
 	report.Manifest, report.Binding, report.Status = &m, binding, "archived_and_restore_verified"
 	report.SameFilesystem = m.Source.Identity.Device == m.ArchiveDirectory.Device
-	if beforeErr == nil {
-		report.AvailableBeforeBytes = &before.FreeBytes
-	}
-	if after, err := measureDisk(rule.Archive.Directory); err == nil {
-		report.AvailableAfterBytes = &after.FreeBytes
-		if beforeErr == nil && after.Device == before.Device {
-			delta := int64(after.FreeBytes) - int64(before.FreeBytes)
-			report.AvailableChangeBytes = &delta
-		}
-	}
+	report.AvailableBeforeBytes = monitor.activity.AvailableBeforeBytes
+	report.AvailableAfterBytes = monitor.activity.AvailableAfterBytes
+	report.AvailableChangeBytes = monitor.activity.AvailableChangeBytes
 	return emit()
 }

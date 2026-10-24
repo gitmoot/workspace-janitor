@@ -43,6 +43,7 @@ type statusReport struct {
 	Policy          policyStatus           `json:"policy"`
 	Store           storeStatus            `json:"store"`
 	Capacity        *core.CapacitySnapshot `json:"capacity,omitempty"`
+	Inventory       *inventoryReport       `json:"inventory_report"`
 }
 
 func runStatus(ctx context.Context, e *env) error {
@@ -100,6 +101,15 @@ func runStatus(ctx context.Context, e *env) error {
 		report.Store.Initialized = true
 		report.Store.Stats = &stats
 		report.Store.ModelUsage = &usage
+		if stats.SchemaVersion == store.SchemaVersion() {
+			if err := db.Read(ctx, func(tx *store.Tx) error {
+				inventory, err := buildInventoryReport(ctx, tx, policy, time.Now().UTC())
+				report.Inventory = &inventory
+				return err
+			}); err != nil {
+				return err
+			}
+		}
 		if len(policy.Prevention.Targets) > 0 && stats.SchemaVersion == store.SchemaVersion() {
 			var snapshot core.CapacitySnapshot
 			if err := db.Read(ctx, func(tx *store.Tx) error {
@@ -136,6 +146,7 @@ func writeStatusText(e *env, report statusReport) error {
 			fields = append(fields, output.Field{Key: volume.Key + ":", Value: fmt.Sprintf("%s hold=%t target=%d reserve=%d recovery=%d (%s)", volume.State, volume.AdmissionHold, volume.TargetBytes, volume.ReserveBytes, volume.RecoveryBytes, volume.Reason)})
 		}
 	}
+	fields = appendInventoryFields(fields, report.Inventory)
 	if report.Store.Stats == nil {
 		fields = append(fields, output.Field{
 			Key:   "store:",

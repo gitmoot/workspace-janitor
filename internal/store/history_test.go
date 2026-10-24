@@ -23,13 +23,12 @@ func TestScanHistoryKeepsAuditReferencesAndLastDeep(t *testing.T) {
 				scan.Status = core.ScanCompleted
 				scan.FinishedAt = &at
 			}
-			if i == 5 || i == 7 {
+			if i == 4 || i == 5 || i == 7 {
 				scan.Collectors = []core.CollectorReport{{Name: "deep_size", Status: core.CollectorRan}}
 			}
-			if i == 5 {
-				// Its later completion advanced the deep clock even though
-				// another deep scan started afterwards.
-				completed := base.Add(10 * time.Hour)
+			if i == 4 || i == 5 {
+				// Preserve two deep baselines by completion order, not start.
+				completed := base.Add(time.Duration(15-i) * time.Hour)
 				scan.FinishedAt = &completed
 			}
 			if err := tx.CreateScan(ctx, scan); err != nil {
@@ -158,16 +157,13 @@ func TestScanHistoryPinsSubsecondDeepCompletion(t *testing.T) {
 	db := openFixture(t)
 	base := time.Date(2026, 9, 24, 0, 0, 0, 0, time.UTC)
 	if err := db.Write(ctx, func(tx *Tx) error {
-		for i := 0; i < RecentScanLimit+2; i++ {
+		for i := range RecentScanLimit + 3 {
 			at := base.Add(time.Duration(i) * time.Minute)
 			scan := fixtureScan(fmt.Sprintf("scan-%03d", i), at)
 			scan.Status, scan.FinishedAt = core.ScanCompleted, &at
-			if i < 2 {
+			if i < 3 {
 				scan.Collectors = []core.CollectorReport{{Name: "deep_size", Status: core.CollectorRan}}
-				finished := base.Add(10 * time.Hour)
-				if i == 1 {
-					finished = finished.Add(500 * time.Millisecond)
-				}
+				finished := base.Add(10*time.Hour + time.Duration(i)*500*time.Millisecond)
 				scan.FinishedAt = &finished
 			}
 			if err := tx.CreateScan(ctx, scan); err != nil {
@@ -183,7 +179,10 @@ func TestScanHistoryPinsSubsecondDeepCompletion(t *testing.T) {
 		if _, err := tx.Scan(ctx, "scan-000"); !errors.Is(err, ErrNotFound) {
 			return fmt.Errorf("earlier deep completion must trim: %v", err)
 		}
-		_, err := tx.Scan(ctx, "scan-001")
+		if _, err := tx.Scan(ctx, "scan-001"); err != nil {
+			return err
+		}
+		_, err := tx.Scan(ctx, "scan-002")
 		return err
 	}); err != nil {
 		t.Fatal(err)
