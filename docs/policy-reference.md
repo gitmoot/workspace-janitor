@@ -219,7 +219,7 @@ Credential-free is an owner's declaration, not an automatic secret detector.
 | `name`, `class`, `path` | Unique name and canonical exact file inside an inventory root. Classes: `completed_report`, `review_evidence`, `session_export`, `evidence_export`. At most 64 rules. |
 | `owner`, `approval`, `completed_at`, `credential_free` | Explicit owner/decision, verified completion timestamp and positive credential-free declaration. A file modified after completion is held. |
 | `source_container`, `source_lifetime` | Exact containing directory and its disposal lifetime. Never infer these from an entire checkout or raw session tree. |
-| `local_retention`, `local_expiry_enabled` | Exactly `30d` from verified completion; expiry is independently opt-in. The normal quarantine grace period and separate deletion permissions still apply. |
+| `local_retention`, `local_expiry_enabled` | Defaults to `30d` from verified completion. Stricter `90d` or `permanent` retention is accepted; `permanent` forbids expiry. Local expiry is independently opt-in, and the normal quarantine grace period and deletion permissions still apply. |
 | `max_bytes` | Per-file ceiling; omitted/zero defaults to 1 GiB. Positive overrides may not exceed 1 GiB; oversized exports remain retained. |
 | `archive.directory`, `archive.owner`, `archive.approval`, `archive.lifetime` | An existing approved directory outside every export source container, with independent ownership/lifetime. Same-lifetime, cache/quarantine overlap, symlinks and ambiguous same-device mount aliases are refused. No storage is provisioned. |
 | `archive.retention`, `archive.delete_enabled` | `permanent` and `false`. Archive deletion is unsupported, regardless of local expiry permission. |

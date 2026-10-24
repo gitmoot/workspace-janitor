@@ -50,13 +50,13 @@ trees/databases and credential-bearing checkouts are not export inputs.
    expiry but does not prevent hash-verified recovery into a new file.
 4. Only with the owner's separate local-removal permission, set
    `local_expiry_enabled: true`. Re-scan, plan and approve the exact export's
-   quarantine action after its 30-day completion window. Use the ordinary
-   quarantine/expiry workflow above; its grace period and deletion gates remain.
+   quarantine action after its configured completion window (30 days by default).
+   Use the ordinary quarantine/expiry workflow above; its grace period and deletion gates remain.
    Corrupt/unavailable archives, changed sources, live/queued users and revoked
    rules preserve the local copy.
 
 Archives never expire through this feature. An interrupted creation may leave
-an unpublished `.pending-*` bundle for diagnosis; it grants no deletion
+an unpublished `.partial-export-*` bundle for diagnosis; it grants no deletion
 permission. Retain the source and inspect the failure rather than treating a
 partial bundle as a backup. No archive rule or destination is enabled by the
 shipped example policy.
