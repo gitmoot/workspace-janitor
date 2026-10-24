@@ -42,7 +42,7 @@ jobs:
         run: go build ./...
 
       - name: go test
-        run: go test ./...
+        run: go test -v ./...
 
       - name: go.mod and go.sum are tidy
         run: |
@@ -56,6 +56,7 @@ jobs:
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
 
       - name: verify candidate source identity
         run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
@@ -68,6 +69,46 @@ jobs:
           ./dist/janitor-linux-amd64 --help
           ./dist/janitor-linux-amd64 version
 
+      # Temporary exact-head evidence for #70; removed after receipts are saved.
+      - name: prove reporting regressions on old and new code
+        env:
+          XDG_STATE_HOME: ${{ runner.temp }}/capacity-proof-state
+        run: |
+          GOBIN="$RUNNER_TEMP/proof-bin" go install github.com/gitmoot/test-check/cmd/test-check@d5f169ab623e8ba0896b727a09f36738612a79e2
+          set +e
+          "$RUNNER_TEMP/proof-bin/test-check" prove --base origin/main --json --test "go test -p 1 ./internal/cli ./internal/store -v -count=1 -run '^{name}$'" > dist/capacity-proof-output.json
+          code=$?
+          set -e
+          test "$code" = 0 || test "$code" = 4
+          python3 - <<'PY'
+          import json, os, shutil
+          from pathlib import Path
+          receipts = list(Path(os.environ["XDG_STATE_HOME"]).glob("test-check/receipts/*/receipt.json"))
+          assert len(receipts) == 1, receipts
+          receipt = json.loads(receipts[0].read_text())
+          proven = {
+              "TestInventoryGrowthKeepsDeepBaselineAcrossMetadataScans",
+              "TestInventoryGrowthDoesNotTurnIncompleteTreesIntoZero",
+              "TestInventoryGrowthRejectsChangedPolicyScope",
+              "TestCapacityHistoryDistinguishesArchiveExpiryAndReplay",
+              "TestScanHistoryKeepsAuditReferencesAndLastDeep",
+              "TestScanHistoryPinsSubsecondDeepCompletion",
+          }
+          guards = {"TestCycleMigratesPreviousSchemaBeforeCheckingDeepCadence", "TestCycleWholeWorktreeContentsPolicy"}
+          outcomes = {test["name"]: test["outcome"] for test in receipt["tests"]}
+          assert proven <= outcomes.keys(), outcomes
+          assert all(outcomes[name] == "proven" for name in proven), outcomes
+          assert all(outcome == "proven" or (name in guards and outcome == "not_red_on_old") for name, outcome in outcomes.items()), outcomes
+          shutil.copyfile(receipts[0], "dist/capacity-proof-receipt.json")
+          shutil.copyfile(receipt["output_ref"], "dist/capacity-proof-detail.json")
+          print(json.dumps(outcomes, indent=2))
+          PY
+
+      - name: exercise real reporting and archive CLI
+        run: |
+          python3 scripts/capacity-reporting-smoke.py ./dist/janitor-linux-amd64 dist/capacity-reporting-smoke.json
+          python3 scripts/capacity-archive-smoke.py ./dist/janitor-linux-amd64 dist/capacity-archive-smoke.json
+
       - name: upload release-readiness artifact
         uses: actions/upload-artifact@v4
         with:
@@ -75,4 +116,5 @@ jobs:
           path: |
             dist/janitor-linux-amd64
             dist/SHA256SUMS
+            dist/capacity-*.json
           if-no-files-found: error
