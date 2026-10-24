@@ -103,6 +103,14 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	report.Recovery, report.Capacity, err = runCapacityRecovery(ctx, e, paths, policy, scanID, capacity)
 	if report.Recovery != nil {
 		err = errors.Join(err, recordRecoveryDecision(ctx, reportDB, report.Recovery, recoveryStarted, err))
+		// Include the decision and any provider outcomes even when recovery
+		// returns an error before the normal end-of-cycle refresh.
+		refreshErr := reportDB.Read(ctx, func(tx *store.Tx) error {
+			var err error
+			report.Inventory.Activities, err = tx.CapacityActivities(ctx)
+			return err
+		})
+		err = errors.Join(err, refreshErr)
 	}
 	if err != nil {
 		return errors.Join(fmt.Errorf("scheduled capacity recovery: %w", err), writeCycleReport(e.stdout, report))

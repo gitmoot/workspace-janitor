@@ -72,7 +72,7 @@ caches:
     result['human_status'] = run('status', human=True)
     configure(depth=2)
     changed = inventory()['growth']
-    assert changed['status'] == 'current_policy_scope_changed'
+    assert changed['status'] == 'configured_scope_mismatch'
     assert all(row['change_apparent_bytes'] is None for row in changed['changes'])
     result['changed_scope'] = changed
     configure(deep_limit=1)

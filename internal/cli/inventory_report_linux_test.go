@@ -101,7 +101,7 @@ func TestInventoryGrowthRejectsChangedPolicyScope(t *testing.T) {
 	f.scanJSON(t, "--deep-size")
 	f.writePolicy(t, "roots:\n  - path: "+f.root+"\n    max_depth: 2\ncollectors:\n  git: false\n  processes: false\n  services: false\n")
 	doc := scanInventoryStatus(t, f)
-	if doc.Data.Inventory.Growth.Status != "current_policy_scope_changed" {
+	if doc.Data.Inventory.Growth.Status != "configured_scope_mismatch" {
 		t.Fatalf("old observations inherited new scope: %+v", doc.Data.Inventory.Growth)
 	}
 	for _, row := range doc.Data.Inventory.Growth.Changes {

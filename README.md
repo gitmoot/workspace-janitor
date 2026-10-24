@@ -323,7 +323,7 @@ hourly bound applies to protected-directory churn alone: overflow or real
 changes can require more scans. Protected metadata may be up to one hour
 stale between scans; safety protections remain in force, and the daily cycle
 does its own full scan. Completed scans keep a bounded recent history (256)
-plus scans pinned by audit records or the latest deep-size scan. The
+plus scans pinned by audit records or the two latest completed deep-size scans. The
 `janitor history` command previews eligible scan and inventory row counts;
 trimming runs in a transaction and never deletes a referenced plan/action,
 cycle, advisory attempt, model usage or cleanup receipt. Row deletion leaves
@@ -361,6 +361,13 @@ hysteresis. `janitor --format json status` exposes `data.capacity` without sampl
 Missing, stale, failed, or policy-mismatched observations are unknown and hold
 admission rather than reporting health. This contract is advisory: it does not
 yet pause jobs, authorize cleanup, or replace the independent dispatch disk guard.
+
+Status, history and daily cycle reports also include comparable inventory
+growth, declared budgets and owners, recent operation measurements and reasons
+recovery stopped. Unknown measurements remain null; filesystem availability
+changes are not attributed solely to Janitor. See
+[capacity reporting and the admission hook](docs/policy-reference.md#capacity-reporting)
+for field meanings, reporting bounds and the default-off consumer contract.
 
 Separate opt-in [bounded cache recovery](docs/policy-reference.md#bounded-cache-recovery)
 uses exact owner-approved retired cache rules and existing official prune

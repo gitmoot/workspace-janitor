@@ -33,13 +33,13 @@ func activityVolume(path string) (diskVolume, error) {
 	}
 }
 
-func startCapacityActivity(ctx context.Context, db *store.Store, kind, receipt, path, owner, samplePath string) (*activityMonitor, error) {
+func startCapacityActivity(ctx context.Context, db *store.Store, kind, receipt, path, owner, samplePath string, sampleBefore func(string) (diskVolume, error)) (*activityMonitor, error) {
 	monitor := &activityMonitor{db: db, samplePath: samplePath, activity: core.CapacityActivity{
 		ID: uuid.NewString(), Kind: kind, State: "starting", ReceiptID: receipt,
 		Path: path, Owner: owner, StartedAt: time.Now().UTC(), Errors: []string{},
 		Attribution: "Available-byte change is an actual filesystem observation, not attributable recovery: concurrent writers and delayed allocation/freeing may contribute. Store reduction is allocated namespace footprint, not proof of returned filesystem blocks. Null means unknown. Reporting history does not authorize replay or deletion.",
 	}}
-	before, err := activityVolume(samplePath)
+	before, err := sampleBefore(samplePath)
 	if err != nil {
 		monitor.activity.MeasurementError = err.Error()
 	} else {
@@ -73,9 +73,13 @@ func (m *activityMonitor) finish(ctx context.Context, operationErr error) error 
 	defer cancel()
 	after, err := activityVolume(m.samplePath)
 	if err != nil {
-		m.activity.MeasurementError = err.Error()
+		if m.activity.MeasurementError == "" {
+			m.activity.MeasurementError = err.Error()
+		}
 	} else if m.activity.AvailableBeforeBytes == nil || after.Device != m.activity.Device {
-		m.activity.MeasurementError = "before/after filesystem observations are not comparable"
+		if m.activity.MeasurementError == "" {
+			m.activity.MeasurementError = "before/after filesystem observations are not comparable"
+		}
 	} else {
 		m.activity.AvailableAfterBytes = &after.FreeBytes
 		if after.FreeBytes <= math.MaxInt64 && *m.activity.AvailableBeforeBytes <= math.MaxInt64 {

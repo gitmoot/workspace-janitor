@@ -217,7 +217,7 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	}
 	var monitor *activityMonitor
 	if !opts.dryRun {
-		monitor, err = startCapacityActivity(ctx, db, "quarantine", report.ID, "", "", policy.Retention.QuarantineDir)
+		monitor, err = startCapacityActivity(ctx, db, "quarantine", report.ID, "", "", policy.Retention.QuarantineDir, activityVolume)
 		if err != nil {
 			return err
 		}
@@ -357,7 +357,7 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 	eligible := make([]core.Entry, 0)
 	var monitor *activityMonitor
 	if !opts.dryRun {
-		monitor, err = startCapacityActivity(ctx, engine.DB, "expiry", opts.cleanupID, "", "", policy.Retention.QuarantineDir)
+		monitor, err = startCapacityActivity(ctx, engine.DB, "expiry", opts.cleanupID, "", "", policy.Retention.QuarantineDir, activityVolume)
 		if err != nil {
 			return err
 		}

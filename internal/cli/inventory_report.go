@@ -173,7 +173,7 @@ func buildInventoryReport(ctx context.Context, tx *store.Tx, policy config.Polic
 		case pair.Scope == "":
 			growth.Status = "legacy_measurement_scope_unknown"
 		case pair.Scope != expectedScope:
-			growth.Status = "current_policy_scope_changed"
+			growth.Status = "configured_scope_mismatch"
 		case pair.Previous != nil:
 			growth.Status = "compared"
 			growth.PreviousScanID = pair.Previous.ID

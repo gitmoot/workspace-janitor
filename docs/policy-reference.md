@@ -115,6 +115,67 @@ If safe candidates or budgets end below target, `no_safe_reclaim` retains an
 admission hold until measured recovery. These observations do not themselves
 enforce admission in another service.
 
+## Capacity reporting
+
+`status` and `history` expose `data.inventory_report` in JSON and a bounded
+summary in text. The daily `cycle` JSON record includes `inventory_report`
+directly. Reporting never approves cleanup or releases a job-admission hold.
+
+| Report field | Meaning and limits |
+| --- | --- |
+| `growth` | Apparent-size changes between matching deep observations, with scan IDs, timestamps, staleness and per-path reasons for unknown values. At most 64 changed/unknown rows; omitted rows are counted. |
+| `store_budgets` | Declared logical-size thresholds, allocated prune caps, export-file caps, retention, owners and approval gaps. These have different units/scopes and must not be added or substituted for each other. |
+| `activities` | Recent quarantine, expiry, official prune, verified archive/restore and recovery-decision outcomes. Fresh completions and replayed receipts have separate counts. |
+| `unresolved_decisions` | Missing owners, approvals and other declared-policy decisions. Existing recovery reports and activity `skipped` rows identify why actions stopped and who owns each decision. |
+
+Metadata-only scans do not displace the latest deep observation. A growth
+baseline needs the same roots, traversal settings, limits and sizing version,
+non-overlapping observation windows, known matching identity/kind, and complete
+size evidence. `configured_scope_mismatch` includes both changed configuration
+and scans made with different CLI roots or bounds. Missing/incomplete evidence
+is unknown, not zero growth. The two most recently completed deep scans remain
+pinned during history reduction; a matching older baseline is not guaranteed.
+Directory rows may overlap, so do not sum them.
+
+Inventory measurements describe the scan, before any subsequent cycle actions.
+Operation records describe later effects; they do not rewrite an old inventory
+as if it were a fresh measurement. Concurrent writers can affect both.
+
+`available_before_bytes`, `available_after_bytes` and `available_change_bytes`
+are actual filesystem observations, **not recovery attributable to Janitor**.
+`store_removed_allocated_bytes` is scoped namespace reduction, not proof that
+physical blocks were returned. `estimated_reclaim_bytes` remains conditional on
+safety revalidation. Move/copy activities report zero actual reclaim; expiry
+and prune leave `actual_reclaimed_bytes` null when attribution is unproved.
+A null measurement is unknown, never zero. An activity left `starting` has no
+confirmed outcome: consult the authoritative cleanup/provider/archive receipt
+before retrying.
+
+The reporting journal retains at most 256 activities of at most 64 KiB each;
+text output shows 16 and discloses the retained count. Recovery decisions retain
+up to eight skipped-path/owner/reason rows and count omissions. This reporting
+bound does not delete authoritative audit records or shrink the SQLite file.
+Schema 10 adds reporting metadata; old observations without a recorded scope
+cannot establish growth.
+
+## Admission consumer hook
+
+The read-only hook is `janitor --format json status`: require the supported
+envelope schema, `kind: status`, and `data.capacity`. A consumer must validate
+the configured policy hash, timestamps/cadence and every device needed by new
+heavy work. Missing, stale, future, unsupported, unknown or incomplete coverage
+must hold that work rather than assume health. Honour `admission_hold`,
+including `no_safe_reclaim`; do not infer release from an increase in free space.
+Release only after a fresh producer observation verifies hysteresis recovery.
+
+This is a contract for an external consumer, not enforcement by Janitor.
+Gitmoot integration is tracked in `gitmoot/gitmoot#2359` and remains default-off
+pending real producer/consumer verification and staged approval. A consumer
+must preserve urgent native messages and read-only diagnostics, never cancel
+running jobs or stop unrelated services, and retain the existing independent
+disk guard. A read-only label on an arbitrary executable is not an exemption.
+
+
 
 ## Worked fixture-only policies
 

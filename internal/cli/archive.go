@@ -118,7 +118,7 @@ func runArchive(ctx context.Context, e *env, args []string, opts archiveOptions)
 					return err
 				}
 				defer db.Close()
-				monitor, err := startCapacityActivity(ctx, db, "archive_restore", rule.Name, opts.restoreTo, rule.Owner, filepath.Dir(opts.restoreTo))
+				monitor, err := startCapacityActivity(ctx, db, "archive_restore", rule.Name, opts.restoreTo, rule.Owner, filepath.Dir(opts.restoreTo), activityVolume)
 				if err != nil {
 					return err
 				}
@@ -175,7 +175,7 @@ func runArchive(ctx context.Context, e *env, args []string, opts archiveOptions)
 		return err
 	}
 	defer db.Close()
-	monitor, err := startCapacityActivity(ctx, db, "verified_archive", rule.Name, rule.Path, rule.Owner, rule.Archive.Directory)
+	monitor, err := startCapacityActivity(ctx, db, "verified_archive", rule.Name, rule.Path, rule.Owner, rule.Archive.Directory, activityVolume)
 	if err != nil {
 		return err
 	}

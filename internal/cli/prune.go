@@ -107,7 +107,10 @@ func runOfficialPrune(ctx context.Context, e *env, format output.Format, stateDi
 	if estimateErr == nil && estimate.SharedInodes == 0 && estimate.Bytes >= 0 {
 		report.StoreBeforeBytes = &estimate.Bytes
 	}
-	monitor, err := startCapacityActivity(ctx, engine.DB, "official_prune", selected.ID, entry.Path, rule.Recovery.Owner, entry.Path)
+	// A missing cache root must not borrow its ancestor's sample to pass a
+	// budgeted prune gate. Destinations that do not exist yet use a different
+	// sampler; this pre-operation sample requires the exact cache path.
+	monitor, err := startCapacityActivity(ctx, engine.DB, "official_prune", selected.ID, entry.Path, rule.Recovery.Owner, entry.Path, measureDisk)
 	if err != nil {
 		return fmt.Errorf("cannot record prune start: %w", err)
 	}
