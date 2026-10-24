@@ -104,6 +104,9 @@ jobs:
           print(json.dumps(outcomes, indent=2))
           PY
 
+      - name: prove measurement error boundaries
+        run: python3 scripts/capacity-activity-smoke.py dist/capacity-activity-smoke.json
+
       - name: exercise real reporting and archive CLI
         run: |
           python3 scripts/capacity-reporting-smoke.py ./dist/janitor-linux-amd64 dist/capacity-reporting-smoke.json
