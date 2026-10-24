@@ -64,6 +64,13 @@ prevention:
   #     target_free_bytes: 53687091200
   #     reserve_free_bytes: 10737418240
   #     recovery_margin_bytes: 2147483648
+  # Separate opt-in; also requires exact owner-approved dedicated cache rules.
+  recovery:
+    enabled: false
+    max_stores: 1
+    max_bytes: 1073741824
+    interval: 24h
+    time_budget: 1m
   # Requires retention.delete_enabled too. Expiry still uses the confirmed
   # apply path and a fresh, complete second safety observation.
   auto_expire: false

@@ -96,8 +96,19 @@ type CacheRule struct {
 	TTL      Duration `yaml:"ttl" json:"ttl"`
 	// Dedicated is an explicit operator assertion that this exact cache root
 	// is exclusively owned and idle for an irreversible official prune.
-	Dedicated      bool   `yaml:"dedicated" json:"dedicated"`
-	OfficialBinary string `yaml:"official_binary" json:"official_binary"`
+	Dedicated      bool          `yaml:"dedicated" json:"dedicated"`
+	OfficialBinary string        `yaml:"official_binary" json:"official_binary"`
+	Recovery       CacheRecovery `yaml:"recovery" json:"recovery"`
+}
+
+// CacheRecovery is an owner's explicit scoped authority for automatic official
+// pruning. A failed/interrupted attempt requires a new approval before retry.
+type CacheRecovery struct {
+	Owner         string   `yaml:"owner" json:"owner"`
+	Approval      string   `yaml:"approval" json:"approval"`
+	RebuildCost   string   `yaml:"rebuild_cost" json:"rebuild_cost"`
+	MaxPruneBytes int64    `yaml:"max_prune_bytes" json:"max_prune_bytes"`
+	MinIdle       Duration `yaml:"min_idle" json:"min_idle"`
 }
 
 // GitmootPolicy locates Gitmoot's own lifecycle ledger. Its managed tree is
@@ -255,6 +266,7 @@ type Prevention struct {
 	AutoQuarantine   bool             `yaml:"auto_quarantine" json:"auto_quarantine"`
 	CapacityInterval Duration         `yaml:"capacity_interval" json:"capacity_interval"`
 	Targets          []CapacityTarget `yaml:"targets" json:"targets"`
+	Recovery         RecoveryPolicy   `yaml:"recovery" json:"recovery"`
 }
 
 // CapacityTarget names an inventory root whose filesystem needs headroom.
@@ -264,6 +276,14 @@ type CapacityTarget struct {
 	TargetFreeBytes     int64  `yaml:"target_free_bytes" json:"target_free_bytes"`
 	ReserveFreeBytes    int64  `yaml:"reserve_free_bytes" json:"reserve_free_bytes"`
 	RecoveryMarginBytes int64  `yaml:"recovery_margin_bytes" json:"recovery_margin_bytes"`
+}
+
+type RecoveryPolicy struct {
+	Enabled    bool     `yaml:"enabled" json:"enabled"`
+	MaxStores  int      `yaml:"max_stores" json:"max_stores"`
+	MaxBytes   int64    `yaml:"max_bytes" json:"max_bytes"`
+	Interval   Duration `yaml:"interval" json:"interval"`
+	TimeBudget Duration `yaml:"time_budget" json:"time_budget"`
 }
 
 // Policy is the validated policy document.
@@ -373,6 +393,7 @@ func DefaultPolicy(p Paths) Policy {
 			MinFreePercent:   10,
 			AlertInterval:    Duration(24 * time.Hour),
 			CapacityInterval: Duration(time.Minute),
+			Recovery:         RecoveryPolicy{MaxStores: 1, MaxBytes: 1 << 30, Interval: Duration(24 * time.Hour), TimeBudget: Duration(time.Minute)},
 		},
 		Source:   "built-in defaults",
 		FromFile: false,
@@ -614,6 +635,15 @@ func (p *Policy) Validate() core.FieldErrors {
 		} else if cache.OfficialBinary != "" {
 			errs.Add(field+".official_binary", "official binary requires dedicated: true")
 		}
+		if cache.Recovery != (CacheRecovery{}) {
+			if !cache.Dedicated || strings.TrimSpace(cache.Recovery.Owner) == "" ||
+				strings.TrimSpace(cache.Recovery.Approval) == "" || strings.TrimSpace(cache.Recovery.RebuildCost) == "" {
+				errs.Add(field+".recovery", "requires a dedicated cache, owner, approval reference, and rebuild cost")
+			}
+			if cache.Recovery.MaxPruneBytes <= 0 || cache.Recovery.MinIdle.Duration() < time.Hour {
+				errs.Add(field+".recovery", "requires positive max_prune_bytes and min_idle of at least 1h")
+			}
+		}
 	}
 	if p.Gitmoot.Home != "" && !core.IsCanonicalPath(p.Gitmoot.Home) {
 		errs.Add("gitmoot.home", "must be an absolute path, got %q", p.Gitmoot.Home)
@@ -627,6 +657,16 @@ func (p *Policy) Validate() core.FieldErrors {
 		}
 		if cache.TTL.Duration() < 0 {
 			errs.Add(fmt.Sprintf("caches[%d].ttl", i), "must not be negative")
+		}
+	}
+	if p.Prevention.Recovery.Enabled {
+		r := p.Prevention.Recovery
+		if len(p.Prevention.Targets) == 0 || r.MaxStores < 1 || r.MaxStores > 16 || r.MaxBytes <= 0 ||
+			r.Interval.Duration() < time.Hour || r.TimeBudget.Duration() <= 0 || r.TimeBudget.Duration() > time.Hour {
+			errs.Add("prevention.recovery", "requires capacity targets, max_stores 1..16, positive max_bytes, interval >=1h, and time_budget in (0,1h]")
+		}
+		if !p.Collectors.Git || !p.Collectors.Processes || !p.Collectors.Services {
+			errs.Add("prevention.recovery", "requires Git, process, and service collectors; active-use checks cannot be disabled")
 		}
 	}
 	if p.Prevention.DeepInterval.Duration() <= 0 {

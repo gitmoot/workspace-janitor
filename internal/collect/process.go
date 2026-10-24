@@ -19,9 +19,9 @@ const maxCommBytes = 256
 // gatherProcessReferences reads the working directory and executable of
 // every visible process from procfs.
 //
-// Only the "cwd", "exe", and "comm" entries are read. The command line and
-// the environment are deliberately not read: both routinely carry
-// credentials, and neither is needed to know that a path is in use.
+// Only "cwd", "exe", and "comm" are read: arguments and environments routinely
+// carry credentials. An automatic recovery cache is additionally held while
+// any corresponding provider is running, even outside the cache directory.
 //
 // A process this run may not inspect is counted as an unknown, which makes
 // the report partial. A partial process collector can never be read as
@@ -93,6 +93,18 @@ func gatherProcessReferences(ctx context.Context, opts *Options) ([]Reference, c
 				Detail:     fmt.Sprintf("pid %s (%s) %s", name, comm, link.label),
 			})
 		}
+		if opts.WorktreePolicy != nil {
+			for _, cache := range opts.WorktreePolicy.Caches {
+				if cache.Recovery.Owner == "" || !cacheProducerMayBeRunning(filepath.Base(cache.OfficialBinary), comm) {
+					continue
+				}
+				refs = append(refs, Reference{
+					Path: cache.Path, Source: core.SourceProcess, Protection: core.ProtectActiveProcess,
+					Signal: "cache_producer",
+					Detail: fmt.Sprintf("pid %s (%s) may use this provider cache; automatic recovery requires idle producers", name, comm),
+				})
+			}
+		}
 	}
 
 	if report.Detail == "" {
@@ -100,6 +112,24 @@ func gatherProcessReferences(ctx context.Context, opts *Options) ([]Reference, c
 			report.Visited, opts.ProcRoot, report.Unknowns)
 	}
 	return refs, report
+}
+
+func cacheProducerMayBeRunning(provider, name string) bool {
+	if name == "unknown" {
+		return true
+	}
+	switch provider {
+	case "go":
+		switch name {
+		case "go", "compile", "link", "asm", "cgo":
+			return true
+		}
+	case "uv":
+		return name == "uv" || name == "uvx"
+	case "npm":
+		return name == "node" || name == "nodejs" || strings.HasPrefix(name, "npm") || name == "npx"
+	}
+	return false
 }
 
 // processName reads the short process name, which carries no arguments and

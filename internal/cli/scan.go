@@ -107,7 +107,7 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 			return err
 		}
 		defer db.Close()
-		capacity, err = sampleCapacity(ctx, policy, paths, time.Now().UTC())
+		capacity, err = sampleCapacity(ctx, policy, paths, time.Now().UTC(), false)
 		if err != nil {
 			return err
 		}

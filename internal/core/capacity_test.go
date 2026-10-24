@@ -45,4 +45,19 @@ func TestCapacityStalenessNeverLooksRecovered(t *testing.T) {
 	}
 }
 
+func TestNoSafeReclaimRemainsHeldUntilRecovery(t *testing.T) {
+	previous := CapacityState{State: "no_safe_reclaim", AdmissionHold: true, Reason: "approved candidates exhausted"}
+	for _, available := range []uint64{10, 90, 110, 120} {
+		current := AdvancePressure(CapacityState{AvailableBytes: capacityBytes(available), TotalBytes: capacityBytes(1000), TargetBytes: 100, ReserveBytes: 20, RecoveryBytes: 120}, previous)
+		if available < 120 {
+			if current.State != "no_safe_reclaim" || !current.AdmissionHold || current.Reason != previous.Reason {
+				t.Fatalf("shortfall lost its hold or explanation: %+v", current)
+			}
+		} else if current.State != PressureRecovered || current.AdmissionHold {
+			t.Fatalf("verified recovery did not release hold: %+v", current)
+		}
+		previous = current
+	}
+}
+
 func capacityBytes(n uint64) *uint64 { return &n }

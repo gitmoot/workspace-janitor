@@ -32,6 +32,14 @@ func collectGitmoot(ctx context.Context, opts *Options, entries []core.Entry, no
 		return report
 	}
 	managed := make([]bool, len(entries))
+	recoveryPaths := make(map[string]bool)
+	if opts.WorktreePolicy != nil {
+		for _, cache := range opts.WorktreePolicy.Caches {
+			if cache.Recovery.Owner != "" {
+				recoveryPaths[cache.Path] = true
+			}
+		}
+	}
 	for i := range entries {
 		managed[i] = core.PathWithin(entries[i].Path, opts.GitmootHome)
 	}
@@ -53,7 +61,7 @@ func collectGitmoot(ctx context.Context, opts *Options, entries []core.Entry, no
 		report.Recorded = 0
 		report.Unknowns = 0
 		for i := range entries {
-			if managed[i] {
+			if managed[i] || recoveryPaths[entries[i].Path] {
 				entries[i].Evidence = removeGitmootEvidence(entries[i].Evidence)
 				mark(&entries[i], "", report.Detail, true)
 			}
@@ -89,6 +97,24 @@ func collectGitmoot(ctx context.Context, opts *Options, entries []core.Entry, no
 	if err := tx.QueryRowContext(observeCtx, `SELECT EXISTS(SELECT 1 FROM jobs
 		WHERE state NOT IN ('succeeded','failed','cancelled') AND NOT json_valid(payload))`).Scan(&malformed); err != nil {
 		return fail(err)
+	}
+	if len(recoveryPaths) != 0 {
+		var pending bool
+		// The current producer ledger does not declare per-cache queued use.
+		// Until that contract exists, no nonterminal job/task is proof of an
+		// idle recovery cache, regardless of its worktree's exact pathname.
+		if err := tx.QueryRowContext(observeCtx, `SELECT
+			EXISTS(SELECT 1 FROM jobs WHERE state IS NULL OR state NOT IN ('succeeded','failed','cancelled'))
+			OR EXISTS(SELECT 1 FROM tasks WHERE state IS NULL OR state NOT IN ('merged','dismissed','superseded','stranded'))`).Scan(&pending); err != nil {
+			return fail(err)
+		}
+		if pending || malformed != 0 {
+			for i := range entries {
+				if recoveryPaths[entries[i].Path] {
+					mark(&entries[i], "", "nonterminal producer work or incomplete job evidence; no cache-use release contract", true)
+				}
+			}
+		}
 	}
 	refs, err := loadGitmootRefs(observeCtx, tx, entries, opts.Limits.MaxEntries)
 	if err != nil {

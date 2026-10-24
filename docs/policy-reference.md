@@ -38,10 +38,11 @@ sample. `scan --no-store` does not sample or update pressure. The snapshot uses
 one SQLite row, survives restart, and expires after twice the interval.
 The watcher samples even without directory events; restart it after policy changes.
 
-States are `target_recovered`, `cleanup_needed`, `critical`, and
-`measurement_unknown`. Below reserve is critical. Below target requests cleanup;
-once pressure begins, recovery requires target plus margin. Critical or unknown
-state sets `admission_hold`; that hold remains until verified hysteresis recovery.
+States are `target_recovered`, `cleanup_needed`, `critical`,
+`no_safe_reclaim`, and `measurement_unknown`. Below reserve is critical; below
+target requests cleanup. Once pressure begins, recovery requires target plus
+margin. Critical, unknown, or exhausted bounded recovery sets `admission_hold`;
+the hold remains until verified hysteresis recovery.
 `available_bytes` excludes filesystem-reserved blocks. Unreadable roots,
 inconsistent volume observations, stale snapshots, and backward clocks cannot
 report healthy capacity. Unknown byte values are JSON `null`, never zero.
@@ -53,6 +54,65 @@ missing data or a changed policy returns unknown until a fresh sample exists.
 `cycle`, stored `scan`, and watcher reports also include the snapshot. This is
 an advisory contract, not deletion authority or an enforced job admission gate.
 No target relaxes the existing independent 5% dispatch floor.
+
+## Bounded cache recovery
+
+Automatic official pruning is off by default. `prevention.recovery.enabled`
+requires capacity targets and enabled Git, process, and service collectors.
+It does not authorize arbitrary deletion, Docker pruning, or backup cleanup.
+Each eligible cache must already have an exact `delete_candidate` rule,
+`dedicated: true`, and an absolute supported `official_binary`, plus:
+
+| Cache `recovery` field | Required authority/bound |
+| --- | --- |
+| `owner` | Responsible artifact owner; unknown ownership stays protected. |
+| `approval` | Owner's saved approval reference for this exact retired cache. |
+| `rebuild_cost` | Human-readable consequence of losing cached objects. |
+| `max_prune_bytes` | Positive whole-store allocated-byte ceiling. |
+| `min_idle` | At least `1h`; complete recursive modification evidence is required. |
+
+Supported automatic providers are offline uv/npm and a dedicated retired Go
+build cache (`.cache/go-build`). Go runs `go -C <cache> clean -cache` with that
+exact `GOCACHE`, local toolchain selection, and disabled Go environment/network
+configuration. Module caches, active shared caches, source, credentials, and
+backup repositories are not added as cleanup classes.
+
+| `prevention.recovery` field | Default and bound |
+| --- | --- |
+| `enabled` | `false`; separate from quarantine/expiry opt-ins. |
+| `max_stores` | `1`; at most 16 stores considered for allocated-byte measurement per pass. |
+| `max_bytes` | `1073741824`; cumulative charged whole-store upper bounds, not provider promises. |
+| `interval` | `24h`; at least `1h` between attempts at a store, persisted across restarts. |
+| `time_budget` | `1m`; positive, at most `1h`, for recovery planning and provider work. Inventory retains its existing collector bounds. |
+
+Recovery-enabled cycles request deep inventory. Oldest eligible stores are
+considered first. Shared inodes, incomplete measurements, oversized stores,
+active references, and exhausted budgets are refusals, not invitations to
+switch to generic deletion. The ordinary plan/approval/apply path rechecks
+safety and the allocated-byte ceiling immediately before provider execution.
+Fresh capacity is measured before recovery and after each attempted provider;
+reaching the recovery threshold stops the pass.
+
+Process arguments and environments remain unread. As a conservative substitute
+for unavailable per-cache producer leases, any running matching provider holds
+its automatic recovery caches, even when its working directory is elsewhere.
+Any nonterminal Gitmoot job/task or an unreadable existing ledger also holds
+automatic recovery caches: completion cannot be guessed from an unmatched
+worktree path. A narrower producer-owned release contract is required before
+loosening these holds.
+
+The cycle's `recovery` report records owner, approval, rebuild cost, skips,
+budget charges, stop reason, before/after store allocation, and before/after
+filesystem availability. Net filesystem change may include concurrent writers;
+it is not attributed solely to Janitor. Quarantine on the same filesystem is
+not counted as reclaim. Official-prune receipts remain in
+`official-prunes.jsonl`; a bounded SQLite row per attempted cache records its
+cooldown and outcome. Failed/interrupted attempts require reconciliation and
+a new owner approval; changing approval does not bypass cooldown.
+If safe candidates or budgets end below target, `no_safe_reclaim` retains an
+admission hold until measured recovery. These observations do not themselves
+enforce admission in another service.
+
 
 ## Worked fixture-only policies
 

@@ -76,6 +76,7 @@ func TestCycleMigratesPreviousSchemaBeforeCheckingDeepCadence(t *testing.T) {
 	}
 	for _, statement := range []string{
 		"DROP TABLE IF EXISTS capacity_snapshot",
+		"DROP TABLE IF EXISTS cache_recovery_attempts",
 		"DROP TABLE advisory_attempts",
 		"DROP TABLE advisory_runs",
 		"DROP TABLE completed_cycles",

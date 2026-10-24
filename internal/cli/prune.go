@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -16,16 +17,23 @@ import (
 )
 
 type pruneReport struct {
-	Mode      string    `json:"mode"`
-	DryRun    bool      `json:"dry_run"`
-	PlanID    string    `json:"plan_id"`
-	ActionID  string    `json:"action_id"`
-	Path      string    `json:"path"`
-	Provider  string    `json:"provider"`
-	Argv      []string  `json:"argv"`
-	Timeout   string    `json:"timeout"`
-	Status    string    `json:"status"`
-	Timestamp time.Time `json:"timestamp"`
+	Mode                 string    `json:"mode"`
+	DryRun               bool      `json:"dry_run"`
+	PlanID               string    `json:"plan_id"`
+	ActionID             string    `json:"action_id"`
+	Path                 string    `json:"path"`
+	Provider             string    `json:"provider"`
+	Argv                 []string  `json:"argv"`
+	Timeout              string    `json:"timeout"`
+	Status               string    `json:"status"`
+	Timestamp            time.Time `json:"timestamp"`
+	StoreBeforeBytes     *int64    `json:"store_before_bytes,omitempty"`
+	StoreAfterBytes      *int64    `json:"store_after_bytes,omitempty"`
+	AvailableBeforeBytes *uint64   `json:"available_before_bytes,omitempty"`
+	AvailableAfterBytes  *uint64   `json:"available_after_bytes,omitempty"`
+	AvailableChangeBytes *int64    `json:"available_change_bytes,omitempty"`
+	MeasurementError     string    `json:"measurement_error,omitempty"`
+	Attribution          string    `json:"attribution,omitempty"`
 }
 
 // runOfficialPrune is deliberately narrower than generic quarantine. Only a
@@ -46,11 +54,11 @@ func runOfficialPrune(ctx context.Context, e *env, format output.Format, stateDi
 		return fmt.Errorf("%s has no exact dedicated cache rule", selected.Path)
 	}
 	adapter, known := plan.DescribeAdapter(entry, policy)
-	if !known || len(adapter.OfficialCommand) == 0 || (adapter.Provider != "uv" && adapter.Provider != "npm") {
+	if !known || len(adapter.OfficialCommand) == 0 || (adapter.Provider != "uv" && adapter.Provider != "npm" && adapter.Provider != "go-build") {
 		return fmt.Errorf("%s has no supported offline official prune", selected.Path)
 	}
-	if filepath.Base(rule.OfficialBinary) != adapter.Provider {
-		return fmt.Errorf("official binary must be a configured %s executable", adapter.Provider)
+	if filepath.Base(rule.OfficialBinary) != adapter.OfficialCommand[0] {
+		return fmt.Errorf("official binary must be a configured %s executable", adapter.OfficialCommand[0])
 	}
 	info, err := os.Stat(rule.OfficialBinary)
 	if err != nil {
@@ -67,6 +75,11 @@ func runOfficialPrune(ctx context.Context, e *env, format output.Format, stateDi
 	report := pruneReport{Mode: "official_prune", DryRun: opts.dryRun, PlanID: selected.PlanID,
 		ActionID: selected.ID, Path: entry.Path, Provider: adapter.Provider, Argv: argv,
 		Timeout: policy.Limits.CommandTimeout.String(), Status: "preview"}
+	defer func() {
+		if opts.pruneResult != nil {
+			*opts.pruneResult = report
+		}
+	}()
 	if opts.dryRun {
 		return writePrune(e.stdout, format, report)
 	}
@@ -82,16 +95,59 @@ func runOfficialPrune(ctx context.Context, e *env, format output.Format, stateDi
 	if err := engine.PreflightOfficial(ctx, entry, selected); err != nil {
 		return err
 	}
+	if opts.pruneLimitBytes > 0 {
+		estimate, err := action.EstimateReclaim(ctx, []core.Entry{entry}, policy.Limits.DeepSizeMaxEntries)
+		if err != nil {
+			return fmt.Errorf("recovery budget measurement: %w", err)
+		}
+		if estimate.Bytes < 0 || estimate.SharedInodes != 0 || uint64(estimate.Bytes) > opts.pruneLimitBytes {
+			return fmt.Errorf("cache exceeds remaining recovery budget or has shared inodes")
+		}
+		report.StoreBeforeBytes = &estimate.Bytes
+	}
+	before, measureErr := measureDisk(entry.Path)
+	if measureErr == nil && before.Device != entry.FilesystemID.Device {
+		measureErr = fmt.Errorf("cache filesystem identity changed")
+	}
+	if measureErr != nil {
+		if opts.pruneLimitBytes > 0 {
+			return fmt.Errorf("before-prune capacity measurement: %w", measureErr)
+		}
+		report.MeasurementError = measureErr.Error()
+	} else {
+		report.AvailableBeforeBytes = &before.FreeBytes
+	}
 	report.Status, report.Timestamp = "starting", time.Now().UTC()
 	if err := recordOfficialPrune(stateDir, report); err != nil {
 		return fmt.Errorf("cannot journal official prune: %w", err)
 	}
 	runErr := executeOfficialPrune(ctx, argv, policy.Limits.CommandTimeout.Duration())
 	report.Timestamp = time.Now().UTC()
+	after, measureErr := measureDisk(entry.Path)
+	if measureErr != nil {
+		report.MeasurementError = measureErr.Error()
+	} else if report.AvailableBeforeBytes != nil && after.Device == before.Device {
+		report.AvailableAfterBytes = &after.FreeBytes
+		if before.FreeBytes <= math.MaxInt64 && after.FreeBytes <= math.MaxInt64 {
+			change := int64(after.FreeBytes) - int64(before.FreeBytes)
+			report.AvailableChangeBytes = &change
+		}
+		report.Attribution = "net filesystem change; concurrent writers may contribute"
+	} else {
+		report.MeasurementError = "before/after filesystem observations are not comparable"
+	}
+	if opts.pruneLimitBytes > 0 {
+		estimate, err := action.EstimateReclaim(ctx, []core.Entry{entry}, policy.Limits.DeepSizeMaxEntries)
+		if err != nil || estimate.SharedInodes != 0 || estimate.Bytes < 0 {
+			report.MeasurementError = "post-prune store accounting is incomplete or shared"
+		} else {
+			report.StoreAfterBytes = &estimate.Bytes
+		}
+	}
 	if runErr != nil {
 		report.Status = "failed: " + runErr.Error()
 	} else {
-		report.Status = "completed; reclaimed bytes unknown until rescan"
+		report.Status = "completed"
 	}
 	if err := recordOfficialPrune(stateDir, report); err != nil {
 		return fmt.Errorf("official command outcome uncertain; cannot journal result: %w", err)
@@ -107,6 +163,12 @@ func writePrune(out io.Writer, format output.Format, report pruneReport) error {
 		return output.WriteJSON(out, report.Mode, report)
 	}
 	_, err := fmt.Fprintf(out, "mode: %s\nplan: %s\naction: %s\nprovider: %s\npath: %s\ncommand: %q\ntimeout: %s\nstatus: %s\n", report.Mode, report.PlanID, report.ActionID, report.Provider, report.Path, report.Argv, report.Timeout, report.Status)
+	if err == nil && report.AvailableChangeBytes != nil {
+		_, err = fmt.Fprintf(out, "available change: %d bytes (%s)\n", *report.AvailableChangeBytes, report.Attribution)
+	}
+	if err == nil && report.MeasurementError != "" {
+		_, err = fmt.Fprintf(out, "measurement unknown: %s\n", report.MeasurementError)
+	}
 	return err
 }
 

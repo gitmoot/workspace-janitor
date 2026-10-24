@@ -358,6 +358,15 @@ Missing, stale, failed, or policy-mismatched observations are unknown and hold
 admission rather than reporting health. This contract is advisory: it does not
 yet pause jobs, authorize cleanup, or replace the independent dispatch disk guard.
 
+Separate opt-in [bounded cache recovery](docs/policy-reference.md#bounded-cache-recovery)
+uses exact owner-approved retired cache rules and existing official prune
+adapters. It stops at target, store/byte/time budgets, or provider failure;
+unknown ownership, active/queued producers, and incomplete evidence remain
+protected. Reports separate store allocation from net filesystem movement.
+Exhausted safe recovery reports `no_safe_reclaim` with an admission hold;
+durable cooldowns prevent automatic erase/rebuild loops. No live cache is
+enabled merely by configuring a free-space target.
+
 Automatic expiry is **off** by default. To opt in, set both
 `retention.delete_enabled: true` and `prevention.auto_expire: true`. The cycle
 then calls the same confirmed `apply --expire` path as an operator: process

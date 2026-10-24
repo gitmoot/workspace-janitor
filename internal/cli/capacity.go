@@ -26,7 +26,7 @@ func capacityPolicyHash(policy config.Policy) string {
 // sampleCapacity serializes the due check and measurement in the existing
 // SQLite writer transaction. Concurrent cycles/watchers share one bounded
 // sample, including failures; a restart does not reset hysteresis or cooldown.
-func sampleCapacity(ctx context.Context, policy config.Policy, paths config.Paths, now time.Time) (*core.CapacitySnapshot, error) {
+func sampleCapacity(ctx context.Context, policy config.Policy, paths config.Paths, now time.Time, force bool) (*core.CapacitySnapshot, error) {
 	if len(policy.Prevention.Targets) == 0 {
 		return nil, nil
 	}
@@ -47,7 +47,7 @@ func sampleCapacity(ctx context.Context, policy config.Policy, paths config.Path
 			snapshot = *unknownCapacity(policy, "sampling time precedes the newest stored sample")
 			return nil
 		}
-		if previous.PolicyHash == hash && !now.Before(previous.SampledAt) && now.Before(previous.SampledAt.Add(interval)) {
+		if !force && previous.PolicyHash == hash && !now.Before(previous.SampledAt) && now.Before(previous.SampledAt.Add(interval)) {
 			snapshot = previous
 			return nil
 		}
