@@ -260,6 +260,16 @@ var migrations = []migration{
 			 BEGIN SELECT RAISE(ABORT, 'advisory attempts are immutable'); END`,
 		},
 	},
+	{
+		version: 8,
+		name:    "capacity_snapshot",
+		statements: []string{
+			`CREATE TABLE capacity_snapshot (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				snapshot TEXT NOT NULL
+			)`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.

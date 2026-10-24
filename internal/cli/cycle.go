@@ -17,13 +17,14 @@ import (
 )
 
 type cycleReport struct {
-	ScanID           string      `json:"scan_id"`
-	Deep             bool        `json:"deep"`
-	Quarantine       string      `json:"quarantine"`
-	QuarantineReport string      `json:"quarantine_report,omitempty"`
-	Expiry           string      `json:"expiry"`
-	DiskAlerts       []diskAlert `json:"disk_alerts"`
-	ExpiryReport     string      `json:"expiry_report,omitempty"`
+	ScanID           string                 `json:"scan_id"`
+	Deep             bool                   `json:"deep"`
+	Quarantine       string                 `json:"quarantine"`
+	QuarantineReport string                 `json:"quarantine_report,omitempty"`
+	Expiry           string                 `json:"expiry"`
+	DiskAlerts       []diskAlert            `json:"disk_alerts"`
+	ExpiryReport     string                 `json:"expiry_report,omitempty"`
+	Capacity         *core.CapacitySnapshot `json:"capacity,omitempty"`
 }
 
 // runCycle is the one-shot daily timer target. A deep scan subsumes that day's
@@ -72,11 +73,16 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 			return err
 		}
 	}
+	capacity, err := sampleCapacity(ctx, policy, paths, time.Now().UTC())
+	if err != nil {
+		return err
+	}
 	alerts, err := reportDiskPressure(ctx, policy, paths, scanID, time.Now().UTC())
 	if err != nil {
 		return err
 	}
 	report := cycleReport{ScanID: scanID, Deep: deep, Quarantine: "disabled", Expiry: "disabled", DiskAlerts: alerts}
+	report.Capacity = capacity
 	var quarantineErr error
 	if policy.Prevention.AutoQuarantine {
 		report.Quarantine, report.QuarantineReport, quarantineErr = autoQuarantine(ctx, e, scanID)

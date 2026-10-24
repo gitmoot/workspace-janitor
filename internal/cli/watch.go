@@ -26,14 +26,15 @@ const watchChurnInterval = time.Hour
 // watchReport describes a persisted inventory reconciliation or a deferred
 // incomplete observation. It never authorizes a filesystem action.
 type watchReport struct {
-	Reason          string          `json:"reason"`
-	ScanID          string          `json:"scan_id"`
-	Paths           []watchGuidance `json:"paths"`
-	Reconciled      bool            `json:"reconciled"`
-	Incomplete      bool            `json:"incomplete"`
-	DeferredEvents  uint64          `json:"deferred_events,omitempty"`
-	NextReconcileAt *time.Time      `json:"next_reconcile_at,omitempty"`
-	DiskAlerts      []diskAlert     `json:"disk_alerts,omitempty"`
+	Reason          string                 `json:"reason"`
+	ScanID          string                 `json:"scan_id"`
+	Paths           []watchGuidance        `json:"paths"`
+	Reconciled      bool                   `json:"reconciled"`
+	Incomplete      bool                   `json:"incomplete"`
+	DeferredEvents  uint64                 `json:"deferred_events,omitempty"`
+	NextReconcileAt *time.Time             `json:"next_reconcile_at,omitempty"`
+	DiskAlerts      []diskAlert            `json:"disk_alerts,omitempty"`
+	Capacity        *core.CapacitySnapshot `json:"capacity,omitempty"`
 }
 
 type watchGuidance struct {
@@ -94,10 +95,28 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 	pendingSettle := map[string]bool{}
 	var settleAt, churnAt time.Time
 	var deferred uint64
+	var capacityAt time.Time
+	if len(policy.Prevention.Targets) > 0 {
+		capacityAt = time.Now().Add(policy.Prevention.CapacityInterval.Duration())
+	}
 	for {
+		if !capacityAt.IsZero() && !time.Now().Before(capacityAt) {
+			now := time.Now().UTC()
+			capacity, err := sampleCapacity(ctx, policy, paths, now)
+			if err != nil {
+				return err
+			}
+			if err := writeWatchReport(e, watchReport{Reason: "capacity", Capacity: capacity}); err != nil {
+				return err
+			}
+			capacityAt = now.Add(policy.Prevention.CapacityInterval.Duration())
+		}
 		deadline := settleAt
 		if !churnAt.IsZero() && (deadline.IsZero() || churnAt.Before(deadline)) {
 			deadline = churnAt
+		}
+		if !capacityAt.IsZero() && (deadline.IsZero() || capacityAt.Before(deadline)) {
+			deadline = capacityAt
 		}
 		eventCtx := ctx
 		cancelWait := func() {}
@@ -299,6 +318,10 @@ func reconcileWatch(ctx context.Context, e *env, paths config.Paths, policy conf
 	}
 	report := watchReport{Reason: reason, ScanID: scan.ID, Reconciled: overflow,
 		Paths: []watchGuidance{}, DeferredEvents: deferred}
+	report.Capacity, err = sampleCapacity(ctx, policy, paths, time.Now().UTC())
+	if err != nil {
+		return err
+	}
 	alerts, err := reportDiskPressure(ctx, policy, paths, scan.ID, time.Now().UTC())
 	if err != nil {
 		return err
@@ -367,6 +390,10 @@ func reconcileWatch(ctx context.Context, e *env, paths config.Paths, policy conf
 		}
 		report.Paths = append(report.Paths, guidance)
 	}
+	return writeWatchReport(e, report)
+}
+
+func writeWatchReport(e *env, report watchReport) error {
 	encoded, err := json.Marshal(report)
 	if err != nil {
 		return err
