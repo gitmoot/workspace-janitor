@@ -52,7 +52,7 @@ func DescribeAdapter(entry core.Entry, _ config.Policy) (Adapter, bool) {
 	case ".gradle/caches":
 		return cache("gradle", "dependencies and build artifacts may need to be fetched or rebuilt")
 	case ".cache/go-build":
-		return cache("go-build", "Go build outputs will be rebuilt")
+		return cache("go-build", "Go build outputs will be rebuilt; only a dedicated retired build cache is eligible", "go", "-C", entry.Path, "clean", "-cache")
 	case "go/pkg/mod", "pkg/mod":
 		return cache("go-module", "Go modules may need to be fetched again")
 	case ".cache/ms-playwright":

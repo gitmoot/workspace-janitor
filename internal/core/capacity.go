@@ -9,6 +9,7 @@ const (
 	PressureCleanupNeeded PressureState = "cleanup_needed"
 	PressureCritical      PressureState = "critical"
 	PressureUnknown       PressureState = "measurement_unknown"
+	PressureNoSafeReclaim PressureState = "no_safe_reclaim"
 )
 
 // CapacityState describes one filesystem, not one inventory root. Available
@@ -55,6 +56,10 @@ func AdvancePressure(current, previous CapacityState) CapacityState {
 	default:
 		current.State, current.AdmissionHold = PressureRecovered, false
 		current.Reason = "fresh measurement satisfies the target and hysteresis"
+	}
+	if previous.State == PressureNoSafeReclaim && current.State != PressureRecovered {
+		current.State, current.Reason = previous.State, previous.Reason
+		current.AdmissionHold = true
 	}
 	return current
 }

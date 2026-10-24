@@ -270,6 +270,18 @@ var migrations = []migration{
 			)`,
 		},
 	},
+	{
+		version: 9,
+		name:    "cache_recovery_attempts",
+		statements: []string{
+			`CREATE TABLE cache_recovery_attempts (
+				path TEXT PRIMARY KEY,
+				approval TEXT NOT NULL,
+				attempted_at TEXT NOT NULL,
+				outcome TEXT NOT NULL
+			)`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.

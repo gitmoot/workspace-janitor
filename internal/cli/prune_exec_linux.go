@@ -34,6 +34,13 @@ func executeOfficialPrune(ctx context.Context, argv []string, limit time.Duratio
 		"UV_OFFLINE=1", "npm_config_offline=true",
 		"npm_config_userconfig=/dev/null", "npm_config_globalconfig=/dev/null",
 	}
+	if filepath.Base(argv[0]) == "go" {
+		if len(argv) != 5 || argv[1] != "-C" || argv[3] != "clean" || argv[4] != "-cache" || !filepath.IsAbs(argv[2]) {
+			return errors.New("Go cleanup requires an exact dedicated cache root and clean -cache")
+		}
+		cmd.Dir = argv[2]
+		cmd.Env = append(cmd.Env, "GOCACHE="+argv[2], "GOENV=off", "GOTOOLCHAIN=local", "GOPROXY=off", "GOSUMDB=off")
+	}
 	if err := cmd.Run(); err != nil {
 		if bounded.Err() != nil {
 			return fmt.Errorf("official prune exceeded %s: %w", limit, bounded.Err())

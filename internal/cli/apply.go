@@ -22,6 +22,8 @@ import (
 type applyOptions struct {
 	planID, cleanupID, actionID                string
 	quarantine, expire, prune, dryRun, confirm bool
+	pruneLimitBytes                            uint64
+	pruneResult                                *pruneReport
 }
 
 type officialCommandHint struct {

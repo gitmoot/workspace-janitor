@@ -102,7 +102,7 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 	for {
 		if !capacityAt.IsZero() && !time.Now().Before(capacityAt) {
 			now := time.Now().UTC()
-			capacity, err := sampleCapacity(ctx, policy, paths, now)
+			capacity, err := sampleCapacity(ctx, policy, paths, now, false)
 			if err != nil {
 				return err
 			}
@@ -318,7 +318,7 @@ func reconcileWatch(ctx context.Context, e *env, paths config.Paths, policy conf
 	}
 	report := watchReport{Reason: reason, ScanID: scan.ID, Reconciled: overflow,
 		Paths: []watchGuidance{}, DeferredEvents: deferred}
-	report.Capacity, err = sampleCapacity(ctx, policy, paths, time.Now().UTC())
+	report.Capacity, err = sampleCapacity(ctx, policy, paths, time.Now().UTC(), false)
 	if err != nil {
 		return err
 	}

@@ -25,6 +25,7 @@ type cycleReport struct {
 	DiskAlerts       []diskAlert            `json:"disk_alerts"`
 	ExpiryReport     string                 `json:"expiry_report,omitempty"`
 	Capacity         *core.CapacitySnapshot `json:"capacity,omitempty"`
+	Recovery         *recoveryReport        `json:"recovery,omitempty"`
 }
 
 // runCycle is the one-shot daily timer target. A deep scan subsumes that day's
@@ -48,6 +49,7 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	if err != nil {
 		return err
 	}
+	deep = deep || policy.Prevention.Recovery.Enabled
 	// Hold the scan lock from this scan through the quarantine apply, so no
 	// watcher scan lands between the plan and the apply's binding check.
 	unlockScan, err := lockScan(ctx, paths.StateDir)
@@ -73,7 +75,7 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 			return err
 		}
 	}
-	capacity, err := sampleCapacity(ctx, policy, paths, time.Now().UTC())
+	capacity, err := sampleCapacity(ctx, policy, paths, time.Now().UTC(), false)
 	if err != nil {
 		return err
 	}
@@ -83,6 +85,10 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	}
 	report := cycleReport{ScanID: scanID, Deep: deep, Quarantine: "disabled", Expiry: "disabled", DiskAlerts: alerts}
 	report.Capacity = capacity
+	report.Recovery, report.Capacity, err = runCapacityRecovery(ctx, e, paths, policy, scanID, capacity)
+	if err != nil {
+		return errors.Join(fmt.Errorf("scheduled capacity recovery: %w", err), writeCycleReport(e.stdout, report))
+	}
 	var quarantineErr error
 	if policy.Prevention.AutoQuarantine {
 		report.Quarantine, report.QuarantineReport, quarantineErr = autoQuarantine(ctx, e, scanID)
@@ -104,6 +110,16 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	if quarantineErr != nil {
 		return quarantineErr
 	}
+	if policy.Prevention.Recovery.Enabled && policy.Prevention.AutoExpire {
+		report.Capacity, err = sampleCapacity(ctx, policy, paths, time.Now().UTC(), true)
+		if err != nil {
+			return errors.Join(err, writeCycleReport(e.stdout, report))
+		}
+		report.Recovery.After = report.Capacity
+		if capacityRecovered(report.Capacity) {
+			report.Recovery.Stopped = "target_recovered"
+		}
+	}
 	// The daily advisory accepts only a cycle that completed its scan and
 	// enabled post-scan actions. Watcher/standalone scans cannot trigger it.
 	db, err := store.OpenExisting(ctx, paths.DatabaseFile)
@@ -120,11 +136,15 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	if closeErr != nil {
 		return closeErr
 	}
+	return writeCycleReport(e.stdout, report)
+}
+
+func writeCycleReport(out io.Writer, report cycleReport) error {
 	data, err := json.Marshal(report)
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(e.stdout, string(data))
+	_, err = fmt.Fprintln(out, string(data))
 	return err
 }
 
