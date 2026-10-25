@@ -26,6 +26,22 @@ retry flags or manual database edits to bypass an unresolved receipt.
 
 Retention reaching its date alone never deletes an object. With `retention.delete_enabled: true`, `janitor apply --expire` previews eligible receipts; `janitor apply --expire --confirm --dry-run=false` separately requests deletion after fresh receipt, original-path, Git and live-reference checks. A changed or newly referenced item enters `investigate` and remains recoverable; address the evidence and re-run a separately confirmed evaluation, or restore it. Automatic expiry also requires `prevention.auto_expire: true` and an operator-installed timer; it uses the guarded path but is irreversible when it succeeds. `prevention.auto_quarantine: true` additionally lets that timer approve and move rule-based quarantine actions without an operator; restore them with `janitor restore <cleanup-id>` before their retention expires. Keep these switches off unless explicitly authorized.
 
+An `identity_changed` refusal after upgrading can also mean that an older
+receipt used a different fingerprint format; it is not proof of replacement.
+Janitor recognizes the pre-Git-activity format only when the saved digest
+matches its immutable snapshot and that snapshot includes a known Git activity
+baseline. It compares that saved snapshot with fresh evidence under the current
+algorithm, without changing historical receipts. Unknown formats or incomplete
+legacy evidence still refuse; so do changed identity, activity, content and
+live protections. Never copy current metadata into an old receipt to make it pass.
+
+Use `janitor apply --expire --cleanup <cleanup-id>` to preview one cleanup
+batch. This scope includes every item in that batch; expiry does not support
+`--action`. Review the whole batch before separately approving execution.
+Deploying an expiry fix with automatic expiry already enabled can retry eligible
+items at the next scheduled cycle, even without a manual command. Keep any
+explicit retry hold in force when planning that deployment.
+
 Official provider `apply --prune` is a separate irreversible command. It does not create a quarantined copy; restore does not undo it. Do not treat a provider-reported success or a cleanup receipt as a backup. In a partial failure, preserve evidence, do not retry an irreversible provider call blindly, and reconcile the provider's actual state before any new approval.
 
 ## Verified export archives

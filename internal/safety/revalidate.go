@@ -100,15 +100,12 @@ func changeProtections(in RevalidateInput, fresh core.Entry) []core.Protection {
 		out = append(out, handleProtections(in, fresh)...)
 	}
 
-	planned := in.Planned.Fingerprint
-	if planned == "" {
-		planned = collect.Fingerprint(in.Planned)
-	}
-	current := fresh.Fingerprint
-	if current == "" {
-		current = collect.Fingerprint(fresh)
-	}
-	if planned != current {
+	planned, known := collect.SnapshotFingerprint(in.Planned)
+	current := collect.Fingerprint(fresh)
+	if !known {
+		out = append(out, protect(core.ProtectIdentityChanged, core.SourceFilesystem,
+			"saved fingerprint has an unknown format or insufficient legacy evidence"))
+	} else if planned != current {
 		out = append(out, protect(core.ProtectIdentityChanged, core.SourceFilesystem,
 			fmt.Sprintf("metadata changed since planning: fingerprint was %s, now %s",
 				shortFingerprint(planned), shortFingerprint(current))))

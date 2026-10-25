@@ -17,6 +17,31 @@ import (
 // protections, and observation timestamps: those change every scan and would
 // make every entry look modified.
 func Fingerprint(entry core.Entry) string {
+	return fingerprint(entry, true)
+}
+
+// SnapshotFingerprint validates a persisted digest against its own saved
+// metadata, then returns the current digest of that same immutable snapshot.
+// It never borrows observations from the live object. Before Git activity was
+// included in digests, receipts already saved LastActivity; only that known
+// historical format with a known activity baseline can be upgraded in memory.
+// Unknown digests or missing legacy evidence cannot authorize mutation.
+func SnapshotFingerprint(entry core.Entry) (string, bool) {
+	current := Fingerprint(entry)
+	if entry.Fingerprint == "" || entry.Fingerprint == current {
+		return current, true
+	}
+	if entry.ContractVersion != core.ContractVersion || entry.Git == nil ||
+		entry.Git.LastActivity.IsZero() || entry.ExportArchive != nil {
+		return "", false
+	}
+	if entry.Fingerprint != fingerprint(entry, false) {
+		return "", false
+	}
+	return current, true
+}
+
+func fingerprint(entry core.Entry, gitActivity bool) string {
 	h := sha256.New()
 	write := func(format string, args ...any) {
 		fmt.Fprintf(h, format+"\x00", args...)
@@ -50,7 +75,9 @@ func Fingerprint(entry core.Entry) string {
 			entry.Git.Head, entry.Git.Branch, entry.Git.DirtyFiles, entry.Git.Stashes,
 			entry.Git.UnpublishedCommits, entry.Git.Locked, entry.Git.Degraded,
 			entry.Git.UpstreamKnown, entry.Git.PublicationKnown, entry.Git.Bare, entry.Git.WorktreeOf, entry.Git.Remote)
-		write("git_activity=%d", entry.Git.LastActivity.UTC().UnixNano())
+		if gitActivity {
+			write("git_activity=%d", entry.Git.LastActivity.UTC().UnixNano())
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -80,7 +107,8 @@ func applyFingerprints(entries []core.Entry, prior []core.Entry, priorScanID str
 			continue
 		}
 		signal := "changed_since_prior_scan"
-		if before.Fingerprint != "" && before.Fingerprint == entry.Fingerprint {
+		beforeFingerprint, known := SnapshotFingerprint(before)
+		if before.Fingerprint != "" && known && beforeFingerprint == entry.Fingerprint {
 			signal = "unchanged_since_prior_scan"
 		}
 		addEvidence(entry, core.Evidence{
