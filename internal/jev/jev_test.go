@@ -325,7 +325,7 @@ func TestLiveRequestMatchesTheAPIContractAndMapsTypedAnswers(t *testing.T) {
 		t.Errorf("estimated cost = %v, want %v", report.Usage.EstimatedCostUSD, want)
 	}
 	usage := advisor.Usage()
-	if len(usage) != 1 || usage[0].Model != "~typesafe/jev-latest" || usage[0].PromptTokens != 1000 || usage[0].ScanID != "scan-1" {
+	if len(usage) != 1 || usage[0].Model != "fixture-resolved-model" || usage[0].PromptTokens != 1000 || usage[0].ScanID != "scan-1" {
 		t.Errorf("usage = %+v", usage)
 	}
 	decisions := advisor.Decisions()
