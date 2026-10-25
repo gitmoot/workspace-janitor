@@ -56,9 +56,9 @@ func newFakeJev(t *testing.T, action, class string) *fakeJev {
 		if err := json.Unmarshal(raw, &request); err != nil {
 			t.Errorf("undecodable request: %v", err)
 		}
-		if request.Model != "typesafe/jev-1.13" ||
+		if request.Model != "~typesafe/jev-latest" ||
 			len(request.Questions) != 4*len(request.State.Entries) {
-			t.Errorf("unexpected pinned model or typed questions: model=%q entries=%d questions=%d",
+			t.Errorf("unexpected rolling alias or typed questions: model=%q entries=%d questions=%d",
 				request.Model, len(request.State.Entries), len(request.Questions))
 		}
 		confidence, unsafe := 0.95, 0.01
@@ -70,7 +70,7 @@ func newFakeJev(t *testing.T, action, class string) *fakeJev {
 			answers[entry.Ref+"_unsafe"] = jev.Answer{Type: "noul", Noul: &unsafe}
 		}
 		_ = json.NewEncoder(w).Encode(jev.Response{
-			Model: "typesafe/jev-1.13", Answers: answers,
+			Model: "~typesafe/jev-latest", Answers: answers,
 			Usage: jev.Usage{InputTokens: 1000, OutputTokens: 40},
 		})
 	}))
@@ -168,15 +168,15 @@ func TestPlanConsultsJevForAmbiguousEntriesOnly(t *testing.T) {
 	}
 
 	report := doc.Data.Advisor
-	if report.Provider != "openrouter" || report.Model != "typesafe/jev-1.13" ||
+	if report.Provider != "openrouter" || report.Model != "~typesafe/jev-latest" ||
 		report.Mode != jev.ModeLive || report.Requests != 1 || report.Usage.InputTokens != 1000 {
 		t.Errorf("advisor report = %+v", report)
 	}
-	if doc.Data.Plan.Advisor != "openrouter:typesafe/jev-1.13" {
+	if doc.Data.Plan.Advisor != "openrouter:~typesafe/jev-latest" {
 		t.Errorf("plan advisor = %q", doc.Data.Plan.Advisor)
 	}
 	mystery := actionAt(t, doc.Data.Plan, filepath.Join(f.root, "mystery"))
-	if mystery.Kind != core.ActionKeep || !containsRule(mystery.Rules, "advisor:openrouter:typesafe/jev-1.13") {
+	if mystery.Kind != core.ActionKeep || !containsRule(mystery.Rules, "advisor:openrouter:~typesafe/jev-latest") {
 		t.Errorf("mystery = %s via %v, want the safer keep credited to the advisor", mystery.Kind, mystery.Rules)
 	}
 	if got := actionAt(t, doc.Data.Plan, filepath.Join(f.root, "node_modules")); got.Kind != core.ActionQuarantine {
@@ -374,7 +374,7 @@ func TestModelCannotMoveAProtectedEntry(t *testing.T) {
 	}
 	rejected := false
 	for _, alternative := range got.Rejected {
-		if alternative.Rule == "advisor:openrouter:typesafe/jev-1.13" {
+		if alternative.Rule == "advisor:openrouter:~typesafe/jev-latest" {
 			rejected = true
 		}
 	}

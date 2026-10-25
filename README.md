@@ -424,12 +424,17 @@ Rules-only planning is the default and is complete on its own. With
 `jev.enabled: true` and an OpenRouter key in the environment variable
 named by `jev.api_key_env` (`OPENROUTER_API_KEY` by default), `plan`
 offers entries the rules left **ambiguous** — and only those, after
-every rule has run — to pinned Jev `typesafe/jev-1.13` through
+every rule has run — to Jev's rolling alias `~typesafe/jev-latest` through
 `https://openrouter.ai/api/v1/systemone`. The direct TypeSafe endpoint
 is rejected. A missing key is not an error: the plan is built from rules
 alone and says so. The CLI reads process environment; it does not load
 dotenv files itself. Supply only the named variable to a future live
 process through the host's secure environment mechanism.
+Explicit older `jev.model` pins must be changed to `~typesafe/jev-latest`;
+other identifiers are rejected. The requested alias and provider-returned model
+are recorded separately. Existing historical decisions are not rewritten; the
+changed request model naturally misses old pinned cache keys. Rolling releases
+do not change deterministic safety thresholds or grant cleanup authority.
 
 What is sent is an allowlisted projection, never the entry itself: a
 `<root>/`-relative path with configured, protected, and secret-looking

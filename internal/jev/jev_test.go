@@ -29,7 +29,7 @@ const testKey = "sk-test-0123456789abcdef"
 func testPolicy(endpoint string) config.JevPolicy {
 	return config.JevPolicy{
 		Enabled:         true,
-		Model:           "typesafe/jev-1.13",
+		Model:           "~typesafe/jev-latest",
 		Endpoint:        endpoint,
 		APIKeyEnv:       "OPENROUTER_API_KEY",
 		MaxBatch:        20,
@@ -86,7 +86,7 @@ func testRedactor() Redactor {
 // it, and the facts a classification needs do.
 func TestRequestCarriesOnlySanitizedFacts(t *testing.T) {
 	projection := Project(sensitiveEntry(), "e1", testRedactor(), fixedNow)
-	body, err := json.Marshal(Build("typesafe/jev-1.13", []Projection{projection}))
+	body, err := json.Marshal(Build("~typesafe/jev-latest", []Projection{projection}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func answersFor(request Request, action, class, retention string, confidence, un
 		answers[retentionKey(entry.Ref)] = Answer{Type: "choice", Choice: retention, Confidence: f64(confidence)}
 		answers[unsafeKey(entry.Ref)] = Answer{Type: "noul", Noul: f64(unsafe)}
 	}
-	return Response{Model: "typesafe/jev-1.13", Answers: answers, Usage: Usage{InputTokens: 1000, OutputTokens: 40}}
+	return Response{Model: "fixture-resolved-model", Answers: answers, Usage: Usage{InputTokens: 1000, OutputTokens: 40}}
 }
 
 func mystery(path string) core.Entry {
@@ -281,7 +281,7 @@ func TestLiveRequestMatchesTheAPIContractAndMapsTypedAnswers(t *testing.T) {
 	if err := json.Unmarshal(server.bodies[0], &sent); err != nil {
 		t.Fatal(err)
 	}
-	if sent.Model != "typesafe/jev-1.13" || len(sent.State.Entries) != 1 || sent.State.Entries[0].Ref != "e1" {
+	if sent.Model != "~typesafe/jev-latest" || len(sent.State.Entries) != 1 || sent.State.Entries[0].Ref != "e1" {
 		t.Fatalf("sent model %q with entries %+v", sent.Model, sent.State.Entries)
 	}
 	keys := make([]string, 0, len(sent.Questions))
@@ -325,12 +325,12 @@ func TestLiveRequestMatchesTheAPIContractAndMapsTypedAnswers(t *testing.T) {
 		t.Errorf("estimated cost = %v, want %v", report.Usage.EstimatedCostUSD, want)
 	}
 	usage := advisor.Usage()
-	if len(usage) != 1 || usage[0].Model != "typesafe/jev-1.13" || usage[0].PromptTokens != 1000 || usage[0].ScanID != "scan-1" {
+	if len(usage) != 1 || usage[0].Model != "~typesafe/jev-latest" || usage[0].PromptTokens != 1000 || usage[0].ScanID != "scan-1" {
 		t.Errorf("usage = %+v", usage)
 	}
 	decisions := advisor.Decisions()
-	if len(decisions) != 1 || decisions[0].Key != CacheKey("fp-/home/fixture/out", SchemaVersion, "typesafe/jev-1.13", "policy-1") ||
-		!decisions[0].ExpiresAt.Equal(fixedNow.Add(24*time.Hour)) || decisions[0].ResolvedModel != "typesafe/jev-1.13" {
+	if len(decisions) != 1 || decisions[0].Key != CacheKey("fp-/home/fixture/out", SchemaVersion, "~typesafe/jev-latest", "policy-1") ||
+		!decisions[0].ExpiresAt.Equal(fixedNow.Add(24*time.Hour)) || decisions[0].ResolvedModel != "fixture-resolved-model" {
 		t.Errorf("decisions = %+v", decisions)
 	}
 }
@@ -401,7 +401,7 @@ func TestUnusableAnswerDoesNotKeepUncertainClass(t *testing.T) {
 func TestMalformedAnswerIsNotCached(t *testing.T) {
 	server := newFakeServer(t, func(n int, request Request) (int, http.Header, any) {
 		if n == 1 {
-			return http.StatusOK, nil, Response{Model: "typesafe/jev-1.13", Answers: map[string]Answer{},
+			return http.StatusOK, nil, Response{Model: "~typesafe/jev-latest", Answers: map[string]Answer{},
 				Usage: Usage{InputTokens: 100}}
 		}
 		return http.StatusOK, nil, answersFor(request, "keep", "cache", "none", 0.9, 0)
@@ -464,7 +464,7 @@ func TestClientRetriesBackpressureHonouringRetryAfter(t *testing.T) {
 				slept = append(slept, d)
 				return nil
 			}
-			exchange, err := client.Evaluate(context.Background(), Build("typesafe/jev-1.13", []Projection{{Ref: "e1"}}))
+			exchange, err := client.Evaluate(context.Background(), Build("~typesafe/jev-latest", []Projection{{Ref: "e1"}}))
 			if err != nil {
 				t.Fatalf("evaluate: %v", err)
 			}
@@ -483,7 +483,7 @@ func TestClientGivesUpAfterBoundedRetries(t *testing.T) {
 	server := newFakeServer(t, func(int, Request) (int, http.Header, any) {
 		return http.StatusTooManyRequests, nil, `{"error":"rate limited"}`
 	})
-	exchange, err := server.client().Evaluate(context.Background(), Build("typesafe/jev-1.13", nil))
+	exchange, err := server.client().Evaluate(context.Background(), Build("~typesafe/jev-latest", nil))
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusTooManyRequests {
 		t.Fatalf("err = %v, want a 429 APIError", err)
@@ -501,7 +501,7 @@ func TestClientDoesNotRetryPermanentFailures(t *testing.T) {
 			server := newFakeServer(t, func(int, Request) (int, http.Header, any) {
 				return status, nil, `{"error":"bad key ` + testKey + `"}`
 			})
-			exchange, err := server.client().Evaluate(context.Background(), Build("typesafe/jev-1.13", nil))
+			exchange, err := server.client().Evaluate(context.Background(), Build("~typesafe/jev-latest", nil))
 			if err == nil {
 				t.Fatal("want an error")
 			}
@@ -536,7 +536,7 @@ func TestClientRefusesRedirects(t *testing.T) {
 		Endpoint: source.URL, APIKey: testKey, HTTP: httpClient,
 		Timeout: time.Second, MaxRetries: 0,
 	}
-	exchange, err := client.Evaluate(context.Background(), Build("typesafe/jev-1.13", []Projection{{Ref: "e1"}}))
+	exchange, err := client.Evaluate(context.Background(), Build("~typesafe/jev-latest", []Projection{{Ref: "e1"}}))
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusTemporaryRedirect || exchange.Attempts != 1 {
 		t.Errorf("redirect = %+v, %v; want an unforwarded 307 after one request", exchange, err)
@@ -565,7 +565,7 @@ func TestClientTimesOutASlowServer(t *testing.T) {
 		Sleep: func(context.Context, time.Duration) error { return nil },
 	}
 	started := time.Now()
-	exchange, err := client.Evaluate(context.Background(), Build("typesafe/jev-1.13", nil))
+	exchange, err := client.Evaluate(context.Background(), Build("~typesafe/jev-latest", nil))
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || !apiErr.Retryable {
 		t.Fatalf("err = %v, want a retryable timeout", err)
@@ -597,7 +597,7 @@ func TestClientRetriesOrdinarySendGateTimeoutBeforeMidnight(t *testing.T) {
 		}
 		return nil
 	}
-	exchange, err := client.Evaluate(context.Background(), Build("typesafe/jev-1.13", []Projection{{Ref: "e1"}}))
+	exchange, err := client.Evaluate(context.Background(), Build("~typesafe/jev-latest", []Projection{{Ref: "e1"}}))
 	if err != nil || exchange.Attempts != 2 || reservations != 2 || server.calls() != 1 {
 		t.Fatalf("ordinary timeout consumed the rest of the advisory: err=%v attempts=%d reservations=%d calls=%d",
 			err, exchange.Attempts, reservations, server.calls())
@@ -628,7 +628,7 @@ func TestClientSendDeadlineCancelsPausedTransportWithoutRetry(t *testing.T) {
 		},
 		BeforeSend: func(context.Context) error { checks++; return nil },
 	}
-	exchange, err := client.Evaluate(context.Background(), Build("typesafe/jev-1.13", nil))
+	exchange, err := client.Evaluate(context.Background(), Build("~typesafe/jev-latest", nil))
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || !apiErr.Fatal || exchange.Attempts != 1 || checks != 1 {
 		t.Fatalf("expired send deadline retried: err=%v exchange=%+v gate checks=%d", err, exchange, checks)
@@ -734,14 +734,14 @@ func TestBatchesRespectLimits(t *testing.T) {
 	huge := Project(mystery("/home/fixture/"+strings.Repeat("deep/", 40000)+"x"), "e6", Redactor{}, fixedNow)
 	projections = append(projections, huge)
 
-	batches, oversized := Batches("typesafe/jev-1.13", projections, 2, 24000)
+	batches, oversized := Batches("~typesafe/jev-latest", projections, 2, 24000)
 	if len(oversized) != 1 || oversized[0].Ref != "e6" {
 		t.Fatalf("oversized = %v, want only e6", oversized)
 	}
 	sizes := []int{}
 	for _, batch := range batches {
 		sizes = append(sizes, len(batch))
-		if tokens := estimateTokens(Build("typesafe/jev-1.13", batch)); tokens > requestTokenLimit {
+		if tokens := estimateTokens(Build("~typesafe/jev-latest", batch)); tokens > requestTokenLimit {
 			t.Errorf("batch of %d estimates %d tokens, over the limit", len(batch), tokens)
 		}
 	}
@@ -751,7 +751,7 @@ func TestBatchesRespectLimits(t *testing.T) {
 
 	// The state budget covers the state plus the longest question, so a
 	// budget that fits a few entries splits five of them.
-	small, _ := Batches("typesafe/jev-1.13", projections[:5], 20, 500)
+	small, _ := Batches("~typesafe/jev-latest", projections[:5], 20, 500)
 	for _, batch := range small {
 		state := State{Task: task, Entries: batch}
 		if estimateTokens(state) > 500 {
@@ -778,15 +778,15 @@ func TestBatchesIncludeQuestionsInOpenRouterContextLimit(t *testing.T) {
 	if tokens := estimateTokens(state); tokens >= 24000 {
 		t.Fatalf("fixture state alone estimates %d tokens, want below the state limit", tokens)
 	}
-	if tokens := estimateTokens(Build("typesafe/jev-1.13", projections)); tokens <= requestTokenLimit {
+	if tokens := estimateTokens(Build("~typesafe/jev-latest", projections)); tokens <= requestTokenLimit {
 		t.Fatalf("fixture request estimates %d tokens, want above the total limit", tokens)
 	}
-	batches, oversized := Batches("typesafe/jev-1.13", projections, 20, 24000)
+	batches, oversized := Batches("~typesafe/jev-latest", projections, 20, 24000)
 	if len(oversized) != 0 || len(batches) < 2 {
 		t.Fatalf("total limit gave %d batch(es) and %d oversized entries", len(batches), len(oversized))
 	}
 	for _, batch := range batches {
-		if tokens := estimateTokens(Build("typesafe/jev-1.13", batch)); tokens > requestTokenLimit {
+		if tokens := estimateTokens(Build("~typesafe/jev-latest", batch)); tokens > requestTokenLimit {
 			t.Errorf("batch estimates %d tokens, over the OpenRouter request limit", tokens)
 		}
 	}
@@ -803,12 +803,12 @@ func (m memoryCache) Lookup(_ context.Context, key string, _ time.Time) (core.Re
 // A cached decision is reused without a request, and the key changes with
 // everything that could change the answer.
 func TestCacheReuseAndKeyBinding(t *testing.T) {
-	base := CacheKey("fp", 1, "typesafe/jev-1.13", "policy")
+	base := CacheKey("fp", 1, "~typesafe/jev-latest", "policy")
 	for name, other := range map[string]string{
-		"fingerprint": CacheKey("fp2", 1, "typesafe/jev-1.13", "policy"),
-		"schema":      CacheKey("fp", 2, "typesafe/jev-1.13", "policy"),
+		"fingerprint": CacheKey("fp2", 1, "~typesafe/jev-latest", "policy"),
+		"schema":      CacheKey("fp", 2, "~typesafe/jev-latest", "policy"),
 		"model":       CacheKey("fp", 1, "typesafe/jev-1.14", "policy"),
-		"policy":      CacheKey("fp", 1, "typesafe/jev-1.13", "policy2"),
+		"policy":      CacheKey("fp", 1, "~typesafe/jev-latest", "policy2"),
 	} {
 		if other == base {
 			t.Errorf("changing the %s did not change the cache key", name)
@@ -821,7 +821,7 @@ func TestCacheReuseAndKeyBinding(t *testing.T) {
 	entry := mystery("/home/fixture/cached")
 	cached := core.Recommendation{Action: core.ActionKeep, Class: core.ClassCache, Retention: core.RetentionNone,
 		Confidence: 0.9, Origin: core.OriginModel, DecidedAt: fixedNow}
-	cache := memoryCache{CacheKey(entry.Fingerprint, SchemaVersion, "typesafe/jev-1.13", "policy-1"): cached}
+	cache := memoryCache{CacheKey(entry.Fingerprint, SchemaVersion, "~typesafe/jev-latest", "policy-1"): cached}
 	advisor := liveAdvisor(t, testPolicy(server.server.URL+"/api/v1/systemone"), server.client(), cache)
 	advice, err := advisor.Classify(context.Background(), []core.Entry{entry})
 	if err != nil {

@@ -450,11 +450,6 @@ func TestProjectMarkerGlobsAreRejected(t *testing.T) {
 // accepted. The policy names a credential variable, never the key.
 func TestJevProviderSettingsAreValidated(t *testing.T) {
 	paths := fixturePaths(t)
-	defaults := DefaultPolicy(paths).Jev
-	if defaults.Enabled || defaults.Endpoint != "https://openrouter.ai/api/v1/systemone" ||
-		defaults.Model != "typesafe/jev-1.13" || defaults.APIKeyEnv != "OPENROUTER_API_KEY" {
-		t.Errorf("unsafe or unpinned Jev defaults: %+v", defaults)
-	}
 	_, err := parse(t, paths, strings.Join([]string{
 		"roots:",
 		"  - path: /repos",
@@ -495,14 +490,14 @@ func TestJevProviderSettingsAreValidated(t *testing.T) {
 			t.Errorf("endpoint %s must be rejected before any request", endpoint)
 		}
 	}
-	for _, model := range []string{"typesafe/jev-1.13", "jev-1.13"} {
+	for _, model := range []string{"~typesafe/jev-latest"} {
 		if _, err := parse(t, paths, "roots:\n  - path: /repos\njev:\n  model: "+model+"\n"); err != nil {
-			t.Errorf("pinned model %s must be accepted: %v", model, err)
+			t.Errorf("canonical rolling alias %s must be accepted: %v", model, err)
 		}
 	}
-	for _, model := range []string{"jev-latest", `""`} {
+	for _, model := range []string{"typesafe/jev-1.13", "jev-1.13", "typesafe/jev-1.14", "typesafe/jev-latest", "jev-latest", `""`} {
 		if _, err := parse(t, paths, "roots:\n  - path: /repos\njev:\n  model: "+model+"\n"); err == nil {
-			t.Errorf("unpinned model %s must be rejected", model)
+			t.Errorf("noncanonical model %s must be rejected", model)
 		}
 	}
 

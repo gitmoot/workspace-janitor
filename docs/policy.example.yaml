@@ -150,7 +150,7 @@ evidence_exports: []
 # projection, and advice is applied only when it is safer than the rules.
 jev:
   enabled: false
-  model: typesafe/jev-1.13
+  model: ~typesafe/jev-latest
   # Hosted calls go only to OpenRouter's System One endpoint. Loopback
   # HTTP is accepted for isolated fake-server tests.
   endpoint: https://openrouter.ai/api/v1/systemone
