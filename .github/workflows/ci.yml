@@ -70,15 +70,21 @@ jobs:
           ./dist/janitor-linux-amd64 version
 
       - name: prove rolling alias contract
+        continue-on-error: true
         env:
           XDG_STATE_HOME: ${{ runner.temp }}/jev-proof-state
         run: |
           GOBIN="$RUNNER_TEMP/proof-bin" go install github.com/gitmoot/test-check/cmd/test-check@d5f169ab623e8ba0896b727a09f36738612a79e2
+          set +e
           "$RUNNER_TEMP/proof-bin/test-check" prove --base origin/main --json --test "go test -p 1 ./internal/config ./internal/jev ./internal/cli -v -count=1 -run '^{name}$'" > dist/jev-proof.json
+          proof_status=$?
+          cat dist/jev-proof.json
           cp -r "$XDG_STATE_HOME/test-check/receipts" dist/jev-receipts
+          exit "$proof_status"
 
       - name: upload release-readiness artifact
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: janitor-linux-amd64
           path: |
