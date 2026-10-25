@@ -12,7 +12,7 @@ import (
 )
 
 // Request is the body of POST /api/v1/systemone on OpenRouter: a state,
-// a pinned model, and a map of typed questions.
+// the configured rolling model alias, and a map of typed questions.
 type Request struct {
 	State     State               `json:"state"`
 	Model     string              `json:"model"`
