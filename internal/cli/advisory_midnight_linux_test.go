@@ -28,7 +28,7 @@ func TestDailyAdvisoryReservationBeforeMidnightCannotSendAfter(t *testing.T) {
 		},
 		BeforeSend: func(context.Context) error { return advisorySendDay(day, clock) },
 	}
-	exchange, err := client.Evaluate(context.Background(), jev.Build("typesafe/jev-1.13", nil))
+	exchange, err := client.Evaluate(context.Background(), jev.Build("~typesafe/jev-latest", nil))
 	var apiErr *jev.APIError
 	if !errors.As(err, &apiErr) || !apiErr.Fatal || exchange.Attempts != 1 || reservations != 1 || calls.Load() != 0 {
 		t.Fatalf("midnight reservation sent or retried: err=%v exchange=%+v reservations=%d calls=%d", err, exchange, reservations, calls.Load())

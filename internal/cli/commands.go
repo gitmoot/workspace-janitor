@@ -105,7 +105,7 @@ func planCommand() *command {
 			"A plan is bound to the scan, the evidence, and the policy it was built\n" +
 			"from, and is immutable once stored. Approving selects actions by id or\n" +
 			"path; it never edits the plan.\n\n" +
-			"Entries the rules leave ambiguous can be offered to pinned Jev via\n" +
+			"Entries the rules leave ambiguous can be offered to Jev's rolling alias via\n" +
 			"OpenRouter when jev.enabled is true and an API key is in the environment\n" +
 			"variable named by jev.api_key_env (default OPENROUTER_API_KEY). Only a\n" +
 			"redacted, allowlisted projection is sent. The model may only propose\n" +

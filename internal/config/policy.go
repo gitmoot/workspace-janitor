@@ -331,7 +331,7 @@ func DefaultPolicy(p Paths) Policy {
 		Caches: []CacheRule{},
 		Jev: JevPolicy{
 			Enabled:   false,
-			Model:     "typesafe/jev-1.13",
+			Model:     "~typesafe/jev-latest",
 			Endpoint:  openRouterSystemOneEndpoint,
 			APIKeyEnv: "OPENROUTER_API_KEY",
 			MaxBatch:  20,
@@ -344,8 +344,8 @@ func DefaultPolicy(p Paths) Policy {
 			BreakerFailures: 3,
 			MinConfidence:   0.7,
 			MaxUnsafe:       0.2,
-			// Published price for jev-1.13.0: $0.042 per million input
-			// tokens; output tokens are free.
+			// Retain the configured input-token cost estimate across alias
+			// updates; actual usage and resolved model are recorded separately.
 			PricePerMTokUSD: 0.042,
 			CacheTTL:        Duration(30 * 24 * time.Hour),
 			RedactSegments:  []string{},
@@ -892,8 +892,8 @@ func validateJev(j JevPolicy) core.FieldErrors {
 	if err := validateEndpoint(j.Endpoint); err != nil {
 		errs.Add("jev.endpoint", "%v", err)
 	}
-	if j.Model != "typesafe/jev-1.13" && j.Model != "jev-1.13" {
-		errs.Add("jev.model", "must pin the OpenRouter Jev 1.13 model, got %q", j.Model)
+	if j.Model != "~typesafe/jev-latest" {
+		errs.Add("jev.model", "must use the OpenRouter rolling alias ~typesafe/jev-latest, got %q", j.Model)
 	}
 	if !isEnvName(j.APIKeyEnv) {
 		errs.Add("jev.api_key_env", "must name an environment variable, got %q", j.APIKeyEnv)

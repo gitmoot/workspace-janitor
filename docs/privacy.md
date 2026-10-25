@@ -2,13 +2,13 @@
 
 No telemetry is sent by default. With `jev.enabled: false` (the default), planning runs from local rules without provider credentials or network calls to Jev; `watch` and `cycle` do not call the model. Local scans, plans, receipts, and optional model usage accounting live in the configured state directory. See [policy reference](policy-reference.md) for configuration and [threat model](threat-model.md) for trust limits.
 
-When an operator explicitly enables Jev, `plan` sends only **ambiguous** entries after deterministic rules. The policy names an environment variable (`OPENROUTER_API_KEY` by default), not a key value. Hosted requests go to `https://openrouter.ai/api/v1/systemone` with model `typesafe/jev-1.13`; a loopback HTTP endpoint is permitted for isolated testing. The key is sent as a bearer header to the configured endpoint. No dotenv file is loaded by the CLI. Missing credentials leave rules-only planning in place. Direct manual `plan` calls are not given the network sandbox of generated systemd services.
+When an operator explicitly enables Jev, `plan` sends only **ambiguous** entries after deterministic rules. The policy names an environment variable (`OPENROUTER_API_KEY` by default), not a key value. Hosted requests go to `https://openrouter.ai/api/v1/systemone` with rolling model alias `~typesafe/jev-latest`; a loopback HTTP endpoint is permitted for isolated testing. The key is sent as a bearer header to the configured endpoint. No dotenv file is loaded by the CLI. Missing credentials leave rules-only planning in place. Direct manual `plan` calls are not given the network sandbox of generated systemd services.
 
 The following is a **synthetic illustration** of the JSON request shape, not a captured request, real workspace name, secret, or copy-paste payload. The actual request has four fully specified questions per entry (class, action, risk, retention), not ellipses; use `janitor plan --jev-dry-run` in an isolated fixture for the exact bytes without sending or storing a request.
 
 ```json
 {
-  "model": "typesafe/jev-1.13",
+  "model": "~typesafe/jev-latest",
   "state": {
     "task": "Classify workspace directories on a developer machine for a cleanup tool. Each entry is sanitized metadata only: no file contents are available. Answers are advisory; a deterministic safety engine makes every final decision.",
     "entries": [{
