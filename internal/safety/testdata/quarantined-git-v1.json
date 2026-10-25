@@ -1,0 +1,65 @@
+{
+  "contract_version": 1,
+  "path": "/root/.local/state/workspace-janitor/quarantine/cleanup-869c8592-ae2c-4296-9d38-c7b8b51c39a7/action-048c4d5f023addc6/item",
+  "root": "/root/.local/state/workspace-janitor/quarantine/cleanup-869c8592-ae2c-4296-9d38-c7b8b51c39a7/action-048c4d5f023addc6",
+  "kind": "directory",
+  "filesystem_id": {
+    "device": 2306,
+    "inode": 18110549
+  },
+  "ownership": {
+    "uid": 0,
+    "gid": 0,
+    "mode": "0755"
+  },
+  "size_bytes": 4096,
+  "size_is_deep": false,
+  "modified_at": "2026-10-14T16:35:17.11423141Z",
+  "latest_modified_at": "0001-01-01T00:00:00Z",
+  "accessed_at": "2026-10-21T16:36:09.916897805Z",
+  "fingerprint": "634e6b126c264acb76e7ceee801d9259d44ab06bcfa0ce11e235764397817726",
+  "class": "unknown",
+  "git": {
+    "repo_root": "/root/.local/state/workspace-janitor/quarantine/cleanup-869c8592-ae2c-4296-9d38-c7b8b51c39a7/action-048c4d5f023addc6/item",
+    "worktree_of": "/root/docus",
+    "bare": false,
+    "remote": "https://github.com/themartianapp/docus.git",
+    "head": "5225755e9ade1b2039aece05aa3931eabf1cb6d1",
+    "upstream_known": false,
+    "last_activity": "2026-10-14T20:40:56.609587935Z",
+    "publication_known": true,
+    "contents_known": true,
+    "dirty_files": 0,
+    "stashes": 0,
+    "unpublished_commits": 0,
+    "locked": false,
+    "degraded": false
+  },
+  "evidence": [
+    {
+      "source": "filesystem",
+      "signal": "lstat",
+      "detail": "directory 0755 identity 2306:18110549",
+      "observed_at": "2026-10-21T22:00:43.600095804Z"
+    },
+    {
+      "source": "filesystem",
+      "signal": "project_marker",
+      "detail": ".git",
+      "observed_at": "2026-10-21T22:00:43.600095804Z"
+    },
+    {
+      "source": "git",
+      "signal": "linked_worktree",
+      "detail": "git directory /root/docus/.git/worktrees/docus-landing",
+      "observed_at": "2026-10-21T22:00:43.600095804Z"
+    },
+    {
+      "source": "git",
+      "signal": "git_state",
+      "detail": "branch \"\" head \"5225755e9ade\" dirty 0 stashes 0 unpublished 0 upstream false",
+      "observed_at": "2026-10-21T22:00:43.600095804Z"
+    }
+  ],
+  "observed_at": "2026-10-21T22:00:43.600095804Z"
+}
