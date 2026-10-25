@@ -56,7 +56,6 @@ jobs:
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 0
 
       - name: verify candidate source identity
         run: test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
@@ -69,16 +68,6 @@ jobs:
           ./dist/janitor-linux-amd64 --help
           ./dist/janitor-linux-amd64 version
 
-      # Temporary cross-version evidence for #77; removed after receipts are saved.
-      - name: prove legacy receipt compatibility
-        env:
-          XDG_STATE_HOME: ${{ runner.temp }}/legacy-proof-state
-        run: |
-          GOBIN="$RUNNER_TEMP/proof-bin" go install github.com/gitmoot/test-check/cmd/test-check@d5f169ab623e8ba0896b727a09f36738612a79e2
-          "$RUNNER_TEMP/proof-bin/test-check" prove --base origin/main --json --test "go test -p 1 ./internal/safety -v -count=1 -run '^{name}$'" > dist/legacy-proof.json
-          python3 scripts/legacy-receipt-smoke.py dist/legacy-smoke.json
-          cp -r "$XDG_STATE_HOME/test-check/receipts" dist/legacy-receipts
-
       - name: upload release-readiness artifact
         uses: actions/upload-artifact@v4
         with:
@@ -86,5 +75,4 @@ jobs:
           path: |
             dist/janitor-linux-amd64
             dist/SHA256SUMS
-            dist/legacy-*
           if-no-files-found: error
