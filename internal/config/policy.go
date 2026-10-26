@@ -288,15 +288,16 @@ type RecoveryPolicy struct {
 
 // Policy is the validated policy document.
 type Policy struct {
-	Version         int                  `yaml:"version" json:"version"`
-	Roots           []Root               `yaml:"roots" json:"roots"`
-	Protect         Protect              `yaml:"protect" json:"protect"`
-	Retention       RetentionPolicy      `yaml:"retention" json:"retention"`
-	Caches          []CacheRule          `yaml:"caches" json:"caches"`
-	EvidenceExports []EvidenceExportRule `yaml:"evidence_exports" json:"evidence_exports"`
-	Gitmoot         GitmootPolicy        `yaml:"gitmoot" json:"gitmoot"`
-	Collectors      Collectors           `yaml:"collectors" json:"collectors"`
-	Safety          Safety               `yaml:"safety" json:"safety"`
+	Version             int                       `yaml:"version" json:"version"`
+	Roots               []Root                    `yaml:"roots" json:"roots"`
+	Protect             Protect                   `yaml:"protect" json:"protect"`
+	Retention           RetentionPolicy           `yaml:"retention" json:"retention"`
+	Caches              []CacheRule               `yaml:"caches" json:"caches"`
+	EvidenceExports     []EvidenceExportRule      `yaml:"evidence_exports" json:"evidence_exports"`
+	SourceNameApprovals *SourceNameApprovalPolicy `yaml:"source_name_approvals,omitempty" json:"source_name_approvals,omitempty"`
+	Gitmoot             GitmootPolicy             `yaml:"gitmoot" json:"gitmoot"`
+	Collectors          Collectors                `yaml:"collectors" json:"collectors"`
+	Safety              Safety                    `yaml:"safety" json:"safety"`
 
 	Prevention     Prevention      `yaml:"prevention" json:"prevention"`
 	CanonicalRoots []CanonicalRoot `yaml:"canonical_roots" json:"canonical_roots"`
@@ -432,6 +433,12 @@ func (p Policy) clone() Policy {
 	out.Protect.NamePatterns = append([]string(nil), p.Protect.NamePatterns...)
 	out.Caches = append([]CacheRule(nil), p.Caches...)
 	out.EvidenceExports = append([]EvidenceExportRule(nil), p.EvidenceExports...)
+	if p.SourceNameApprovals != nil {
+		approvals := *p.SourceNameApprovals
+		approvals.Reviewers = append([]string(nil), approvals.Reviewers...)
+		approvals.Files = append([]SourceNameApproval(nil), approvals.Files...)
+		out.SourceNameApprovals = &approvals
+	}
 	out.Prevention.Targets = append([]CapacityTarget(nil), p.Prevention.Targets...)
 	out.Gitmoot = p.Gitmoot
 	out.Jev.RedactSegments = append([]string(nil), p.Jev.RedactSegments...)
@@ -568,6 +575,7 @@ func mergeUnique(base, extra []string) []string {
 func (p *Policy) Validate() core.FieldErrors {
 	var errs core.FieldErrors
 	p.validateEvidenceExports(&errs)
+	p.validateSourceNameApprovals(&errs)
 	if p.Version != PolicyVersion {
 		errs.Add("version", "must be %d, got %d", PolicyVersion, p.Version)
 	}

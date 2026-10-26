@@ -267,6 +267,55 @@ including receipts created by older binaries. Receipt descendants retain their
 original policy paths after Git-aware relocation; removing a cache approval
 revokes expiry permission. Restore remains available after a proof refusal.
 
+## Reviewed source-name exceptions
+
+`source_name_approvals` is absent by default. A tracked, published file such as
+`credentials.go` can still match a protected name. Tracking, a source extension,
+or a secret scan never creates permission to remove it. Without an exact
+authorized review record, the name remains protected.
+
+This optional policy adjudicates **one protected-name match**, not the containing
+workspace's lifecycle or disposal permission. The operator must explicitly
+authorize each reviewer's source-content scope and record the determination
+that the exact bytes are ordinary source/documentation, not credential or
+evidence payloads. A reviewer may be an authorized agent; do not describe that
+as human review. Janitor neither authenticates the external review record nor
+generates approvals. Protect the policy file as an administrative authority.
+
+| Field | Contract |
+| --- | --- |
+| `source_name_approvals.generation` | Nonempty policy generation, at most 128 bytes. |
+| `source_name_approvals.reviewers` | Explicit authorized issuer identities; at most 64 unique entries. |
+| `source_name_approvals.files` | At most 64 exact file/pattern records; no directory, glob or repository-wide approvals. |
+| `files[].repository`, `remote`, `path` | Canonical absolute **original checkout** path, exact credential-free HTTPS origin URL or canonical local origin path, and exact relative source/documentation file path. SSH origin forms are not supported for these records. |
+| `commit`, `blob`, `sha256` | Full lowercase commit/blob IDs and SHA-256 of reviewed file bytes. The commit must be published according to local origin-tracking refs; its path's blob, current index blob and actual Git object hash must agree. No fetch occurs. |
+| `name_pattern` | One configured `protect.name_patterns` rule matching this basename. Every matching protected-name rule needs its own record. |
+| `reviewer`, `record`, `generation` | Authorized issuer, reference to the exact content review, and current policy generation. Store references, not credential contents. |
+| `reviewed_at`, `expires_at` | Explicit timestamps; review must not be in the future and expiry must be strictly later than the current evaluation time. |
+
+Only ordinary source/documentation extensions are eligible, and that is only
+a negative filter. The file must be Git-tracked, regular, non-hardlinked, at
+most 1 MiB, and match the index executable/type mode. Hidden path components,
+secret containers such as `.env`, keys and credential JSON, databases, evidence
+name matches, links, special files and mount crossings cannot be approved.
+Explicit protected paths, report-only roots and preserving/bounded cache rules
+still win. Dirty/stashed/unpublished state, consumers, lifecycle and capacity
+gates remain independent.
+
+Quarantine and expiry reopen and hash the actual file without following links,
+check its identity before and after reading, and revalidate the record. The
+complete approval policy is included in the safety fingerprint whenever used;
+changing even another record invalidates an existing approval snapshot.
+Unknown, missing, changed, ambiguous, revoked or expired approval preserves the
+workspace. Restore remains available after refusal. No live approval entries
+are installed by enabling this feature.
+
+A protected-name refusal is reported as `policy_protected`, with a path and
+rule but no file contents. It is not reported as broken Git metadata or a
+collector failure. Actual metadata, I/O and bounded-proof failures retain their
+existing fail-closed reporting.
+
+
 ## Exact evidence exports
 
 `evidence_exports` is empty by default. Each rule names one completed, inactive,
