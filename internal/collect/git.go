@@ -162,13 +162,20 @@ func collectGit(ctx context.Context, opts *Options, entries []core.Entry, now ti
 		}
 		report.Recorded++
 		if entry.Git != nil && !entry.Git.Bare && !entry.Git.Degraded && entry.Git.DirtyFiles == 0 {
-			if err := proveWorktreeContents(ctx, runner, entry.Path, opts); err != nil {
-				entry.Git.Degraded = true
-				entry.Git.DegradedReason = err.Error()
-				addUnknown(entry, core.SourceGit, core.ProtectCollectorFailure,
-					"worktree_contents_unknown", err.Error(), now)
-				report.Unknowns++
-				report.Status = core.CollectorPartial
+			if err := proveWorktreeContents(ctx, runner, entry.Path, opts, entry.Git, now); err != nil {
+				var refusal *worktreePolicyRefusal
+				if errors.As(err, &refusal) {
+					entry.Git.ContentsProtection = refusal.Error()
+					addProtection(entry, core.Protection{Kind: core.ProtectPolicyProtected, Source: core.SourceGit, Blocking: true, Reason: refusal.Error()})
+					addEvidence(entry, core.Evidence{Source: core.SourceGit, Signal: "worktree_protected_name", Detail: refusal.Error(), ObservedAt: now})
+				} else {
+					entry.Git.Degraded = true
+					entry.Git.DegradedReason = err.Error()
+					addUnknown(entry, core.SourceGit, core.ProtectCollectorFailure,
+						"worktree_contents_unknown", err.Error(), now)
+					report.Unknowns++
+					report.Status = core.CollectorPartial
+				}
 			} else {
 				entry.Git.ContentsKnown = true
 			}

@@ -78,6 +78,9 @@ func fingerprint(entry core.Entry, gitActivity bool) string {
 		if gitActivity {
 			write("git_activity=%d", entry.Git.LastActivity.UTC().UnixNano())
 		}
+		if entry.Git.SourceApprovalFingerprint != "" {
+			write("source_approvals=%s", entry.Git.SourceApprovalFingerprint)
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

@@ -155,11 +155,16 @@ type GitState struct {
 	// PublicationKnown records that UnpublishedCommits was measured against
 	// every remote-tracking branch. Without it publication is unknown.
 	PublicationKnown bool `json:"publication_known"`
-	// ContentsKnown means a bounded, metadata-only proof found no unapproved
-	// ignored content. Mutations must recompute it under the current policy.
-	// Omit the unknown value to preserve legacy receipt JSON identity checks.
+	// ContentsKnown means a bounded proof found no unapproved descendants.
+	// Only explicitly reviewed source-name exceptions require content hashing.
+	// Omit new zero fields to preserve legacy receipt JSON identity checks.
 	ContentsKnown bool `json:"contents_known,omitempty"`
-	DirtyFiles    int  `json:"dirty_files"`
+	// ContentsProtection is an observed policy refusal, not broken Git metadata.
+	ContentsProtection string `json:"contents_protection,omitempty"`
+	// SourceApprovalFingerprint binds any used source exception to its complete
+	// current approval policy. Changes invalidate quarantine/expiry snapshots.
+	SourceApprovalFingerprint string `json:"source_approval_fingerprint,omitempty"`
+	DirtyFiles                int    `json:"dirty_files"`
 	// Stashes counts stash entries removing this checkout would lose. A
 	// linked worktree shares its repository's stashes, so it records zero.
 	Stashes            int    `json:"stashes"`
