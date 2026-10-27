@@ -71,7 +71,7 @@ type categoryArchiveReport struct {
 // report-only roots, ...) refuses its path; otherwise its path simply has no
 // archive authority and stays local.
 func withCategoryArchives(ctx context.Context, paths config.Paths, policy config.Policy) (config.Policy, error) {
-	if len(policy.WorkspaceArchiveCategories) == 0 {
+	if !policy.HasArchiveCategories() {
 		return policy, nil
 	}
 	records, err := store.ReadCategoryArchives(ctx, paths.DatabaseFile)
@@ -91,7 +91,7 @@ func withCategoryArchives(ctx context.Context, paths config.Paths, policy config
 // activeCategoryRule rebuilds the pinned rule of record, or reports why the
 // receipt carries no local-expiry authority under policy.
 func activeCategoryRule(policy config.Policy, record store.CategoryArchive) (config.WorkspaceArchiveRule, string) {
-	category, ok := policy.WorkspaceArchiveCategory(record.Category)
+	category, ok := policy.ArchiveCategory(record.Category, record.Kind)
 	switch {
 	case !ok:
 		return config.WorkspaceArchiveRule{}, "its category is no longer configured"
@@ -243,7 +243,7 @@ func categoryPreflight(paths config.Paths, category config.WorkspaceArchiveCateg
 	if err != nil {
 		return fmt.Errorf("policy recheck refused category archive: %w", err)
 	}
-	latest, ok := current.WorkspaceArchiveCategory(category.Name)
+	latest, ok := current.ArchiveCategory(category.Name, string(category.Kind))
 	if !ok || latest.Kind != category.Kind || latest.Archive != category.Archive || latest.LocalRetention != category.LocalRetention ||
 		!slices.Contains(latest.Roots, filepath.Dir(path)) {
 		return fmt.Errorf("archive category %q was withdrawn or changed during archiving; original retained", category.Name)
@@ -263,8 +263,8 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 	now := time.Now().UTC()
 	report := categoryArchiveReport{Mode: "category_archive", DryRun: dryRun, RunID: "category-" + now.Format("20060102T150405.000000000Z"), Status: "preview", Items: []categoryArchiveItem{},
 		Attribution: "Category archive creation copies data and frees no source bytes. Archived items reach quarantine only after their local retention, through the ordinary quarantine and expiry engine."}
-	if len(policy.WorkspaceArchiveCategories) == 0 {
-		return report, errors.New("no workspace_archive_categories are configured")
+	if !policy.HasArchiveCategories() {
+		return report, errors.New("no workspace_archive_categories are configured and report.release_action is not archive")
 	}
 	var db *store.Store
 	if !dryRun {
@@ -289,23 +289,39 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 	for _, record := range records {
 		recorded[record.Path] = record
 	}
+	releases, err := archivableReleases(ctx, paths, policy)
+	if err != nil {
+		return report, fmt.Errorf("stale report replies: %w", err)
+	}
+	if len(policy.WorkspaceArchiveCategories) == 0 && len(releases) == 0 {
+		if !dryRun {
+			report.Status = "completed"
+		}
+		return report, nil
+	}
 
-	// One fresh, deep, depth-1 observation of every category root with the
-	// policy file alone: existing category pins must not shape selection.
-	// Every candidate gets its own deep-size budget, so a few large siblings
-	// cannot leave the rest of a root unmeasured (and so unselectable).
-	var specs []collect.RootSpec
+	// One fresh, deep, depth-1 observation of every category root (and, with
+	// releases to archive, every report root) with the policy file alone:
+	// existing category pins must not shape selection. Every candidate gets
+	// its own deep-size budget, so a few large siblings cannot leave the rest
+	// of a root unmeasured (and so unselectable).
+	var roots []string
 	for _, category := range policy.WorkspaceArchiveCategories {
-		for _, root := range category.Roots {
-			if slices.ContainsFunc(specs, func(spec collect.RootSpec) bool { return spec.Path == root }) {
-				continue
-			}
-			for _, configured := range policy.Roots {
-				if configured.Path == root {
-					spec := rootSpec(configured, scanOptions{})
-					spec.MaxDepth = 1
-					specs = append(specs, spec)
-				}
+		roots = append(roots, category.Roots...)
+	}
+	if len(releases) != 0 {
+		roots = append(roots, policy.Report.Roots...)
+	}
+	var specs []collect.RootSpec
+	for _, root := range roots {
+		if slices.ContainsFunc(specs, func(spec collect.RootSpec) bool { return spec.Path == root }) {
+			continue
+		}
+		for _, configured := range policy.Roots {
+			if configured.Path == root {
+				spec := rootSpec(configured, scanOptions{})
+				spec.MaxDepth = 1
+				specs = append(specs, spec)
 			}
 		}
 	}
@@ -317,22 +333,48 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 		return report, err
 	}
 	safetyPolicy := enginePolicy(paths, policy)
+	releaseOwners := releaseOwnerAttribution(ctx, policy, releases)
 
 	type pending struct {
-		item   int
-		newest time.Time
+		item     int
+		newest   time.Time
+		category config.WorkspaceArchiveCategory
+		release  *store.ReportReply
 	}
 	queues := map[string][]pending{}
 	for _, entry := range observed.Entries {
 		parent := filepath.Dir(entry.Path)
-		var matching []config.WorkspaceArchiveCategory
-		for _, category := range policy.WorkspaceArchiveCategories {
-			if slices.Contains(category.Roots, parent) {
-				matching = append(matching, category)
+		kind, reason := categoryKindOf(entry)
+		var (
+			category *config.WorkspaceArchiveCategory
+			release  *store.ReportReply
+		)
+		if reply, ok := releases[entry.Path]; ok && slices.Contains(policy.Report.Roots, parent) {
+			// An owner's release takes the item out of any category: it is
+			// archived as released, or not at all.
+			release = &reply
+			if releaseCategory, ok := policy.Report.ReleaseCategory(kind); ok {
+				category = &releaseCategory
 			}
-		}
-		if len(matching) == 0 {
-			continue
+		} else {
+			var matching []config.WorkspaceArchiveCategory
+			for _, candidate := range policy.WorkspaceArchiveCategories {
+				if slices.Contains(candidate.Roots, parent) {
+					matching = append(matching, candidate)
+				}
+			}
+			if len(matching) == 0 {
+				continue
+			}
+			for i := range matching {
+				if kind != "" && matching[i].Kind == kind {
+					category = &matching[i]
+					break
+				}
+			}
+			if category == nil && reason == "" {
+				reason = fmt.Sprintf("a %s item matches no category configured for %s", kind, parent)
+			}
 		}
 		item := categoryArchiveItem{Path: entry.Path, Status: categoryRefused, SizeBytes: entry.SizeBytes, SizeKnown: entry.SizeIsDeep && !entry.SizeIsLowerBound}
 		if !entry.LatestModifiedAt.IsZero() {
@@ -340,18 +382,7 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			item.NewestModifiedAt = &newest
 			item.IdleFor = now.Sub(newest).Truncate(time.Second).String()
 		}
-		kind, reason := categoryKindOf(entry)
-		var category *config.WorkspaceArchiveCategory
-		for i := range matching {
-			if kind != "" && matching[i].Kind == kind {
-				category = &matching[i]
-				break
-			}
-		}
 		if category == nil {
-			if reason == "" {
-				reason = fmt.Sprintf("a %s item matches no category configured for %s", kind, parent)
-			}
 			item.Reasons = []string{reason}
 			report.Items = append(report.Items, item)
 			continue
@@ -367,21 +398,39 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			report.Items = append(report.Items, item)
 			continue
 		}
+		if release != nil {
+			if void := releaseVoid(*release, entry, releaseOwners.owner(entry.Path)); void != "" {
+				item.Reasons = []string{fmt.Sprintf("release by %s (reply %d) is void: %s", release.Role, release.Sequence, void)}
+				report.Items = append(report.Items, item)
+				continue
+			}
+			if active := releaseOwners.active(entry.Path); active != "" {
+				item.Reasons = []string{"released item is in use: " + active}
+				report.Items = append(report.Items, item)
+				continue
+			}
+		}
 		entry.Class = plan.Classify(entry, policy).Class
 		verdict := safety.Evaluate(safety.Input{Entry: entry, Policy: safetyPolicy, Now: now})
 		if item.Reasons = categoryRefusals(policy, *category, entry, verdict, now); len(item.Reasons) == 0 {
-			queues[category.Name] = append(queues[category.Name], pending{len(report.Items), entry.LatestModifiedAt})
+			queues[category.Name] = append(queues[category.Name], pending{len(report.Items), entry.LatestModifiedAt, *category, release})
 		}
 		report.Items = append(report.Items, item)
 	}
 
 	var failures []error
-	// Every category rule searches every inventory root for dependents, so
-	// one snapshot walk of them serves every candidate of this run instead of
-	// one bounded walk per candidate. Built only when there is a candidate.
+	// Every category rule (released report items included) searches every
+	// inventory root for dependents, so one snapshot walk of them serves every
+	// candidate of this run instead of one bounded walk per candidate. Built
+	// only when there is a candidate.
 	var dependents *workspacearchive.DependentIndex
+	order := make([]string, 0, len(policy.WorkspaceArchiveCategories)+1)
 	for _, category := range policy.WorkspaceArchiveCategories {
-		queue := queues[category.Name]
+		order = append(order, category.Name)
+	}
+	order = append(order, config.ReportReleaseCategory)
+	for _, categoryName := range order {
+		queue := queues[categoryName]
 		// Oldest first: the longest-idle items are archived before newer ones.
 		sort.SliceStable(queue, func(i, j int) bool {
 			if !queue[i].newest.Equal(queue[j].newest) {
@@ -390,6 +439,7 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			return report.Items[queue[i].item].Path < report.Items[queue[j].item].Path
 		})
 		for n, next := range queue {
+			category := next.category
 			item := &report.Items[next.item]
 			if n >= category.MaxItemsPerCycle {
 				item.Status = categoryDeferred
@@ -402,7 +452,20 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			}
 			name := categoryItemName(category.Name, item.Path, report.RunID)
 			owner := config.CategoryOwnerPrefix + category.Name
-			rule := categoryRule(category, name, item.Path, owner, owner+"@"+report.RunID)
+			release := owner + "@" + report.RunID
+			path := item.Path
+			preflight := func() error { return categoryPreflight(paths, category, path) }
+			if next.release != nil {
+				reply := *next.release
+				release = fmt.Sprintf("%s@report-reply-%d", reply.Role, reply.Sequence)
+				preflight = func() error {
+					if err := categoryPreflight(paths, category, path); err != nil {
+						return err
+					}
+					return releaseStillEffective(ctx, paths, reply)
+				}
+			}
+			rule := categoryRule(category, name, item.Path, owner, release)
 			scope := workspacearchive.PolicyScope(policy, rule)
 			if dependents == nil {
 				dependents = workspacearchive.BuildDependentIndex(ctx, scope.SearchRoots, policy.Limits.DependentIndexMaxEntries)
@@ -424,7 +487,7 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 				item.Status, item.Name = categoryWouldArchive, name
 				continue
 			}
-			binding, err := createCategoryArchive(ctx, db, paths, category, rule, scope, report.RunID)
+			binding, err := createCategoryArchive(ctx, db, paths, category, rule, scope, report.RunID, preflight)
 			if err != nil {
 				item.Status, item.Reasons = categoryFailed, []string{err.Error()}
 				failures = append(failures, fmt.Errorf("%s: %w", item.Path, err))
@@ -460,13 +523,14 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 
 // createCategoryArchive runs the verified copy-only Create under a capacity
 // activity receipt and records the pinned manifest in Janitor's state.
-func createCategoryArchive(ctx context.Context, db *store.Store, paths config.Paths, category config.WorkspaceArchiveCategory, rule config.WorkspaceArchiveRule, scope workspacearchive.Scope, runID string) (*workspacearchive.Binding, error) {
+// preflight runs before and after the copy; any error retains the original.
+func createCategoryArchive(ctx context.Context, db *store.Store, paths config.Paths, category config.WorkspaceArchiveCategory, rule config.WorkspaceArchiveRule, scope workspacearchive.Scope, runID string, preflight func() error) (*workspacearchive.Binding, error) {
 	monitor, err := startCapacityActivity(ctx, db, "verified_archive", rule.Name, rule.Path, rule.Owner, rule.Archive.Directory, activityVolume)
 	if err != nil {
 		return nil, err
 	}
 	monitor.activity.Attempted = 1
-	m, binding, err := workspacearchive.Create(ctx, rule, scope, func() error { return categoryPreflight(paths, category, rule.Path) })
+	m, binding, err := workspacearchive.Create(ctx, rule, scope, preflight)
 	if err == nil {
 		err = db.Write(ctx, func(tx *store.Tx) error {
 			return tx.RecordCategoryArchive(ctx, store.CategoryArchive{
@@ -571,7 +635,7 @@ func runCategoryItemRestore(ctx context.Context, e *env, opts archiveOptions, fo
 		}
 		// Mount expectations come from the category while it still names the
 		// same directory; they are never part of the archive's rule hash.
-		category, _ := policy.WorkspaceArchiveCategory(record.Category)
+		category, _ := policy.ArchiveCategory(record.Category, record.Kind)
 		if category.Archive.Directory != record.ArchiveDirectory {
 			category = config.WorkspaceArchiveCategory{Archive: config.WorkspaceArchiveCategoryDestination{Directory: record.ArchiveDirectory}}
 		}

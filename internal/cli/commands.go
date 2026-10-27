@@ -27,6 +27,7 @@ func rootCommand() *command {
 			applyCommand(),
 			restoreCommand(),
 			archiveCommand(),
+			reportCommand(),
 			statusCommand(),
 			policyCommand(),
 			doctorCommand(),

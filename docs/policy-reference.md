@@ -550,3 +550,51 @@ categories are configured, so `local_retention: none` items can be
 auto-quarantined in that cycle. Item failures are reported in
 `category_archives` and fail the cycle only after quarantine and expiry have
 run. See [recovery](recovery.md#category-archive-items).
+
+### Stale-workspace report
+
+`report` is off by default: on existing installs it changes nothing. When it is
+enabled, `janitor report stale` lists depth-1 directories of `report.roots`
+that have not changed for `report.idle` and are not in use. It groups them by
+owning role. A host timer can send `janitor report stale --role <r> --format
+text` once a week as a Gitmoot message to each role.
+
+| Key | Contract |
+| --- | --- |
+| `report.enabled` | Default `false`. |
+| `report.roots` | Configured inventory roots. With `release_action: archive` they follow the category root rules. |
+| `report.idle` | Default `14d`, at least `1d`. Measured from the newest modification in the tree (bounded deep walk). |
+| `report.coordinator_role` | Required when enabled. Receives the `unknown` owner group and is the only role that may reply for it. |
+| `report.release_action` | `none` (default) records a release and lists it for the operator. `archive` makes the next cycle archive released items. |
+| `report.archive`, `local_retention`, `max_items_per_cycle`, `max_bytes_per_item` | Used only with `archive`. They follow the same rules and defaults as a category. |
+
+An entry is not listed while any of these hold: a live process, registered
+agent, service, lock or live database uses it; nonterminal Gitmoot work names
+it; it changed within `idle`; its newest mtime is unmeasured; or policy already
+decides it (protect.paths, KEEP, explicit rules, caches, dot-named or
+credential stores). An item that an active category receipt archived, and that
+is unchanged since, is not listed either. Live-use collectors may be
+incomplete. In that case no entry is suggested for archiving, and every reply
+is refused.
+
+Each entry shows its path, size (`deep`, `lower_bound` or `metadata`), Git
+state (`merged`, `pushed`, `unpushed`, `dirty`, `not_git` or `unknown`), owner
+and suggested action (`archive`, `keep` or `ask`). Owners come only from
+Gitmoot's ledger: `tasks.disposal_escalation_role` and `jobs.dispatched_by`
+for the exact path. Anything else is in the `unknown` group, addressed to the
+coordinator, and is always `ask`. It is never treated as disposable. Gitmoot's
+existing provenance guard still applies to ledger-referenced paths outside its
+home, so these are suggested `ask`, and the archive step refuses them.
+
+Replies are `janitor report release <path> --role <r> [--note]` and `janitor
+report keep <path> --role <r> [--until YYYY-MM-DD] [--note]`. Each reply is
+checked against a fresh observation: the path must be a current entry, and the
+role must be its owner, or the coordinator if the owner is unknown. Replies are
+appended to the immutable `report_replies` table (schema 12). Each reply
+snapshots the item's newest mtime, size and identity. A keep suppresses the
+entry until `--until` or until the item changes. Once the item changes, a
+release is void. With `archive`, the cycle's category step archives unchanged
+released items as category `report-release`. It applies every category check,
+oldest first, at most `max_items_per_cycle` per run. The archive pins then
+follow the normal Bind → quarantine → expiry flow. Sizes are local bytes only;
+free space on the archive mount is never counted as local headroom.

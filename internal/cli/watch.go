@@ -285,7 +285,7 @@ func reconcileWatch(ctx context.Context, e *env, paths config.Paths, policy conf
 	quiet.stdout = io.Discard
 	// Category archive pins live in Janitor's state and change between
 	// cycles; the policy file itself is still read once per watcher.
-	if e.filePolicy != nil && len(e.filePolicy.WorkspaceArchiveCategories) != 0 {
+	if e.filePolicy != nil && e.filePolicy.HasArchiveCategories() {
 		refreshed, err := withCategoryArchives(ctx, paths, *e.filePolicy)
 		if err != nil {
 			return err

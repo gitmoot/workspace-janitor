@@ -182,6 +182,16 @@ janitor history              # read-only count of old, unreferenced scan snapsho
 janitor history --confirm    # discard only those snapshots; does not shrink SQLite file
 ```
 
+Weekly stale-workspace report (opt-in through `report.enabled`): a host timer
+runs `janitor report stale --role <role> --format text` and sends the output to
+each owning role as a Gitmoot message. Items with an unknown owner go to
+`report.coordinator_role`. Owners reply with `janitor report release <path>
+--role <role>` or `janitor report keep <path> --role <role> [--until DATE]`.
+With the default `release_action: none`, a release is only recorded. With
+`archive`, the daily cycle archives released items that have not changed
+through the verified category path. See
+[policy reference](docs/policy-reference.md#stale-workspace-report).
+
 ### Exit codes
 
 | Code | Meaning |

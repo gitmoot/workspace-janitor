@@ -327,6 +327,23 @@ var migrations = []migration{
 			 BEGIN SELECT RAISE(ABORT, 'category archive withdrawals are immutable'); END`,
 		},
 	},
+	{
+		version: reportRepliesVersion,
+		name:    "report_replies",
+		statements: []string{
+			`CREATE TABLE report_replies (
+				sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+				path TEXT NOT NULL,
+				reply TEXT NOT NULL CHECK (reply IN ('release', 'keep')),
+				document TEXT NOT NULL CHECK (length(document) <= 65536)
+			)`,
+			`CREATE INDEX report_replies_path ON report_replies(path, sequence)`,
+			`CREATE TRIGGER report_replies_no_update BEFORE UPDATE ON report_replies
+			 BEGIN SELECT RAISE(ABORT, 'stale report replies are immutable'); END`,
+			`CREATE TRIGGER report_replies_no_delete BEFORE DELETE ON report_replies
+			 BEGIN SELECT RAISE(ABORT, 'stale report replies are immutable'); END`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.
