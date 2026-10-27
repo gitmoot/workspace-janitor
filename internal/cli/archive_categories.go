@@ -292,6 +292,8 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 
 	// One fresh, deep, depth-1 observation of every category root with the
 	// policy file alone: existing category pins must not shape selection.
+	// Every candidate gets its own deep-size budget, so a few large siblings
+	// cannot leave the rest of a root unmeasured (and so unselectable).
 	var specs []collect.RootSpec
 	for _, category := range policy.WorkspaceArchiveCategories {
 		for _, root := range category.Roots {
@@ -309,7 +311,7 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 	}
 	engine := cleanupEngine(e, nil, paths, policy)
 	options := engine.Collect
-	options.Roots, options.DeepSize = specs, true
+	options.Roots, options.DeepSize, options.DeepSizePerEntry = specs, true, true
 	observed, err := collect.Run(ctx, options)
 	if err != nil {
 		return report, err

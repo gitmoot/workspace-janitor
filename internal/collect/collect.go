@@ -100,10 +100,17 @@ type Options struct {
 	// VerifyArchiveContents is required for mutation-time recollection.
 	VerifyArchiveContents bool
 
-	DeepSize  bool
-	Git       bool
-	Processes bool
-	Services  bool
+	DeepSize bool
+	// DeepSizePerEntry gives every sized directory its own
+	// Limits.DeepSizeMaxEntries budget instead of one budget shared by its
+	// root, and leaves dot-named directories unsized. Only archive category
+	// selection sets it: each candidate's idle age and size must be measured
+	// on its own, and dot-named entries are never candidates. Inventory scans
+	// keep the shared per-root budget.
+	DeepSizePerEntry bool
+	Git              bool
+	Processes        bool
+	Services         bool
 	// GitmootHome is the protected Gitmoot-managed tree. GitmootDatabase is
 	// observed read-only; it never grants the generic janitor mutation rights.
 	GitmootHome     string

@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -22,7 +23,9 @@ import (
 func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, now time.Time) core.CollectorReport {
 	report := core.CollectorReport{Name: CollectorDeepSize, Status: core.CollectorRan}
 	// Each root gets its own budget, so one enormous tree cannot leave every
-	// later root unsized.
+	// later root unsized. With DeepSizePerEntry each directory entry gets its
+	// own budget instead, so one enormous entry cannot leave its siblings
+	// unsized either.
 	budgets := make(map[string]int, len(opts.Roots))
 	rootsByPath := make(map[string]RootSpec, len(opts.Roots))
 	for _, root := range opts.Roots {
@@ -39,6 +42,15 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 		if entry.Kind != core.EntryKindDirectory {
 			continue
 		}
+		if opts.DeepSizePerEntry && strings.HasPrefix(filepath.Base(entry.Path), ".") {
+			addEvidence(entry, core.Evidence{
+				Source:     core.SourceFilesystem,
+				Signal:     "deep_size_skipped",
+				Detail:     "dot-named entries are never archive category items, so they are not deep-sized",
+				ObservedAt: now,
+			})
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			report.Status = core.CollectorPartial
 			report.Detail = err.Error()
@@ -46,7 +58,7 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 		}
 		root := rootsByPath[entry.Root]
 		budget, seen := budgets[entry.Root]
-		if !seen {
+		if !seen || opts.DeepSizePerEntry {
 			budget = opts.Limits.DeepSizeMaxEntries
 		}
 		var rd rootDevice
@@ -123,8 +135,12 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 	}
 
 	if report.Detail == "" {
-		report.Detail = fmt.Sprintf("sized %d director(ies) within %d entrie(s)",
-			report.Recorded, opts.Limits.DeepSizeMaxEntries)
+		each := ""
+		if opts.DeepSizePerEntry {
+			each = " each"
+		}
+		report.Detail = fmt.Sprintf("sized %d director(ies) within %d entrie(s)%s",
+			report.Recorded, opts.Limits.DeepSizeMaxEntries, each)
 		if lowerBounds > 0 {
 			report.Detail += fmt.Sprintf("; %d size(s) are lower bounds", lowerBounds)
 		}

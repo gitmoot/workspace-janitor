@@ -490,7 +490,7 @@ Binding is full before the quarantine move and before expiry.
 | `name` | Unique; 1-48 letters, digits, `_` or `-`. Item archives are named `<name>-<base>-<hash12>` (hash of path and run). |
 | `kind` | `merged_worktrees` (linked Git worktree), `pushed_clones` (standalone non-bare checkout) or `root_scratch` (no `.git` at the item root). One category per kind and root. |
 | `roots` | Exact configured inventory roots. A root may not be `report_only`, inside `protect.paths`, or inside a `workspace_archive_keep` path. Only depth-1 entries are candidates. |
-| `idle` | Minimum age of the newest modification anywhere in the tree, measured by a bounded deep walk. Use `Nd` or Go syntax. At least `14d` for `merged_worktrees` and `30d` otherwise (also the defaults). |
+| `idle` | Minimum age of the newest modification anywhere in the tree, measured by a bounded deep walk of that item alone (see below). Use `Nd` or Go syntax. At least `14d` for `merged_worktrees` and `30d` otherwise (also the defaults). |
 | `archive.directory`, `expect_mount_source`, `expect_fstype` | Same approval rules as `workspace_archives` destinations. The directory must also be outside every inventory root. |
 | `local_retention` | `none`, `30d` (default) or `90d`, measured from archive creation. `none` proposes quarantine as soon as the verified archive binds the local tree. The quarantine retention (`retention.default`) still applies before deletion, and deletion still re-binds the quarantined copy. |
 | `max_items_per_cycle` | Default 20, at most 200. Extra candidates are `deferred`, oldest first. |
@@ -510,7 +510,12 @@ be a directory directly inside a category root. It is refused by any of these:
 - for Git kinds: dirty files, stashes, a Git lock, unmeasured publication,
   commits that are not on a remote-tracking branch, degraded metadata, or
   ignored contents that are unproven
-- an unknown or partial deep size or newest mtime, or a size above the bound
+- an unknown or partial deep size or newest mtime, or a size above the bound.
+  Category selection walks each candidate with its own
+  `limits.deep_size_max_entries` and `limits.deep_size_max_depth` budget, so a
+  large sibling cannot leave the rest of a root unmeasured; an item whose own
+  walk reaches the bound stays partial and is refused. Dot-named entries are
+  not walked. Inventory scans still share one deep-size budget per root.
 - every archive-time refusal: secret-like names, mount crossings, external
   gitdir, alternates or symlink dependents, unsupported file types, and the
   destination mount expectations

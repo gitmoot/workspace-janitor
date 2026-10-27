@@ -36,6 +36,8 @@ type categoryFixture struct {
 	retention               string
 	maxItems                int
 	extra, prevention       string
+	// limits holds extra lines under limits:, each indented two spaces.
+	limits                  string
 	agents                  []collect.AgentSource
 	files                   map[string][]byte
 }
@@ -89,8 +91,8 @@ prevention:
   min_free_percent: 0
 %slimits:
   command_timeout: 30s
-workspace_archive_categories:
-%s%s%s%s`, x.work, x.archive, x.proc, x.services, x.prevention,
+%sworkspace_archive_categories:
+%s%s%s%s`, x.work, x.archive, x.proc, x.services, x.prevention, x.limits,
 		category("scratch", "root_scratch"), category("merged", "merged_worktrees"), category("clones", "pushed_clones"), x.extra))
 }
 
@@ -469,6 +471,45 @@ func TestCategoryArchiveHonorsMaxItemsPerCycle(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("archiving removed %s: %v", path, err)
 		}
+	}
+}
+
+// limits.deep_size_max_entries bounds each category item on its own: a large
+// first sibling that exceeds it stays refused as partial, but no longer
+// exhausts a budget shared by the root, so a later small item is still
+// measured and selected. The large tree sits below the dependent-scan depth so
+// the same small bound does not refuse the small item's dependent scan.
+func TestCategoryArchiveDeepBudgetIsPerItem(t *testing.T) {
+	x := newCategoryFixture(t)
+	x.limits = "  deep_size_max_entries: 40\n"
+	x.write(t)
+	big := filepath.Join(x.work, "a-big")
+	deep := filepath.Join(big, "d1", "d2", "d3", "d4", "d5", "d6")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 50 {
+		if err := os.WriteFile(filepath.Join(deep, fmt.Sprintf("f%02d", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hidden := x.scratch(t, ".hidden-scratch", map[string]string{"README.md": "hidden\n"})
+	for _, path := range []string{big, x.source, hidden} {
+		backdate(t, path, categoryIdleAge)
+	}
+	report := x.categories(t, true)
+	item := categoryItem(t, report, big)
+	if item.Status != categoryRefused || item.SizeKnown || item.NewestModifiedAt != nil ||
+		!strings.Contains(strings.Join(item.Reasons, "\n"), "partial") {
+		t.Fatalf("an item whose own walk exceeds the bound was not refused as partial: %+v", item)
+	}
+	item = categoryItem(t, report, x.source)
+	if item.Status != categoryWouldArchive || !item.SizeKnown || item.NewestModifiedAt == nil {
+		t.Fatalf("a small sibling after a large item was not measured on its own budget: %+v", item)
+	}
+	item = categoryItem(t, report, hidden)
+	if item.Status != categoryRefused || item.SizeKnown || !strings.Contains(strings.Join(item.Reasons, "\n"), "dot-named") {
+		t.Fatalf("dot-named entry under a category root: %+v", item)
 	}
 }
 
