@@ -98,11 +98,12 @@ as permission to delete.
    every archived byte and the bundle without needing the source.
 4. To recover, preview `janitor archive --workspace NAME --restore-to
    /new/path`, then add `--dry-run=false --confirm`. The destination must not
-   exist; restoring to the original path works once that path is gone. The
-   tree is extracted into a private staging directory beside the destination,
-   renamed into place without replacement, and walked again to confirm every
-   member, mode, owner, mtime, link target and content hash. A restore that
-   fails before publication leaves nothing; one that fails verification after
+   exist and must not be inside or contain the original workspace path; the
+   original path itself is a valid destination once it is gone. The tree is
+   extracted into a private staging directory beside the destination, renamed
+   into place without replacement, and walked again to confirm every member,
+   mode, owner, mtime, link target and content hash. A restore that fails
+   before publication leaves nothing; one that fails verification after
    publication says so and leaves the tree for inspection.
 5. A linked worktree's restored `.git` file still points at its original admin
    entry. If that entry is gone, recover the history with

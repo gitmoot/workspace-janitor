@@ -545,15 +545,22 @@ func Check(ctx context.Context, rule config.WorkspaceArchiveRule, full bool) (Ma
 	return m, &Binding{Manifest: rule.Archive.Manifest, ManifestSHA256: rule.Archive.ManifestSHA256}, nil
 }
 
-// Restore extracts the verified tree to destination, which must not exist,
-// then re-walks the restored tree and compares it with the manifest. It
-// never overwrites anything and never touches the archive.
+// Restore extracts the verified tree to destination, which must not exist and
+// must not be strictly inside or strictly contain the source path, then
+// re-walks the restored tree and compares it with the manifest. It never
+// overwrites anything and never touches the archive or the source.
 func Restore(ctx context.Context, rule config.WorkspaceArchiveRule, destination string) (Manifest, error) {
 	if !core.IsCanonicalPath(destination) || destination == "/" {
 		return Manifest{}, errors.New("restore destination must be a canonical absolute path")
 	}
 	if core.PathsOverlap(destination, rule.Archive.Directory) {
 		return Manifest{}, errors.New("restore must not modify the archive directory")
+	}
+	// The source is copy-only: a destination inside or around it would write
+	// into or over the released tree. The original path itself is allowed;
+	// the existence check below refuses it while the source is still there.
+	if destination != rule.Path && core.PathsOverlap(destination, rule.Path) {
+		return Manifest{}, errors.New("restore destination must not be inside or contain the released workspace path")
 	}
 	m, root, tarFile, err := load(ctx, rule)
 	if err != nil {

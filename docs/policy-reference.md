@@ -398,12 +398,17 @@ Creation refuses, leaving the source and destination untouched, when:
 - a process has its working directory, root, executable or an open descriptor
   inside the path, or a process cannot be inspected (`collectors.proc_root`);
 - a gitdir file, `objects/info/alternates` file or symlink outside the path
-  (searched to depth 6 on each search root's filesystem) resolves into it, or a
-  search exceeds `limits.deep_size_max_entries`;
+  (searched to depth 6 on each search root's filesystem) resolves into it, a
+  gitdir or alternates file there exceeds 64 KiB, or a search exceeds
+  `limits.deep_size_max_entries`. Symlinks are followed as the kernel would,
+  through chained links and symlinked directories; one that reaches the path at
+  any step is a dependent, and one that loops, chains more than 40 links or
+  cannot be examined also refuses;
 - the tree crosses a mount, holds anything but directories, regular files and
   symlinks, carries extended attributes, exceeds `limits.deep_size_max_entries`
-  members, borrows Git objects from outside via alternates, or has a nested
-  worktree whose history lives outside;
+  members, borrows Git objects from outside via alternates, has a nested
+  worktree whose history lives outside, or has a `.git` symlink anywhere
+  (including the root) that does not resolve to a directory inside the tree;
 - the destination mount differs from its expectation, or any output name
   already exists (an interrupted run's published names are never reused).
 
@@ -413,9 +418,10 @@ while every byte written and every file read is hashed. The written file is
 then read back: its SHA-256 must equal the stream SHA-256, its member list,
 types, sizes, modes, owners, mtimes, link targets and per-file SHA-256 must
 equal the local tree, and every source member must still have its recorded
-identity, metadata and change time. A linked worktree (a root `.git` file
-pointing outside) additionally gets a `git bundle` of `HEAD`, verified with
-`git bundle verify` and `git bundle list-heads`; the manifest records the
+identity, metadata and change time. A linked worktree (a root `.git` file,
+never a symlink, pointing outside) additionally gets a `git bundle` of `HEAD`,
+verified with `git bundle verify` and `git bundle list-heads`; the manifest
+records the
 worktree's admin entry and whether it is locked. Janitor does not lock or
 otherwise modify the admin entry. Policy, live-process, dependent, mount and
 source checks run again immediately before publication, which renames the
