@@ -424,3 +424,176 @@ func TestLinkedWorktreeGetsVerifiedHeadBundle(t *testing.T) {
 		t.Fatal("full Check accepted a corrupted history bundle")
 	}
 }
+
+// outsideDir is a directory outside the fixture home and so outside every
+// dependent search root.
+func outsideDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestCreateRefusesOutboundGitSymlink(t *testing.T) {
+	for name, tc := range map[string]struct {
+		setup func(t *testing.T, f *fixture)
+		want  string
+	}{
+		"root": {func(t *testing.T, f *fixture) {
+			if err := os.MkdirAll(filepath.Join(f.home, "main", ".git"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			mustSymlink(t, filepath.Join(f.home, "main", ".git"), filepath.Join(f.source, ".git"))
+		}, ".git: Git history lives outside the archived tree"},
+		"root through an internal link": {func(t *testing.T, f *fixture) {
+			outside := outsideDir(t)
+			mustSymlink(t, outside, filepath.Join(f.source, "history"))
+			mustSymlink(t, "history", filepath.Join(f.source, ".git"))
+		}, ".git: Git history lives outside the archived tree"},
+		"nested": {func(t *testing.T, f *fixture) {
+			if err := os.MkdirAll(filepath.Join(f.home, "main", ".git"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			mustSymlink(t, filepath.Join(f.home, "main", ".git"), filepath.Join(f.source, "sub", "vendored", ".git"))
+		}, "sub/vendored/.git: nested worktree history lives outside the archived tree"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.populate(t)
+			tc.setup(t, f)
+			if _, err := Inspect(context.Background(), f.rule, f.scope); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Inspect = %v, want refusal containing %q", err, tc.want)
+			}
+			if _, _, err := Create(context.Background(), f.rule, f.scope, allow); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Create = %v, want refusal containing %q", err, tc.want)
+			}
+			if names := f.archiveEntries(t); len(names) != 0 {
+				t.Fatalf("refused archive left %v", names)
+			}
+		})
+	}
+
+	// A .git symlink to a directory inside the tree is archived verbatim.
+	f := newFixture(t)
+	f.populate(t)
+	if err := os.MkdirAll(filepath.Join(f.source, "history"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, "history", filepath.Join(f.source, ".git"))
+	if _, _, err := Create(context.Background(), f.rule, f.scope, allow); err != nil {
+		t.Fatalf("Create with an inward .git symlink: %v", err)
+	}
+}
+
+func TestRestoreRefusesDestinationOverlappingSource(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.populate(t)
+	before := treeSnapshot(t, f.source)
+	_, binding, err := Create(ctx, f.rule, f.scope, allow)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	pinned := pin(f.rule, binding)
+	const want = "must not be inside or contain the released workspace path"
+
+	inside := filepath.Join(f.source, "sub", "restored")
+	if _, err := Restore(ctx, pinned, inside); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Restore(%s) = %v, want overlap refusal", inside, err)
+	}
+	if _, err := os.Lstat(inside); !os.IsNotExist(err) {
+		t.Fatalf("refused restore wrote %s: %v", inside, err)
+	}
+	sameTree(t, before, treeSnapshot(t, f.source))
+
+	// The original path itself is refused only while the source exists.
+	if _, err := Restore(ctx, pinned, f.source); err == nil || !strings.Contains(err.Error(), "must not exist") {
+		t.Fatalf("Restore(%s) = %v, want existing destination refusal", f.source, err)
+	}
+	sameTree(t, before, treeSnapshot(t, f.source))
+
+	// With the source gone, a parent of it is still refused.
+	work := filepath.Join(f.home, "work")
+	if err := os.RemoveAll(work); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(ctx, pinned, work); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("Restore(%s) = %v, want overlap refusal", work, err)
+	}
+	if _, err := os.Lstat(work); !os.IsNotExist(err) {
+		t.Fatalf("refused restore wrote %s: %v", work, err)
+	}
+
+	// The vacated original path is the main recovery destination.
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(ctx, pinned, f.source); err != nil {
+		t.Fatalf("Restore to the vacated original path: %v", err)
+	}
+	sameTree(t, before, treeSnapshot(t, f.source))
+}
+
+func TestCreateRefusesChainedSymlinkDependent(t *testing.T) {
+	for name, tc := range map[string]struct {
+		setup func(t *testing.T, f *fixture)
+		want  string
+	}{
+		"chain through a link outside the search roots": {func(t *testing.T, f *fixture) {
+			hop := filepath.Join(outsideDir(t), "hop")
+			mustSymlink(t, f.source, hop)
+			mustSymlink(t, hop, filepath.Join(f.home, "other", "uses"))
+		}, "reaches"},
+		"symlinked directory component": {func(t *testing.T, f *fixture) {
+			workdir := filepath.Join(outsideDir(t), "workdir")
+			mustSymlink(t, filepath.Join(f.home, "work"), workdir)
+			mustSymlink(t, filepath.Join(workdir, "released", "README.md"), filepath.Join(f.home, "other", "readme"))
+		}, "reaches"},
+		"loop": {func(t *testing.T, f *fixture) {
+			mustSymlink(t, "loop-b", filepath.Join(f.home, "other", "loop-a"))
+			mustSymlink(t, "loop-a", filepath.Join(f.home, "other", "loop-b"))
+		}, "cannot be resolved"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.populate(t)
+			tc.setup(t, f)
+			_, _, err := Create(context.Background(), f.rule, f.scope, allow)
+			if err == nil || !strings.Contains(err.Error(), "external dependents") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Create = %v, want external dependent refusal containing %q", err, tc.want)
+			}
+			if names := f.archiveEntries(t); len(names) != 0 {
+				t.Fatalf("refused archive left %v", names)
+			}
+		})
+	}
+}
+
+func TestCreateRefusesOversizedDependentPointer(t *testing.T) {
+	for name, setup := range map[string]func(t *testing.T, f *fixture){
+		// The in-source target sits past the 64 KiB read bound.
+		"object alternates": func(t *testing.T, f *fixture) {
+			data := strings.Repeat("# padding\n", 7000) + filepath.Join(f.source, ".git", "objects") + "\n"
+			write(t, filepath.Join(f.home, "other", "repo", ".git", "objects", "info", "alternates"), []byte(data), 0o644)
+		},
+		"worktree gitdir": func(t *testing.T, f *fixture) {
+			data := "gitdir:" + strings.Repeat(" ", 70000) + filepath.Join(f.source, ".git", "worktrees", "checkout") + "\n"
+			write(t, filepath.Join(f.home, "other", "checkout", ".git"), []byte(data), 0o644)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			f.populate(t)
+			setup(t, f)
+			_, _, err := Create(context.Background(), f.rule, f.scope, allow)
+			if err == nil || !strings.Contains(err.Error(), "dependent scan") || !strings.Contains(err.Error(), "exceeds the 65536-byte bound") {
+				t.Fatalf("Create = %v, want oversized pointer refusal", err)
+			}
+			if names := f.archiveEntries(t); len(names) != 0 {
+				t.Fatalf("refused archive left %v", names)
+			}
+		})
+	}
+}

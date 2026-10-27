@@ -27,7 +27,9 @@ const (
 	dependentDepth = 6
 	maxTreeDepth   = 512
 	maxPointerSize = 64 << 10
-	maxReported    = 20
+	// maxLinkHops matches the kernel's MAXSYMLINKS.
+	maxLinkHops = 40
+	maxReported = 20
 )
 
 // Built-in screen ported from the proven manual mover. Policy
@@ -235,6 +237,9 @@ func (w *walker) walk(dir *os.File, rel string, depth int) error {
 				return fmt.Errorf("readlink %s: %w", path, err)
 			}
 			m.Linkname = target
+			if name == ".git" && !w.verify {
+				w.screenGitLink(path, rel, target)
+			}
 			if err := w.add(m, st); err != nil {
 				return err
 			}
@@ -246,8 +251,9 @@ func (w *walker) walk(dir *os.File, rel string, depth int) error {
 }
 
 // readRegular hashes verified files and screens Git pointers: a tree whose
-// history lives outside it is archived only as a root linked worktree, with a
-// bundle; nested outbound gitdirs and alternates are refused.
+// history lives outside it is archived only as a root linked worktree (a root
+// .git file), with a bundle; nested outbound gitdirs and alternates are
+// refused. .git symlinks are screened by screenGitLink.
 func (w *walker) readRegular(dir *os.File, name, rel string, m *Member, st state) error {
 	f, err := openChild(dir, name, unix.O_RDONLY)
 	if err != nil {
@@ -302,6 +308,82 @@ func (w *walker) readRegular(dir *os.File, name, rel string, m *Member, st state
 		}
 	}
 	return nil
+}
+
+// screenGitLink treats a .git symlink like a gitdir file. Symlinked history is
+// never bundled, even at the root: the link must resolve to a directory inside
+// the archived tree, so an outbound, dangling, non-directory or unresolvable
+// link refuses.
+func (w *walker) screenGitLink(path, rel, target string) {
+	visited, err := resolveLink(filepath.Join(w.source, rel, ".git"), target)
+	if err != nil {
+		w.refuse("%s: .git symlink to %s cannot be resolved: %v", path, target, err)
+		return
+	}
+	final := visited[len(visited)-1]
+	var st unix.Stat_t
+	switch {
+	case core.PathWithin(final, w.source):
+		if err := unix.Lstat(final, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFDIR {
+			w.refuse("%s: .git symlink to %s does not resolve to a directory inside the archived tree", path, target)
+		}
+	case rel == ".":
+		w.refuse("%s: Git history lives outside the archived tree at %s behind a symlink, which is never bundled", path, final)
+	default:
+		w.refuse("%s: nested worktree history lives outside the archived tree at %s", path, final)
+	}
+}
+
+// resolveLink follows the symlink at link, whose text is target, the way the
+// kernel would: component by component, through chained links and symlinked
+// directories, for at most maxLinkHops links. link's directory must already be
+// symlink-free. It returns every path the resolution reaches, the final
+// location last; a missing component ends resolution with the remainder
+// joined lexically. A loop, a longer chain or a component that cannot be
+// examined is an error, never "resolves nowhere".
+func resolveLink(link, target string) ([]string, error) {
+	dir, pending := filepath.Dir(link), target
+	if filepath.IsAbs(target) {
+		dir = "/"
+	}
+	var visited []string
+	hops := 1
+	for pending != "" {
+		var part string
+		part, pending, _ = strings.Cut(pending, "/")
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			dir = filepath.Dir(dir)
+			continue
+		}
+		next := filepath.Join(dir, part)
+		visited = append(visited, next)
+		var st unix.Stat_t
+		if err := unix.Lstat(next, &st); err != nil {
+			if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) {
+				return append(visited, filepath.Join(next, pending)), nil
+			}
+			return visited, fmt.Errorf("examine %s: %w", next, err)
+		}
+		if st.Mode&unix.S_IFMT != unix.S_IFLNK {
+			dir = next
+			continue
+		}
+		if hops++; hops > maxLinkHops {
+			return visited, fmt.Errorf("more than %d chained symlinks (loop or overlong chain)", maxLinkHops)
+		}
+		text, err := os.Readlink(next)
+		if err != nil {
+			return visited, fmt.Errorf("readlink %s: %w", next, err)
+		}
+		if filepath.IsAbs(text) {
+			dir = "/"
+		}
+		pending = text + "/" + pending
+	}
+	return append(visited, dir), nil
 }
 
 func readlinkAt(dirfd int, name string) (string, error) {
@@ -509,9 +591,11 @@ func liveReferences(ctx context.Context, procRoot, source string) error {
 }
 
 // externalDependents finds gitdir files, object alternates and symlinks
-// outside source that resolve into it. Each search root is walked to a
-// bounded depth on its own filesystem; an exceeded bound or unreadable
-// directory refuses rather than reporting "no dependents".
+// outside source that resolve into it; symlinks are followed through chains
+// and symlinked directories. Each search root is walked to a bounded depth on
+// its own filesystem; an exceeded bound, unreadable directory, oversized
+// pointer file or unresolvable symlink refuses rather than reporting "no
+// dependents".
 func externalDependents(ctx context.Context, source string, roots []string, limit int) error {
 	var hits []string
 	for _, root := range roots {
@@ -547,9 +631,14 @@ func scanDependents(ctx context.Context, dir *os.File, dirAbs, source string, de
 		return err
 	}
 	fd := int(dir.Fd())
+	hit := func(detail string) {
+		if len(*hits) < maxReported {
+			*hits = append(*hits, detail)
+		}
+	}
 	record := func(path, target, what string) {
-		if core.PathWithin(target, source) && len(*hits) < maxReported {
-			*hits = append(*hits, fmt.Sprintf("%s %s -> %s", what, path, target))
+		if core.PathWithin(target, source) {
+			hit(fmt.Sprintf("%s %s -> %s", what, path, target))
 		}
 	}
 	for _, name := range names {
@@ -577,10 +666,24 @@ func scanDependents(ctx context.Context, dir *os.File, dirAbs, source string, de
 			if err != nil {
 				return err
 			}
-			if !filepath.IsAbs(target) {
-				target = filepath.Join(dirAbs, target)
+			// Every path the chain reaches counts, so a link through source or
+			// a symlinked directory is a dependent; a chain that cannot be
+			// followed to its end may reach source and refuses.
+			reached, err := resolveLink(path, target)
+			if err != nil {
+				hit(fmt.Sprintf("symlink %s -> %s cannot be resolved: %v", path, target, err))
+				continue
 			}
-			record(path, filepath.Clean(target), "symlink")
+			lexical := target
+			if !filepath.IsAbs(lexical) {
+				lexical = filepath.Join(dirAbs, lexical)
+			}
+			for _, p := range append(reached, filepath.Clean(lexical)) {
+				if core.PathWithin(p, source) {
+					hit(fmt.Sprintf("symlink %s -> %s reaches %s", path, target, p))
+					break
+				}
+			}
 		case unix.S_IFREG:
 			isAlternates := name == "alternates" && filepath.Base(dirAbs) == "info" && filepath.Base(filepath.Dir(dirAbs)) == "objects"
 			if name != ".git" && !isAlternates {
@@ -588,7 +691,7 @@ func scanDependents(ctx context.Context, dir *os.File, dirAbs, source string, de
 			}
 			data, err := readSmall(dir, name)
 			if err != nil {
-				return err
+				return fmt.Errorf("read %s: %w", path, err)
 			}
 			if isAlternates {
 				for _, target := range alternateTargets(data, filepath.Dir(dirAbs)) {
@@ -621,8 +724,14 @@ func readSmall(dir *os.File, name string) (string, error) {
 		return "", err
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxPointerSize))
-	return string(data), err
+	data, err := io.ReadAll(io.LimitReader(f, maxPointerSize+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxPointerSize {
+		return "", fmt.Errorf("pointer file exceeds the %d-byte bound; cannot rule out a dependent", maxPointerSize)
+	}
+	return string(data), nil
 }
 
 // hasXattrs fails closed: extended metadata is not archived, so any present
