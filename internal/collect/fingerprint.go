@@ -32,7 +32,7 @@ func SnapshotFingerprint(entry core.Entry) (string, bool) {
 		return current, true
 	}
 	if entry.ContractVersion != core.ContractVersion || entry.Git == nil ||
-		entry.Git.LastActivity.IsZero() || entry.ExportArchive != nil {
+		entry.Git.LastActivity.IsZero() || entry.ExportArchive != nil || entry.WorkspaceArchive != nil {
 		return "", false
 	}
 	if entry.Fingerprint != fingerprint(entry, false) {
@@ -62,6 +62,10 @@ func fingerprint(entry core.Entry, gitActivity bool) string {
 	write("link=%s", entry.SymlinkTarget)
 	if entry.ExportArchive != nil {
 		write("export_archive=%s|%s", entry.ExportArchive.Manifest, entry.ExportArchive.ManifestSHA256)
+	}
+	if entry.WorkspaceArchive != nil {
+		b := entry.WorkspaceArchive
+		write("workspace_archive=%s|%s|%d|%s|%d", b.Manifest, b.ManifestSHA256, b.MemberCount, b.TreeDigest, b.CreatedAt.UTC().UnixNano())
 	}
 	if entry.Git == nil {
 		write("git=none")

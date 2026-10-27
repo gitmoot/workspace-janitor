@@ -90,7 +90,7 @@ func inspect(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope)
 	if in.source, err = openDirectory(rule.Path); err != nil {
 		return nil, fmt.Errorf("workspace: %w", err)
 	}
-	walk, err := scanTree(ctx, in.source, rule.Path, scope.SensitiveNames, scope.limit(), false)
+	walk, err := scanTree(ctx, in.source, rule.Path, scope.SensitiveNames, scope.limit(), false, true)
 	if err != nil {
 		return nil, err
 	}
@@ -523,26 +523,33 @@ func Check(ctx context.Context, rule config.WorkspaceArchiveRule, full bool) (Ma
 	defer root.Close()
 	defer tarFile.Close()
 	if full {
-		readback, err := verifyTar(ctx, tarFile, m.Members, m.TarBytes)
-		if err != nil {
+		if err := verifyArchive(ctx, m, root, tarFile); err != nil {
 			return m, nil, err
-		}
-		if readback != m.StreamSHA256 {
-			return m, nil, errors.New("archive tar checksum differs from its manifest")
-		}
-		if m.Bundle != nil {
-			bundle, _, err := openRegularChild(root, m.Bundle.File)
-			if err != nil {
-				return m, nil, err
-			}
-			err = verifyBundle(ctx, bundle, m.Bundle)
-			bundle.Close()
-			if err != nil {
-				return m, nil, err
-			}
 		}
 	}
 	return m, &Binding{Manifest: rule.Archive.Manifest, ManifestSHA256: rule.Archive.ManifestSHA256}, nil
+}
+
+// verifyArchive is the full read-back shared by Check and Bind: the whole tar
+// (stream hash, member list, metadata and per-file content) and the history
+// bundle.
+func verifyArchive(ctx context.Context, m Manifest, root, tarFile *os.File) error {
+	readback, err := verifyTar(ctx, tarFile, m.Members, m.TarBytes)
+	if err != nil {
+		return err
+	}
+	if readback != m.StreamSHA256 {
+		return errors.New("archive tar checksum differs from its manifest")
+	}
+	if m.Bundle == nil {
+		return nil
+	}
+	bundle, _, err := openRegularChild(root, m.Bundle.File)
+	if err != nil {
+		return err
+	}
+	defer bundle.Close()
+	return verifyBundle(ctx, bundle, m.Bundle)
 }
 
 // Restore extracts the verified tree to destination, which must not exist and
@@ -675,7 +682,7 @@ func extractMember(stage *os.File, m Member, content io.Reader) error {
 }
 
 func verifyRestored(ctx context.Context, root *os.File, destination string, m Manifest) error {
-	walk, err := scanTree(ctx, root, destination, nil, len(m.Members), true)
+	walk, err := scanTree(ctx, root, destination, nil, len(m.Members), true, false)
 	if err != nil {
 		return err
 	}

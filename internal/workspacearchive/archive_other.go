@@ -7,6 +7,7 @@ import (
 	"errors"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
+	"github.com/gitmoot/workspace-janitor/internal/core"
 )
 
 var errUnsupported = errors.New("verified workspace archives require Linux descriptor-anchored file operations; retain the original")
@@ -22,4 +23,7 @@ func Check(context.Context, config.WorkspaceArchiveRule, bool) (Manifest, *Bindi
 }
 func Restore(context.Context, config.WorkspaceArchiveRule, string) (Manifest, error) {
 	return Manifest{}, errUnsupported
+}
+func Bind(context.Context, config.WorkspaceArchiveRule, Scope, string, bool) (*core.WorkspaceArchiveBinding, error) {
+	return nil, errUnsupported
 }

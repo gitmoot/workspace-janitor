@@ -366,10 +366,10 @@ A workspace archive is an **opt-in, copy-only** verified tar of one released
 directory, written to any directory you already mounted (external disk, NAS,
 SSHFS/NFS, rclone mount). No storage is provisioned or assumed. `janitor
 archive --workspace NAME` never removes the source or an archive and reports
-`local_freed_bytes: 0`; local removal remains with the ordinary
-quarantine/expiry workflow. Binding expiry to a pinned workspace archive is a
-separate, later change: until then a workspace archive grants no deletion
-permission at all.
+`local_freed_bytes: 0`. Local removal remains with the ordinary
+quarantine/expiry workflow and is permitted only through
+[local expiry](#workspace-archive-local-expiry), which binds it to a pinned
+archive that exactly matches the local tree.
 
 | Field | Contract |
 | --- | --- |
@@ -379,6 +379,7 @@ permission at all.
 | `dependent_roots` | Optional canonical directories searched for external dependents. Empty means every inventory root. |
 | `archive.directory` | Existing canonical directory outside every workspace archive source and evidence export container, not overlapping the quarantine, Gitmoot home, a cache rule or Janitor's state, and covered by an independent `protect.paths` entry. Every path component is opened without following symlinks. |
 | `archive.expect_mount_source`, `archive.expect_fstype` | Optional `/proc/self/mountinfo` source and filesystem type of the destination mount. A mismatch, including an unmounted destination that shows the parent filesystem, refuses creation, verification and restore; nothing is ever written to a local fallback. |
+| `local_retention`, `local_expiry_enabled` | `local_retention` defaults to `30d`, measured from the pinned manifest's `created_at`; stricter `90d` or `permanent` is accepted and `permanent` forbids expiry. `local_expiry_enabled` defaults to `false`; enabling it requires a pinned `archive.manifest`/`manifest_sha256` and the Git, process and service collectors. Neither field is part of the archive's rule hash, so enabling expiry never invalidates an existing archive. |
 | `archive.manifest`, `archive.manifest_sha256` | Empty before creation. Pin the exact `<directory>/<name>.manifest.json` path and SHA-256 returned by a successful creation. |
 
 `workspace_archive_keep` records an owner's KEEP decision: `path`, `owner` and
@@ -427,3 +428,48 @@ otherwise modify the admin entry. Policy, live-process, dependent, mount and
 source checks run again immediately before publication, which renames the
 outputs without replacement, manifest last. See
 [restoring a workspace archive](recovery.md#workspace-archives).
+
+### Workspace archive local expiry
+
+Local expiry mirrors [exact evidence exports](#exact-evidence-exports) and adds
+no second deletion path: the ordinary plan, approval, quarantine, grace period
+and `apply --expire` workflow removes the local copy, and only while the pinned
+archive still stands in for it. Every entry at a rule's path, and a quarantined
+copy mapped back to it, is held by a blocking `durable_evidence` protection
+("released workspace remains retained") unless all of the following hold:
+
+- `local_expiry_enabled: true`, no `workspace_archive_keep` record overlaps the
+  path, the path is an ordinary directory and no other blocking protection,
+  `protect.paths` or `protect.name_patterns` match applies;
+- the pinned manifest's SHA-256 matches, it belongs to this rule, and the
+  destination mount matches its expectation;
+- the **current local tree equals the manifest member list exactly**: the same
+  paths, types, sizes, modes, owners, nanosecond modification times and link
+  targets, with no extra or missing member. Any local change made after
+  archiving would be lost, so it holds the workspace;
+- the creation-time refusals still pass against the local tree: secret-like
+  names, extended attributes, mount crossings, unsupported types, outbound Git
+  history, and live process references and external dependents of both the
+  local tree and the rule's original path. A linked worktree's `HEAD` must
+  still equal the bundled `HEAD`;
+- `local_retention` has elapsed since the manifest's `created_at`.
+
+Then the entry carries a `workspace_archive` binding (manifest, manifest
+SHA-256, member count, member-list digest, creation time), which participates
+in the entry fingerprint, and the `policy.workspace_archive:NAME` rule proposes
+`quarantine` at the explicit tier. Otherwise it proposes `keep`. Safety
+refusals, protected and canonical locations, Git dirty/unpublished state, live
+references, `report_only` roots and KEEP records still win.
+
+Inventory scans compare file sizes and modification times. Mutation-time
+recollection, both before the quarantine move and immediately before expiry
+deletes the quarantined copy, re-reads and re-hashes the whole archive, the
+history bundle and every local file, and requires every per-file SHA-256 to
+match. A binding that cannot be re-established (archive corrupted, missing or
+unmounted, manifest re-pinned or unpinned, rule removed, file changed inside
+the quarantined copy) changes the fingerprint and refuses the move or the
+expiry; `janitor restore` remains available. Ancestor directories of a
+released workspace are protected so a broader rule cannot remove it wholesale.
+Full verification runs inside `limits.command_timeout`; a timeout holds the
+workspace. After expiry, recover with
+[`archive --workspace NAME --restore-to`](recovery.md#workspace-archives).

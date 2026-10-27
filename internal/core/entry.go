@@ -250,19 +250,20 @@ type Entry struct {
 	ModifiedAt       time.Time `json:"modified_at"`
 	// LatestModifiedAt is set only by a complete deep walk. A cache TTL
 	// cannot infer subtree age from the directory inode's mtime alone.
-	LatestModifiedAt time.Time             `json:"latest_modified_at,omitempty"`
-	AccessedAt       time.Time             `json:"accessed_at"`
-	SymlinkTarget    string                `json:"symlink_target,omitempty"`
-	CanonicalPath    string                `json:"canonical_path,omitempty"`
-	Destination      string                `json:"destination,omitempty"`
-	Fingerprint      string                `json:"fingerprint,omitempty"`
-	Class            ArtifactClass         `json:"class"`
-	Git              *GitState             `json:"git,omitempty"`
-	ExportArchive    *ExportArchiveBinding `json:"export_archive,omitempty"`
-	Evidence         []Evidence            `json:"evidence,omitempty"`
-	Protections      []Protection          `json:"protections,omitempty"`
-	Recommendation   *Recommendation       `json:"recommendation,omitempty"`
-	ObservedAt       time.Time             `json:"observed_at"`
+	LatestModifiedAt time.Time                `json:"latest_modified_at,omitempty"`
+	AccessedAt       time.Time                `json:"accessed_at"`
+	SymlinkTarget    string                   `json:"symlink_target,omitempty"`
+	CanonicalPath    string                   `json:"canonical_path,omitempty"`
+	Destination      string                   `json:"destination,omitempty"`
+	Fingerprint      string                   `json:"fingerprint,omitempty"`
+	Class            ArtifactClass            `json:"class"`
+	Git              *GitState                `json:"git,omitempty"`
+	ExportArchive    *ExportArchiveBinding    `json:"export_archive,omitempty"`
+	WorkspaceArchive *WorkspaceArchiveBinding `json:"workspace_archive,omitempty"`
+	Evidence         []Evidence               `json:"evidence,omitempty"`
+	Protections      []Protection             `json:"protections,omitempty"`
+	Recommendation   *Recommendation          `json:"recommendation,omitempty"`
+	ObservedAt       time.Time                `json:"observed_at"`
 }
 
 // Protected reports whether any blocking protection applies. Callers must
@@ -296,6 +297,9 @@ func (e *Entry) Normalize() {
 	e.ObservedAt = e.ObservedAt.UTC()
 	for i := range e.Evidence {
 		e.Evidence[i].ObservedAt = e.Evidence[i].ObservedAt.UTC()
+	}
+	if e.WorkspaceArchive != nil {
+		e.WorkspaceArchive.CreatedAt = e.WorkspaceArchive.CreatedAt.UTC()
 	}
 	if e.Recommendation != nil {
 		e.Recommendation.DecidedAt = e.Recommendation.DecidedAt.UTC()

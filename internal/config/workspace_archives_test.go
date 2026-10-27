@@ -157,3 +157,38 @@ func TestPolicyCloneDeepCopiesWorkspaceArchives(t *testing.T) {
 		t.Fatalf("clone shares workspace archive state: %+v", original)
 	}
 }
+
+func TestWorkspaceArchiveLocalExpiryRequiresPinnedManifestAndRetention(t *testing.T) {
+	doc := workspaceArchiveBase + "workspace_archives:\n" + workspaceArchiveEntry("released-a", "/srv/work/released-a")
+	policy, err := parse(t, fixturePaths(t), doc)
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+	if rule := policy.WorkspaceArchives[0]; rule.LocalExpiryEnabled || rule.LocalRetention != "30d" {
+		t.Fatalf("local expiry must default off with 30d retention: %+v", rule)
+	}
+	pin := "      manifest: /srv/archive/released-a.manifest.json\n      manifest_sha256: " + strings.Repeat("a", 64) + "\n"
+	enabled := doc + pin + "    local_expiry_enabled: true\n"
+	policy, err = parse(t, fixturePaths(t), enabled)
+	if err != nil {
+		t.Fatalf("pinned local expiry rejected: %v", err)
+	}
+	if rule := policy.WorkspaceArchives[0]; !rule.LocalExpiryEnabled || rule.LocalRetention != "30d" {
+		t.Fatalf("local expiry not decoded: %+v", rule)
+	}
+	if _, err = parse(t, fixturePaths(t), enabled+"    local_retention: 90d\n"); err != nil {
+		t.Fatalf("90d local retention rejected: %v", err)
+	}
+
+	_, err = parse(t, fixturePaths(t), doc+"    local_expiry_enabled: true\n")
+	requireFieldError(t, err, "workspace_archives[0].local_expiry_enabled", "requires a pinned archive manifest")
+	_, err = parse(t, fixturePaths(t), enabled+"    local_retention: permanent\n")
+	requireFieldError(t, err, "workspace_archives[0].local_expiry_enabled", "cannot expire permanent local retention")
+	_, err = parse(t, fixturePaths(t), enabled+"    local_retention: 7d\n")
+	requireFieldError(t, err, "workspace_archives[0].local_retention", "at least 30d")
+	_, err = parse(t, fixturePaths(t), enabled+"collectors:\n  services: false\n")
+	requireFieldError(t, err, "workspace_archives[0].local_expiry_enabled", "requires Git, process, and service collectors")
+	if _, err = parse(t, fixturePaths(t), doc+pin+"    local_retention: permanent\n"); err != nil {
+		t.Fatalf("permanent retention without expiry rejected: %v", err)
+	}
+}

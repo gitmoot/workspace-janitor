@@ -145,16 +145,22 @@ caches:
 evidence_exports: []
 
 # Opt-in, copy-only verified directory archives; none is enabled. Archiving
-# never removes the source: local removal stays with quarantine and expiry.
+# never removes the source: local removal stays with quarantine and expiry,
+# and only after local_expiry_enabled, local_retention since archive creation,
+# and an exact match between the pinned archive and the local tree.
 # See policy-reference.md#workspace-archives and recovery.md#workspace-archives.
 # - name: released-checkout
 #   path: ~/work/released-checkout
 #   owner: seat-a
 #   release: release-message-id
+#   local_retention: 30d          # 30d (default), 90d or permanent
+#   local_expiry_enabled: false   # true requires the manifest pin below
 #   archive:
 #     directory: /mnt/backup/janitor-archive   # also list it in protect.paths
 #     expect_mount_source: backup.example:/export
 #     expect_fstype: nfs4
+#     manifest: /mnt/backup/janitor-archive/released-checkout.manifest.json
+#     manifest_sha256: <sha256 returned by janitor archive --workspace>
 workspace_archives: []
 # Owner KEEP records; any archive at, inside or above a kept path is refused.
 workspace_archive_keep: []

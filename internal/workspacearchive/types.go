@@ -109,8 +109,9 @@ func ManifestName(rule config.WorkspaceArchiveRule) string {
 }
 
 // RuleHash binds name, path, owner, release and destination. The pinned
-// receipt, dependent scan scope and live mount expectations are excluded:
-// they are checked afresh and changing them does not change the archive.
+// receipt, dependent scan scope, live mount expectations and local expiry
+// settings are excluded: they are checked afresh and changing them does not
+// change the archive.
 func RuleHash(rule config.WorkspaceArchiveRule) string {
 	data, _ := json.Marshal(archiveRule(rule))
 	sum := sha256.Sum256(data)
@@ -121,5 +122,20 @@ func archiveRule(rule config.WorkspaceArchiveRule) config.WorkspaceArchiveRule {
 	rule.Archive.Manifest, rule.Archive.ManifestSHA256 = "", ""
 	rule.Archive.ExpectMountSource, rule.Archive.ExpectFSType = "", ""
 	rule.DependentRoots = []string{}
+	rule.LocalRetention, rule.LocalExpiryEnabled = "", false
 	return rule
+}
+
+// PolicyScope is the host scope a policy grants one rule: its dependent roots
+// (every inventory root when unset), protect.name_patterns and the deep-size
+// entry bound.
+func PolicyScope(policy config.Policy, rule config.WorkspaceArchiveRule) Scope {
+	scope := Scope{ProcRoot: policy.Collectors.ProcRoot, SearchRoots: append([]string(nil), rule.DependentRoots...),
+		SensitiveNames: policy.Protect.NamePatterns, MaxEntries: policy.Limits.DeepSizeMaxEntries}
+	if len(scope.SearchRoots) == 0 {
+		for _, root := range policy.Roots {
+			scope.SearchRoots = append(scope.SearchRoots, root.Path)
+		}
+	}
+	return scope
 }

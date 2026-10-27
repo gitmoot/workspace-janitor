@@ -174,6 +174,21 @@ func proposals(entry core.Entry, class Classification, policy config.Policy, ver
 			Reason: reason,
 		})
 	}
+	for _, rule := range policy.WorkspaceArchives {
+		if entry.Path != rule.Path {
+			continue
+		}
+		kind, reason := core.ActionKeep, "released workspace remains retained until local expiry is enabled, its approved local lifetime has elapsed and its pinned archive matches the local tree"
+		if rule.LocalExpiryEnabled && entry.WorkspaceArchive != nil &&
+			rule.LocalRetention.Expired(entry.WorkspaceArchive.CreatedAt, entry.ObservedAt) {
+			kind, reason = core.ActionQuarantine, "released workspace exactly matches its pinned verified archive and its approved local lifetime has elapsed"
+		}
+		out = append(out, Proposal{
+			Rule: "policy.workspace_archive:" + rule.Name, Tier: TierExplicit,
+			Kind: kind, Retention: policy.Retention.Default, Specificity: len(rule.Path),
+			Reason: reason,
+		})
+	}
 
 	if policy.Ownership.InvestigateForeignOwner && foreignOwner(entry, policy) {
 		out = append(out, Proposal{

@@ -71,13 +71,7 @@ func runWorkspaceArchive(ctx context.Context, e *env, opts archiveOptions, forma
 	if core.PathsOverlap(rule.Archive.Directory, paths.StateDir) {
 		return errors.New("workspace archive directory overlaps Janitor's state directory")
 	}
-	scope := workspacearchive.Scope{ProcRoot: policy.Collectors.ProcRoot, SearchRoots: rule.DependentRoots,
-		SensitiveNames: policy.Protect.NamePatterns, MaxEntries: policy.Limits.DeepSizeMaxEntries}
-	if len(scope.SearchRoots) == 0 {
-		for _, root := range policy.Roots {
-			scope.SearchRoots = append(scope.SearchRoots, root.Path)
-		}
-	}
+	scope := workspacearchive.PolicyScope(policy, *rule)
 	report := workspaceArchiveReport{Mode: "workspace_archive", Workspace: rule.Name, Source: rule.Path, DryRun: opts.dryRun, Status: "preview",
 		Attribution: "Workspace archive creation copies data and frees no source bytes. Local removal remains with quarantine and expiry; archive storage on the same filesystem counts against eventual net recovery."}
 	emit := func() error {
