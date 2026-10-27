@@ -37,9 +37,9 @@ type categoryFixture struct {
 	maxItems                int
 	extra, prevention       string
 	// limits holds extra lines under limits:, each indented two spaces.
-	limits                  string
-	agents                  []collect.AgentSource
-	files                   map[string][]byte
+	limits string
+	agents []collect.AgentSource
+	files  map[string][]byte
 }
 
 func newCategoryFixture(t *testing.T) *categoryFixture {
