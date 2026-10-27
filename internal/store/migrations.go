@@ -335,6 +335,9 @@ func SchemaVersion() int { return migrations[len(migrations)-1].version }
 // migrate applies every pending migration and returns the resulting version.
 // Each step runs in its own transaction together with its bookkeeping row, so
 // an interrupted upgrade never leaves a half-applied step recorded as done.
+// Several processes may open the same database right after an upgrade (the
+// watcher, the cycle timer, a CLI call); applyMigration re-reads the version
+// under the write lock so only the first one applies each step.
 func (s *Store) migrate(ctx context.Context) (int, error) {
 	current, err := s.userVersion(ctx)
 	if err != nil {
@@ -366,6 +369,16 @@ func (s *Store) applyMigration(ctx context.Context, m migration) error {
 			_ = tx.Rollback()
 		}
 	}()
+	// The DSN makes every transaction BEGIN IMMEDIATE, so this read happens
+	// under the write lock: another process that migrated after migrate()
+	// read the version is visible here, and its step must not run again.
+	var applied int
+	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&applied); err != nil {
+		return fmt.Errorf("store: read user_version for migration %d: %w", m.version, err)
+	}
+	if applied >= m.version {
+		return nil
+	}
 	for _, stmt := range m.statements {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("store: migration %d (%s): %w", m.version, m.name, err)

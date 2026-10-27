@@ -3,11 +3,13 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,6 +112,87 @@ func TestOpenAppliesMigrations(t *testing.T) {
 	}
 	if reopenedStats.SchemaVersion != SchemaVersion() {
 		t.Errorf("schema version after reopen = %d", reopenedStats.SchemaVersion)
+	}
+}
+
+// A process reads the schema version, then another process applies the
+// pending step before the first one takes the write lock. The late process
+// must see the step as done instead of re-running it ("table already
+// exists"), which is what failed a live upgrade from schema 10 to 11 when the
+// restarted watcher and a CLI call opened the database together.
+func TestApplyMigrationSkipsStepAppliedByAnotherProcess(t *testing.T) {
+	ctx := context.Background()
+	db := openFixture(t)
+	last := migrations[len(migrations)-1]
+	if err := db.applyMigration(ctx, last); err != nil {
+		t.Fatalf("applyMigration of an already applied step: %v", err)
+	}
+	var applied []AppliedMigration
+	if err := db.Read(ctx, func(tx *Tx) error {
+		var err error
+		applied, err = tx.AppliedMigrations(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("AppliedMigrations: %v", err)
+	}
+	if len(applied) != len(migrations) {
+		t.Fatalf("recorded %d migrations, want %d (step recorded twice?)", len(applied), len(migrations))
+	}
+}
+
+func TestConcurrentOpenMigratesOnce(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "janitor.db")
+	// Create the file in WAL mode without migrating, so every opener below
+	// starts from schema 0 and they race on the same pending steps.
+	raw, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if err := raw.PingContext(ctx); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	raw.Close()
+
+	const openers = 6
+	start := make(chan struct{})
+	errs := make(chan error, openers)
+	var wg sync.WaitGroup
+	for i := 0; i < openers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			s, err := Open(ctx, path)
+			if err == nil {
+				err = s.Close()
+			}
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Open: %v", err)
+		}
+	}
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s.Close()
+	var applied []AppliedMigration
+	if err := s.Read(ctx, func(tx *Tx) error {
+		var err error
+		applied, err = tx.AppliedMigrations(ctx)
+		return err
+	}); err != nil {
+		t.Fatalf("AppliedMigrations: %v", err)
+	}
+	if len(applied) != len(migrations) {
+		t.Fatalf("recorded %d migrations, want %d", len(applied), len(migrations))
 	}
 }
 
