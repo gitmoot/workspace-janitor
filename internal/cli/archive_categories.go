@@ -103,6 +103,8 @@ func activeCategoryRule(policy config.Policy, record store.CategoryArchive) (con
 		return config.WorkspaceArchiveRule{}, "its path is no longer directly inside a category root"
 	case record.RestoredByOwner:
 		return config.WorkspaceArchiveRule{}, "its quarantine was restored after archiving; it stays local until it changes, idles again and is archived anew"
+	case record.Withdrawn:
+		return config.WorkspaceArchiveRule{}, "it was restored from its archive; it stays local until it changes, idles again and is archived anew"
 	}
 	if refusals := policy.CategoryArchiveRefusals(record.Path); len(refusals) != 0 {
 		return config.WorkspaceArchiveRule{}, strings.Join(refusals, "; ")

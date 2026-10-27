@@ -587,6 +587,55 @@ func TestCategoryArchiveOwnerRestoreWithdrawsExpiry(t *testing.T) {
 	}
 }
 
+// Restoring an expired category item from its archive to its original path
+// durably withdraws that archive's expiry authority: the metadata-identical
+// tree would otherwise bind again and be quarantined and expired again. Only a
+// change followed by a new idle period lets a new archive (and receipt) in.
+func TestCategoryArchivePostExpiryRestoreIsNotUndone(t *testing.T) {
+	x := newCategoryFixture(t)
+	// The receipt predates nothing in the restored tree: the tree is older
+	// than the archive, so a later change can idle past it.
+	backdate(t, x.source, 120*24*time.Hour)
+	x.recordBackdated(t, 90*24*time.Hour)
+	receipt := x.quarantine(t)
+	if _, _, code := x.run(t, "apply", "--expire", "--cleanup", receipt.CleanupID, "--dry-run=false", "--confirm"); code != ExitOK {
+		t.Fatalf("expiry of a verified category item failed: exit %d", code)
+	}
+	if _, err := os.Lstat(receipt.Destination); !os.IsNotExist(err) {
+		t.Fatalf("expiry kept the quarantined copy: %v", err)
+	}
+	restored := x.data(t, "archive", "--restore-category-item", x.source, "--restore-to", x.source, "--dry-run=false", "--confirm")
+	var status string
+	field(t, restored, "status", &status)
+	if status != "restored" {
+		t.Fatalf("restore status = %q", status)
+	}
+	x.preserved(t, x.source)
+	if _, action := x.action(t, x.source); action.Kind == core.ActionQuarantine {
+		t.Fatal("a tree restored from its category archive was proposed for quarantine again")
+	}
+	item := categoryItem(t, x.categories(t, true), x.source)
+	if item.Status != categoryAlreadyArchived || !strings.Contains(strings.Join(item.Reasons, "\n"), "restored from its archive") {
+		t.Fatalf("restored item report = %+v", item)
+	}
+	x.preserved(t, x.source)
+
+	if err := os.WriteFile(filepath.Join(x.source, "README.md"), []byte("changed after restore\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backdate(t, x.source, categoryIdleAge)
+	x.files["README.md"] = []byte("changed after restore\n")
+	if item := categoryItem(t, x.categories(t, true), x.source); item.Status != categoryWouldArchive {
+		t.Fatalf("changed and idle again item not selected for a new archive: %+v", item)
+	}
+	if item := categoryItem(t, x.categories(t, false), x.source); item.Status != categoryArchived {
+		t.Fatalf("changed and idle again item not archived anew: %+v", item)
+	}
+	if _, action := x.action(t, x.source); action.Kind != core.ActionQuarantine {
+		t.Fatalf("new category archive did not restore expiry authority: %s", action.Kind)
+	}
+}
+
 // The daily cycle archives categories before it scans, so auto-quarantine
 // moves a local_retention none item in the same cycle.
 func TestCycleArchivesCategoriesBeforePlanning(t *testing.T) {

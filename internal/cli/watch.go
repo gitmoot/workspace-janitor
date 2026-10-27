@@ -54,7 +54,7 @@ func runWatch(ctx context.Context, e *env, args []string) error {
 	if err != nil {
 		return err
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(ctx)
 	if err != nil {
 		return err
 	}

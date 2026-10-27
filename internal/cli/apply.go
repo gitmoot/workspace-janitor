@@ -94,7 +94,7 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	if err != nil {
 		return err
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(ctx)
 	if err != nil {
 		return err
 	}
@@ -299,7 +299,7 @@ func runRestore(ctx context.Context, e *env, args []string, confirm bool) error 
 	if err != nil {
 		return err
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(ctx)
 	if err != nil {
 		return err
 	}

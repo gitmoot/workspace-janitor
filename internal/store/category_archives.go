@@ -39,6 +39,10 @@ type CategoryArchive struct {
 	// restored after the archive was created. The owner's undo withdraws the
 	// receipt's expiry authority until the path changes and is archived anew.
 	RestoredByOwner bool `json:"-"`
+	// Withdrawn is derived from category_archive_withdrawals: the archive was
+	// restored from (for example after expiry), so it no longer authorizes
+	// removing the local tree.
+	Withdrawn bool `json:"-"`
 }
 
 func (a CategoryArchive) validate() error {
@@ -79,8 +83,24 @@ func (t *Tx) RecordCategoryArchive(ctx context.Context, a CategoryArchive) error
 	return nil
 }
 
+// WithdrawCategoryArchive appends an immutable withdrawal of one receipt's
+// local expiry authority. It is recorded before an archive restore so the
+// restored tree is never quarantined or expired again on that receipt; the
+// path regains authority only through a new receipt.
+func (t *Tx) WithdrawCategoryArchive(ctx context.Context, name, reason string, at time.Time) error {
+	if strings.TrimSpace(name) == "" || strings.TrimSpace(reason) == "" || at.IsZero() {
+		return errors.New("store: category archive withdrawal requires a name, reason and time")
+	}
+	if _, err := t.tx.ExecContext(ctx, `INSERT INTO category_archive_withdrawals (name, reason, withdrawn_at) VALUES (?, ?, ?)`,
+		name, reason, formatTime(at)); err != nil {
+		return fmt.Errorf("store: withdraw category archive %s: %w", name, err)
+	}
+	return nil
+}
+
 // CategoryArchives returns the newest receipt of every archived path,
-// ordered by path, with RestoredByOwner derived from cleanup receipts.
+// ordered by path, with RestoredByOwner derived from cleanup receipts and
+// Withdrawn from recorded withdrawals.
 func (t *Tx) CategoryArchives(ctx context.Context) ([]CategoryArchive, error) {
 	rows, err := t.tx.QueryContext(ctx, `SELECT document FROM category_archives AS c
 		WHERE sequence = (SELECT MAX(sequence) FROM category_archives WHERE path = c.path)
@@ -91,6 +111,7 @@ func (t *Tx) CategoryArchives(ctx context.Context) ([]CategoryArchive, error) {
 	defer rows.Close()
 	out := []CategoryArchive{}
 	index := map[string]int{}
+	byName := map[string]int{}
 	for rows.Next() {
 		var data string
 		if err := rows.Scan(&data); err != nil {
@@ -104,6 +125,7 @@ func (t *Tx) CategoryArchives(ctx context.Context) ([]CategoryArchive, error) {
 			return nil, err
 		}
 		index[a.Path] = len(out)
+		byName[a.Name] = len(out)
 		out = append(out, a)
 	}
 	if err := rows.Err(); err != nil {
@@ -134,6 +156,24 @@ func (t *Tx) CategoryArchives(ctx context.Context) ([]CategoryArchive, error) {
 	}
 	if err := restored.Err(); err != nil {
 		return nil, fmt.Errorf("store: list restored cleanup items: %w", err)
+	}
+	restored.Close()
+	withdrawn, err := t.tx.QueryContext(ctx, `SELECT DISTINCT name FROM category_archive_withdrawals`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list category archive withdrawals: %w", err)
+	}
+	defer withdrawn.Close()
+	for withdrawn.Next() {
+		var name string
+		if err := withdrawn.Scan(&name); err != nil {
+			return nil, fmt.Errorf("store: scan category archive withdrawal: %w", err)
+		}
+		if i, ok := byName[name]; ok {
+			out[i].Withdrawn = true
+		}
+	}
+	if err := withdrawn.Err(); err != nil {
+		return nil, fmt.Errorf("store: list category archive withdrawals: %w", err)
 	}
 	return out, nil
 }

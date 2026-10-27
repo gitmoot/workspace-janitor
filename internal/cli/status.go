@@ -55,7 +55,7 @@ func runStatus(ctx context.Context, e *env) error {
 	if err != nil {
 		return err
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(ctx)
 	if err != nil {
 		return err
 	}

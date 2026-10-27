@@ -72,7 +72,7 @@ func runDoctor(ctx context.Context, e *env) error {
 		}
 	}
 
-	if policy, err := e.loadPolicy(); err != nil {
+	if policy, err := e.loadPolicy(ctx); err != nil {
 		add("policy", checkFail, "%v", err)
 	} else {
 		add("policy", checkOK, "%s: version %d, %d root(s), %d cache rule(s), jev=%s",

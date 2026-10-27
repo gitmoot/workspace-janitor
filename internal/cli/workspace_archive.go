@@ -94,7 +94,7 @@ func runWorkspaceArchiveRule(ctx context.Context, e *env, opts archiveOptions, f
 		}
 		return err
 	}
-	record := func(kind, path, sample string, run func() error) error {
+	record := func(kind, path, sample string, run func(db *store.Store) error) error {
 		if err := config.EnsureDir(paths.StateDir); err != nil {
 			return err
 		}
@@ -114,7 +114,7 @@ func runWorkspaceArchiveRule(ctx context.Context, e *env, opts archiveOptions, f
 		}
 		report.Activity = &monitor.activity
 		monitor.activity.Attempted = 1
-		err = run()
+		err = run(db)
 		if err == nil {
 			monitor.activity.Completed = 1
 		}
@@ -131,7 +131,18 @@ func runWorkspaceArchiveRule(ctx context.Context, e *env, opts archiveOptions, f
 		if opts.restoreTo != "" {
 			report.Mode, report.RestoredTo, report.Status = "workspace_archive_restore", opts.restoreTo, "preview"
 			if !opts.dryRun {
-				if err := record("archive_restore", opts.restoreTo, filepath.Dir(opts.restoreTo), func() error {
+				if err := record("archive_restore", opts.restoreTo, filepath.Dir(opts.restoreTo), func(db *store.Store) error {
+					// A category item restored from its archive is the owner's
+					// undo: withdraw the receipt's expiry authority durably
+					// before any tree appears, or the next cycle would bind the
+					// metadata-identical tree and remove it again.
+					if strings.HasPrefix(rule.Owner, config.CategoryOwnerPrefix) {
+						if err := db.Write(ctx, func(tx *store.Tx) error {
+							return tx.WithdrawCategoryArchive(ctx, rule.Name, "restored to "+opts.restoreTo, time.Now().UTC())
+						}); err != nil {
+							return err
+						}
+					}
 					_, err := workspacearchive.Restore(ctx, *rule, opts.restoreTo)
 					return err
 				}); err != nil {
@@ -170,7 +181,7 @@ func runWorkspaceArchiveRule(ctx context.Context, e *env, opts archiveOptions, f
 	}
 	var m workspacearchive.Manifest
 	var binding *workspacearchive.Binding
-	if err = record("verified_archive", rule.Path, rule.Archive.Directory, func() error {
+	if err = record("verified_archive", rule.Path, rule.Archive.Directory, func(*store.Store) error {
 		var err error
 		m, binding, err = workspacearchive.Create(ctx, *rule, scope, preflight)
 		return err

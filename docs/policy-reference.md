@@ -522,7 +522,10 @@ its expiry authority while any of these hold:
 
 - its category is removed, or its kind, root or archive directory changes
 - the policy now refuses its path
-- the owner restored its quarantine with `janitor restore`
+- the owner restored its quarantine with `janitor restore`, or restored the
+  item from its archive (`archive --restore-category-item` or `archive
+  --workspace <item name> --restore-to`); the archive restore records an
+  immutable withdrawal before any file is written
 
 `janitor archive --categories` previews by default and writes nothing.
 `--dry-run=false --confirm` creates the archives under the apply lock and

@@ -112,7 +112,7 @@ func (e *env) resolvePaths() (config.Paths, error) {
 // file plus a pinned workspace archive rule for every active category
 // archive recorded in Janitor's state. Collectors, planning, quarantine and
 // expiry therefore treat category archives exactly like workspace_archives.
-func (e *env) loadPolicy() (config.Policy, error) {
+func (e *env) loadPolicy(ctx context.Context) (config.Policy, error) {
 	if e.policy != nil {
 		return *e.policy, nil
 	}
@@ -124,7 +124,7 @@ func (e *env) loadPolicy() (config.Policy, error) {
 	if err != nil {
 		return config.Policy{}, err
 	}
-	policy, err := withCategoryArchives(context.Background(), paths, file)
+	policy, err := withCategoryArchives(ctx, paths, file)
 	if err != nil {
 		return config.Policy{}, err
 	}

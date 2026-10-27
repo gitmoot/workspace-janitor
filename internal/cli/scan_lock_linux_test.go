@@ -86,7 +86,7 @@ func TestWatcherScanWaitsForTheScanLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

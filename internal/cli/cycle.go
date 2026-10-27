@@ -40,7 +40,7 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	if err != nil {
 		return err
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(ctx)
 	if err != nil {
 		return err
 	}
@@ -64,7 +64,7 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 			categoryErr = fmt.Errorf("scheduled category archives: %w", categoryErr)
 		}
 		e.policy = nil
-		if policy, err = e.loadPolicy(); err != nil {
+		if policy, err = e.loadPolicy(ctx); err != nil {
 			return errors.Join(categoryErr, err)
 		}
 	}

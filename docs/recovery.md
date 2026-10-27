@@ -152,4 +152,7 @@ policy.
   restores the newest archive of that path. `--verify` re-reads it without
   restoring. `janitor archive --workspace <synthesized name> --verify` or
   `--restore-to` also works while the item's archive is active; the name is in
-  the category report and the cycle report.
+  the category report and the cycle report. A confirmed restore first records
+  an immutable withdrawal of that archive's expiry authority, so the restored
+  tree is never quarantined or expired again on that archive; it is archived
+  anew only after it changes and is idle again.

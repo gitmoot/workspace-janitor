@@ -191,7 +191,7 @@ func TestWatchMetadataDoesNotAdvanceWeeklyDeepScan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestWatchOverflowAndRestartReconcileMissedChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +372,7 @@ func TestWatchBoundsProtectedChurnWithoutLosingRealDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

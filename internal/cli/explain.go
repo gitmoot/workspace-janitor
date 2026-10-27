@@ -47,7 +47,7 @@ func runExplain(ctx context.Context, e *env, args []string, opts explainOptions)
 	if err != nil {
 		return err
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(ctx)
 	if err != nil {
 		return err
 	}
