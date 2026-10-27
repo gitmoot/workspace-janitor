@@ -288,16 +288,19 @@ type RecoveryPolicy struct {
 
 // Policy is the validated policy document.
 type Policy struct {
-	Version             int                       `yaml:"version" json:"version"`
-	Roots               []Root                    `yaml:"roots" json:"roots"`
-	Protect             Protect                   `yaml:"protect" json:"protect"`
-	Retention           RetentionPolicy           `yaml:"retention" json:"retention"`
-	Caches              []CacheRule               `yaml:"caches" json:"caches"`
-	EvidenceExports     []EvidenceExportRule      `yaml:"evidence_exports" json:"evidence_exports"`
-	SourceNameApprovals *SourceNameApprovalPolicy `yaml:"source_name_approvals,omitempty" json:"source_name_approvals,omitempty"`
-	Gitmoot             GitmootPolicy             `yaml:"gitmoot" json:"gitmoot"`
-	Collectors          Collectors                `yaml:"collectors" json:"collectors"`
-	Safety              Safety                    `yaml:"safety" json:"safety"`
+	Version         int                  `yaml:"version" json:"version"`
+	Roots           []Root               `yaml:"roots" json:"roots"`
+	Protect         Protect              `yaml:"protect" json:"protect"`
+	Retention       RetentionPolicy      `yaml:"retention" json:"retention"`
+	Caches          []CacheRule          `yaml:"caches" json:"caches"`
+	EvidenceExports []EvidenceExportRule `yaml:"evidence_exports" json:"evidence_exports"`
+	// WorkspaceArchives are opt-in, copy-only verified directory archives.
+	WorkspaceArchives    []WorkspaceArchiveRule    `yaml:"workspace_archives" json:"workspace_archives"`
+	WorkspaceArchiveKeep []WorkspaceArchiveKeep    `yaml:"workspace_archive_keep" json:"workspace_archive_keep"`
+	SourceNameApprovals  *SourceNameApprovalPolicy `yaml:"source_name_approvals,omitempty" json:"source_name_approvals,omitempty"`
+	Gitmoot              GitmootPolicy             `yaml:"gitmoot" json:"gitmoot"`
+	Collectors           Collectors                `yaml:"collectors" json:"collectors"`
+	Safety               Safety                    `yaml:"safety" json:"safety"`
 
 	Prevention     Prevention      `yaml:"prevention" json:"prevention"`
 	CanonicalRoots []CanonicalRoot `yaml:"canonical_roots" json:"canonical_roots"`
@@ -433,6 +436,11 @@ func (p Policy) clone() Policy {
 	out.Protect.NamePatterns = append([]string(nil), p.Protect.NamePatterns...)
 	out.Caches = append([]CacheRule(nil), p.Caches...)
 	out.EvidenceExports = append([]EvidenceExportRule(nil), p.EvidenceExports...)
+	out.WorkspaceArchives = append([]WorkspaceArchiveRule(nil), p.WorkspaceArchives...)
+	for i := range out.WorkspaceArchives {
+		out.WorkspaceArchives[i].DependentRoots = append([]string(nil), p.WorkspaceArchives[i].DependentRoots...)
+	}
+	out.WorkspaceArchiveKeep = append([]WorkspaceArchiveKeep(nil), p.WorkspaceArchiveKeep...)
 	if p.SourceNameApprovals != nil {
 		approvals := *p.SourceNameApprovals
 		approvals.Reviewers = append([]string(nil), approvals.Reviewers...)
@@ -488,6 +496,7 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 		}
 	}
 	p.normalizeEvidenceExports(expand)
+	p.normalizeWorkspaceArchives(expand)
 	if p.Gitmoot.Home != "" {
 		p.Gitmoot.Home = expand("gitmoot.home", p.Gitmoot.Home)
 	}
@@ -575,6 +584,7 @@ func mergeUnique(base, extra []string) []string {
 func (p *Policy) Validate() core.FieldErrors {
 	var errs core.FieldErrors
 	p.validateEvidenceExports(&errs)
+	p.validateWorkspaceArchives(&errs)
 	p.validateSourceNameApprovals(&errs)
 	if p.Version != PolicyVersion {
 		errs.Add("version", "must be %d, got %d", PolicyVersion, p.Version)

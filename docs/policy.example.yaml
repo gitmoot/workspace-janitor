@@ -144,6 +144,21 @@ caches:
 # Archive deletion is always disabled; raw stores/checkouts are not exports.
 evidence_exports: []
 
+# Opt-in, copy-only verified directory archives; none is enabled. Archiving
+# never removes the source: local removal stays with quarantine and expiry.
+# See policy-reference.md#workspace-archives and recovery.md#workspace-archives.
+# - name: released-checkout
+#   path: ~/work/released-checkout
+#   owner: seat-a
+#   release: release-message-id
+#   archive:
+#     directory: /mnt/backup/janitor-archive   # also list it in protect.paths
+#     expect_mount_source: backup.example:/export
+#     expect_fstype: nfs4
+workspace_archives: []
+# Owner KEEP records; any archive at, inside or above a kept path is refused.
+workspace_archive_keep: []
+
 # The Jev model classifier is optional and disabled by default: the tool must
 # be fully useful with no credentials and no network. When enabled, only
 # entries the rules left ambiguous are sent, as a redacted allowlisted
