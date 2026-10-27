@@ -283,6 +283,15 @@ func reconcileWatch(ctx context.Context, e *env, paths config.Paths, policy conf
 	reason string, changed map[string]bool, overflow bool, deferred uint64) error {
 	quiet := *e
 	quiet.stdout = io.Discard
+	// Category archive pins live in Janitor's state and change between
+	// cycles; the policy file itself is still read once per watcher.
+	if e.filePolicy != nil && len(e.filePolicy.WorkspaceArchiveCategories) != 0 {
+		refreshed, err := withCategoryArchives(ctx, paths, *e.filePolicy)
+		if err != nil {
+			return err
+		}
+		quiet.policy = &refreshed
+	}
 	// Background inventory is local and rules-only; neither planning nor
 	// Jev nor an action engine is invoked by this path.
 	var scanID string

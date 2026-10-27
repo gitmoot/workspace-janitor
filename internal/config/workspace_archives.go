@@ -118,6 +118,9 @@ func (p *Policy) validateWorkspaceArchives(errs *core.FieldErrors) {
 		if strings.TrimSpace(rule.Owner) == "" || strings.TrimSpace(rule.Release) == "" {
 			errs.Add(field, "requires the releasing owner and a release reference")
 		}
+		if strings.HasPrefix(rule.Owner, CategoryOwnerPrefix) {
+			errs.Add(field+".owner", "the %q prefix is reserved for Janitor's own category archive records", CategoryOwnerPrefix)
+		}
 		if !core.IsCanonicalPath(rule.Path) || rule.Path == "/" {
 			errs.Add(field+".path", "must be a canonical absolute directory path, got %q", rule.Path)
 		} else {
@@ -188,46 +191,8 @@ func (p *Policy) validateWorkspaceArchiveSource(errs *core.FieldErrors, index in
 }
 
 func (p *Policy) validateWorkspaceArchiveDestination(errs *core.FieldErrors, field string, rule WorkspaceArchiveRule) {
-	dir := rule.Archive.Directory
-	if !core.IsCanonicalPath(dir) || dir == "/" {
-		errs.Add(field+".archive.directory", "must be a canonical absolute directory path, got %q", dir)
+	if !p.validateArchiveDirectory(errs, field+".archive", rule.Archive.Directory, rule.Archive.ExpectMountSource, rule.Archive.ExpectFSType) {
 		return
-	}
-	for _, other := range p.WorkspaceArchives {
-		if core.PathsOverlap(dir, other.Path) {
-			errs.Add(field+".archive.directory", "overlaps workspace archive source %q", other.Path)
-		}
-	}
-	for _, export := range p.EvidenceExports {
-		if core.PathsOverlap(dir, export.SourceContainer) {
-			errs.Add(field+".archive.directory", "overlaps an evidence export source container")
-		}
-	}
-	if core.PathsOverlap(dir, p.Retention.QuarantineDir) {
-		errs.Add(field+".archive.directory", "archive cannot share a cleanup receipt container")
-	}
-	if core.PathsOverlap(dir, p.Gitmoot.Home) {
-		errs.Add(field+".archive.directory", "archive cannot overlap Gitmoot's managed state")
-	}
-	for _, cache := range p.Caches {
-		if core.PathsOverlap(dir, cache.Path) {
-			errs.Add(field+".archive.directory", "archive overlaps a cache cleanup scope")
-		}
-	}
-	protectedArchive := false
-	for _, protected := range p.Protect.Paths {
-		protectedArchive = protectedArchive || core.PathWithin(dir, protected)
-	}
-	if !protectedArchive {
-		errs.Add(field+".archive.directory", "must also be covered by an independent protect.paths rule that survives removal of this archive rule")
-	}
-	for _, value := range []struct{ name, value string }{
-		{"expect_mount_source", rule.Archive.ExpectMountSource},
-		{"expect_fstype", rule.Archive.ExpectFSType},
-	} {
-		if strings.ContainsAny(value.value, " \t\n") {
-			errs.Add(field+".archive."+value.name, "must not contain whitespace; mountinfo escapes it as octal")
-		}
 	}
 	if rule.Archive.Manifest != "" {
 		if rule.Archive.Manifest != WorkspaceArchiveManifestPath(rule) {
@@ -239,4 +204,51 @@ func (p *Policy) validateWorkspaceArchiveDestination(errs *core.FieldErrors, fie
 	} else if rule.Archive.ManifestSHA256 != "" {
 		errs.Add(field+".archive.manifest_sha256", "requires an exact manifest path")
 	}
+}
+
+// validateArchiveDirectory holds every workspace archive destination,
+// explicit or category, to the same approval rules. It reports false when the
+// directory is not a usable path, so callers skip dependent checks.
+func (p *Policy) validateArchiveDirectory(errs *core.FieldErrors, field, dir, mountSource, fstype string) bool {
+	if !core.IsCanonicalPath(dir) || dir == "/" {
+		errs.Add(field+".directory", "must be a canonical absolute directory path, got %q", dir)
+		return false
+	}
+	for _, other := range p.WorkspaceArchives {
+		if core.PathsOverlap(dir, other.Path) {
+			errs.Add(field+".directory", "overlaps workspace archive source %q", other.Path)
+		}
+	}
+	for _, export := range p.EvidenceExports {
+		if core.PathsOverlap(dir, export.SourceContainer) {
+			errs.Add(field+".directory", "overlaps an evidence export source container")
+		}
+	}
+	if core.PathsOverlap(dir, p.Retention.QuarantineDir) {
+		errs.Add(field+".directory", "archive cannot share a cleanup receipt container")
+	}
+	if core.PathsOverlap(dir, p.Gitmoot.Home) {
+		errs.Add(field+".directory", "archive cannot overlap Gitmoot's managed state")
+	}
+	for _, cache := range p.Caches {
+		if core.PathsOverlap(dir, cache.Path) {
+			errs.Add(field+".directory", "archive overlaps a cache cleanup scope")
+		}
+	}
+	protectedArchive := false
+	for _, protected := range p.Protect.Paths {
+		protectedArchive = protectedArchive || core.PathWithin(dir, protected)
+	}
+	if !protectedArchive {
+		errs.Add(field+".directory", "must also be covered by an independent protect.paths rule that survives removal of this archive rule")
+	}
+	for _, value := range []struct{ name, value string }{
+		{"expect_mount_source", mountSource},
+		{"expect_fstype", fstype},
+	} {
+		if strings.ContainsAny(value.value, " \t\n") {
+			errs.Add(field+"."+value.name, "must not contain whitespace; mountinfo escapes it as octal")
+		}
+	}
+	return true
 }

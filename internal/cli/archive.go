@@ -16,8 +16,8 @@ import (
 )
 
 type archiveOptions struct {
-	rule, workspace, restoreTo string
-	verify, dryRun, confirm    bool
+	rule, workspace, restoreTo, categoryItem string
+	verify, dryRun, confirm, categories      bool
 }
 type archiveReport struct {
 	Mode                 string                     `json:"mode"`
@@ -38,10 +38,12 @@ type archiveReport struct {
 }
 
 func archiveCommand() *command {
-	return &command{name: "archive", usage: "janitor archive (--rule NAME | --workspace NAME) [--verify | --restore-to PATH] [--dry-run=false --confirm]", summary: "Archive or restore one approved evidence export or released workspace; never delete its source or archive", register: func(fs *flag.FlagSet) func(context.Context, *env, []string) error {
+	return &command{name: "archive", usage: "janitor archive (--rule NAME | --workspace NAME | --restore-category-item PATH | --categories) [--verify | --restore-to PATH] [--dry-run=false --confirm]", summary: "Archive or restore one approved evidence export, released workspace or category item, or archive owner-approved categories; never delete a source or archive", register: func(fs *flag.FlagSet) func(context.Context, *env, []string) error {
 		opts := archiveOptions{}
 		fs.StringVar(&opts.rule, "rule", "", "exact evidence_exports rule name")
 		fs.StringVar(&opts.workspace, "workspace", "", "exact workspace_archives rule name (copy-only directory archive)")
+		fs.BoolVar(&opts.categories, "categories", false, "select and archive idle items of every workspace_archive_categories entry (copy-only)")
+		fs.StringVar(&opts.categoryItem, "restore-category-item", "", "original path of a category-archived item to verify or restore from its newest archive")
 		fs.BoolVar(&opts.verify, "verify", false, "verify the pinned archive payload and restore integrity")
 		fs.StringVar(&opts.restoreTo, "restore-to", "", "restore to a new, nonexisting absolute path")
 		fs.BoolVar(&opts.dryRun, "dry-run", true, "preview without creating archive or restored files")
@@ -51,8 +53,20 @@ func archiveCommand() *command {
 }
 
 func runArchive(ctx context.Context, e *env, args []string, opts archiveOptions) error {
-	if len(args) != 0 || (opts.rule == "") == (opts.workspace == "") || (opts.verify && opts.restoreTo != "") {
-		return &usageError{msg: "archive requires exactly one of --rule or --workspace and at most one of --verify or --restore-to"}
+	modes := 0
+	for _, selected := range []bool{opts.rule != "", opts.workspace != "", opts.categories, opts.categoryItem != ""} {
+		if selected {
+			modes++
+		}
+	}
+	if len(args) != 0 || modes != 1 || (opts.verify && opts.restoreTo != "") {
+		return &usageError{msg: "archive requires exactly one of --rule, --workspace, --categories or --restore-category-item and at most one of --verify or --restore-to"}
+	}
+	if opts.categories && (opts.verify || opts.restoreTo != "") {
+		return &usageError{msg: "--categories only creates archives; verify or restore one item with --restore-category-item"}
+	}
+	if opts.categoryItem != "" && (!core.IsCanonicalPath(opts.categoryItem) || (!opts.verify && opts.restoreTo == "")) {
+		return &usageError{msg: "--restore-category-item requires a canonical absolute path and --verify or --restore-to"}
 	}
 	if opts.restoreTo != "" && !core.IsCanonicalPath(opts.restoreTo) {
 		return &usageError{msg: "--restore-to must be a canonical absolute path"}
@@ -74,6 +88,12 @@ func runArchive(ctx context.Context, e *env, args []string, opts archiveOptions)
 	}
 	if opts.workspace != "" {
 		return runWorkspaceArchive(ctx, e, opts, format, paths, policy)
+	}
+	if opts.categories {
+		return runCategoryArchives(ctx, e, opts, format, paths)
+	}
+	if opts.categoryItem != "" {
+		return runCategoryItemRestore(ctx, e, opts, format, paths, policy)
 	}
 	var rule *config.EvidenceExportRule
 	for i := range policy.EvidenceExports {

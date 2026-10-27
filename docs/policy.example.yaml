@@ -164,6 +164,37 @@ evidence_exports: []
 workspace_archives: []
 # Owner KEEP records; any archive at, inside or above a kept path is refused.
 workspace_archive_keep: []
+# Owner-approved archive categories; empty by default. Janitor itself selects
+# idle depth-1 items of each root, archives them copy-only and verified, and
+# pins each manifest in its state database (never in this file). Pinned items
+# then follow the workspace_archives Bind -> quarantine -> expiry flow.
+# See policy-reference.md#workspace-archive-categories.
+# - name: merged
+#   kind: merged_worktrees        # linked worktree, clean, all commits pushed
+#   roots: [/root]                # exact, non-report_only inventory roots
+#   idle: 14d                     # newest mtime in the tree; minimum 14d
+#   local_retention: none         # none, 30d (default) or 90d
+#   max_items_per_cycle: 20       # default 20, at most 200
+#   max_bytes_per_item: 10737418240
+#   archive:
+#     directory: /mnt/backup/janitor-categories   # protected, outside every root
+#     expect_mount_source: backup.example:/export
+#     expect_fstype: nfs4
+# - name: clones
+#   kind: pushed_clones           # standalone clone, clean, all commits pushed
+#   roots: [/root]
+#   idle: 30d                     # minimum 30d
+#   local_retention: none
+#   archive:
+#     directory: /mnt/backup/janitor-categories
+# - name: scratch
+#   kind: root_scratch            # non-Git directory directly inside the root
+#   roots: [/root]
+#   idle: 30d                     # minimum 30d
+#   local_retention: none
+#   archive:
+#     directory: /mnt/backup/janitor-categories
+workspace_archive_categories: []
 
 # The Jev model classifier is optional and disabled by default: the tool must
 # be fully useful with no credentials and no network. When enabled, only

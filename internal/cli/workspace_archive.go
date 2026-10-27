@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
@@ -56,18 +57,24 @@ func summarizeWorkspaceArchive(m workspacearchive.Manifest) *workspaceArchiveSum
 
 // runWorkspaceArchive is the copy-only directory counterpart of runArchive.
 // It never removes the source or an archive; local removal stays with
-// quarantine and expiry.
+// quarantine and expiry. Active category archive items are listed under
+// their synthesized names and may be verified or restored, never re-created.
 func runWorkspaceArchive(ctx context.Context, e *env, opts archiveOptions, format output.Format, paths config.Paths, policy config.Policy) error {
-	var rule *config.WorkspaceArchiveRule
-	for i := range policy.WorkspaceArchives {
-		if policy.WorkspaceArchives[i].Name == opts.workspace {
-			rule = &policy.WorkspaceArchives[i]
-			break
+	for _, rule := range policy.WorkspaceArchives {
+		if rule.Name != opts.workspace {
+			continue
 		}
+		if strings.HasPrefix(rule.Owner, config.CategoryOwnerPrefix) && !opts.verify && opts.restoreTo == "" {
+			return errors.New("category archive items are created only by `janitor archive --categories`; use --verify or --restore-to with this name")
+		}
+		return runWorkspaceArchiveRule(ctx, e, opts, format, paths, policy, &rule)
 	}
-	if rule == nil {
-		return fmt.Errorf("no exact workspace archive rule %q", opts.workspace)
-	}
+	return fmt.Errorf("no exact workspace archive rule %q", opts.workspace)
+}
+
+// runWorkspaceArchiveRule previews, creates, verifies or restores the archive
+// of one workspace archive rule.
+func runWorkspaceArchiveRule(ctx context.Context, e *env, opts archiveOptions, format output.Format, paths config.Paths, policy config.Policy, rule *config.WorkspaceArchiveRule) error {
 	if core.PathsOverlap(rule.Archive.Directory, paths.StateDir) {
 		return errors.New("workspace archive directory overlaps Janitor's state directory")
 	}

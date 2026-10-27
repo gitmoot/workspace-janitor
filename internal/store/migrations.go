@@ -299,6 +299,23 @@ var migrations = []migration{
 			)`,
 		},
 	},
+	{
+		version: categoryArchivesVersion,
+		name:    "category_archives",
+		statements: []string{
+			`CREATE TABLE category_archives (
+				sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+				name TEXT NOT NULL UNIQUE,
+				path TEXT NOT NULL,
+				document TEXT NOT NULL CHECK (length(document) <= 65536)
+			)`,
+			`CREATE INDEX category_archives_path ON category_archives(path, sequence)`,
+			`CREATE TRIGGER category_archives_no_update BEFORE UPDATE ON category_archives
+			 BEGIN SELECT RAISE(ABORT, 'category archive receipts are immutable'); END`,
+			`CREATE TRIGGER category_archives_no_delete BEFORE DELETE ON category_archives
+			 BEGIN SELECT RAISE(ABORT, 'category archive receipts are immutable'); END`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.
