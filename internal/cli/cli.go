@@ -76,6 +76,9 @@ type env struct {
 	paths    *config.Paths
 	policy   *config.Policy
 	buildRef buildinfo.Info
+	// filePolicy is the policy file alone; policy adds the pinned rules of
+	// Janitor's recorded category archives.
+	filePolicy *config.Policy
 }
 
 // format returns the validated output format.
@@ -105,10 +108,35 @@ func (e *env) resolvePaths() (config.Paths, error) {
 	return paths, nil
 }
 
-// loadPolicy loads and caches the policy for this run.
-func (e *env) loadPolicy() (config.Policy, error) {
+// loadPolicy loads and caches the effective policy for this run: the policy
+// file plus a pinned workspace archive rule for every active category
+// archive recorded in Janitor's state. Collectors, planning, quarantine and
+// expiry therefore treat category archives exactly like workspace_archives.
+func (e *env) loadPolicy(ctx context.Context) (config.Policy, error) {
 	if e.policy != nil {
 		return *e.policy, nil
+	}
+	file, err := e.loadFilePolicy()
+	if err != nil {
+		return config.Policy{}, err
+	}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		return config.Policy{}, err
+	}
+	policy, err := withCategoryArchives(ctx, paths, file)
+	if err != nil {
+		return config.Policy{}, err
+	}
+	e.policy = &policy
+	return policy, nil
+}
+
+// loadFilePolicy loads and caches the policy file without state-derived
+// rules.
+func (e *env) loadFilePolicy() (config.Policy, error) {
+	if e.filePolicy != nil {
+		return *e.filePolicy, nil
 	}
 	paths, err := e.resolvePaths()
 	if err != nil {
@@ -118,7 +146,7 @@ func (e *env) loadPolicy() (config.Policy, error) {
 	if err != nil {
 		return config.Policy{}, err
 	}
-	e.policy = &policy
+	e.filePolicy = &policy
 	return policy, nil
 }
 

@@ -302,6 +302,10 @@ type Policy struct {
 	Collectors           Collectors                `yaml:"collectors" json:"collectors"`
 	Safety               Safety                    `yaml:"safety" json:"safety"`
 
+	// WorkspaceArchiveCategories are opt-in, owner-approved categories whose
+	// matching items Janitor archives itself; their pins live in its state.
+	WorkspaceArchiveCategories []WorkspaceArchiveCategory `yaml:"workspace_archive_categories" json:"workspace_archive_categories"`
+
 	Prevention     Prevention      `yaml:"prevention" json:"prevention"`
 	CanonicalRoots []CanonicalRoot `yaml:"canonical_roots" json:"canonical_roots"`
 	Classification Classification  `yaml:"classification" json:"classification"`
@@ -441,6 +445,10 @@ func (p Policy) clone() Policy {
 		out.WorkspaceArchives[i].DependentRoots = append([]string(nil), p.WorkspaceArchives[i].DependentRoots...)
 	}
 	out.WorkspaceArchiveKeep = append([]WorkspaceArchiveKeep(nil), p.WorkspaceArchiveKeep...)
+	out.WorkspaceArchiveCategories = append([]WorkspaceArchiveCategory(nil), p.WorkspaceArchiveCategories...)
+	for i := range out.WorkspaceArchiveCategories {
+		out.WorkspaceArchiveCategories[i].Roots = append([]string(nil), p.WorkspaceArchiveCategories[i].Roots...)
+	}
 	if p.SourceNameApprovals != nil {
 		approvals := *p.SourceNameApprovals
 		approvals.Reviewers = append([]string(nil), approvals.Reviewers...)
@@ -497,6 +505,7 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	}
 	p.normalizeEvidenceExports(expand)
 	p.normalizeWorkspaceArchives(expand)
+	p.normalizeWorkspaceArchiveCategories(expand)
 	if p.Gitmoot.Home != "" {
 		p.Gitmoot.Home = expand("gitmoot.home", p.Gitmoot.Home)
 	}
@@ -585,6 +594,7 @@ func (p *Policy) Validate() core.FieldErrors {
 	var errs core.FieldErrors
 	p.validateEvidenceExports(&errs)
 	p.validateWorkspaceArchives(&errs)
+	p.validateWorkspaceArchiveCategories(&errs)
 	p.validateSourceNameApprovals(&errs)
 	if p.Version != PolicyVersion {
 		errs.Add("version", "must be %d, got %d", PolicyVersion, p.Version)

@@ -26,6 +26,7 @@ type cycleReport struct {
 	ExpiryReport     string                 `json:"expiry_report,omitempty"`
 	Capacity         *core.CapacitySnapshot `json:"capacity,omitempty"`
 	Recovery         *recoveryReport        `json:"recovery,omitempty"`
+	CategoryArchives *categoryArchiveReport `json:"category_archives,omitempty"`
 	Inventory        *inventoryReport       `json:"inventory_report"`
 }
 
@@ -39,7 +40,7 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	if err != nil {
 		return err
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(ctx)
 	if err != nil {
 		return err
 	}
@@ -51,6 +52,22 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 		return err
 	}
 	deep = deep || policy.Prevention.Recovery.Enabled
+	// Category archives are created before the scan, so the scan, plan and
+	// quarantine below see their freshly recorded pins (local_retention none
+	// proposes quarantine in this same cycle). Item failures do not stop the
+	// cycle; they are reported and returned once the cycle has finished.
+	var categories *categoryArchiveReport
+	var categoryErr error
+	if len(policy.WorkspaceArchiveCategories) != 0 {
+		categories, categoryErr = cycleCategoryArchives(ctx, e, paths)
+		if categoryErr != nil {
+			categoryErr = fmt.Errorf("scheduled category archives: %w", categoryErr)
+		}
+		e.policy = nil
+		if policy, err = e.loadPolicy(ctx); err != nil {
+			return errors.Join(categoryErr, err)
+		}
+	}
 	// Hold the scan lock from this scan through the quarantine apply, so no
 	// watcher scan lands between the plan and the apply's binding check.
 	unlockScan, err := lockScan(ctx, paths.StateDir)
@@ -86,6 +103,7 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	}
 	report := cycleReport{ScanID: scanID, Deep: deep, Quarantine: "disabled", Expiry: "disabled", DiskAlerts: alerts}
 	report.Capacity = capacity
+	report.CategoryArchives = categories
 	reportDB, err := store.OpenExisting(ctx, paths.DatabaseFile)
 	if err != nil {
 		return err
@@ -113,7 +131,7 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 		err = errors.Join(err, refreshErr)
 	}
 	if err != nil {
-		return errors.Join(fmt.Errorf("scheduled capacity recovery: %w", err), writeCycleReport(e.stdout, report))
+		return errors.Join(fmt.Errorf("scheduled capacity recovery: %w", err), categoryErr, writeCycleReport(e.stdout, report))
 	}
 	var quarantineErr error
 	if policy.Prevention.AutoQuarantine {
@@ -130,11 +148,11 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 		report.Expiry = "checked"
 		report.ExpiryReport = strings.TrimSpace(expiryOutput.String())
 		if err != nil {
-			return errors.Join(quarantineErr, fmt.Errorf("scheduled expiry: %w; %s", err, report.ExpiryReport))
+			return errors.Join(quarantineErr, categoryErr, fmt.Errorf("scheduled expiry: %w; %s", err, report.ExpiryReport))
 		}
 	}
 	if quarantineErr != nil {
-		return quarantineErr
+		return errors.Join(quarantineErr, categoryErr)
 	}
 	if policy.Prevention.Recovery.Enabled && policy.Prevention.AutoExpire {
 		report.Capacity, err = sampleCapacity(ctx, policy, paths, time.Now().UTC(), true)
@@ -168,6 +186,9 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	}
 	if closeErr != nil {
 		return closeErr
+	}
+	if categoryErr != nil {
+		return errors.Join(categoryErr, writeCycleReport(e.stdout, report))
 	}
 	return writeCycleReport(e.stdout, report)
 }

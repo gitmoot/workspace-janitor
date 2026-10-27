@@ -130,3 +130,29 @@ the manifest before relying on it. An interrupted creation may leave an
 unpublished `.partial-workspace-*` directory, or published outputs without a
 manifest. Neither is a verified archive. A rerun never reuses them: it refuses
 while any `<name>.*` output exists, so inspect and remove those first.
+
+### Category archive items
+
+Items Janitor archived for a
+[workspace archive category](policy-reference.md#workspace-archive-categories)
+use the same archive format and the same quarantine/expiry receipts; their
+manifest pins live in Janitor's state (`category_archives` table), not in the
+policy.
+
+- `janitor archive --categories` previews candidates, sizes, idle ages and every
+  refusal; `--dry-run=false --confirm` creates the archives. The daily
+  `janitor cycle` runs the same step before it scans whenever categories are
+  configured.
+- Until expiry, `janitor restore <cleanup-id>` moves a quarantined item back
+  (the 3-day quarantine undo on this host). That restore is the owner's undo:
+  the item's archive loses local expiry authority, so it is not quarantined
+  again; it is archived anew only after it changes and is idle again.
+- After expiry, `janitor archive --restore-category-item <original path>
+  --restore-to <original path>` previews and, with `--dry-run=false --confirm`,
+  restores the newest archive of that path. `--verify` re-reads it without
+  restoring. `janitor archive --workspace <synthesized name> --verify` or
+  `--restore-to` also works while the item's archive is active; the name is in
+  the category report and the cycle report. A confirmed restore first records
+  an immutable withdrawal of that archive's expiry authority, so the restored
+  tree is never quarantined or expired again on that archive; it is archived
+  anew only after it changes and is idle again.

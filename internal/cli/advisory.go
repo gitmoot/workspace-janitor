@@ -94,7 +94,7 @@ func runDailyAdvisory(ctx context.Context, e *env, keyFile string) error {
 	if err != nil {
 		return err
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(ctx)
 	if err != nil {
 		return err
 	}

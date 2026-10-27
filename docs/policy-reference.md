@@ -473,3 +473,65 @@ released workspace are protected so a broader rule cannot remove it wholesale.
 Full verification runs inside `limits.command_timeout`; a timeout holds the
 workspace. After expiry, recover with
 [`archive --workspace NAME --restore-to`](recovery.md#workspace-archives).
+
+### Workspace archive categories
+
+`workspace_archive_categories` is empty by default. Each entry is an
+owner-approved category whose matching items Janitor archives itself, with the
+same copy-only, verified `janitor archive --workspace` machinery. The manifest
+pins are not written to this policy. Janitor records them as immutable receipts
+in its state database. Every active receipt becomes a pinned workspace archive
+rule with local expiry enabled, so the collectors, `plan`, `apply --quarantine`
+and `apply --expire` treat it exactly like a pinned `workspace_archives` rule.
+Binding is full before the quarantine move and before expiry.
+
+| Field | Contract |
+| --- | --- |
+| `name` | Unique; 1-48 letters, digits, `_` or `-`. Item archives are named `<name>-<base>-<hash12>` (hash of path and run). |
+| `kind` | `merged_worktrees` (linked Git worktree), `pushed_clones` (standalone non-bare checkout) or `root_scratch` (no `.git` at the item root). One category per kind and root. |
+| `roots` | Exact configured inventory roots. A root may not be `report_only`, inside `protect.paths`, or inside a `workspace_archive_keep` path. Only depth-1 entries are candidates. |
+| `idle` | Minimum age of the newest modification anywhere in the tree, measured by a bounded deep walk. Use `Nd` or Go syntax. At least `14d` for `merged_worktrees` and `30d` otherwise (also the defaults). |
+| `archive.directory`, `expect_mount_source`, `expect_fstype` | Same approval rules as `workspace_archives` destinations. The directory must also be outside every inventory root. |
+| `local_retention` | `none`, `30d` (default) or `90d`, measured from archive creation. `none` proposes quarantine as soon as the verified archive binds the local tree. The quarantine retention (`retention.default`) still applies before deletion, and deletion still re-binds the quarantined copy. |
+| `max_items_per_cycle` | Default 20, at most 200. Extra candidates are `deferred`, oldest first. |
+| `max_bytes_per_item` | Default 10 GiB. Larger or unmeasured trees are refused. |
+
+Categories require the Git, process and service collectors. A candidate must
+be a directory directly inside a category root. It is refused by any of these:
+
+- dot-named entries, raw runtime/credential stores and KEEP records
+- overlap with `protect.paths`, explicit `workspace_archives` or
+  `evidence_exports` rules, cache rules, `report_only` roots, other inventory
+  roots, the quarantine directory, Gitmoot's managed state or an archive
+  directory
+- any blocking safety-engine protection: live process, registered agent,
+  Gitmoot job, service reference, Git state, sensitive name, unknown evidence
+  or durable evidence
+- for Git kinds: dirty files, stashes, a Git lock, unmeasured publication,
+  commits that are not on a remote-tracking branch, degraded metadata, or
+  ignored contents that are unproven
+- an unknown or partial deep size or newest mtime, or a size above the bound
+- every archive-time refusal: secret-like names, mount crossings, external
+  gitdir, alternates or symlink dependents, unsupported file types, and the
+  destination mount expectations
+
+A recorded path that is unchanged since archiving reports `already_archived`.
+A path that changed after archiving fails Bind, so it is retained. It is
+archived again, under a new name, only after it is idle again. A receipt loses
+its expiry authority while any of these hold:
+
+- its category is removed, or its kind, root or archive directory changes
+- the policy now refuses its path
+- the owner restored its quarantine with `janitor restore`, or restored the
+  item from its archive (`archive --restore-category-item` or `archive
+  --workspace <item name> --restore-to`); the archive restore records an
+  immutable withdrawal before any file is written
+
+`janitor archive --categories` previews by default and writes nothing.
+`--dry-run=false --confirm` creates the archives under the apply lock and
+records a capacity activity per item. It re-reads the policy file before and
+after each copy. `janitor cycle` runs the same step before its scan whenever
+categories are configured, so `local_retention: none` items can be
+auto-quarantined in that cycle. Item failures are reported in
+`category_archives` and fail the cycle only after quarantine and expiry have
+run. See [recovery](recovery.md#category-archive-items).

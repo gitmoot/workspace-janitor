@@ -81,7 +81,7 @@ func runPlan(ctx context.Context, e *env, args []string, opts planOptions) error
 	if err != nil {
 		return err
 	}
-	policy, err := e.loadPolicy()
+	policy, err := e.loadPolicy(ctx)
 	if err != nil {
 		return err
 	}
