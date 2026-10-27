@@ -28,6 +28,10 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 	for _, root := range opts.Roots {
 		rootsByPath[root.Path] = root
 	}
+	// The metadata walk reports a mount-boundary directory without entering it.
+	// Measure every entry against its root's device, not its own, so the
+	// separate deep pass cannot start a walk inside that other filesystem.
+	rootDevices := make(map[string]rootDevice, len(opts.Roots))
 
 	lowerBounds := 0
 	for i := range entries {
@@ -45,6 +49,15 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 		if !seen {
 			budget = opts.Limits.DeepSizeMaxEntries
 		}
+		var rd rootDevice
+		if !root.CrossFilesystem {
+			cached := false
+			rd, cached = rootDevices[entry.Root]
+			if !cached {
+				rd = statRootDevice(entry.Root)
+				rootDevices[entry.Root] = rd
+			}
+		}
 		sum := &sizeSum{
 			crossFilesystem: root.CrossFilesystem,
 			device:          entry.FilesystemID.Device,
@@ -52,7 +65,20 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 			budget:          budget,
 			newest:          entry.ModifiedAt,
 		}
-		sum.walk(ctx, entry.Path, 1)
+		switch {
+		case root.CrossFilesystem || (rd.err == nil && !rd.known):
+			// Crossing is allowed, or this platform exposes no device identity.
+			sum.walk(ctx, entry.Path, 1)
+		case rd.err != nil:
+			sum.blind = true
+			sum.note(fmt.Sprintf("root %s device is unknown (%v), so %s was not sized", entry.Root, rd.err, entry.Path))
+		case entry.FilesystemID.Device != rd.device:
+			// Unknown, never zero: the bytes behind a boundary are simply unseen.
+			sum.blind = true
+			sum.note(fmt.Sprintf("stopped at mount boundary %s (device %d, root device %d)", entry.Path, entry.FilesystemID.Device, rd.device))
+		default:
+			sum.walk(ctx, entry.Path, 1)
+		}
 		budgets[entry.Root] = sum.budget
 		report.Visited += sum.visited
 		report.Recorded++
@@ -189,4 +215,19 @@ func (s *sizeSum) walk(ctx context.Context, dir string, depth int) {
 		}
 		s.walk(ctx, path, depth+1)
 	}
+}
+
+type rootDevice struct {
+	device uint64
+	known  bool
+	err    error
+}
+
+func statRootDevice(path string) rootDevice {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return rootDevice{err: err}
+	}
+	stat := statOf(info)
+	return rootDevice{device: stat.Device, known: stat.Known}
 }
