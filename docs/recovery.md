@@ -76,3 +76,42 @@ an unpublished `.partial-export-*` bundle for diagnosis; it grants no deletion
 permission. Retain the source and inspect the failure rather than treating a
 partial bundle as a backup. No archive rule or destination is enabled by the
 shipped example policy.
+
+## Workspace archives
+
+Workspace archives are opt-in and copy-only; see
+[the policy contract](policy-reference.md#workspace-archives). They never
+delete the source, and removing the local copy still goes through the ordinary
+quarantine/expiry workflow above. Expiry does not yet require a pinned
+workspace archive, so treat a workspace archive as an independent backup, not
+as permission to delete.
+
+1. Add the `workspace_archives` rule with an empty manifest, check the policy
+   and preview `janitor archive --workspace NAME`. The preview runs every
+   refusal check and writes nothing.
+2. Run `janitor archive --workspace NAME --dry-run=false --confirm`. Success
+   means `<name>.tar` (and `<name>.bundle` for a linked worktree) was read
+   back and matched the stream hash, member list and per-file contents. Pin the
+   returned manifest path and SHA-256 as `archive.manifest` and
+   `archive.manifest_sha256`.
+3. Run `janitor archive --workspace NAME --verify` at any time; it re-reads
+   every archived byte and the bundle without needing the source.
+4. To recover, preview `janitor archive --workspace NAME --restore-to
+   /new/path`, then add `--dry-run=false --confirm`. The destination must not
+   exist; restoring to the original path works once that path is gone. The
+   tree is extracted into a private staging directory beside the destination,
+   renamed into place without replacement, and walked again to confirm every
+   member, mode, owner, mtime, link target and content hash. A restore that
+   fails before publication leaves nothing; one that fails verification after
+   publication says so and leaves the tree for inspection.
+5. A linked worktree's restored `.git` file still points at its original admin
+   entry. If that entry is gone, recover the history with
+   `git -C <main repository> fetch <archive>/<name>.bundle HEAD` or
+   `git clone <archive>/<name>.bundle <dir>`.
+
+Without Janitor, the same tar extracts with
+`tar -C /new/path --numeric-owner -xpf <archive>/<name>.tar`; compare against
+the manifest before relying on it. An interrupted creation may leave an
+unpublished `.partial-workspace-*` directory, or published outputs without a
+manifest. Neither is a verified archive. A rerun never reuses them: it refuses
+while any `<name>.*` output exists, so inspect and remove those first.

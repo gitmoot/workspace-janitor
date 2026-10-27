@@ -16,8 +16,8 @@ import (
 )
 
 type archiveOptions struct {
-	rule, restoreTo         string
-	verify, dryRun, confirm bool
+	rule, workspace, restoreTo string
+	verify, dryRun, confirm    bool
 }
 type archiveReport struct {
 	Mode                 string                     `json:"mode"`
@@ -38,11 +38,12 @@ type archiveReport struct {
 }
 
 func archiveCommand() *command {
-	return &command{name: "archive", usage: "janitor archive --rule NAME [--verify | --restore-to PATH] [--dry-run=false --confirm]", summary: "Archive or restore one approved evidence export; never delete its source or archive", register: func(fs *flag.FlagSet) func(context.Context, *env, []string) error {
+	return &command{name: "archive", usage: "janitor archive (--rule NAME | --workspace NAME) [--verify | --restore-to PATH] [--dry-run=false --confirm]", summary: "Archive or restore one approved evidence export or released workspace; never delete its source or archive", register: func(fs *flag.FlagSet) func(context.Context, *env, []string) error {
 		opts := archiveOptions{}
 		fs.StringVar(&opts.rule, "rule", "", "exact evidence_exports rule name")
+		fs.StringVar(&opts.workspace, "workspace", "", "exact workspace_archives rule name (copy-only directory archive)")
 		fs.BoolVar(&opts.verify, "verify", false, "verify the pinned archive payload and restore integrity")
-		fs.StringVar(&opts.restoreTo, "restore-to", "", "restore to a new, nonexisting absolute file path")
+		fs.StringVar(&opts.restoreTo, "restore-to", "", "restore to a new, nonexisting absolute path")
 		fs.BoolVar(&opts.dryRun, "dry-run", true, "preview without creating archive or restored files")
 		fs.BoolVar(&opts.confirm, "confirm", false, "confirm archive creation or restoration")
 		return func(ctx context.Context, e *env, args []string) error { return runArchive(ctx, e, args, opts) }
@@ -50,11 +51,11 @@ func archiveCommand() *command {
 }
 
 func runArchive(ctx context.Context, e *env, args []string, opts archiveOptions) error {
-	if len(args) != 0 || opts.rule == "" || (opts.verify && opts.restoreTo != "") {
-		return &usageError{msg: "archive requires --rule and at most one of --verify or --restore-to"}
+	if len(args) != 0 || (opts.rule == "") == (opts.workspace == "") || (opts.verify && opts.restoreTo != "") {
+		return &usageError{msg: "archive requires exactly one of --rule or --workspace and at most one of --verify or --restore-to"}
 	}
 	if opts.restoreTo != "" && !core.IsCanonicalPath(opts.restoreTo) {
-		return &usageError{msg: "--restore-to must be a canonical absolute file path"}
+		return &usageError{msg: "--restore-to must be a canonical absolute path"}
 	}
 	if !opts.verify && !opts.dryRun && !opts.confirm {
 		return &usageError{msg: "--confirm is required with --dry-run=false"}
@@ -70,6 +71,9 @@ func runArchive(ctx context.Context, e *env, args []string, opts archiveOptions)
 	policy, err := e.loadPolicy()
 	if err != nil {
 		return err
+	}
+	if opts.workspace != "" {
+		return runWorkspaceArchive(ctx, e, opts, format, paths, policy)
 	}
 	var rule *config.EvidenceExportRule
 	for i := range policy.EvidenceExports {

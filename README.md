@@ -41,6 +41,7 @@ default.
 | `janitor apply --expire` | implemented (deletion disabled by default) |
 | `janitor restore <cleanup-id>` | implemented (preview by default) |
 | `janitor archive --rule <name>` | Linux exact-file evidence archival, integrity verification and restore; no source/archive deletion |
+| `janitor archive --workspace <name>` | opt-in Linux copy-only verified tar of one released directory (plus a `HEAD` bundle for linked worktrees), integrity verification and restore; no source/archive deletion |
 
 ## Inventory
 

@@ -357,3 +357,67 @@ not attributable cleanup credit. `same_filesystem_at_archive_creation` describes
 the recorded creation topology, not an assertion about a later recovery host.
 See [the archive workflow](recovery.md#verified-export-archives) before enabling
 any local expiry.
+
+## Workspace archives
+
+`workspace_archives` and `workspace_archive_keep` are empty by default; with
+neither configured Janitor behaves exactly as before (report/quarantine only).
+A workspace archive is an **opt-in, copy-only** verified tar of one released
+directory, written to any directory you already mounted (external disk, NAS,
+SSHFS/NFS, rclone mount). No storage is provisioned or assumed. `janitor
+archive --workspace NAME` never removes the source or an archive and reports
+`local_freed_bytes: 0`; local removal remains with the ordinary
+quarantine/expiry workflow. Binding expiry to a pinned workspace archive is a
+separate, later change: until then a workspace archive grants no deletion
+permission at all.
+
+| Field | Contract |
+| --- | --- |
+| `name` | Unique; 1-128 letters, digits, `.`, `_` or `-`, starting with a letter or digit. Names the outputs `<name>.tar`, `<name>.manifest.json` and `<name>.bundle`. At most 64 rules. |
+| `path` | Canonical absolute directory strictly inside an inventory root. Refused when it equals, contains or lies inside another rule's path, a `protect.paths` entry, a `report_only` root, a `workspace_archive_keep` path, or a raw runtime/credential store (`.git`, `.ssh`, `.gitmoot`, ...). |
+| `owner`, `release` | The releasing owner and a reference to the release decision (for example a message ID). Both required. |
+| `dependent_roots` | Optional canonical directories searched for external dependents. Empty means every inventory root. |
+| `archive.directory` | Existing canonical directory outside every workspace archive source and evidence export container, not overlapping the quarantine, Gitmoot home, a cache rule or Janitor's state, and covered by an independent `protect.paths` entry. Every path component is opened without following symlinks. |
+| `archive.expect_mount_source`, `archive.expect_fstype` | Optional `/proc/self/mountinfo` source and filesystem type of the destination mount. A mismatch, including an unmounted destination that shows the parent filesystem, refuses creation, verification and restore; nothing is ever written to a local fallback. |
+| `archive.manifest`, `archive.manifest_sha256` | Empty before creation. Pin the exact `<directory>/<name>.manifest.json` path and SHA-256 returned by a successful creation. |
+
+`workspace_archive_keep` records an owner's KEEP decision: `path`, `owner` and
+`reference` are all required. Any workspace archive at, inside or containing a
+kept path is an unresolved KEEP/release conflict and the whole policy is
+refused before any archive work. Only the custodian or an authorized
+coordinator resolves it, by removing the keep record or the release.
+
+Creation refuses, leaving the source and destination untouched, when:
+
+- any name in the tree is secret-like: the built-in screen (`.env`, `.env.*`
+  except `.env.example`/`.sample`/`.template`, `id_rsa*`, `id_ed25519*`,
+  `.netrc`, `.pgpass`, `.npmrc`, `.pypirc`, `credentials.json`,
+  `service-account.json`, `token.json`, `*.pem`, `*.key`, `*.p12`, `*.pfx`,
+  `*.kdbx`, `*.keystore`, `*.jks`; certifi's public `cacert.pem` is exempt) or
+  any `protect.name_patterns` entry matches;
+- a process has its working directory, root, executable or an open descriptor
+  inside the path, or a process cannot be inspected (`collectors.proc_root`);
+- a gitdir file, `objects/info/alternates` file or symlink outside the path
+  (searched to depth 6 on each search root's filesystem) resolves into it, or a
+  search exceeds `limits.deep_size_max_entries`;
+- the tree crosses a mount, holds anything but directories, regular files and
+  symlinks, carries extended attributes, exceeds `limits.deep_size_max_entries`
+  members, borrows Git objects from outside via alternates, or has a nested
+  worktree whose history lives outside;
+- the destination mount differs from its expectation, or any output name
+  already exists (an interrupted run's published names are never reused).
+
+The tar is written with Go's `archive/tar` (PAX, numeric owners, nanosecond
+modification times) into a private staging directory under the destination
+while every byte written and every file read is hashed. The written file is
+then read back: its SHA-256 must equal the stream SHA-256, its member list,
+types, sizes, modes, owners, mtimes, link targets and per-file SHA-256 must
+equal the local tree, and every source member must still have its recorded
+identity, metadata and change time. A linked worktree (a root `.git` file
+pointing outside) additionally gets a `git bundle` of `HEAD`, verified with
+`git bundle verify` and `git bundle list-heads`; the manifest records the
+worktree's admin entry and whether it is locked. Janitor does not lock or
+otherwise modify the admin entry. Policy, live-process, dependent, mount and
+source checks run again immediately before publication, which renames the
+outputs without replacement, manifest last. See
+[restoring a workspace archive](recovery.md#workspace-archives).

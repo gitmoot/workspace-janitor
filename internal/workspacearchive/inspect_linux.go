@@ -1,0 +1,636 @@
+//go:build linux
+
+package workspacearchive
+
+import (
+	"bufio"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/gitmoot/workspace-janitor/internal/config"
+	"github.com/gitmoot/workspace-janitor/internal/core"
+	"golang.org/x/sys/unix"
+)
+
+const (
+	defaultMaxEntries = 200000
+	// dependentDepth matches the proven manual mover's bounded search.
+	dependentDepth = 6
+	maxTreeDepth   = 512
+	maxPointerSize = 64 << 10
+	maxReported    = 20
+)
+
+// Built-in screen ported from the proven manual mover. Policy
+// protect.name_patterns are applied in addition, verbatim.
+var (
+	secretNames    = []string{".env", "id_rsa", "id_ed25519", ".netrc", ".pgpass", ".npmrc", ".pypirc", "credentials.json", "service-account.json", "token.json"}
+	secretSuffixes = []string{".pem", ".key", ".p12", ".pfx", ".kdbx", ".keystore", ".jks"}
+	secretExamples = []string{".env.example", ".env.sample", ".env.template"}
+)
+
+func builtinSecret(name, parent string) bool {
+	low := strings.ToLower(name)
+	for _, example := range secretExamples {
+		if low == example {
+			return false
+		}
+	}
+	// certifi's cacert.pem is the public Mozilla CA bundle, not a secret.
+	if low == "cacert.pem" && filepath.Base(parent) == "certifi" {
+		return false
+	}
+	for _, exact := range secretNames {
+		if low == exact {
+			return true
+		}
+	}
+	if strings.HasPrefix(low, ".env.") || strings.HasPrefix(low, "id_rsa") || strings.HasPrefix(low, "id_ed25519") {
+		return true
+	}
+	for _, suffix := range secretSuffixes {
+		if strings.HasSuffix(low, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func secretLike(name, parent string, patterns []string) bool {
+	if builtinSecret(name, parent) {
+		return true
+	}
+	for _, pattern := range patterns {
+		// An unusable pattern is an unknown, not an all-clear.
+		if matched, err := filepath.Match(pattern, name); matched || err != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// inventory is the exact local tree, in archive order, with the statx
+// observation each member was recorded from.
+type inventory struct {
+	members       []Member
+	states        []state
+	contentBytes  int64
+	worktreeAdmin string
+}
+
+type walker struct {
+	ctx       context.Context
+	source    string
+	rootState state
+	patterns  []string
+	max       int
+	verify    bool
+	inv       inventory
+	secrets   []string
+	refusals  []string
+}
+
+func (w *walker) refuse(format string, args ...any) {
+	if len(w.refusals) < maxReported {
+		w.refusals = append(w.refusals, fmt.Sprintf(format, args...))
+	}
+}
+
+func (w *walker) add(m Member, st state) error {
+	if len(w.inv.members) >= w.max {
+		return fmt.Errorf("tree exceeds the %d-entry archive bound; retain the original", w.max)
+	}
+	w.inv.members = append(w.inv.members, m)
+	w.inv.states = append(w.inv.states, st)
+	w.inv.contentBytes += m.Size
+	return nil
+}
+
+// scanTree records every member without following symlinks or crossing
+// mounts. In verify mode it also hashes regular files and skips the refusal
+// screens, which only apply to sources.
+func scanTree(ctx context.Context, root *os.File, source string, patterns []string, limit int, verify bool) (*walker, error) {
+	rootState, err := fstate(root)
+	if err != nil {
+		return nil, err
+	}
+	if rootState.kind() != unix.S_IFDIR {
+		return nil, errors.New("workspace archive source must be a directory")
+	}
+	w := &walker{ctx: ctx, source: source, rootState: rootState, patterns: patterns, max: limit, verify: verify}
+	if !verify {
+		if secretLike(filepath.Base(source), filepath.Dir(source), patterns) {
+			w.secrets = append(w.secrets, ".")
+		}
+		if hasXattrs(unix.Flistxattr(int(root.Fd()), nil)) {
+			w.refuse(".: extended attributes are unsupported")
+		}
+	}
+	if err = w.add(Member{Path: ".", Type: TypeDirectory, Mode: rootState.mode & 07777, UID: rootState.uid, GID: rootState.gid, ModifiedNS: rootState.mtimeNS}, rootState); err != nil {
+		return nil, err
+	}
+	if err = w.walk(root, ".", 0); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func readNames(dir *os.File, limit int) ([]string, error) {
+	if _, err := dir.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	var names []string
+	for {
+		batch, err := dir.Readdirnames(256)
+		names = append(names, batch...)
+		if len(names) > limit {
+			return nil, fmt.Errorf("directory listing exceeds the %d-entry bound", limit)
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func (w *walker) walk(dir *os.File, rel string, depth int) error {
+	if depth > maxTreeDepth {
+		return fmt.Errorf("%s exceeds the %d-level depth bound", rel, maxTreeDepth)
+	}
+	names, err := readNames(dir, w.max)
+	if err != nil {
+		return fmt.Errorf("list %s: %w", rel, err)
+	}
+	fd := int(dir.Fd())
+	for _, name := range names {
+		if err := w.ctx.Err(); err != nil {
+			return err
+		}
+		path := joinMember(rel, name)
+		st, err := statxAt(fd, name, 0)
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", path, err)
+		}
+		if st.id.Device != w.rootState.id.Device || st.mountID != w.rootState.mountID {
+			w.refuse("%s: crosses a mount boundary inside the tree", path)
+			continue
+		}
+		if !w.verify {
+			if secretLike(name, filepath.Join(w.source, rel), w.patterns) && len(w.secrets) < maxReported {
+				w.secrets = append(w.secrets, path)
+			}
+			if hasXattrs(unix.Llistxattr(fmt.Sprintf("%s/%s", descriptorPath(dir), name), nil)) {
+				w.refuse("%s: extended attributes are unsupported", path)
+			}
+		}
+		m := Member{Path: path, Mode: st.mode & 07777, UID: st.uid, GID: st.gid, ModifiedNS: st.mtimeNS}
+		switch st.kind() {
+		case unix.S_IFDIR:
+			m.Type = TypeDirectory
+			if err := w.add(m, st); err != nil {
+				return err
+			}
+			child, err := openChild(dir, name, unix.O_RDONLY|unix.O_DIRECTORY)
+			if err != nil {
+				return err
+			}
+			opened, err := fstate(child)
+			if err == nil && opened.id != st.id {
+				err = fmt.Errorf("%s changed while being inspected", path)
+			}
+			if err == nil {
+				err = w.walk(child, path, depth+1)
+			}
+			child.Close()
+			if err != nil {
+				return err
+			}
+		case unix.S_IFREG:
+			m.Type, m.Size = TypeFile, st.size
+			if w.verify || name == ".git" || name == "alternates" {
+				if err := w.readRegular(dir, name, rel, &m, st); err != nil {
+					return err
+				}
+			}
+			if err := w.add(m, st); err != nil {
+				return err
+			}
+		case unix.S_IFLNK:
+			m.Type = TypeSymlink
+			target, err := readlinkAt(fd, name)
+			if err != nil {
+				return fmt.Errorf("readlink %s: %w", path, err)
+			}
+			m.Linkname = target
+			if err := w.add(m, st); err != nil {
+				return err
+			}
+		default:
+			w.refuse("%s: unsupported file type (only directories, regular files and symlinks are archived)", path)
+		}
+	}
+	return nil
+}
+
+// readRegular hashes verified files and screens Git pointers: a tree whose
+// history lives outside it is archived only as a root linked worktree, with a
+// bundle; nested outbound gitdirs and alternates are refused.
+func (w *walker) readRegular(dir *os.File, name, rel string, m *Member, st state) error {
+	f, err := openChild(dir, name, unix.O_RDONLY)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	opened, err := fstate(f)
+	if err != nil || opened.id != st.id {
+		return fmt.Errorf("%s changed while being inspected", m.Path)
+	}
+	if w.verify {
+		hash := sha256.New()
+		n, err := io.Copy(hash, contextReader{w.ctx, io.LimitReader(f, st.size+1)})
+		if err != nil {
+			return err
+		}
+		if n != st.size {
+			return fmt.Errorf("%s size changed while being verified", m.Path)
+		}
+		m.SHA256 = hex.EncodeToString(hash.Sum(nil))
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxPointerSize+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > maxPointerSize {
+		w.refuse("%s: oversized Git pointer file", m.Path)
+		return nil
+	}
+	dirAbs := filepath.Join(w.source, rel)
+	switch name {
+	case ".git":
+		target, ok := gitdirTarget(string(data), dirAbs)
+		switch {
+		case !ok:
+			w.refuse("%s: unrecognized .git file", m.Path)
+		case core.PathWithin(target, w.source):
+		case rel == ".":
+			w.inv.worktreeAdmin = target
+		default:
+			w.refuse("%s: nested worktree history lives outside the archived tree at %s", m.Path, target)
+		}
+	case "alternates":
+		if filepath.Base(dirAbs) != "info" || filepath.Base(filepath.Dir(dirAbs)) != "objects" {
+			return nil
+		}
+		for _, target := range alternateTargets(string(data), filepath.Dir(dirAbs)) {
+			if !core.PathWithin(target, w.source) {
+				w.refuse("%s: repository borrows objects from %s outside the archived tree", m.Path, target)
+			}
+		}
+	}
+	return nil
+}
+
+func readlinkAt(dirfd int, name string) (string, error) {
+	buf := make([]byte, unix.PathMax)
+	n, err := unix.Readlinkat(dirfd, name, buf)
+	if err != nil {
+		return "", err
+	}
+	if n >= len(buf) {
+		return "", errors.New("symlink target exceeds PATH_MAX")
+	}
+	return string(buf[:n]), nil
+}
+
+func gitdirTarget(content, dirAbs string) (string, bool) {
+	line, _, _ := strings.Cut(content, "\n")
+	target, ok := strings.CutPrefix(strings.TrimSpace(line), "gitdir:")
+	target = strings.TrimSpace(target)
+	if !ok || target == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(dirAbs, target)
+	}
+	return filepath.Clean(target), true
+}
+
+func alternateTargets(content, objectsDir string) []string {
+	var out []string
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !filepath.IsAbs(line) {
+			line = filepath.Join(objectsDir, line)
+		}
+		out = append(out, filepath.Clean(line))
+	}
+	return out
+}
+
+func (w *walker) err() error {
+	if len(w.secrets) > 0 {
+		return fmt.Errorf("secret-like files keep %s local: %s", w.source, strings.Join(w.secrets, ", "))
+	}
+	if len(w.refusals) > 0 {
+		return fmt.Errorf("%s cannot be archived faithfully: %s", w.source, strings.Join(w.refusals, "; "))
+	}
+	return nil
+}
+
+// unchanged is the extraction-equivalent comparison: every recorded member
+// still has its identity, type, size, ownership, mode, mtime and ctime.
+func (inv *inventory) unchanged(src *os.File) error {
+	for i, m := range inv.members {
+		var st state
+		var err error
+		if m.Path == "." {
+			st, err = fstate(src)
+		} else {
+			st, err = statBeneath(src, m.Path)
+		}
+		if err != nil || st != inv.states[i] {
+			return fmt.Errorf("source member %s changed during archiving; original retained", m.Path)
+		}
+	}
+	return nil
+}
+
+// mountFacts returns the mountinfo source and filesystem type for a statx
+// mount ID, as seen by this process.
+func mountFacts(mountID uint64) (source, fstype string, err error) {
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return "", "", err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	want := strconv.FormatUint(mountID, 10)
+	for scanner.Scan() {
+		line := scanner.Text()
+		id, _, _ := strings.Cut(line, " ")
+		if id != want {
+			continue
+		}
+		_, tail, ok := strings.Cut(line, " - ")
+		fields := strings.Fields(tail)
+		if !ok || len(fields) < 2 {
+			return "", "", fmt.Errorf("malformed mountinfo entry for mount %d", mountID)
+		}
+		return unescapeMount(fields[1]), unescapeMount(fields[0]), nil
+	}
+	if err := scanner.Err(); err != nil {
+		return "", "", err
+	}
+	return "", "", fmt.Errorf("mount %d is absent from mountinfo", mountID)
+}
+
+func unescapeMount(value string) string {
+	var b strings.Builder
+	for i := 0; i < len(value); i++ {
+		if value[i] == '\\' && i+3 < len(value) {
+			if n, err := strconv.ParseUint(value[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(n))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(value[i])
+	}
+	return b.String()
+}
+
+// checkMount refuses a destination whose live mount differs from the
+// expectation; an unmounted destination shows the parent filesystem's facts
+// and is refused the same way, never written as a local fallback.
+func checkMount(rule config.WorkspaceArchiveRule, root state) (source, fstype string, err error) {
+	source, fstype, err = mountFacts(root.mountID)
+	if err != nil {
+		return "", "", err
+	}
+	if want := rule.Archive.ExpectMountSource; want != "" && source != want {
+		return source, fstype, fmt.Errorf("archive directory %s is mounted from %q, expected %q; refusing to write anywhere else", rule.Archive.Directory, source, want)
+	}
+	if want := rule.Archive.ExpectFSType; want != "" && fstype != want {
+		return source, fstype, fmt.Errorf("archive directory %s is on a %q mount, expected %q; refusing to write anywhere else", rule.Archive.Directory, fstype, want)
+	}
+	return source, fstype, nil
+}
+
+// liveReferences fails closed: any process whose cwd, root, executable or
+// open descriptor is inside source, or any process that cannot be inspected,
+// keeps the source local.
+func liveReferences(ctx context.Context, procRoot, source string) error {
+	if procRoot == "" {
+		return errors.New("live process check requires a procfs root")
+	}
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return fmt.Errorf("live process check: %w", err)
+	}
+	self := strconv.Itoa(os.Getpid())
+	var hits []string
+	unknown := 0
+	inside := func(target string) bool {
+		target = strings.TrimSuffix(target, " (deleted)")
+		return filepath.IsAbs(target) && core.PathWithin(filepath.Clean(target), source)
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		pid := entry.Name()
+		if _, err := strconv.Atoi(pid); err != nil || pid == self {
+			continue
+		}
+		dir := filepath.Join(procRoot, pid)
+		found, unreadable := "", false
+		for _, link := range []string{"cwd", "root", "exe"} {
+			target, err := os.Readlink(filepath.Join(dir, link))
+			if err != nil {
+				unreadable = unreadable || !errors.Is(err, os.ErrNotExist)
+				continue
+			}
+			if inside(target) {
+				found = link
+				break
+			}
+		}
+		if found == "" {
+			descriptors, err := os.ReadDir(filepath.Join(dir, "fd"))
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				unreadable = true
+			}
+			for _, descriptor := range descriptors {
+				target, err := os.Readlink(filepath.Join(dir, "fd", descriptor.Name()))
+				if err != nil {
+					unreadable = unreadable || !errors.Is(err, os.ErrNotExist)
+					continue
+				}
+				if inside(target) {
+					found = "fd " + descriptor.Name()
+					break
+				}
+			}
+		}
+		switch {
+		case found != "":
+			if len(hits) < maxReported {
+				hits = append(hits, fmt.Sprintf("pid %s %s", pid, found))
+			}
+		case unreadable:
+			// A process that exited meanwhile holds nothing.
+			if _, err := os.Lstat(dir); err == nil {
+				unknown++
+			}
+		}
+	}
+	if len(hits) > 0 || unknown > 0 {
+		return fmt.Errorf("live process references keep %s local: [%s]; %d process(es) could not be inspected", source, strings.Join(hits, ", "), unknown)
+	}
+	return nil
+}
+
+// externalDependents finds gitdir files, object alternates and symlinks
+// outside source that resolve into it. Each search root is walked to a
+// bounded depth on its own filesystem; an exceeded bound or unreadable
+// directory refuses rather than reporting "no dependents".
+func externalDependents(ctx context.Context, source string, roots []string, limit int) error {
+	var hits []string
+	for _, root := range roots {
+		if core.PathWithin(root, source) {
+			continue
+		}
+		dir, err := openDirectory(root)
+		if err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return fmt.Errorf("dependent scan of %s: %w", root, err)
+		}
+		rootState, err := fstate(dir)
+		if err == nil {
+			visited := 0
+			err = scanDependents(ctx, dir, root, source, rootState.id.Device, 0, &visited, limit, &hits)
+		}
+		dir.Close()
+		if err != nil {
+			return fmt.Errorf("dependent scan of %s: %w", root, err)
+		}
+	}
+	if len(hits) > 0 {
+		return fmt.Errorf("external dependents keep %s local: %s", source, strings.Join(hits, "; "))
+	}
+	return nil
+}
+
+func scanDependents(ctx context.Context, dir *os.File, dirAbs, source string, device uint64, depth int, visited *int, limit int, hits *[]string) error {
+	names, err := readNames(dir, limit)
+	if err != nil {
+		return err
+	}
+	fd := int(dir.Fd())
+	record := func(path, target, what string) {
+		if core.PathWithin(target, source) && len(*hits) < maxReported {
+			*hits = append(*hits, fmt.Sprintf("%s %s -> %s", what, path, target))
+		}
+	}
+	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		*visited++
+		if *visited > limit {
+			return fmt.Errorf("exceeded the %d-entry bound; narrow dependent_roots", limit)
+		}
+		path := filepath.Join(dirAbs, name)
+		if core.PathWithin(path, source) {
+			continue
+		}
+		st, err := statxAt(fd, name, 0)
+		if err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return err
+		}
+		switch st.kind() {
+		case unix.S_IFLNK:
+			target, err := readlinkAt(fd, name)
+			if err != nil {
+				return err
+			}
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(dirAbs, target)
+			}
+			record(path, filepath.Clean(target), "symlink")
+		case unix.S_IFREG:
+			isAlternates := name == "alternates" && filepath.Base(dirAbs) == "info" && filepath.Base(filepath.Dir(dirAbs)) == "objects"
+			if name != ".git" && !isAlternates {
+				continue
+			}
+			data, err := readSmall(dir, name)
+			if err != nil {
+				return err
+			}
+			if isAlternates {
+				for _, target := range alternateTargets(data, filepath.Dir(dirAbs)) {
+					record(path, target, "alternates")
+				}
+			} else if target, ok := gitdirTarget(data, dirAbs); ok {
+				record(path, target, "gitdir")
+			}
+		case unix.S_IFDIR:
+			if depth+1 >= dependentDepth || st.id.Device != device {
+				continue
+			}
+			child, err := openChild(dir, name, unix.O_RDONLY|unix.O_DIRECTORY)
+			if err != nil {
+				return err
+			}
+			err = scanDependents(ctx, child, path, source, device, depth+1, visited, limit, hits)
+			child.Close()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func readSmall(dir *os.File, name string) (string, error) {
+	f, err := openChild(dir, name, unix.O_RDONLY)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxPointerSize))
+	return string(data), err
+}
+
+// hasXattrs fails closed: extended metadata is not archived, so any present
+// or unknowable attribute keeps the item local. A filesystem without xattr
+// support has none.
+func hasXattrs(n int, err error) bool {
+	if errors.Is(err, unix.ENOTSUP) {
+		return false
+	}
+	return err != nil || n != 0
+}
