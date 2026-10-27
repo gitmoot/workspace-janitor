@@ -513,6 +513,53 @@ func TestCategoryArchiveDeepBudgetIsPerItem(t *testing.T) {
 	}
 }
 
+// A category run walks the inventory roots for dependents once, under
+// limits.dependent_index_max_entries, instead of once per candidate under
+// the per-tree bound (deep_size_max_entries). Many small items whose root
+// holds more entries than that per-tree bound are archived, and their
+// archives bind (and so expire) through the same shared index; an index walk
+// over its own bound refuses every candidate.
+func TestCategoryArchiveSharesOneDependentIndex(t *testing.T) {
+	setup := func(t *testing.T, limits string) (*categoryFixture, []string) {
+		x := newCategoryFixture(t)
+		x.limits = limits
+		x.write(t)
+		items := []string{x.source}
+		for i := range 8 {
+			items = append(items, x.scratch(t, fmt.Sprintf("scratch-%d", i), map[string]string{"a": "a\n", "b": "b\n", "c/d": "d\n"}))
+		}
+		for _, item := range items {
+			backdate(t, item, categoryIdleAge)
+		}
+		return x, items
+	}
+	t.Run("fits one index walk", func(t *testing.T) {
+		x, items := setup(t, "  deep_size_max_entries: 30\n")
+		report := x.categories(t, true)
+		for _, path := range items {
+			if item := categoryItem(t, report, path); item.Status != categoryWouldArchive {
+				t.Fatalf("%s refused although one index walk fits: %+v", path, item)
+			}
+		}
+		if report := x.categories(t, false); report.Archived != len(items) {
+			t.Fatalf("archived %d of %d items: %+v", report.Archived, len(items), report.Items)
+		}
+		if _, action := x.action(t, x.source); action.Kind != core.ActionQuarantine {
+			t.Fatalf("category archive did not bind through the shared index: %+v", action)
+		}
+	})
+	t.Run("index over its bound", func(t *testing.T) {
+		x, items := setup(t, "  dependent_index_max_entries: 5\n")
+		report := x.categories(t, true)
+		for _, path := range items {
+			item := categoryItem(t, report, path)
+			if item.Status != categoryRefused || !strings.Contains(strings.Join(item.Reasons, "\n"), "dependent index of") {
+				t.Fatalf("%s not refused by an over-bound dependent index: %+v", path, item)
+			}
+		}
+	})
+}
+
 // local_retention none: a verified, bound category archive is proposed for
 // quarantine at once; expiry re-binds the quarantined copy; the item restores
 // from its archive by original path.

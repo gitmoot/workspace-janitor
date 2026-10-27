@@ -376,6 +376,10 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 	}
 
 	var failures []error
+	// Every category rule searches every inventory root for dependents, so
+	// one snapshot walk of them serves every candidate of this run instead of
+	// one bounded walk per candidate. Built only when there is a candidate.
+	var dependents *workspacearchive.DependentIndex
 	for _, category := range policy.WorkspaceArchiveCategories {
 		queue := queues[category.Name]
 		// Oldest first: the longest-idle items are archived before newer ones.
@@ -400,6 +404,10 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			owner := config.CategoryOwnerPrefix + category.Name
 			rule := categoryRule(category, name, item.Path, owner, owner+"@"+report.RunID)
 			scope := workspacearchive.PolicyScope(policy, rule)
+			if dependents == nil {
+				dependents = workspacearchive.BuildDependentIndex(ctx, scope.SearchRoots, policy.Limits.DependentIndexMaxEntries)
+			}
+			scope.Dependents = dependents
 			inspection, err := workspacearchive.Inspect(ctx, rule, scope)
 			switch {
 			case err != nil:

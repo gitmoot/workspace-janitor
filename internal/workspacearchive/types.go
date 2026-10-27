@@ -89,6 +89,10 @@ type Scope struct {
 	// MaxEntries bounds the archived tree and each dependent walk; an
 	// exceeded bound refuses rather than archiving a partial view.
 	MaxEntries int
+	// Dependents, when set, replaces the per-tree walk of SearchRoots with a
+	// snapshot index built once (BuildDependentIndex) and shared by many
+	// trees. Pointers created after the snapshot are not seen.
+	Dependents *DependentIndex
 }
 
 // Inspection is the refusal-free result of the pre-archive checks.

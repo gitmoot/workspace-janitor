@@ -404,7 +404,16 @@ Creation refuses, leaving the source and destination untouched, when:
   `limits.deep_size_max_entries`. Symlinks are followed as the kernel would,
   through chained links and symlinked directories; one that reaches the path at
   any step is a dependent, and one that loops, chains more than 40 links or
-  cannot be examined also refuses;
+  cannot be examined also refuses. Archive category runs, and collections
+  that bind category archives, instead walk the search roots once into a
+  shared index of these pointers, bounded in total by
+  `limits.dependent_index_max_entries` (default 5000000; exceeding it refuses
+  every category item, never "no dependents"), and check each item against
+  that index. The index is a snapshot from the start of the run: a pointer
+  created after it is built is not seen by that run's archive or binding of
+  the item. Live-process, Git, Gitmoot and service checks are still repeated
+  immediately before each copy, quarantine move and expiry, and the next
+  collection rebuilds the index;
 - the tree crosses a mount, holds anything but directories, regular files and
   symlinks, carries extended attributes, exceeds `limits.deep_size_max_entries`
   members, borrows Git objects from outside via alternates, has a nested
@@ -518,7 +527,8 @@ be a directory directly inside a category root. It is refused by any of these:
   not walked. Inventory scans still share one deep-size budget per root.
 - every archive-time refusal: secret-like names, mount crossings, external
   gitdir, alternates or symlink dependents, unsupported file types, and the
-  destination mount expectations
+  destination mount expectations (dependents are checked against the run's
+  shared dependent index, see above)
 
 A recorded path that is unchanged since archiving reports `already_archived`.
 A path that changed after archiving fails Bind, so it is retained. It is

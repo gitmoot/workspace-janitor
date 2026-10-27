@@ -273,3 +273,7 @@ limits:
   max_dir_entries: 5000
   deep_size_max_entries: 200000
   deep_size_max_depth: 16
+  # One dependent-index walk per archive category run (and per collection
+  # that binds category archives) over every inventory root; exceeding it
+  # refuses every category item.
+  dependent_index_max_entries: 5000000
