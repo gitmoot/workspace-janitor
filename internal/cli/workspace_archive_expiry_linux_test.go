@@ -232,7 +232,23 @@ func TestWorkspaceArchiveExpiryQuarantinesExpiresAndRestoresFromArchive(t *testi
 	x.archiveAndPin(t, pastRetention, true)
 	receipt := x.quarantine(t)
 	x.preserved(t, receipt.Destination)
-	if receipt.Quarantined == nil || receipt.Quarantined.WorkspaceArchive == nil || receipt.Quarantined.WorkspaceArchive.ManifestSHA256 != x.sha {
+	// Read the binding through the serialized receipt so this check does not
+	// depend on Go field names (the same receipt bytes a consumer would see).
+	var snapshot struct {
+		WorkspaceArchive *struct {
+			ManifestSHA256 string `json:"manifest_sha256"`
+		} `json:"workspace_archive"`
+	}
+	if receipt.Quarantined != nil {
+		raw, err := json.Marshal(receipt.Quarantined)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if snapshot.WorkspaceArchive == nil || snapshot.WorkspaceArchive.ManifestSHA256 != x.sha {
 		t.Fatalf("quarantine snapshot lacks the archive binding: %+v", receipt.Quarantined)
 	}
 	if code := x.expire(t, receipt); code != ExitOK {
