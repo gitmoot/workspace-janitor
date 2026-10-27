@@ -292,6 +292,8 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 
 	// One fresh, deep, depth-1 observation of every category root with the
 	// policy file alone: existing category pins must not shape selection.
+	// Every candidate gets its own deep-size budget, so a few large siblings
+	// cannot leave the rest of a root unmeasured (and so unselectable).
 	var specs []collect.RootSpec
 	for _, category := range policy.WorkspaceArchiveCategories {
 		for _, root := range category.Roots {
@@ -309,7 +311,7 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 	}
 	engine := cleanupEngine(e, nil, paths, policy)
 	options := engine.Collect
-	options.Roots, options.DeepSize = specs, true
+	options.Roots, options.DeepSize, options.DeepSizePerEntry = specs, true, true
 	observed, err := collect.Run(ctx, options)
 	if err != nil {
 		return report, err
@@ -374,6 +376,10 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 	}
 
 	var failures []error
+	// Every category rule searches every inventory root for dependents, so
+	// one snapshot walk of them serves every candidate of this run instead of
+	// one bounded walk per candidate. Built only when there is a candidate.
+	var dependents *workspacearchive.DependentIndex
 	for _, category := range policy.WorkspaceArchiveCategories {
 		queue := queues[category.Name]
 		// Oldest first: the longest-idle items are archived before newer ones.
@@ -398,6 +404,10 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			owner := config.CategoryOwnerPrefix + category.Name
 			rule := categoryRule(category, name, item.Path, owner, owner+"@"+report.RunID)
 			scope := workspacearchive.PolicyScope(policy, rule)
+			if dependents == nil {
+				dependents = workspacearchive.BuildDependentIndex(ctx, scope.SearchRoots, policy.Limits.DependentIndexMaxEntries)
+			}
+			scope.Dependents = dependents
 			inspection, err := workspacearchive.Inspect(ctx, rule, scope)
 			switch {
 			case err != nil:

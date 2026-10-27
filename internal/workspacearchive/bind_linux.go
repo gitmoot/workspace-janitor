@@ -91,7 +91,7 @@ func Bind(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope, lo
 		if err := liveReferences(ctx, scope.ProcRoot, path); err != nil {
 			return nil, err
 		}
-		if err := externalDependents(ctx, path, scope.SearchRoots, scope.limit()); err != nil {
+		if err := scope.dependents(ctx, path); err != nil {
 			return nil, err
 		}
 	}

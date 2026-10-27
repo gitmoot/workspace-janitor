@@ -2,6 +2,7 @@ package collect
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -373,6 +374,65 @@ func TestDeepSizeDoesNotFollowSymlinks(t *testing.T) {
 
 	if entry.SizeBytes >= 10000 {
 		t.Errorf("size = %d: deep sizing followed a symlink out of the tree", entry.SizeBytes)
+	}
+}
+
+// budgetFixture holds a large first sibling that alone exceeds a 10-entry
+// budget, a small second sibling and a dot-named directory, all under one root.
+func budgetFixture(t *testing.T) (root, big, small, hidden string) {
+	t.Helper()
+	root = t.TempDir()
+	big = mustMkdir(t, filepath.Join(root, "a-big"))
+	for i := range 30 {
+		mustWrite(t, filepath.Join(big, fmt.Sprintf("f%02d", i)), "x")
+	}
+	small = mustMkdir(t, filepath.Join(root, "b-small"))
+	mustWrite(t, filepath.Join(small, "one"), "1")
+	mustWrite(t, filepath.Join(small, "sub", "two"), "2")
+	hidden = mustMkdir(t, filepath.Join(root, ".hidden"))
+	mustWrite(t, filepath.Join(hidden, "inside"), "h")
+	return root, big, small, hidden
+}
+
+// Inventory scans keep one deep-size budget per root: a large first entry
+// exhausts it for its siblings.
+func TestDeepSizeSharesOneBudgetPerRootByDefault(t *testing.T) {
+	root, big, small, hidden := budgetFixture(t)
+	opts := fixtureOptions(root)
+	opts.DeepSize = true
+	opts.Limits.DeepSizeMaxEntries = 10
+	result := run(t, opts)
+	if entry := entryFor(t, result, big); !entry.SizeIsLowerBound {
+		t.Fatalf("large entry not bounded: %+v", entry)
+	}
+	if entry := entryFor(t, result, small); !entry.SizeIsLowerBound || !entry.LatestModifiedAt.IsZero() {
+		t.Fatalf("shared per-root budget was not exhausted for the later sibling: %+v", entry)
+	}
+	if entry := entryFor(t, result, hidden); !entry.SizeIsDeep || hasSignal(entry, "deep_size_skipped") {
+		t.Fatalf("inventory scans must still deep-size dot-named entries: %+v", entry)
+	}
+}
+
+// Category selection (DeepSizePerEntry) gives each entry its own budget: a
+// small sibling of an entry that exceeds the bound is still fully measured,
+// the oversized entry stays a lower bound with no newest-mtime claim, and
+// dot-named entries are not walked at all.
+func TestDeepSizePerEntryBudgetMeasuresEverySibling(t *testing.T) {
+	root, big, small, hidden := budgetFixture(t)
+	opts := fixtureOptions(root)
+	opts.DeepSize, opts.DeepSizePerEntry = true, true
+	opts.Limits.DeepSizeMaxEntries = 10
+	result := run(t, opts)
+	if entry := entryFor(t, result, big); !entry.SizeIsDeep || !entry.SizeIsLowerBound || !entry.LatestModifiedAt.IsZero() ||
+		!hasSignal(entry, "deep_size_lower_bound") {
+		t.Fatalf("an entry whose own walk exceeds the bound must stay partial: %+v", entry)
+	}
+	entry := entryFor(t, result, small)
+	if !entry.SizeIsDeep || entry.SizeIsLowerBound || entry.LatestModifiedAt.IsZero() || entry.SizeBytes < 2 || !hasSignal(entry, "deep_size") {
+		t.Fatalf("small sibling not measured on its own budget: %+v", entry)
+	}
+	if entry := entryFor(t, result, hidden); entry.SizeIsDeep || !entry.LatestModifiedAt.IsZero() || !hasSignal(entry, "deep_size_skipped") {
+		t.Fatalf("dot-named entry was deep-walked: %+v", entry)
 	}
 }
 

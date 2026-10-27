@@ -3,6 +3,7 @@ package collect
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
@@ -50,6 +51,10 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 	refs, report := runBounded(ctx, opts, CollectorWorkspaceArchives, func(ctx context.Context, _ *Options) ([]Reference, core.CollectorReport) {
 		report := core.CollectorReport{Name: CollectorWorkspaceArchives, Status: core.CollectorRan}
 		refs := make([]Reference, 0, len(candidates))
+		// Category archives search every inventory root for dependents; one
+		// snapshot walk serves all of them in this collection instead of one
+		// bounded walk per item. Explicit rules keep their own walk.
+		var categoryDependents *workspacearchive.DependentIndex
 		for _, item := range candidates {
 			rule := item.rule
 			ref := Reference{Path: item.path, Source: core.SourcePolicy, Protection: core.ProtectDurableEvidence, Signal: "workspace_archive", Detail: "released workspace remains retained"}
@@ -65,6 +70,12 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 			default:
 				scope := workspacearchive.PolicyScope(*policy, rule)
 				scope.ProcRoot = opts.ProcRoot
+				if strings.HasPrefix(rule.Owner, config.CategoryOwnerPrefix) {
+					if categoryDependents == nil {
+						categoryDependents = workspacearchive.BuildDependentIndex(ctx, scope.SearchRoots, policy.Limits.DependentIndexMaxEntries)
+					}
+					scope.Dependents = categoryDependents
+				}
 				binding, err := workspacearchive.Bind(ctx, rule, scope, item.path, opts.VerifyArchiveContents)
 				switch {
 				case err != nil:

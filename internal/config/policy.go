@@ -175,6 +175,10 @@ type Limits struct {
 	MaxDirEntries      int      `yaml:"max_dir_entries" json:"max_dir_entries"`
 	DeepSizeMaxEntries int      `yaml:"deep_size_max_entries" json:"deep_size_max_entries"`
 	DeepSizeMaxDepth   int      `yaml:"deep_size_max_depth" json:"deep_size_max_depth"`
+	// DependentIndexMaxEntries bounds the one dependent-index walk an archive
+	// category run (or a binding of category archives) makes over the
+	// inventory roots; exceeding it refuses every category item.
+	DependentIndexMaxEntries int `yaml:"dependent_index_max_entries" json:"dependent_index_max_entries"`
 }
 
 // Collectors selects which evidence collectors run and where the reference
@@ -396,6 +400,8 @@ func DefaultPolicy(p Paths) Policy {
 			MaxDirEntries:      5000,
 			DeepSizeMaxEntries: 200000,
 			DeepSizeMaxDepth:   16,
+
+			DependentIndexMaxEntries: 5000000,
 		},
 		Prevention: Prevention{
 			DeepInterval:     Duration(7 * 24 * time.Hour),
@@ -767,6 +773,7 @@ func (p *Policy) Validate() core.FieldErrors {
 		{"limits.max_dir_entries", p.Limits.MaxDirEntries},
 		{"limits.deep_size_max_entries", p.Limits.DeepSizeMaxEntries},
 		{"limits.deep_size_max_depth", p.Limits.DeepSizeMaxDepth},
+		{"limits.dependent_index_max_entries", p.Limits.DependentIndexMaxEntries},
 	} {
 		if bound.value <= 0 {
 			errs.Add(bound.field, "must be greater than zero, got %d", bound.value)

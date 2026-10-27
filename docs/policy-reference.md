@@ -404,7 +404,16 @@ Creation refuses, leaving the source and destination untouched, when:
   `limits.deep_size_max_entries`. Symlinks are followed as the kernel would,
   through chained links and symlinked directories; one that reaches the path at
   any step is a dependent, and one that loops, chains more than 40 links or
-  cannot be examined also refuses;
+  cannot be examined also refuses. Archive category runs, and collections
+  that bind category archives, instead walk the search roots once into a
+  shared index of these pointers, bounded in total by
+  `limits.dependent_index_max_entries` (default 5000000; exceeding it refuses
+  every category item, never "no dependents"), and check each item against
+  that index. The index is a snapshot from the start of the run: a pointer
+  created after it is built is not seen by that run's archive or binding of
+  the item. Live-process, Git, Gitmoot and service checks are still repeated
+  immediately before each copy, quarantine move and expiry, and the next
+  collection rebuilds the index;
 - the tree crosses a mount, holds anything but directories, regular files and
   symlinks, carries extended attributes, exceeds `limits.deep_size_max_entries`
   members, borrows Git objects from outside via alternates, has a nested
@@ -490,7 +499,7 @@ Binding is full before the quarantine move and before expiry.
 | `name` | Unique; 1-48 letters, digits, `_` or `-`. Item archives are named `<name>-<base>-<hash12>` (hash of path and run). |
 | `kind` | `merged_worktrees` (linked Git worktree), `pushed_clones` (standalone non-bare checkout) or `root_scratch` (no `.git` at the item root). One category per kind and root. |
 | `roots` | Exact configured inventory roots. A root may not be `report_only`, inside `protect.paths`, or inside a `workspace_archive_keep` path. Only depth-1 entries are candidates. |
-| `idle` | Minimum age of the newest modification anywhere in the tree, measured by a bounded deep walk. Use `Nd` or Go syntax. At least `14d` for `merged_worktrees` and `30d` otherwise (also the defaults). |
+| `idle` | Minimum age of the newest modification anywhere in the tree, measured by a bounded deep walk of that item alone (see below). Use `Nd` or Go syntax. At least `14d` for `merged_worktrees` and `30d` otherwise (also the defaults). |
 | `archive.directory`, `expect_mount_source`, `expect_fstype` | Same approval rules as `workspace_archives` destinations. The directory must also be outside every inventory root. |
 | `local_retention` | `none`, `30d` (default) or `90d`, measured from archive creation. `none` proposes quarantine as soon as the verified archive binds the local tree. The quarantine retention (`retention.default`) still applies before deletion, and deletion still re-binds the quarantined copy. |
 | `max_items_per_cycle` | Default 20, at most 200. Extra candidates are `deferred`, oldest first. |
@@ -510,10 +519,16 @@ be a directory directly inside a category root. It is refused by any of these:
 - for Git kinds: dirty files, stashes, a Git lock, unmeasured publication,
   commits that are not on a remote-tracking branch, degraded metadata, or
   ignored contents that are unproven
-- an unknown or partial deep size or newest mtime, or a size above the bound
+- an unknown or partial deep size or newest mtime, or a size above the bound.
+  Category selection walks each candidate with its own
+  `limits.deep_size_max_entries` and `limits.deep_size_max_depth` budget, so a
+  large sibling cannot leave the rest of a root unmeasured; an item whose own
+  walk reaches the bound stays partial and is refused. Dot-named entries are
+  not walked. Inventory scans still share one deep-size budget per root.
 - every archive-time refusal: secret-like names, mount crossings, external
   gitdir, alternates or symlink dependents, unsupported file types, and the
-  destination mount expectations
+  destination mount expectations (dependents are checked against the run's
+  shared dependent index, see above)
 
 A recorded path that is unchanged since archiving reports `already_archived`.
 A path that changed after archiving fails Bind, so it is retained. It is

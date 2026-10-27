@@ -104,7 +104,7 @@ func inspect(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope)
 	if err = liveReferences(ctx, scope.ProcRoot, rule.Path); err != nil {
 		return nil, err
 	}
-	if err = externalDependents(ctx, rule.Path, scope.SearchRoots, scope.limit()); err != nil {
+	if err = scope.dependents(ctx, rule.Path); err != nil {
 		return nil, err
 	}
 	ok = true
@@ -126,7 +126,7 @@ func (in *inspected) fresh(ctx context.Context, rule config.WorkspaceArchiveRule
 	if err := liveReferences(ctx, scope.ProcRoot, rule.Path); err != nil {
 		return err
 	}
-	return externalDependents(ctx, rule.Path, scope.SearchRoots, scope.limit())
+	return scope.dependents(ctx, rule.Path)
 }
 
 // Create writes <name>.tar, <name>.manifest.json and, for a linked worktree,
