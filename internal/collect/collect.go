@@ -36,6 +36,9 @@ const (
 	CollectorServices   = "services"
 	CollectorGitmoot    = "gitmoot"
 	CollectorExports    = "evidence_exports"
+	// CollectorWorkspaceArchives binds released workspaces to their pinned
+	// archives; it runs only when the policy has workspace_archives.
+	CollectorWorkspaceArchives = "workspace_archives"
 )
 
 // RootSpec is one discovery root and the bounds that apply inside it.
@@ -266,6 +269,9 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	if opts.WorktreePolicy != nil && len(opts.WorktreePolicy.EvidenceExports) != 0 {
 		result.Reports = append(result.Reports, collectEvidenceExports(ctx, &opts, entries, now))
 	}
+	if opts.WorktreePolicy != nil && len(opts.WorktreePolicy.WorkspaceArchives) != 0 {
+		result.Reports = append(result.Reports, collectWorkspaceArchives(ctx, &opts, entries, now))
+	}
 
 	// Overlapping roots are valid policy input, so the same path can be
 	// reached twice. Merging keeps one entry per path with the union of its
@@ -315,12 +321,13 @@ func attachGitmootObservations(entries []core.Entry, refs []Reference, report *c
 
 // Reference is a path that something outside the filesystem points at.
 type Reference struct {
-	Path          string
-	Source        core.EvidenceSource
-	Protection    core.ProtectionKind
-	Signal        string
-	Detail        string
-	ExportArchive *core.ExportArchiveBinding `json:"export_archive,omitempty"`
+	Path             string
+	Source           core.EvidenceSource
+	Protection       core.ProtectionKind
+	Signal           string
+	Detail           string
+	ExportArchive    *core.ExportArchiveBinding    `json:"export_archive,omitempty"`
+	WorkspaceArchive *core.WorkspaceArchiveBinding `json:"workspace_archive,omitempty"`
 }
 
 // attachReferences records each reference on every entry that contains it,

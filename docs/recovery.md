@@ -82,9 +82,10 @@ shipped example policy.
 Workspace archives are opt-in and copy-only; see
 [the policy contract](policy-reference.md#workspace-archives). They never
 delete the source, and removing the local copy still goes through the ordinary
-quarantine/expiry workflow above. Expiry does not yet require a pinned
-workspace archive, so treat a workspace archive as an independent backup, not
-as permission to delete.
+quarantine/expiry workflow above. A released workspace under a rule is held
+until [local expiry](policy-reference.md#workspace-archive-local-expiry) is
+enabled, its retention has elapsed since archive creation, and the pinned
+archive exactly matches the local tree.
 
 1. Add the `workspace_archives` rule with an empty manifest, check the policy
    and preview `janitor archive --workspace NAME`. The preview runs every
@@ -109,6 +110,19 @@ as permission to delete.
    entry. If that entry is gone, recover the history with
    `git -C <main repository> fetch <archive>/<name>.bundle HEAD` or
    `git clone <archive>/<name>.bundle <dir>`.
+6. To let expiry remove the local copy, keep the pin and set
+   `local_expiry_enabled: true` (and optionally `local_retention: 90d`). Scan
+   and plan: once the retention has elapsed and the tree still matches, the
+   workspace is proposed for quarantine; approve and `apply --quarantine` as
+   usual. Until expiry, `janitor restore <cleanup-id>` moves the quarantined
+   copy back. `apply --expire` re-hashes the archive, bundle and quarantined
+   tree immediately before deleting; any mismatch refuses expiry (the receipt
+   goes to investigation) and `janitor restore` still works.
+7. After expiry, the original path is gone and the archive is the copy:
+   `janitor archive --workspace NAME --restore-to <original path> --dry-run=false
+   --confirm` restores it in place. Do not remove or re-pin the archive before
+   then; the archive directory's `protect.paths` entry keeps Janitor from
+   touching it.
 
 Without Janitor, the same tar extracts with
 `tar -C /new/path --numeric-owner -xpf <archive>/<name>.tar`; compare against

@@ -41,7 +41,7 @@ default.
 | `janitor apply --expire` | implemented (deletion disabled by default) |
 | `janitor restore <cleanup-id>` | implemented (preview by default) |
 | `janitor archive --rule <name>` | Linux exact-file evidence archival, integrity verification and restore; no source/archive deletion |
-| `janitor archive --workspace <name>` | opt-in Linux copy-only verified tar of one released directory (plus a `HEAD` bundle for linked worktrees), integrity verification and restore; no source/archive deletion |
+| `janitor archive --workspace <name>` | opt-in Linux copy-only verified tar of one released directory (plus a `HEAD` bundle for linked worktrees), integrity verification and restore; no source/archive deletion. With `local_expiry_enabled`, quarantine/expiry may remove the local copy only while the pinned archive exactly matches it |
 
 ## Inventory
 
@@ -58,6 +58,7 @@ no decisions and mutates nothing.
 | `gitmoot` | read-only Gitmoot job, task, and cleanup-obligation ledger for exact paths | command timeout, entry bound; missing or uncertain state fails closed |
 | `services` | systemd `WorkingDirectory`/`Exec*`, cron command paths, PM2 `pm_cwd`/`pm_exec_path` | per-file byte bound, per-directory entries |
 | `evidence_exports` | approved manifest, exact export header/metadata and archive identity; full content verification before mutation | at most 64 rules, explicit byte ceiling, command timeout; existing protections stay blocking |
+| `workspace_archives` | pinned workspace archive manifest and the released tree's member list (paths, types, sizes, modes, owners, mtimes, link targets); full archive and per-file content verification before mutation; live-process and dependent re-checks | at most 64 rules, member bound from the pinned manifest, command timeout; existing protections stay blocking |
 
 Three properties hold across all of them:
 

@@ -10,8 +10,10 @@ import (
 )
 
 // WorkspaceArchiveRule names one released directory whose owner approved a
-// copy-only verified archive. It never authorizes removing the directory:
-// local removal stays with the ordinary quarantine and expiry engine.
+// copy-only verified archive. Archiving never removes the directory. Local
+// removal stays with the ordinary quarantine and expiry engine, and only when
+// LocalExpiryEnabled, LocalRetention has elapsed since the pinned manifest was
+// created, and the pinned archive exactly matches the current local tree.
 type WorkspaceArchiveRule struct {
 	Name    string `yaml:"name" json:"name"`
 	Path    string `yaml:"path" json:"path"`
@@ -19,8 +21,13 @@ type WorkspaceArchiveRule struct {
 	Release string `yaml:"release" json:"release"`
 	// DependentRoots are scanned for gitdir files, object alternates and
 	// symlinks that depend on Path. Empty means every inventory root.
-	DependentRoots []string                    `yaml:"dependent_roots" json:"dependent_roots"`
-	Archive        WorkspaceArchiveDestination `yaml:"archive" json:"archive"`
+	DependentRoots []string `yaml:"dependent_roots" json:"dependent_roots"`
+	// LocalRetention and LocalExpiryEnabled are omitted from manifests (and
+	// so from RuleHash) when unset: enabling expiry later never invalidates
+	// an existing archive.
+	LocalRetention     core.Retention              `yaml:"local_retention" json:"local_retention,omitempty"`
+	LocalExpiryEnabled bool                        `yaml:"local_expiry_enabled" json:"local_expiry_enabled,omitempty"`
+	Archive            WorkspaceArchiveDestination `yaml:"archive" json:"archive"`
 }
 
 // WorkspaceArchiveDestination is an existing, independently protected
@@ -66,6 +73,9 @@ func (p *Policy) normalizeWorkspaceArchives(expand func(string, string) string) 
 		}
 		if rule.DependentRoots == nil {
 			rule.DependentRoots = []string{}
+		}
+		if rule.LocalRetention == "" {
+			rule.LocalRetention = core.Retention30Days
 		}
 	}
 	for i := range p.WorkspaceArchiveKeep {
@@ -122,6 +132,28 @@ func (p *Policy) validateWorkspaceArchives(errs *core.FieldErrors) {
 			errs.Add(field, "raw runtime/session stores and credential containers cannot be workspace archive sources or destinations")
 		}
 		p.validateWorkspaceArchiveDestination(errs, field, rule)
+		p.validateWorkspaceArchiveExpiry(errs, field, rule)
+	}
+}
+
+// validateWorkspaceArchiveExpiry mirrors evidence export local expiry: at least
+// 30 days, never permanent, and only against an exact pinned manifest whose
+// live-use, Git and service evidence the collectors can observe.
+func (p *Policy) validateWorkspaceArchiveExpiry(errs *core.FieldErrors, field string, rule WorkspaceArchiveRule) {
+	if rule.LocalRetention != core.Retention30Days && rule.LocalRetention != core.Retention90Days && rule.LocalRetention != core.RetentionPermanent {
+		errs.Add(field+".local_retention", "must retain released workspaces for at least 30d (30d, 90d, or permanent)")
+	}
+	if !rule.LocalExpiryEnabled {
+		return
+	}
+	if rule.LocalRetention == core.RetentionPermanent {
+		errs.Add(field+".local_expiry_enabled", "cannot expire permanent local retention")
+	}
+	if rule.Archive.Manifest == "" || rule.Archive.ManifestSHA256 == "" {
+		errs.Add(field+".local_expiry_enabled", "requires a pinned archive manifest and manifest_sha256; create and verify the archive first")
+	}
+	if !p.Collectors.Git || !p.Collectors.Services {
+		errs.Add(field+".local_expiry_enabled", "requires Git, process, and service collectors")
 	}
 }
 

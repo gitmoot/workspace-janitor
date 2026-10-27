@@ -95,10 +95,12 @@ type walker struct {
 	rootState state
 	patterns  []string
 	max       int
-	verify    bool
-	inv       inventory
-	secrets   []string
-	refusals  []string
+	// hash records each regular file's SHA-256; screen applies the source
+	// refusal screens (secret-like names, xattrs, outbound Git pointers).
+	hash, screen bool
+	inv          inventory
+	secrets      []string
+	refusals     []string
 }
 
 func (w *walker) refuse(format string, args ...any) {
@@ -118,9 +120,9 @@ func (w *walker) add(m Member, st state) error {
 }
 
 // scanTree records every member without following symlinks or crossing
-// mounts. In verify mode it also hashes regular files and skips the refusal
-// screens, which only apply to sources.
-func scanTree(ctx context.Context, root *os.File, source string, patterns []string, limit int, verify bool) (*walker, error) {
+// mounts. hash also hashes regular files; screen applies the refusal screens,
+// which apply to sources and to local trees bound for expiry, not to restores.
+func scanTree(ctx context.Context, root *os.File, source string, patterns []string, limit int, hash, screen bool) (*walker, error) {
 	rootState, err := fstate(root)
 	if err != nil {
 		return nil, err
@@ -128,8 +130,8 @@ func scanTree(ctx context.Context, root *os.File, source string, patterns []stri
 	if rootState.kind() != unix.S_IFDIR {
 		return nil, errors.New("workspace archive source must be a directory")
 	}
-	w := &walker{ctx: ctx, source: source, rootState: rootState, patterns: patterns, max: limit, verify: verify}
-	if !verify {
+	w := &walker{ctx: ctx, source: source, rootState: rootState, patterns: patterns, max: limit, hash: hash, screen: screen}
+	if screen {
 		if secretLike(filepath.Base(source), filepath.Dir(source), patterns) {
 			w.secrets = append(w.secrets, ".")
 		}
@@ -190,7 +192,7 @@ func (w *walker) walk(dir *os.File, rel string, depth int) error {
 			w.refuse("%s: crosses a mount boundary inside the tree", path)
 			continue
 		}
-		if !w.verify {
+		if w.screen {
 			if secretLike(name, filepath.Join(w.source, rel), w.patterns) && len(w.secrets) < maxReported {
 				w.secrets = append(w.secrets, path)
 			}
@@ -222,7 +224,7 @@ func (w *walker) walk(dir *os.File, rel string, depth int) error {
 			}
 		case unix.S_IFREG:
 			m.Type, m.Size = TypeFile, st.size
-			if w.verify || name == ".git" || name == "alternates" {
+			if w.hash || (w.screen && (name == ".git" || name == "alternates")) {
 				if err := w.readRegular(dir, name, rel, &m, st); err != nil {
 					return err
 				}
@@ -237,7 +239,7 @@ func (w *walker) walk(dir *os.File, rel string, depth int) error {
 				return fmt.Errorf("readlink %s: %w", path, err)
 			}
 			m.Linkname = target
-			if name == ".git" && !w.verify {
+			if name == ".git" && w.screen {
 				w.screenGitLink(path, rel, target)
 			}
 			if err := w.add(m, st); err != nil {
@@ -250,10 +252,10 @@ func (w *walker) walk(dir *os.File, rel string, depth int) error {
 	return nil
 }
 
-// readRegular hashes verified files and screens Git pointers: a tree whose
-// history lives outside it is archived only as a root linked worktree (a root
-// .git file), with a bundle; nested outbound gitdirs and alternates are
-// refused. .git symlinks are screened by screenGitLink.
+// readRegular hashes files when hashing and screens Git pointers when
+// screening: a tree whose history lives outside it is archived only as a root
+// linked worktree (a root .git file), with a bundle; nested outbound gitdirs
+// and alternates are refused. .git symlinks are screened by screenGitLink.
 func (w *walker) readRegular(dir *os.File, name, rel string, m *Member, st state) error {
 	f, err := openChild(dir, name, unix.O_RDONLY)
 	if err != nil {
@@ -264,7 +266,7 @@ func (w *walker) readRegular(dir *os.File, name, rel string, m *Member, st state
 	if err != nil || opened.id != st.id {
 		return fmt.Errorf("%s changed while being inspected", m.Path)
 	}
-	if w.verify {
+	if w.hash {
 		hash := sha256.New()
 		n, err := io.Copy(hash, contextReader{w.ctx, io.LimitReader(f, st.size+1)})
 		if err != nil {
@@ -274,7 +276,12 @@ func (w *walker) readRegular(dir *os.File, name, rel string, m *Member, st state
 			return fmt.Errorf("%s size changed while being verified", m.Path)
 		}
 		m.SHA256 = hex.EncodeToString(hash.Sum(nil))
-		return nil
+		if !w.screen || (name != ".git" && name != "alternates") {
+			return nil
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxPointerSize+1))
 	if err != nil {
