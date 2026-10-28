@@ -38,8 +38,10 @@ type CategoryArchive struct {
 	// RestoredByOwner is derived, never stored: a quarantine of this path was
 	// restored after the archive was created. The owner's undo withdraws the
 	// receipt's expiry authority until the path changes and is archived anew.
-	// Cancelling a prepared receipt whose move never happened is not an undo:
-	// the item never left, so it keeps its expiry authority.
+	// Only a receipt whose move was recorded (moved_at) counts: a receipt that
+	// never moved, whatever route it took to restored (a cancelled prepare, or
+	// investigate after the source went away and came back), is not an undo,
+	// so the item keeps its archive's expiry authority.
 	RestoredByOwner bool `json:"-"`
 	// Withdrawn is derived from category_archive_withdrawals: the archive was
 	// restored from (for example after expiry), so it no longer authorizes
@@ -134,13 +136,13 @@ func (t *Tx) CategoryArchives(ctx context.Context) ([]CategoryArchive, error) {
 		return nil, fmt.Errorf("store: list category archives: %w", err)
 	}
 	rows.Close()
-	// A prepared item becomes restored directly only when its move never
-	// happened (Engine.Restore requires the unmoved source and an absent
-	// destination); a moved item is reconciled to quarantined first.
-	restored, err := t.tx.QueryContext(ctx, `SELECT source, updated_at FROM cleanup_items AS i
-		WHERE state = 'restored' AND NOT EXISTS (SELECT 1 FROM cleanup_events AS e
-			WHERE e.cleanup_id = i.cleanup_id AND e.action_id = i.action_id
-			AND e.from_state = 'prepared' AND e.to_state = 'restored')`)
+	// finishMove sets moved_at exactly when a move is journaled, and restore
+	// keeps it, so it is the evidence that the item actually left. A move
+	// interrupted before its journal update is indistinguishable from one
+	// that never happened; its undo is not counted (the archive is verified,
+	// so a later quarantine loses nothing).
+	restored, err := t.tx.QueryContext(ctx, `SELECT source, updated_at FROM cleanup_items
+		WHERE state = 'restored' AND moved_at IS NOT NULL`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list restored cleanup items: %w", err)
 	}
