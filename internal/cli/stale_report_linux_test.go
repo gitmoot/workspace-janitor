@@ -76,6 +76,7 @@ prevention:
   min_free_percent: 0
 limits:
   command_timeout: 30s
+%s
 gitmoot:
   home: %s
   database: %s
@@ -88,7 +89,7 @@ report:
   max_items_per_cycle: %d
   archive:
     directory: %s
-%s`, x.work, x.archive, x.proc, x.services, x.gitmoot, filepath.Join(x.gitmoot, "gitmoot.db"), x.work, x.releaseAction, x.reportMaxItems, x.archive, x.extra))
+%s`, x.work, x.archive, x.proc, x.services, x.limits, x.gitmoot, filepath.Join(x.gitmoot, "gitmoot.db"), x.work, x.releaseAction, x.reportMaxItems, x.archive, x.extra))
 }
 
 // job records a Gitmoot job for path dispatched by role.
@@ -233,6 +234,39 @@ func TestStaleReportRoutesUnknownOwnerToCoordinatorAndNeverSuggestsArchive(t *te
 	if code != ExitOK || !strings.Contains(text, x.source) || !strings.Contains(text, "Owner unknown") ||
 		!strings.Contains(text, "janitor report release <path> --role coordinator") || strings.Contains(text, owned) {
 		t.Fatalf("coordinator message: exit=%d %s\n%s", code, stderr, text)
+	}
+}
+
+// Each report candidate is measured on its own deep-size budget. A large
+// first item must not leave a small idle sibling unmeasured (live 2026-10-28:
+// 94 /root items unmeasured because the whole root shared one budget).
+func TestStaleReportDeepBudgetIsPerItem(t *testing.T) {
+	x := newStaleFixture(t)
+	x.limits = "  deep_size_max_entries: 40\n"
+	x.write(t)
+	big := filepath.Join(x.work, "a-big")
+	deep := filepath.Join(big, "d1", "d2", "d3", "d4", "d5", "d6")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 50 {
+		if err := os.WriteFile(filepath.Join(deep, fmt.Sprintf("f%02d", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{big, x.source} {
+		backdate(t, path, categoryIdleAge)
+	}
+	report := x.stale(t)
+	if _, entry, ok := staleListed(report, x.source); !ok || entry.SizeMeasure != "deep" {
+		t.Fatalf("a small idle sibling after a large item was not measured on its own budget: listed=%v %+v unmeasured=%+v", ok, entry, report.Unmeasured)
+	}
+	found := false
+	for _, item := range report.Unmeasured {
+		found = found || item.Path == big
+	}
+	if !found {
+		t.Fatalf("an item whose own walk exceeds the bound is not reported unmeasured: %+v", report.Unmeasured)
 	}
 }
 
