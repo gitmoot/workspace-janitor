@@ -675,12 +675,11 @@ func TestCategoryArchiveOwnerRestoreWithdrawsExpiry(t *testing.T) {
 	}
 }
 
-// A scheduled quarantine that the mutation-time re-check refuses leaves a
-// prepared receipt; the item never moved. Cancelling that receipt with
-// restore is not the owner's undo, so the archive keeps its expiry authority
-// and the next plan proposes quarantine again (live 2026-10-28: six archived
-// items lost expiry after their never-moved receipts were cancelled).
-func TestCategoryArchiveCancelledPrepareKeepsExpiry(t *testing.T) {
+// refusedCategoryQuarantine archives the fixture item, approves its
+// quarantine, and has a process start using it so apply's fresh check refuses
+// the move: the receipt stays prepared and the item never moves.
+func refusedCategoryQuarantine(t *testing.T) (*categoryFixture, core.CleanupItem) {
+	t.Helper()
 	x := newCategoryFixture(t)
 	backdate(t, x.source, categoryIdleAge)
 	x.categories(t, false)
@@ -689,8 +688,6 @@ func TestCategoryArchiveCancelledPrepareKeepsExpiry(t *testing.T) {
 		t.Fatalf("category-archived item not proposed for quarantine: %+v", action)
 	}
 	x.data(t, "plan", "--plan", plan.ID, "--approve", action.ID, "--no-jev")
-	// A process starts using the item after planning: apply's fresh check
-	// refuses the move and leaves the receipt prepared.
 	pid := filepath.Join(x.proc, "434343")
 	if err := os.MkdirAll(pid, 0o700); err != nil {
 		t.Fatal(err)
@@ -712,13 +709,54 @@ func TestCategoryArchiveCancelledPrepareKeepsExpiry(t *testing.T) {
 	if err := os.RemoveAll(pid); err != nil {
 		t.Fatal(err)
 	}
-	x.data(t, "restore", "--confirm", receipt.CleanupID)
+	return x, receipt
+}
+
+// keepsCategoryExpiry fails unless the never-moved item is proposed for
+// quarantine again and is not reported as restored.
+func keepsCategoryExpiry(t *testing.T, x *categoryFixture) {
+	t.Helper()
 	if _, next := x.action(t, x.source); next.Kind != core.ActionQuarantine {
-		t.Fatalf("cancelling a never-moved receipt withdrew the archive's expiry: %+v", next)
+		t.Fatalf("a never-moved receipt reaching restored withdrew the archive's expiry: %+v", next)
 	}
 	if item := categoryItem(t, x.categories(t, true), x.source); strings.Contains(strings.Join(item.Reasons, "\n"), "restored") {
 		t.Fatalf("never-moved item reported as restored: %+v", item)
 	}
+}
+
+// Cancelling a prepared receipt whose move never happened is not the owner's
+// undo, so the archive keeps its expiry authority (live 2026-10-28: six
+// archived items lost expiry after their never-moved receipts were cancelled).
+func TestCategoryArchiveCancelledPrepareKeepsExpiry(t *testing.T) {
+	x, receipt := refusedCategoryQuarantine(t)
+	x.data(t, "restore", "--confirm", receipt.CleanupID)
+	keepsCategoryExpiry(t, x)
+}
+
+// The same never-moved receipt can reach restored through investigate: the
+// source is moved aside (both ends absent, so restore marks it investigate
+// and cannot restore), then moved back and restored. No move was journaled,
+// so this is not an undo either.
+func TestCategoryArchiveNeverMovedInvestigateRestoreKeepsExpiry(t *testing.T) {
+	x, receipt := refusedCategoryQuarantine(t)
+	aside := x.source + ".aside"
+	if err := os.Rename(x.source, aside); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, code := x.run(t, "restore", "--confirm", receipt.CleanupID); code == ExitOK {
+		t.Fatal("restore succeeded with both the source and the quarantine destination absent")
+	}
+	if state := x.receipt(t).State; state != core.CleanupInvestigate {
+		t.Fatalf("receipt with both ends absent is %s, want investigate", state)
+	}
+	if err := os.Rename(aside, x.source); err != nil {
+		t.Fatal(err)
+	}
+	x.data(t, "restore", "--confirm", receipt.CleanupID)
+	if state := x.receipt(t).State; state != core.CleanupRestored {
+		t.Fatalf("receipt after the source returned is %s, want restored", state)
+	}
+	keepsCategoryExpiry(t, x)
 }
 
 // Restoring an expired category item from its archive to its original path

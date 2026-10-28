@@ -543,10 +543,14 @@ its expiry authority while any of these hold:
 - the owner restored its quarantine with `janitor restore`, or restored the
   item from its archive (`archive --restore-category-item` or `archive
   --workspace <item name> --restore-to`); the archive restore records an
-  immutable withdrawal before any file is written. Cancelling a prepared
-  receipt whose move never happened (`janitor restore` of a refused
-  quarantine) is not an undo: the item never left, so its archive keeps its
-  expiry authority.
+  immutable withdrawal before any file is written. Only a quarantine whose
+  move was recorded counts as the owner's undo. A receipt that never moved
+  (`janitor restore` of a refused quarantine, or one restored after its source
+  was moved away and back) is not an undo: the item never left, so its archive
+  keeps its expiry authority. A move interrupted before Janitor recorded it
+  cannot be told apart from one that never happened, so restoring it does not
+  withdraw expiry either; the archive stays verified, so a later quarantine
+  loses nothing.
 
 `janitor archive --categories` previews by default and writes nothing.
 `--dry-run=false --confirm` creates the archives under the apply lock and
