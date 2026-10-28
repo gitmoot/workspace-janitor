@@ -398,19 +398,11 @@ func observeStale(ctx context.Context, e *env, paths config.Paths, policy config
 	for _, reply := range replyList {
 		replies[reply.Path] = reply
 	}
-	// Not in use is only established when every live-use collector ran.
-	var gaps []string
-	for _, collector := range observed.Reports {
-		switch collector.Name {
-		case collect.CollectorProcesses, collect.CollectorAgents, collect.CollectorServices:
-			if collector.Status == core.CollectorPartial || collector.Status == core.CollectorFailed {
-				gaps = append(gaps, fmt.Sprintf("%s: %s", collector.Name, collector.Detail))
-			}
-		}
-	}
-	obs.report.InUseEvidence = "complete: process, registered-agent and service references were observed"
-	if len(gaps) != 0 {
-		obs.inUseGap = "live-use observation incomplete (" + strings.Join(gaps, "; ") + ")"
+	// Not in use is only established under the same evidence rules as a
+	// quarantine or expiry recheck (action.Engine.observeAround).
+	obs.report.InUseEvidence = "complete: filesystem, process, service, Gitmoot and registered-agent evidence were observed"
+	if gap := collect.EvidenceGap(observed.Reports, len(options.AgentSources) != 0); gap != nil {
+		obs.inUseGap = "live-use observation incomplete (" + gap.Error() + ")"
 		obs.report.InUseEvidence = obs.inUseGap
 	}
 
@@ -485,8 +477,10 @@ func observeStale(ctx context.Context, e *env, paths config.Paths, policy config
 		}
 		obs.candidates[item.Path] = item
 		if reply, ok := replies[item.Path]; ok {
+			// A reply binds the item as its owner saw it: a change of the item
+			// or of its owner attribution voids a keep as well as a release.
 			void := snapshotChanged(reply, item.entry)
-			if void == "" && reply.Reply == store.ReportReplyRelease && reply.Owner != item.Owner {
+			if void == "" && reply.Owner != item.Owner {
 				void = fmt.Sprintf("its owner attribution changed from %s to %s", reply.Owner, item.Owner)
 			}
 			switch {

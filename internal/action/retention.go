@@ -55,28 +55,8 @@ func (e *Engine) observeAround(ctx context.Context, path string, deep bool) (col
 	if err != nil {
 		return collect.Result{}, err
 	}
-	for _, report := range result.Reports {
-		switch report.Name {
-		case collect.CollectorFilesystem, collect.CollectorProcesses, collect.CollectorServices:
-			if report.Status != core.CollectorRan {
-				return collect.Result{}, fmt.Errorf("%s evidence incomplete: %s: %s", path, report.Name, report.Detail)
-			}
-		case collect.CollectorGit:
-			// Git's aggregate report becomes partial when any sibling repo is
-			// unknown. The target's own unknown Git state is represented in
-			// its entry and blocked by the safety engine.
-			if report.Status != core.CollectorRan && report.Status != core.CollectorPartial {
-				return collect.Result{}, fmt.Errorf("%s Git evidence incomplete: %s", path, report.Detail)
-			}
-		case collect.CollectorGitmoot:
-			if report.Status != core.CollectorRan && report.Status != core.CollectorSkipped {
-				return collect.Result{}, fmt.Errorf("%s Gitmoot evidence incomplete: %s", path, report.Detail)
-			}
-		case collect.CollectorAgents:
-			if len(opts.AgentSources) != 0 && report.Status != core.CollectorRan {
-				return collect.Result{}, fmt.Errorf("%s agent evidence incomplete: %s", path, report.Detail)
-			}
-		}
+	if err := collect.EvidenceGap(result.Reports, len(opts.AgentSources) != 0); err != nil {
+		return collect.Result{}, fmt.Errorf("%s %w", path, err)
 	}
 	return result, nil
 }

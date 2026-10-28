@@ -514,3 +514,91 @@ func TestStaleReportKeepSuppressesUntilExpiry(t *testing.T) {
 		t.Fatalf("keep with a past date: exit=%d %s", code, stderr)
 	}
 }
+
+// Live-use evidence follows the quarantine/expiry recheck rules: a skipped
+// process collector or a partial Gitmoot collector makes the whole report
+// incomplete, so no entry is suggested for archiving and every reply is
+// refused, even for items that would otherwise pass.
+func TestStaleReportIncompleteLiveUseEvidenceSuggestsNothingAndRefusesReplies(t *testing.T) {
+	for _, tc := range []struct {
+		name, collector string
+		degrade         func(t *testing.T, x *staleFixture)
+	}{
+		{"processes skipped", "processes", func(t *testing.T, x *staleFixture) {
+			if err := os.RemoveAll(x.proc); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"gitmoot partial", "Gitmoot", func(t *testing.T, x *staleFixture) {
+			// The cleanup ledger is gone, so collectGitmoot cannot mark any
+			// path, while the job ledger still attributes an owner.
+			db, err := sql.Open("sqlite", filepath.Join(x.gitmoot, "gitmoot.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err := db.Exec(`DROP TABLE cleanup_obligations`); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := newStaleFixture(t)
+			owned := x.scratch(t, "owned", map[string]string{"README.md": "owned\n"})
+			for _, path := range []string{x.source, owned} {
+				backdate(t, path, categoryIdleAge)
+			}
+			x.job(t, "job-owned", "succeeded", "seat-a", owned)
+			tc.degrade(t, x)
+
+			report := x.stale(t)
+			if !strings.Contains(report.InUseEvidence, "incomplete") || !strings.Contains(report.InUseEvidence, tc.collector) {
+				t.Fatalf("in-use evidence = %q, want incomplete naming %s", report.InUseEvidence, tc.collector)
+			}
+			for _, path := range []string{x.source, owned} {
+				_, entry, ok := staleListed(report, path)
+				if !ok {
+					t.Fatalf("%s missing: %+v", path, report.Groups)
+				}
+				if entry.SuggestedAction == staleSuggestArchive {
+					t.Errorf("%s suggested for archiving on incomplete live-use evidence: %+v", path, entry)
+				}
+			}
+			for _, reply := range [][]string{
+				{"release", x.source, "--role", "coordinator"},
+				{"keep", x.source, "--role", "coordinator"},
+				{"release", owned, "--role", "seat-a"},
+			} {
+				code, stderr := x.reply(t, reply...)
+				if code == ExitOK || !strings.Contains(stderr, "cannot be verified as not in use") {
+					t.Errorf("%v accepted on incomplete evidence: exit=%d %s", reply, code, stderr)
+				}
+			}
+			if n := replyCount(t, x); n != 0 {
+				t.Fatalf("%d replies recorded on incomplete evidence", n)
+			}
+		})
+	}
+}
+
+// A keep binds the owner who gave it, like a release: once the ledger
+// attributes the item to a different owner, the keep no longer suppresses
+// it and the new owner is asked.
+func TestStaleReportKeepVoidedWhenOwnerChanges(t *testing.T) {
+	x := newStaleFixture(t)
+	backdate(t, x.source, categoryIdleAge)
+	x.mustReply(t, "keep", x.source, "--role", "coordinator")
+	if _, _, ok := staleListed(x.stale(t), x.source); ok {
+		t.Fatal("kept item still listed")
+	}
+	x.job(t, "job-late", "succeeded", "seat-a", x.source)
+
+	report := x.stale(t)
+	group, entry, ok := staleListed(report, x.source)
+	if !ok || group.Owner != "seat-a" || !strings.Contains(entry.PriorReply, "owner attribution changed from unknown to seat-a") {
+		t.Fatalf("keep survived an owner change: %+v %+v", group, entry)
+	}
+	if report.Counts.Kept != 0 {
+		t.Fatalf("kept count = %d after the owner changed", report.Counts.Kept)
+	}
+}
