@@ -31,6 +31,33 @@ func (r contextReader) Read(p []byte) (int, error) {
 	return r.Reader.Read(p)
 }
 
+// renameat2 is unix.Renameat2; tests replace it to model a filesystem that
+// lacks RENAME_NOREPLACE.
+var renameat2 = unix.Renameat2
+
+// publishNoReplace moves the regular file from into to and never replaces an
+// existing name. Some filesystems, sshfs among them, reject RENAME_NOREPLACE
+// with EINVAL; a plain rename there would silently overwrite. For a regular
+// file a hard link gives the same guarantee, because linkat refuses an
+// existing name, and removing the staged name then completes the move.
+func publishNoReplace(fromDir int, from string, toDir int, to string) error {
+	err := renameat2(fromDir, from, toDir, to, unix.RENAME_NOREPLACE)
+	if !errors.Is(err, unix.EINVAL) {
+		return err
+	}
+	var st unix.Stat_t
+	if err := unix.Fstatat(fromDir, from, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("filesystem lacks no-replace rename and %s is not a regular file", from)
+	}
+	if err := unix.Linkat(fromDir, from, toDir, to, 0); err != nil {
+		return fmt.Errorf("no-replace link (filesystem lacks no-replace rename): %w", err)
+	}
+	return unix.Unlinkat(fromDir, from, 0)
+}
+
 type spaceWriter struct {
 	root    *os.File
 	reserve uint64
