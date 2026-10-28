@@ -372,7 +372,10 @@ func observeStale(ctx context.Context, e *env, paths config.Paths, policy config
 	}
 	engine := cleanupEngine(e, nil, paths, policy)
 	options := engine.Collect
-	options.Roots, options.DeepSize = specs, true
+	// Each candidate gets its own deep-size budget, as category selection does:
+	// one shared per-root budget leaves every item after the first large ones
+	// unmeasured.
+	options.Roots, options.DeepSize, options.DeepSizePerEntry = specs, true, true
 	observed, err := collect.Run(ctx, options)
 	if err != nil {
 		return obs, err
