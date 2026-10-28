@@ -369,7 +369,10 @@ archive --workspace NAME` never removes the source or an archive and reports
 `local_freed_bytes: 0`. Local removal remains with the ordinary
 quarantine/expiry workflow and is permitted only through
 [local expiry](#workspace-archive-local-expiry), which binds it to a pinned
-archive that exactly matches the local tree.
+archive that exactly matches the local tree. Outputs are published without
+ever replacing an existing name: by `renameat2(RENAME_NOREPLACE)`, or, where
+the filesystem rejects that flag (SSHFS does), by a hard link that refuses an
+existing name followed by removal of the staged file.
 
 | Field | Contract |
 | --- | --- |

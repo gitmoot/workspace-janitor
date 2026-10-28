@@ -251,7 +251,7 @@ func Create(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope, 
 	}
 	publish = append(publish, struct{ from, to string }{"manifest.json", ManifestName(rule)})
 	for _, item := range publish {
-		if err = unix.Renameat2(int(stage.Fd()), item.from, int(in.root.Fd()), item.to, unix.RENAME_NOREPLACE); err != nil {
+		if err = publishNoReplace(int(stage.Fd()), item.from, int(in.root.Fd()), item.to); err != nil {
 			return m, nil, fmt.Errorf("publish %s: %w; inspect any already published outputs before retrying", item.to, err)
 		}
 	}
