@@ -675,6 +675,52 @@ func TestCategoryArchiveOwnerRestoreWithdrawsExpiry(t *testing.T) {
 	}
 }
 
+// A scheduled quarantine that the mutation-time re-check refuses leaves a
+// prepared receipt; the item never moved. Cancelling that receipt with
+// restore is not the owner's undo, so the archive keeps its expiry authority
+// and the next plan proposes quarantine again (live 2026-10-28: six archived
+// items lost expiry after their never-moved receipts were cancelled).
+func TestCategoryArchiveCancelledPrepareKeepsExpiry(t *testing.T) {
+	x := newCategoryFixture(t)
+	backdate(t, x.source, categoryIdleAge)
+	x.categories(t, false)
+	plan, action := x.action(t, x.source)
+	if action.Kind != core.ActionQuarantine {
+		t.Fatalf("category-archived item not proposed for quarantine: %+v", action)
+	}
+	x.data(t, "plan", "--plan", plan.ID, "--approve", action.ID, "--no-jev")
+	// A process starts using the item after planning: apply's fresh check
+	// refuses the move and leaves the receipt prepared.
+	pid := filepath.Join(x.proc, "434343")
+	if err := os.MkdirAll(pid, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pid, "comm"), []byte("editor\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(x.source, filepath.Join(pid, "cwd")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, code := x.run(t, "apply", "--quarantine", "--action", action.ID, "--dry-run=false", "--confirm"); code == ExitOK {
+		t.Fatal("quarantine moved an item a live process was using")
+	}
+	receipt := x.receipt(t)
+	if receipt.State != core.CleanupPrepared {
+		t.Fatalf("refused quarantine left receipt %s, want prepared", receipt.State)
+	}
+	x.preserved(t, x.source)
+	if err := os.RemoveAll(pid); err != nil {
+		t.Fatal(err)
+	}
+	x.data(t, "restore", "--confirm", receipt.CleanupID)
+	if _, next := x.action(t, x.source); next.Kind != core.ActionQuarantine {
+		t.Fatalf("cancelling a never-moved receipt withdrew the archive's expiry: %+v", next)
+	}
+	if item := categoryItem(t, x.categories(t, true), x.source); strings.Contains(strings.Join(item.Reasons, "\n"), "restored") {
+		t.Fatalf("never-moved item reported as restored: %+v", item)
+	}
+}
+
 // Restoring an expired category item from its archive to its original path
 // durably withdraws that archive's expiry authority: the metadata-identical
 // tree would otherwise bind again and be quarantined and expired again. Only a
