@@ -52,13 +52,14 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 		return err
 	}
 	deep = deep || policy.Prevention.Recovery.Enabled
-	// Category archives are created before the scan, so the scan, plan and
+	// Category archives (and, with report.release_action archive, released
+	// report items) are created before the scan, so the scan, plan and
 	// quarantine below see their freshly recorded pins (local_retention none
 	// proposes quarantine in this same cycle). Item failures do not stop the
 	// cycle; they are reported and returned once the cycle has finished.
 	var categories *categoryArchiveReport
 	var categoryErr error
-	if len(policy.WorkspaceArchiveCategories) != 0 {
+	if policy.HasArchiveCategories() {
 		categories, categoryErr = cycleCategoryArchives(ctx, e, paths)
 		if categoryErr != nil {
 			categoryErr = fmt.Errorf("scheduled category archives: %w", categoryErr)

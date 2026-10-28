@@ -310,6 +310,9 @@ type Policy struct {
 	// matching items Janitor archives itself; their pins live in its state.
 	WorkspaceArchiveCategories []WorkspaceArchiveCategory `yaml:"workspace_archive_categories" json:"workspace_archive_categories"`
 
+	// Report is the opt-in weekly stale-workspace report and its replies.
+	Report StaleReport `yaml:"report" json:"report"`
+
 	Prevention     Prevention      `yaml:"prevention" json:"prevention"`
 	CanonicalRoots []CanonicalRoot `yaml:"canonical_roots" json:"canonical_roots"`
 	Classification Classification  `yaml:"classification" json:"classification"`
@@ -410,6 +413,7 @@ func DefaultPolicy(p Paths) Policy {
 			CapacityInterval: Duration(time.Minute),
 			Recovery:         RecoveryPolicy{MaxStores: 1, MaxBytes: 1 << 30, Interval: Duration(24 * time.Hour), TimeBudget: Duration(time.Minute)},
 		},
+		Report:   defaultStaleReport(),
 		Source:   "built-in defaults",
 		FromFile: false,
 	}
@@ -455,6 +459,7 @@ func (p Policy) clone() Policy {
 	for i := range out.WorkspaceArchiveCategories {
 		out.WorkspaceArchiveCategories[i].Roots = append([]string(nil), p.WorkspaceArchiveCategories[i].Roots...)
 	}
+	out.Report.Roots = append([]string(nil), p.Report.Roots...)
 	if p.SourceNameApprovals != nil {
 		approvals := *p.SourceNameApprovals
 		approvals.Reviewers = append([]string(nil), approvals.Reviewers...)
@@ -512,6 +517,7 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	p.normalizeEvidenceExports(expand)
 	p.normalizeWorkspaceArchives(expand)
 	p.normalizeWorkspaceArchiveCategories(expand)
+	p.normalizeStaleReport(expand)
 	if p.Gitmoot.Home != "" {
 		p.Gitmoot.Home = expand("gitmoot.home", p.Gitmoot.Home)
 	}
@@ -601,6 +607,7 @@ func (p *Policy) Validate() core.FieldErrors {
 	p.validateEvidenceExports(&errs)
 	p.validateWorkspaceArchives(&errs)
 	p.validateWorkspaceArchiveCategories(&errs)
+	p.validateStaleReport(&errs)
 	p.validateSourceNameApprovals(&errs)
 	if p.Version != PolicyVersion {
 		errs.Add("version", "must be %d, got %d", PolicyVersion, p.Version)

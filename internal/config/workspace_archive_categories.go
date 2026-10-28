@@ -227,6 +227,16 @@ func (p *Policy) CategoryArchiveRefusals(path string) []string {
 			}
 		}
 	}
+	if p.Report.ArchivesReleases() {
+		if core.PathsOverlap(path, p.Report.Archive.Directory) {
+			out = append(out, "overlaps the report archive directory")
+		}
+		for _, root := range p.Report.Roots {
+			if core.PathWithin(root, path) {
+				out = append(out, fmt.Sprintf("contains report root %q", root))
+			}
+		}
+	}
 	return out
 }
 
