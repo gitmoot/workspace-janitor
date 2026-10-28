@@ -232,7 +232,7 @@ func TestStaleReportRoutesUnknownOwnerToCoordinatorAndNeverSuggestsArchive(t *te
 	}
 	text, stderr, code := x.runAgents(t, "report", "stale", "--role", "coordinator", "--format", "text")
 	if code != ExitOK || !strings.Contains(text, x.source) || !strings.Contains(text, "Owner unknown") ||
-		!strings.Contains(text, "janitor report release <path> --role coordinator") || strings.Contains(text, owned) {
+		!strings.Contains(text, "janitor report release <path>... --role coordinator") || strings.Contains(text, owned) {
 		t.Fatalf("coordinator message: exit=%d %s\n%s", code, stderr, text)
 	}
 }
@@ -634,5 +634,167 @@ func TestStaleReportKeepVoidedWhenOwnerChanges(t *testing.T) {
 	}
 	if report.Counts.Kept != 0 {
 		t.Fatalf("kept count = %d after the owner changed", report.Counts.Kept)
+	}
+}
+
+// replyDoc runs a reply and decodes its document; it fails unless the call
+// succeeded.
+func (x *staleFixture) replyDoc(t *testing.T, args ...string) (staleReplyReport, string) {
+	t.Helper()
+	out, stderr, code := x.runAgents(t, append([]string{"--format", "json", "report"}, args...)...)
+	if code != ExitOK {
+		t.Fatalf("%v: exit=%d %s", args, code, stderr)
+	}
+	var doc struct {
+		Data staleReplyReport `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("%v: %v\n%s", args, err, out)
+	}
+	return doc.Data, out
+}
+
+// staleParityFixture has one entry for each way the full report lists or
+// excludes an item: unknown owner, owned by seat-a, in use by a process,
+// changed recently, and unmeasured because its own deep walk exceeds the
+// bound.
+func staleParityFixture(t *testing.T) (x *staleFixture, owned, live, recent, big string) {
+	t.Helper()
+	x = newStaleFixture(t)
+	x.limits = "  deep_size_max_entries: 40\n"
+	x.write(t)
+	idle := map[string]string{"README.md": "idle\n"}
+	owned = x.scratch(t, "owned", idle)
+	live = x.scratch(t, "live", idle)
+	big = filepath.Join(x.work, "a-big")
+	deep := filepath.Join(big, "d1", "d2", "d3")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 60 {
+		if err := os.WriteFile(filepath.Join(deep, fmt.Sprintf("f%02d", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{x.source, owned, live, big} {
+		backdate(t, path, categoryIdleAge)
+	}
+	recent = x.scratch(t, "recent", idle)
+	backdate(t, recent, 3*24*time.Hour)
+	pid := filepath.Join(x.proc, "424242")
+	if err := os.MkdirAll(pid, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pid, "comm"), []byte("editor\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(live, filepath.Join(pid, "cwd")); err != nil {
+		t.Fatal(err)
+	}
+	x.job(t, "job-owned", "succeeded", "seat-a", owned)
+	return x, owned, live, recent, big
+}
+
+// A reply observes only its own entry, yet it is accepted or refused exactly
+// when the full report says that role may reply for that path: listed with
+// that owner (or unknown, for the coordinator), and not in use, changed
+// recently or unmeasured.
+func TestStaleReportReplyMatchesFullReport(t *testing.T) {
+	x, owned, live, recent, big := staleParityFixture(t)
+	full := x.stale(t)
+	unmeasured := false
+	for _, item := range full.Unmeasured {
+		unmeasured = unmeasured || item.Path == big
+	}
+	if !unmeasured {
+		t.Fatalf("fixture: %s is not unmeasured in the full report: %+v", big, full.Unmeasured)
+	}
+	for _, tc := range []struct{ path, role, refusal string }{
+		{x.source, "seat-a", "only the coordinator role"},
+		{owned, "coordinator", "owned by seat-a"},
+		{live, "coordinator", "in use"},
+		{recent, "coordinator", "changed"},
+		{big, "coordinator", "newest modification"},
+		{x.source, "coordinator", ""},
+		{owned, "seat-a", ""},
+	} {
+		group, _, listed := staleListed(full, tc.path)
+		want := listed && (group.Owner == tc.role || group.Owner == config.UnknownOwner && tc.role == "coordinator")
+		if want != (tc.refusal == "") {
+			t.Fatalf("fixture: full report says replyable=%v for %s by %s", want, tc.path, tc.role)
+		}
+		code, stderr := x.reply(t, "keep", tc.path, "--role", tc.role)
+		if got := code == ExitOK; got != want {
+			t.Errorf("keep %s by %s: accepted=%v, full report says %v: %s", tc.path, tc.role, got, want, stderr)
+		}
+		if !want && !strings.Contains(stderr, tc.refusal) {
+			t.Errorf("keep %s by %s refused without %q: %s", tc.path, tc.role, tc.refusal, stderr)
+		}
+	}
+	if n := replyCount(t, x); n != 2 {
+		t.Fatalf("%d replies recorded, want the 2 accepted ones", n)
+	}
+}
+
+// Several paths are validated together against one observation: one refused
+// path records nothing; when all are valid each gets its own reply.
+func TestStaleReportMultiPathReplyIsAllOrNothing(t *testing.T) {
+	x, owned, live, _, _ := staleParityFixture(t)
+	other := x.scratch(t, "other", map[string]string{"README.md": "other\n"})
+	backdate(t, other, categoryIdleAge)
+	for _, args := range [][]string{
+		{"keep", x.source, owned, "--role", "coordinator"},
+		{"release", x.source, "--role", "coordinator", live},
+		{"keep", x.source, other, filepath.Join(x.home, "elsewhere"), "--role", "coordinator"},
+	} {
+		code, stderr := x.reply(t, args...)
+		if code == ExitOK || !strings.Contains(stderr, "no reply was recorded") {
+			t.Errorf("%v: exit=%d %s", args, code, stderr)
+		}
+	}
+	if code, stderr := x.reply(t, "keep", x.source, x.source, "--role", "coordinator"); code != ExitUsage || !strings.Contains(stderr, "more than once") {
+		t.Errorf("duplicate path: exit=%d %s", code, stderr)
+	}
+	if n := replyCount(t, x); n != 0 {
+		t.Fatalf("%d replies recorded by refused multi-path calls", n)
+	}
+
+	doc, _ := x.replyDoc(t, "keep", x.source, "--role", "coordinator", other, "--note", "both kept")
+	if len(doc.Replies) != 2 || doc.Replies[0].Path != x.source || doc.Replies[1].Path != other ||
+		doc.Replies[0].Sequence == doc.Replies[1].Sequence || doc.Replies[1].Note != "both kept" {
+		t.Fatalf("multi-path replies = %+v", doc.Replies)
+	}
+	if n := replyCount(t, x); n != 2 {
+		t.Fatalf("%d effective replies, want one per path", n)
+	}
+	report := x.stale(t)
+	if report.Counts.Kept != 2 {
+		t.Fatalf("kept = %+v, want both paths kept", report.Kept)
+	}
+}
+
+// A reply's observation covers only the replied entry: a large sibling whose
+// own deep walk exceeds deep_size_max_entries (unmeasured in the full report)
+// is neither walked nor mentioned, and does not affect the reply.
+func TestStaleReportReplyObservesOnlyRepliedEntries(t *testing.T) {
+	x, _, _, _, big := staleParityFixture(t)
+	doc, out := x.replyDoc(t, "keep", x.source, "--role", "coordinator")
+	if len(doc.Observation.Entries) != 1 || doc.Observation.Entries[0] != x.source {
+		t.Fatalf("reply observed %v, want only %s", doc.Observation.Entries, x.source)
+	}
+	deepSized := false
+	for _, collector := range doc.Observation.Collectors {
+		if collector.Name == collect.CollectorDeepSize {
+			deepSized = true
+			if collector.Status != core.CollectorRan || strings.Contains(collector.Detail, "lower bound") {
+				t.Fatalf("reply deep-size report shows another entry's walk: %+v", collector)
+			}
+		}
+	}
+	if !deepSized {
+		t.Fatalf("reply did not deep-size its entry: %+v", doc.Observation.Collectors)
+	}
+	if strings.Contains(out, big) {
+		t.Fatalf("reply output mentions the unreplied sibling %s:\n%s", big, out)
 	}
 }

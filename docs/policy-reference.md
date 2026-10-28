@@ -599,10 +599,19 @@ coordinator, and is always `ask`. It is never treated as disposable. Gitmoot's
 existing provenance guard still applies to ledger-referenced paths outside its
 home, so these are suggested `ask`, and the archive step refuses them.
 
-Replies are `janitor report release <path> --role <r> [--note]` and `janitor
-report keep <path> --role <r> [--until YYYY-MM-DD] [--note]`. Each reply is
-checked against a fresh observation: the path must be a current entry, and the
-role must be its owner, or the coordinator if the owner is unknown. Replies are
+Replies are `janitor report release <path>... --role <r> [--note]` and
+`janitor report keep <path>... --role <r> [--until YYYY-MM-DD] [--note]`. One
+call checks every path against one fresh observation: each path must be a
+current entry, and the role must be its owner, or the coordinator if the owner
+is unknown. If any path is refused, the call records nothing. Otherwise every
+path gets its own reply, in one transaction. The observation covers only the
+replied entries. Their report roots are still listed and every sibling is
+still lstat'd, so filesystem bounds and failures count as in the full report.
+Every collector and rule also applies as it does for the full report. Only the
+deep walk, Git inspection and owner lookup are limited to the replied entries.
+A reply is therefore refused exactly when the full report would not offer that
+path to that role. The reply output lists the observed entries and every
+collector's report. Replies are
 appended to the immutable `report_replies` table (schema 12). Each reply
 snapshots the item's newest mtime, size and identity, and its owner
 attribution. A keep suppresses the entry until `--until` or until the item or

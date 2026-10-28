@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -48,6 +49,13 @@ type RootSpec struct {
 	FollowSymlinks  bool
 	CrossFilesystem bool
 	ReportOnly      bool
+	// Only, when set, restricts the returned entries to these exact paths
+	// directly inside Path; it requires MaxDepth 1. The root is still listed
+	// and every child is still lstat'd under the same bounds, so the
+	// filesystem report is the one a full walk would give; only the
+	// unselected children are left out of the result, and so out of deep
+	// sizing, Git and every per-entry collector.
+	Only []string
 }
 
 // Limits bounds every collector.
@@ -103,10 +111,11 @@ type Options struct {
 	DeepSize bool
 	// DeepSizePerEntry gives every sized directory its own
 	// Limits.DeepSizeMaxEntries budget instead of one budget shared by its
-	// root, and leaves dot-named directories unsized. Only archive category
-	// selection sets it: each candidate's idle age and size must be measured
-	// on its own, and dot-named entries are never candidates. Inventory scans
-	// keep the shared per-root budget.
+	// root, and leaves dot-named directories unsized. Archive category
+	// selection and the stale-workspace report (and its replies) set it: each
+	// candidate's idle age and size must be measured on its own, and
+	// dot-named entries are never candidates. Inventory scans keep the shared
+	// per-root budget.
 	DeepSizePerEntry bool
 	Git              bool
 	Processes        bool
@@ -161,6 +170,14 @@ func (o *Options) Validate() error {
 		}
 		if root.MaxDepth < 1 {
 			errs.Add(fmt.Sprintf("roots[%d].max_depth", i), "must be at least 1, got %d", root.MaxDepth)
+		}
+		if len(root.Only) != 0 && root.MaxDepth != 1 {
+			errs.Add(fmt.Sprintf("roots[%d].only", i), "requires max_depth 1, got %d", root.MaxDepth)
+		}
+		for _, only := range root.Only {
+			if !core.IsCanonicalPath(only) || filepath.Dir(only) != root.Path {
+				errs.Add(fmt.Sprintf("roots[%d].only", i), "must name entries directly inside %s, got %q", root.Path, only)
+			}
 		}
 	}
 	for _, bound := range []struct {

@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -122,6 +123,11 @@ func (w *metadataWalk) walk(ctx context.Context, dir string, depth int) ([]core.
 
 		path := filepath.Join(dir, name)
 		entry, descend := w.entryFor(path, names.bounded)
+		if depth == 1 && len(w.root.Only) != 0 && !slices.Contains(w.root.Only, path) {
+			// Unselected: its lstat bookkeeping above is all a full walk
+			// would do at MaxDepth 1, so the report is unchanged.
+			continue
+		}
 		entries = append(entries, entry)
 
 		if !descend || depth >= w.root.MaxDepth {

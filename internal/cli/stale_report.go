@@ -147,6 +147,10 @@ type staleObservation struct {
 	// claim that could not be observed is never assumed.
 	ownerErr error
 	inUseGap string
+	// observed and collectors describe the collection itself: the entries it
+	// returned and every collector's report.
+	observed   []string
+	collectors []core.CollectorReport
 }
 
 func sizeMeasure(entry core.Entry) string {
@@ -347,8 +351,12 @@ func staleSuggestion(policy config.Policy, entry core.Entry, verdict core.Verdic
 }
 
 // observeStale runs one fresh, deep, depth-1 observation of the report roots
-// and builds the report.
-func observeStale(ctx context.Context, e *env, paths config.Paths, policy config.Policy) (staleObservation, error) {
+// and builds the report. With only set (a reply), the collection returns just
+// those depth-1 entries of their report roots: every root is still listed and
+// every child lstat'd, and every collector and rule runs exactly as for the
+// full report, but no other entry is deep-walked, Git-inspected or
+// attributed. A path outside every report root is simply not observed.
+func observeStale(ctx context.Context, e *env, paths config.Paths, policy config.Policy, only []string) (staleObservation, error) {
 	now := time.Now().UTC()
 	r := policy.Report
 	obs := staleObservation{candidates: map[string]staleEntry{}, excluded: map[string]string{}}
@@ -365,10 +373,23 @@ func observeStale(ctx context.Context, e *env, paths config.Paths, policy config
 			if configured.Path == root {
 				spec := rootSpec(configured, scanOptions{})
 				spec.MaxDepth = 1
+				if only != nil {
+					for _, path := range only {
+						if filepath.Dir(path) == root {
+							spec.Only = append(spec.Only, path)
+						}
+					}
+					if len(spec.Only) == 0 {
+						break
+					}
+				}
 				specs = append(specs, spec)
 				break
 			}
 		}
+	}
+	if only != nil && len(specs) == 0 {
+		return obs, nil
 	}
 	engine := cleanupEngine(e, nil, paths, policy)
 	options := engine.Collect
@@ -379,6 +400,10 @@ func observeStale(ctx context.Context, e *env, paths config.Paths, policy config
 	observed, err := collect.Run(ctx, options)
 	if err != nil {
 		return obs, err
+	}
+	obs.collectors = observed.Reports
+	for _, entry := range observed.Entries {
+		obs.observed = append(obs.observed, entry.Path)
 	}
 	safetyPolicy := enginePolicy(paths, policy)
 	records, err := store.ReadCategoryArchives(ctx, paths.DatabaseFile)
@@ -580,7 +605,7 @@ func runReportStale(ctx context.Context, e *env, role string) error {
 	if err != nil {
 		return err
 	}
-	obs, err := observeStale(ctx, e, paths, policy)
+	obs, err := observeStale(ctx, e, paths, policy, nil)
 	if err != nil {
 		return err
 	}
@@ -630,9 +655,10 @@ func writeStaleRoleText(e *env, report staleReport) error {
 	if report.Counts.Listed == 0 {
 		fmt.Fprintf(&b, "No items unchanged for %s and not in use are waiting for your reply.\n", report.Idle)
 	} else {
-		fmt.Fprintf(&b, "%d item(s) unchanged for at least %s and not in use. Reply per item:\n", report.Counts.Listed, report.Idle)
-		fmt.Fprintf(&b, "  janitor report release <path> --role %s [--note TEXT]\n", report.Role)
-		fmt.Fprintf(&b, "  janitor report keep <path> --role %s [--until YYYY-MM-DD] [--note TEXT]\n", report.Role)
+		fmt.Fprintf(&b, "%d item(s) unchanged for at least %s and not in use. Reply with one or more paths per call:\n", report.Counts.Listed, report.Idle)
+		fmt.Fprintf(&b, "  janitor report release <path>... --role %s [--note TEXT]\n", report.Role)
+		fmt.Fprintf(&b, "  janitor report keep <path>... --role %s [--until YYYY-MM-DD] [--note TEXT]\n", report.Role)
+		b.WriteString("A call is all-or-nothing: if any path is refused, nothing is recorded.\n")
 		if report.ReleaseAction == string(config.StaleReleaseArchive) {
 			b.WriteString("A release is archived (verified copy, then quarantine) by the next cycle if every safety check still passes; any change to the item voids it.\n")
 		} else {
@@ -699,9 +725,17 @@ func writeStaleText(e *env, report staleReport) error {
 }
 
 type staleReplyReport struct {
-	Mode   string            `json:"mode"`
-	Reply  store.ReportReply `json:"reply"`
-	Effect string            `json:"effect"`
+	Mode    string              `json:"mode"`
+	Replies []store.ReportReply `json:"replies"`
+	Effect  string              `json:"effect"`
+	// Observation is the fresh collection the replies were validated
+	// against: only the replied entries, with every collector's report.
+	Observation staleReplyObservation `json:"observation"`
+}
+
+type staleReplyObservation struct {
+	Entries    []string               `json:"entries"`
+	Collectors []core.CollectorReport `json:"collectors"`
 }
 
 // parseUntil accepts a date (end of that day, UTC) or an RFC 3339 time.
@@ -724,10 +758,12 @@ func parseUntil(value string, now time.Time) (*time.Time, error) {
 	return &until, nil
 }
 
-// runReportReply records a release or keep reply after validating, against a
-// fresh observation, that path is a current stale report entry and role is
-// its owner (or the coordinator for an unknown-owner entry).
-func runReportReply(ctx context.Context, e *env, kind, path, role, note, untilText string) error {
+// runReportReply records one release or keep reply per path after
+// validating all of them, against one fresh observation of just those
+// entries, under the same rules as the full report: each path is a current
+// stale report entry and role is its owner (or the coordinator for an
+// unknown-owner entry). Any refused path records nothing.
+func runReportReply(ctx context.Context, e *env, kind string, replied []string, role, note, untilText string) error {
 	format, err := e.format()
 	if err != nil {
 		return err
@@ -735,8 +771,15 @@ func runReportReply(ctx context.Context, e *env, kind, path, role, note, untilTe
 	if !config.ValidRole(role) {
 		return &usageError{msg: fmt.Sprintf("--role %q is not a role name", role)}
 	}
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return &usageError{msg: fmt.Sprintf("%q is not an absolute, cleaned path", path)}
+	seen := make(map[string]bool, len(replied))
+	for _, path := range replied {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return &usageError{msg: fmt.Sprintf("%q is not an absolute, cleaned path", path)}
+		}
+		if seen[path] {
+			return &usageError{msg: fmt.Sprintf("%s is given more than once", path)}
+		}
+		seen[path] = true
 	}
 	if len(note) > 1024 {
 		return &usageError{msg: "--note exceeds 1024 bytes"}
@@ -754,31 +797,28 @@ func runReportReply(ctx context.Context, e *env, kind, path, role, note, untilTe
 	if err != nil {
 		return err
 	}
-	obs, err := observeStale(ctx, e, paths, policy)
+	obs, err := observeStale(ctx, e, paths, policy, replied)
 	if err != nil {
 		return err
 	}
-	item, ok := obs.candidates[path]
-	if !ok {
-		reason := obs.excluded[path]
-		if reason == "" {
-			reason = "it is not a depth-1 entry of a report root"
+	replies := make([]store.ReportReply, 0, len(replied))
+	var refused []string
+	for _, path := range replied {
+		item, why := replyable(obs, policy, path, role)
+		if why != "" {
+			refused = append(refused, why)
+			continue
 		}
-		return fmt.Errorf("%s is not a current stale report entry: %s", path, reason)
+		replies = append(replies, store.ReportReply{Path: path, Reply: kind, Role: role, Owner: item.Owner, Note: note, Until: until,
+			NewestModifiedAt: item.entry.LatestModifiedAt, SizeBytes: item.entry.SizeBytes, SizeIsLowerBound: item.entry.SizeIsLowerBound,
+			Device: item.entry.FilesystemID.Device, Inode: item.entry.FilesystemID.Inode, RecordedAt: now})
 	}
 	switch {
-	case obs.ownerErr != nil:
-		return fmt.Errorf("owner evidence is unavailable, so the owner of %s cannot be verified: %w", path, obs.ownerErr)
-	case obs.inUseGap != "":
-		return fmt.Errorf("%s cannot be verified as not in use: %s", path, obs.inUseGap)
-	case item.Owner == config.UnknownOwner && role != policy.Report.CoordinatorRole:
-		return fmt.Errorf("%s has no known owner; only the coordinator role %s may reply for it, not %s", path, policy.Report.CoordinatorRole, role)
-	case item.Owner != config.UnknownOwner && role != item.Owner:
-		return fmt.Errorf("%s is owned by %s; %s may not reply for it", path, item.Owner, role)
+	case len(refused) == 1 && len(replied) == 1:
+		return errors.New(refused[0])
+	case len(refused) != 0:
+		return fmt.Errorf("refused %d of %d paths, so no reply was recorded:\n  %s", len(refused), len(replied), strings.Join(refused, "\n  "))
 	}
-	reply := store.ReportReply{Path: path, Reply: kind, Role: role, Owner: item.Owner, Note: note, Until: until,
-		NewestModifiedAt: item.entry.LatestModifiedAt, SizeBytes: item.entry.SizeBytes, SizeIsLowerBound: item.entry.SizeIsLowerBound,
-		Device: item.entry.FilesystemID.Device, Inode: item.entry.FilesystemID.Inode, RecordedAt: now}
 	if err := config.EnsureDir(paths.StateDir); err != nil {
 		return err
 	}
@@ -787,20 +827,34 @@ func runReportReply(ctx context.Context, e *env, kind, path, role, note, untilTe
 		return err
 	}
 	defer db.Close()
+	// One transaction: every reply is recorded, or none is.
 	err = db.Write(ctx, func(tx *store.Tx) error {
-		var err error
-		reply.Sequence, err = tx.RecordReportReply(ctx, reply)
-		return err
+		for i := range replies {
+			var err error
+			if replies[i].Sequence, err = tx.RecordReportReply(ctx, replies[i]); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return err
 	}
-	if reply.Until != nil {
-		normalized := reply.Until.UTC()
-		reply.Until = &normalized
+	for i := range replies {
+		if replies[i].Until != nil {
+			normalized := replies[i].Until.UTC()
+			replies[i].Until = &normalized
+		}
+		replies[i].NewestModifiedAt, replies[i].RecordedAt = replies[i].NewestModifiedAt.UTC(), replies[i].RecordedAt.UTC()
 	}
-	reply.NewestModifiedAt, reply.RecordedAt = reply.NewestModifiedAt.UTC(), reply.RecordedAt.UTC()
-	report := staleReplyReport{Mode: "stale_report_reply", Reply: reply}
+	report := staleReplyReport{Mode: "stale_report_reply", Replies: replies,
+		Observation: staleReplyObservation{Entries: obs.observed, Collectors: obs.collectors}}
+	if report.Observation.Entries == nil {
+		report.Observation.Entries = []string{}
+	}
+	if report.Observation.Collectors == nil {
+		report.Observation.Collectors = []core.CollectorReport{}
+	}
 	switch {
 	case kind == store.ReportReplyKeep && until != nil:
 		report.Effect = fmt.Sprintf("kept: left out of stale reports until %s or until it changes", until.Format(time.RFC3339))
@@ -814,8 +868,40 @@ func runReportReply(ctx context.Context, e *env, kind, path, role, note, untilTe
 	if format == output.FormatJSON {
 		return output.WriteJSON(e.stdout, report.Mode, report)
 	}
-	_, err = fmt.Fprintf(e.stdout, "mode: %s\nreply: %d\npath: %s\n%s by %s (owner %s)\n%s\n", report.Mode, reply.Sequence, reply.Path, reply.Reply, reply.Role, reply.Owner, report.Effect)
+	var b strings.Builder
+	fmt.Fprintf(&b, "mode: %s\n", report.Mode)
+	for _, reply := range replies {
+		fmt.Fprintf(&b, "reply %d: %s %s by %s (owner %s)\n", reply.Sequence, reply.Reply, reply.Path, reply.Role, reply.Owner)
+	}
+	fmt.Fprintf(&b, "%s\n", report.Effect)
+	_, err = fmt.Fprint(e.stdout, b.String())
 	return err
+}
+
+// replyable returns the observed entry for path, or why role may not reply
+// for it. The reasons are the full report's: not a current entry, owner or
+// in-use evidence unavailable, or role is neither the owner nor (for an
+// unknown owner) the coordinator.
+func replyable(obs staleObservation, policy config.Policy, path, role string) (staleEntry, string) {
+	item, ok := obs.candidates[path]
+	if !ok {
+		reason := obs.excluded[path]
+		if reason == "" {
+			reason = "it is not a depth-1 entry of a report root"
+		}
+		return item, fmt.Sprintf("%s is not a current stale report entry: %s", path, reason)
+	}
+	switch {
+	case obs.ownerErr != nil:
+		return item, fmt.Sprintf("owner evidence is unavailable, so the owner of %s cannot be verified: %v", path, obs.ownerErr)
+	case obs.inUseGap != "":
+		return item, fmt.Sprintf("%s cannot be verified as not in use: %s", path, obs.inUseGap)
+	case item.Owner == config.UnknownOwner && role != policy.Report.CoordinatorRole:
+		return item, fmt.Sprintf("%s has no known owner; only the coordinator role %s may reply for it, not %s", path, policy.Report.CoordinatorRole, role)
+	case item.Owner != config.UnknownOwner && role != item.Owner:
+		return item, fmt.Sprintf("%s is owned by %s; %s may not reply for it", path, item.Owner, role)
+	}
+	return item, ""
 }
 
 func reportCommand() *command {
@@ -848,9 +934,9 @@ func reportCommand() *command {
 }
 
 func reportReplyCommand(kind, summary string) *command {
-	usage := "janitor report " + kind + " <path> --role ROLE [--note TEXT]"
+	usage := "janitor report " + kind + " <path>... --role ROLE [--note TEXT]"
 	if kind == store.ReportReplyKeep {
-		usage = "janitor report keep <path> --role ROLE [--until YYYY-MM-DD] [--note TEXT]"
+		usage = "janitor report keep <path>... --role ROLE [--until YYYY-MM-DD] [--note TEXT]"
 	}
 	return &command{
 		name:    kind,
@@ -864,20 +950,30 @@ func reportReplyCommand(kind, summary string) *command {
 				until = fs.String("until", "", "keep until this date (YYYY-MM-DD, end of day UTC) or RFC 3339 time; default: until the item changes")
 			}
 			return func(ctx context.Context, e *env, args []string) error {
-				// Flags may follow the path.
-				if len(args) > 1 {
-					if err := fs.Parse(args[1:]); err != nil {
+				// Flags may come before, between or after the paths; after
+				// "--" every argument is a path.
+				var replied []string
+				for rest := args; len(rest) != 0; {
+					if err := fs.Parse(rest); err != nil {
 						return &usageError{msg: err.Error()}
 					}
-					args = append([]string{args[0]}, fs.Args()...)
+					left := fs.Args()
+					if consumed := len(rest) - len(left); consumed > 0 && rest[consumed-1] == "--" {
+						replied = append(replied, left...)
+						break
+					}
+					if len(left) == 0 {
+						break
+					}
+					replied, rest = append(replied, left[0]), left[1:]
 				}
-				if len(args) != 1 {
-					return &usageError{msg: fmt.Sprintf("report %s takes exactly one path", kind)}
+				if len(replied) == 0 {
+					return &usageError{msg: fmt.Sprintf("report %s takes at least one path", kind)}
 				}
 				if *role == "" {
 					return &usageError{msg: "--role is required"}
 				}
-				return runReportReply(ctx, e, kind, args[0], *role, *note, *until)
+				return runReportReply(ctx, e, kind, replied, *role, *note, *until)
 			}
 		},
 	}
