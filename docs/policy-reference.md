@@ -533,7 +533,10 @@ be a directory directly inside a category root. It is refused by any of these:
   destination mount expectations (dependents are checked against the run's
   shared dependent index, see above)
 
-A recorded path that is unchanged since archiving reports `already_archived`.
+A recorded path that is unchanged since archiving reports `already_archived`:
+its newest modification is no later than the newest one the archive recorded.
+(File timestamps come from a coarse kernel clock, so they are compared with
+the archived files' timestamps, never with the archive's creation time.)
 A path that changed after archiving fails Bind, so it is retained. It is
 archived again, under a new name, only after it is idle again. A receipt loses
 its expiry authority while any of these hold:

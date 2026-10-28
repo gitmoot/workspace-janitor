@@ -388,7 +388,7 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			continue
 		}
 		item.Category, item.Kind = category.Name, string(category.Kind)
-		if record, ok := recorded[entry.Path]; ok && (entry.LatestModifiedAt.IsZero() || !entry.LatestModifiedAt.After(record.CreatedAt)) {
+		if record, ok := recorded[entry.Path]; ok && record.Unchanged(entry.LatestModifiedAt) {
 			item.Status, item.Name = categoryAlreadyArchived, record.Name
 			follow := "its local retention and quarantine follow that archive"
 			if _, inactive := activeCategoryRule(policy, record); inactive != "" {
@@ -538,6 +538,7 @@ func createCategoryArchive(ctx context.Context, db *store.Store, paths config.Pa
 				Owner: rule.Owner, Release: rule.Release, RunID: runID, ArchiveDirectory: rule.Archive.Directory,
 				Manifest: binding.Manifest, ManifestSHA256: binding.ManifestSHA256,
 				ContentBytes: m.ContentBytes, Members: len(m.Members), CreatedAt: m.CreatedAt, RecordedAt: time.Now().UTC(),
+				TreeModifiedAt: newestMember(m.Members),
 			})
 		})
 		if err != nil {
@@ -550,6 +551,20 @@ func createCategoryArchive(ctx context.Context, db *store.Store, paths config.Pa
 		return nil, err
 	}
 	return binding, nil
+}
+
+// newestMember is the latest modification time among archived members, the
+// same lstat timestamps the deep walk compares; zero when none is known, so
+// Unchanged falls back to the archive's creation time.
+func newestMember(members []workspacearchive.Member) time.Time {
+	var newest int64
+	for _, member := range members {
+		newest = max(newest, member.ModifiedNS)
+	}
+	if newest <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, newest).UTC()
 }
 
 // runCategoryArchives is `janitor archive --categories`.

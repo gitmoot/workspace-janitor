@@ -35,6 +35,10 @@ type CategoryArchive struct {
 	Members          int       `json:"members"`
 	CreatedAt        time.Time `json:"created_at"`
 	RecordedAt       time.Time `json:"recorded_at"`
+	// TreeModifiedAt is the newest modification time among the archived
+	// members, root directory included: the same set and precision the deep
+	// walk reports. Receipts recorded before it existed hold the zero time.
+	TreeModifiedAt time.Time `json:"tree_modified_at"`
 	// RestoredByOwner is derived, never stored: a quarantine of this path was
 	// restored after the archive was created. The owner's undo withdraws the
 	// receipt's expiry authority until the path changes and is archived anew.
@@ -47,6 +51,21 @@ type CategoryArchive struct {
 	// restored from (for example after expiry), so it no longer authorizes
 	// removing the local tree.
 	Withdrawn bool `json:"-"`
+}
+
+// Unchanged reports whether a tree whose deep walk found newest as its latest
+// modification still looks like this archive. It compares file timestamps
+// with the archived files' timestamps, never with the wall-clock CreatedAt:
+// the kernel stamps files from a coarse clock that can lag the wall clock, so
+// an edit made just after archiving can carry an earlier timestamp than
+// CreatedAt. An unknown newest (a partial walk) counts as unchanged; Bind
+// still decides expiry by content. Older receipts fall back to CreatedAt.
+func (a CategoryArchive) Unchanged(newest time.Time) bool {
+	bound := a.TreeModifiedAt
+	if bound.IsZero() {
+		bound = a.CreatedAt
+	}
+	return newest.IsZero() || !newest.After(bound)
 }
 
 func (a CategoryArchive) validate() error {

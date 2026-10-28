@@ -657,6 +657,35 @@ func TestCategoryArchiveChangedItemIsRetained(t *testing.T) {
 	}
 }
 
+// The kernel stamps files from a coarse clock that can lag the wall clock,
+// so an edit made just after archiving can carry a timestamp earlier than the
+// archive's CreatedAt (seen as a flaky failure of the test above on CI). That
+// edit is still a change: it is newer than every archived file.
+func TestCategoryArchiveEditStampedBeforeCreationIsChanged(t *testing.T) {
+	x := newCategoryFixture(t)
+	backdate(t, x.source, categoryIdleAge)
+	x.categories(t, false)
+	records, err := store.ReadCategoryArchives(context.Background(), x.paths(t).DatabaseFile)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("category receipts = %+v, %v", records, err)
+	}
+	readme := filepath.Join(x.source, "README.md")
+	if err := os.WriteFile(readme, []byte("edited just after archiving\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stamp := records[0].CreatedAt.Add(-time.Millisecond)
+	if err := os.Chtimes(readme, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	item := categoryItem(t, x.categories(t, true), x.source)
+	if item.Status == categoryAlreadyArchived {
+		t.Fatalf("an edit stamped before the archive's creation time was treated as unchanged: %+v", item)
+	}
+	if item.Status != categoryRefused || !strings.Contains(strings.Join(item.Reasons, "\n"), "idle") {
+		t.Fatalf("changed item report = %+v", item)
+	}
+}
+
 // Restoring a quarantined category item is the owner's undo: its archive
 // loses local expiry authority instead of re-quarantining it next cycle.
 func TestCategoryArchiveOwnerRestoreWithdrawsExpiry(t *testing.T) {

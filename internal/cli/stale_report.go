@@ -461,7 +461,7 @@ func observeStale(ctx context.Context, e *env, paths config.Paths, policy config
 			obs.excluded[entry.Path] = "the bounded deep walk could not establish its newest modification"
 			continue
 		}
-		if record, ok := archivedBy[entry.Path]; ok && !entry.LatestModifiedAt.After(record.CreatedAt) {
+		if record, ok := archivedBy[entry.Path]; ok && record.Unchanged(entry.LatestModifiedAt) {
 			if _, inactive := activeCategoryRule(policy, record); inactive == "" {
 				// A category archive already decides this unchanged item.
 				obs.report.Counts.Archived++
