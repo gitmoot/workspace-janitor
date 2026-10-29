@@ -78,8 +78,17 @@ func withCategoryArchives(ctx context.Context, paths config.Paths, policy config
 	if err != nil {
 		return config.Policy{}, fmt.Errorf("category archive receipts: %w", err)
 	}
+	// An unexpired keep reply also holds an already archived item: its rule
+	// gets no local-expiry authority, so it is not quarantined or deleted.
+	keeps, err := activeKeeps(ctx, paths, time.Now())
+	if err != nil {
+		return config.Policy{}, fmt.Errorf("stale report keeps: %w", err)
+	}
 	rules := append([]config.WorkspaceArchiveRule(nil), policy.WorkspaceArchives...)
 	for _, record := range records {
+		if _, kept := keeps[record.Path]; kept {
+			continue
+		}
 		if rule, inactive := activeCategoryRule(policy, record); inactive == "" {
 			rules = append(rules, rule)
 		}
@@ -293,6 +302,10 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 	if err != nil {
 		return report, fmt.Errorf("stale report replies: %w", err)
 	}
+	keeps, err := activeKeeps(ctx, paths, now)
+	if err != nil {
+		return report, fmt.Errorf("stale report keeps: %w", err)
+	}
 	if len(policy.WorkspaceArchiveCategories) == 0 && len(releases) == 0 {
 		if !dryRun {
 			report.Status = "completed"
@@ -395,6 +408,15 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 				follow = "it has no local expiry authority: " + inactive
 			}
 			item.Reasons = []string{fmt.Sprintf("archived as %s at %s and unchanged since; %s", record.Name, record.CreatedAt.Format(time.RFC3339), follow)}
+			report.Items = append(report.Items, item)
+			continue
+		}
+		if keep, ok := keeps[entry.Path]; ok {
+			until := "with no end date"
+			if keep.Until != nil {
+				until = "until " + keep.Until.Format(time.RFC3339)
+			}
+			item.Reasons = []string{fmt.Sprintf("kept by %s (report reply %d) %s", keep.Role, keep.Sequence, until)}
 			report.Items = append(report.Items, item)
 			continue
 		}
