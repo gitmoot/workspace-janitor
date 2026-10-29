@@ -92,12 +92,21 @@ const (
 	CategoryRootScratch WorkspaceArchiveCategoryKind = "root_scratch"
 )
 
-// MinIdle is the shortest idle period the owner approved for the kind.
-func (k WorkspaceArchiveCategoryKind) MinIdle() time.Duration {
+// DefaultIdle is the idle period used when a category sets none.
+func (k WorkspaceArchiveCategoryKind) DefaultIdle() time.Duration {
 	if k == CategoryMergedWorktrees {
 		return 14 * 24 * time.Hour
 	}
 	return 30 * 24 * time.Hour
+}
+
+// MinIdle is the shortest idle period the owner approved for the kind
+// (owner, 2026-10-29: merged worktrees 7d, other kinds 14d).
+func (k WorkspaceArchiveCategoryKind) MinIdle() time.Duration {
+	if k == CategoryMergedWorktrees {
+		return 7 * 24 * time.Hour
+	}
+	return 14 * 24 * time.Hour
 }
 
 // Valid reports whether k is a known category kind.
@@ -258,7 +267,7 @@ func (p *Policy) normalizeWorkspaceArchiveCategories(expand func(string, string)
 			category.Archive.Directory = expand(field+".archive.directory", category.Archive.Directory)
 		}
 		if category.Idle == 0 && category.Kind.Valid() {
-			category.Idle = IdleDuration(category.Kind.MinIdle())
+			category.Idle = IdleDuration(category.Kind.DefaultIdle())
 		}
 		if category.LocalRetention == "" {
 			category.LocalRetention = core.Retention30Days
