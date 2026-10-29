@@ -53,13 +53,31 @@ func TestWorkspaceArchiveCategoriesAreOptInAndDefaultBounded(t *testing.T) {
 	}
 }
 
+// The owner-approved floors (7d merged worktrees, 14d other kinds) are
+// accepted exactly at the boundary, while the defaults stay 14d and 30d.
+func TestWorkspaceArchiveCategoriesAcceptOwnerApprovedFloors(t *testing.T) {
+	doc := categoryBase + "workspace_archive_categories:\n" +
+		categoryEntry("merged", "merged_worktrees", "/srv/work") + "    idle: 7d\n" +
+		categoryEntry("clones", "pushed_clones", "/srv/work") + "    idle: 14d\n" +
+		categoryEntry("scratch", "root_scratch", "/srv/scratch") + "    idle: 336h\n"
+	policy, err := parse(t, fixturePaths(t), doc)
+	if err != nil {
+		t.Fatalf("owner-approved floors refused: %v", err)
+	}
+	for i, want := range []time.Duration{7 * 24 * time.Hour, 14 * 24 * time.Hour, 14 * 24 * time.Hour} {
+		if got := policy.WorkspaceArchiveCategories[i].Idle.Duration(); got != want {
+			t.Fatalf("category %d idle = %s, want %s", i, got, want)
+		}
+	}
+}
+
 func TestWorkspaceArchiveCategoriesRefuseUnsafeSettings(t *testing.T) {
 	for _, tc := range []struct {
 		name, doc, field, fragment string
 	}{
-		{"short merged idle", categoryEntry("m", "merged_worktrees", "/srv/work") + "    idle: 13d\n", "workspace_archive_categories[0].idle", "at least"},
-		{"short clone idle", categoryEntry("c", "pushed_clones", "/srv/work") + "    idle: 29d\n", "workspace_archive_categories[0].idle", "at least"},
-		{"short scratch idle", categoryEntry("s", "root_scratch", "/srv/scratch") + "    idle: 336h\n", "workspace_archive_categories[0].idle", "at least"},
+		{"short merged idle", categoryEntry("m", "merged_worktrees", "/srv/work") + "    idle: 6d\n", "workspace_archive_categories[0].idle", "at least"},
+		{"short clone idle", categoryEntry("c", "pushed_clones", "/srv/work") + "    idle: 13d\n", "workspace_archive_categories[0].idle", "at least"},
+		{"short scratch idle", categoryEntry("s", "root_scratch", "/srv/scratch") + "    idle: 335h\n", "workspace_archive_categories[0].idle", "at least"},
 		{"unknown kind", categoryEntry("x", "everything", "/srv/work"), "workspace_archive_categories[0].kind", "must be"},
 		{"unconfigured root", categoryEntry("s", "root_scratch", "/srv/elsewhere"), "workspace_archive_categories[0].roots[0]", "configured inventory root"},
 		{"nested non-root", categoryEntry("s", "root_scratch", "/srv/work/sub"), "workspace_archive_categories[0].roots[0]", "configured inventory root"},
