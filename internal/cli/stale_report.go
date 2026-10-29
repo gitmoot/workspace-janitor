@@ -305,6 +305,24 @@ func archivableReleases(ctx context.Context, paths config.Paths, policy config.P
 	return out, nil
 }
 
+// activeKeeps returns every path whose newest report reply is an unexpired
+// keep. Category archiving honors these unconditionally: unlike the report,
+// it does not void a keep because the item changed, since a coordinator or
+// owner hold must never be overridden by an automatic archive.
+func activeKeeps(ctx context.Context, paths config.Paths, now time.Time) (map[string]store.ReportReply, error) {
+	out := map[string]store.ReportReply{}
+	replies, err := store.ReadReportReplies(ctx, paths.DatabaseFile)
+	if err != nil {
+		return nil, err
+	}
+	for _, reply := range replies {
+		if reply.Reply == store.ReportReplyKeep && (reply.Until == nil || now.Before(*reply.Until)) {
+			out[reply.Path] = reply
+		}
+	}
+	return out, nil
+}
+
 func releaseOwnerAttribution(ctx context.Context, policy config.Policy, releases map[string]store.ReportReply) ownerLookup {
 	paths := make([]string, 0, len(releases))
 	for path := range releases {

@@ -798,3 +798,65 @@ func TestStaleReportReplyObservesOnlyRepliedEntries(t *testing.T) {
 		t.Fatalf("reply output mentions the unreplied sibling %s:\n%s", big, out)
 	}
 }
+
+// withScratchCategory adds a root_scratch category over the report root, so
+// the same item is both a report entry and a category candidate.
+func (x *staleFixture) withScratchCategory(t *testing.T) {
+	t.Helper()
+	x.extra = fmt.Sprintf("workspace_archive_categories:\n  - name: scratch\n    kind: root_scratch\n    roots: [%s]\n    local_retention: none\n    max_items_per_cycle: 20\n    archive:\n      directory: %s\n", x.work, x.archive)
+	x.write(t)
+}
+
+// A coordinator keep from the report must stop category archiving of that
+// item (live 2026-10-29: two items the coordinator kept until 2026-11-04
+// would have been archived once their category idle time was shortened).
+func TestCategoryArchiveHonorsReportKeep(t *testing.T) {
+	x := newStaleFixture(t)
+	x.withScratchCategory(t)
+	backdate(t, x.source, categoryIdleAge)
+	x.mustReply(t, "keep", x.source, "--role", "coordinator", "--note", "owner unresolved")
+	item := categoryItem(t, x.archiveRun(t), x.source)
+	if item.Status != categoryRefused || !strings.Contains(strings.Join(item.Reasons, "\n"), "kept by coordinator") {
+		t.Fatalf("a kept item was not refused by category archiving: %+v", item)
+	}
+	if entries, err := os.ReadDir(x.archive); err != nil || len(entries) != 0 {
+		t.Fatalf("archive directory holds %d entries for a kept item (%v)", len(entries), err)
+	}
+	x.preserved(t, x.source)
+}
+
+// A keep recorded after an item was already archived withholds that
+// archive's expiry authority: the plan must not propose quarantine.
+func TestReportKeepWithholdsExpiryOfArchivedItem(t *testing.T) {
+	x := newStaleFixture(t)
+	x.withScratchCategory(t)
+	backdate(t, x.source, categoryIdleAge)
+	if item := categoryItem(t, x.archiveRun(t), x.source); item.Status != categoryArchived {
+		t.Fatalf("not archived: %+v", item)
+	}
+	if _, action := x.action(t, x.source); action.Kind != core.ActionQuarantine {
+		t.Fatalf("archived item not proposed for quarantine before the keep: %+v", action)
+	}
+	ctx := context.Background()
+	db, err := store.Open(ctx, x.paths(t).DatabaseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	until := now.Add(7 * 24 * time.Hour)
+	err = db.Write(ctx, func(tx *store.Tx) error {
+		_, err := tx.RecordReportReply(ctx, store.ReportReply{Path: x.source, Reply: store.ReportReplyKeep, Role: "coordinator",
+			Owner: config.UnknownOwner, Until: &until, NewestModifiedAt: now.Add(-categoryIdleAge), RecordedAt: now})
+		return err
+	})
+	if closeErr := db.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, action := x.action(t, x.source); action.Kind == core.ActionQuarantine {
+		t.Fatal("a kept, already archived item was proposed for quarantine")
+	}
+	x.preserved(t, x.source)
+}

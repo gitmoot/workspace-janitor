@@ -543,6 +543,9 @@ its expiry authority while any of these hold:
 
 - its category is removed, or its kind, root or archive directory changes
 - the policy now refuses its path
+- its newest stale-report reply is an unexpired `keep` (the same keep also
+  stops a not-yet-archived item from being archived by its category, even if
+  the item changed after the reply)
 - the owner restored its quarantine with `janitor restore`, or restored the
   item from its archive (`archive --restore-category-item` or `archive
   --workspace <item name> --restore-to`); the archive restore records an
