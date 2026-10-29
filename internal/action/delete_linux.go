@@ -45,6 +45,17 @@ func deleteAnchored(path string, expected core.FilesystemID) error {
 	return unix.Fsync(parent)
 }
 
+// RemoveAnchored removes one file, symlink or directory tree at path while
+// it still has the expected identity. It never follows a symlink, never
+// resolves a child outside the opened parent and never crosses into another
+// filesystem; a mount found mid-tree stops the removal there.
+func RemoveAnchored(ctx context.Context, path string, expected core.FilesystemID) error {
+	if err := verifyDeletionTree(ctx, path, expected); err != nil {
+		return err
+	}
+	return deleteAnchored(path, expected)
+}
+
 // verifyDeletionTree checks mount boundaries before mutation. It uses the
 // same no-follow descriptor traversal as removeAt but retains no inode map
 // and no directory-sized listing in memory.

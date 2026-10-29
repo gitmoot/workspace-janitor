@@ -143,3 +143,51 @@ func PolicyScope(policy config.Policy, rule config.WorkspaceArchiveRule) Scope {
 	}
 	return scope
 }
+
+// ScratchManifestVersion is the only scratch manifest layout accepted.
+const ScratchManifestVersion = 1
+
+// ScratchEntry is one observed depth-1 entry of a scratch directory.
+type ScratchEntry struct {
+	Name string `json:"name"`
+	// Type is the entry's own member type (dir, file or symlink).
+	Type     string            `json:"type"`
+	Identity core.FilesystemID `json:"identity"`
+	Members  int               `json:"members"`
+	// SizeBytes sums the sizes of the regular files in the entry.
+	SizeBytes int64 `json:"size_bytes"`
+	// NewestNS is the newest mtime or ctime of any member.
+	NewestNS int64 `json:"newest_ns"`
+	// Sensitive names the first member whose name matches the built-in
+	// secret screen or protect.name_patterns: the entry stays local.
+	Sensitive string `json:"sensitive,omitempty"`
+	// Refusal explains why the entry cannot be archived or deleted
+	// faithfully: a socket, fifo or device, a mount crossing, extended
+	// attributes or Git history outside it.
+	Refusal string `json:"refusal,omitempty"`
+
+	inv scratchInventory
+}
+
+// ScratchManifest is the durable receipt of one scratch run's verified
+// archive. Member paths start with their entry name.
+type ScratchManifest struct {
+	Version          int               `json:"version"`
+	RunID            string            `json:"run_id"`
+	ScratchDirectory string            `json:"scratch_directory"`
+	Entries          []string          `json:"entries"`
+	ArchiveDirectory core.FilesystemID `json:"archive_directory"`
+	MountSource      string            `json:"mount_source"`
+	FSType           string            `json:"fstype"`
+	TarFile          string            `json:"tar_file"`
+	TarBytes         int64             `json:"tar_bytes"`
+	StreamSHA256     string            `json:"stream_sha256"`
+	ReadbackSHA256   string            `json:"readback_sha256"`
+	ContentBytes     int64             `json:"content_bytes"`
+	Members          []Member          `json:"members"`
+	CreatedAt        time.Time         `json:"created_at"`
+	VerifiedAt       time.Time         `json:"verified_at"`
+}
+
+// ScratchArchiveName names one run's archive files.
+func ScratchArchiveName(runID string) string { return "scratch-" + runID }

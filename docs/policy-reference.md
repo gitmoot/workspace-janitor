@@ -633,3 +633,59 @@ released items as category `report-release`. It applies every category check,
 oldest first, at most `max_items_per_cycle` per run. The archive pins then
 follow the normal Bind → quarantine → expiry flow. Sizes are local bytes only;
 free space on the archive mount is never counted as local headroom.
+
+## Scratch cleanup
+
+`scratch_cleanup` is empty by default, so existing installs change nothing.
+Each entry names one scratch directory, such as `/tmp`, whose idle depth-1
+entries Janitor removes. Entries that match no list are archived first.
+
+| Field | Contract |
+| --- | --- |
+| `path` | Absolute directory other than `/`. It must not overlap an inventory root, the quarantine directory, Gitmoot's state, a workspace archive, a category archive directory or a cache rule. It must not lie inside `protect.paths` or a `workspace_archive_keep` path. |
+| `idle` | Default `72h`, at least `24h`. Measured from the newest mtime or ctime of anything in the entry. |
+| `every` | Default `48h`, at least `24h`. `janitor cycle` runs the directory once this long has passed since its last recorded run. |
+| `skip` | `filepath.Match` globs on the entry name. A match is never touched. |
+| `regenerable` | Globs on the entry name. An idle, unused match is deleted without an archive. |
+| `archive.directory`, `expect_mount_source`, `expect_fstype` | Every other idle, unused entry is archived here before deletion. The same approval rules apply as for `workspace_archives` destinations: covered by an independent `protect.paths` rule, outside every inventory root and scratch directory, and the mount expectations are checked before writing. |
+| `max_bytes_per_run` | Default `0` (no bound). The total local bytes one run may remove. Entries past the bound are `deferred`, oldest first. |
+| `max_entries` | Default `100000`, at least `1`. Bounds the depth-1 listing of this directory, independently of `limits.max_dir_entries` (which bounds inventory scans). A directory with more entries refuses the whole run before anything is touched; a partial listing is never cleaned. Only the names are held for every entry. Each entry is observed and then released, and member lists are kept only for the entries this run removes. The report lists up to 1000 kept, skipped and deferred entries and counts the rest under `unlisted`. |
+
+Scratch cleanup requires the process collector. An entry is kept, neither
+archived nor deleted, while any of these hold:
+
+- a process uses it: cwd, root, executable, an open descriptor or a mapped
+  file inside it. If any process cannot be inspected, the whole run stops
+  before touching anything.
+- it overlaps `protect.paths` or a `workspace_archive_keep` path
+- a sensitive name appears anywhere inside it, file or directory. Sensitive
+  names come only from the built-in secret screen and `protect.name_patterns`.
+  Both match case-insensitively; `protect.name_patterns` use `filepath.Match`
+  syntax. This is the same screen workspace archives use, and it applies to
+  regenerable entries too.
+- it is, or contains, a socket, fifo or device, a mount crossing, extended
+  attributes, or Git history outside it
+- anything in it changed within `idle`, or it cannot be read
+
+`janitor scratch` previews by default. `--dry-run=false --confirm` acts under
+the apply lock:
+
+1. Every entry to archive goes into one tar per run,
+   `<archive.directory>/scratch-<run>.tar`. Its manifest
+   (`scratch-<run>.manifest.json`) records every member's metadata and every
+   file's SHA-256. The whole tar is read back and compared before it is
+   published. Publishing never replaces an existing file, including on sshfs,
+   which lacks no-replace rename. The policy file is re-read before and after
+   the copy.
+2. The published archive is read back again, from the archive directory
+   alone. Any mismatch deletes nothing at all, regenerable entries included.
+3. An immutable run receipt is recorded, with the manifest path and SHA-256.
+4. Each entry is checked again just before deletion: still unused, every
+   member unchanged since it was observed, still idle. It is then removed
+   without following symlinks or crossing filesystems. An immutable receipt
+   records the entry, its run, its archive (if any) and its size.
+
+The receipts are in the `scratch_runs` and `scratch_deletions` tables
+(schema 13). Reported sizes are local bytes. Free space on the archive mount is
+never counted as local headroom. To restore an entry, see
+[recovery](recovery.md#scratch-cleanup).

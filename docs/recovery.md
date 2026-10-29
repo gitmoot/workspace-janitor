@@ -156,3 +156,28 @@ policy.
   an immutable withdrawal of that archive's expiry authority, so the restored
   tree is never quarantined or expired again on that archive; it is archived
   anew only after it changes and is idle again.
+
+## Scratch cleanup
+
+Each acting [scratch cleanup](policy-reference.md#scratch-cleanup) run that
+archived anything leaves `scratch-<run>.tar` and `scratch-<run>.manifest.json`
+in the configured archive directory. Run and deletion receipts are in
+Janitor's state (`scratch_runs`, `scratch_deletions`). The run id is shown in
+the `janitor scratch` and `janitor cycle` reports. Regenerable entries were
+deleted without an archive and cannot be restored.
+
+- `janitor scratch restore <run> <entry>` re-reads the whole archive and
+  verifies it without writing anything.
+- `janitor scratch restore <run> <entry> --dry-run=false --confirm` restores
+  the entry to its original path. `--restore-to PATH` restores it elsewhere.
+  The destination must not exist; nothing is ever overwritten. The entry is
+  extracted into a private staging directory next to the destination. Every
+  file is checked against its manifest SHA-256 and the restored tree is
+  re-walked and compared, and only then is the entry renamed into place.
+- Without Janitor, the tar is a plain POSIX tar whose members start with the
+  entry name: `tar -xf scratch-<run>.tar -C /tmp <entry>`. Compare the files
+  with the manifest checksums yourself.
+
+An interrupted run may leave a `.partial-scratch-*` staging directory, or a
+published tar without its manifest. Neither is a verified archive, and nothing
+was deleted on its account. Remove them after inspection.
