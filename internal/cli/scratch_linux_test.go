@@ -4,6 +4,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,8 +26,11 @@ type scratchFixture struct {
 	*fixture
 	work, scratch, archive, proc string
 	// extra is appended at the top level, limits under limits: and
-	// options under the scratch_cleanup entry.
-	extra, limits, options string
+	// options under the scratch_cleanup entry. protect, patterns and
+	// regenerable extend protect.paths, protect.name_patterns and the
+	// regenerable list.
+	extra, limits, options         string
+	protect, patterns, regenerable []string
 }
 
 func newScratchFixture(t *testing.T) *scratchFixture {
@@ -38,7 +42,7 @@ func newScratchFixture(t *testing.T) *scratchFixture {
 	}
 	f.home, f.env[config.EnvHome] = home, home
 	x := &scratchFixture{fixture: f, work: filepath.Join(home, "work"), scratch: filepath.Join(home, "scratch"),
-		archive: filepath.Join(home, "archive"), proc: filepath.Join(home, "proc")}
+		archive: filepath.Join(home, "archive"), proc: filepath.Join(home, "proc"), regenerable: []string{"go-build*", "bunx-*"}}
 	for _, dir := range []string{x.work, x.scratch, x.archive, x.proc} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
@@ -65,7 +69,7 @@ func (x *scratchFixture) write(t *testing.T) {
     max_depth: 1
 protect:
   paths: [%s]
-  name_patterns: ["*token*", "notes.private"]
+  name_patterns: [%s]
 collectors:
   proc_root: %s
   systemd_dirs: []
@@ -81,10 +85,19 @@ limits:
     idle: 24h
     every: 48h
     skip: ["keep-me-*", "tmux-*"]
-    regenerable: ["go-build*", "bunx-*"]
+    regenerable: [%s]
     archive:
       directory: %s
-%s%s`, x.work, x.archive, x.proc, x.limits, x.scratch, x.archive, x.options, x.extra))
+%s%s`, x.work, strings.Join(append([]string{x.archive}, x.protect...), ", "), quoted(append([]string{"*token*", "notes.private", "[^a-z]*.DAT"}, x.patterns...)),
+		x.proc, x.limits, x.scratch, quoted(x.regenerable), x.archive, x.options, x.extra))
+}
+
+func quoted(values []string) string {
+	out := make([]string, len(values))
+	for i, value := range values {
+		out[i] = fmt.Sprintf("%q", value)
+	}
+	return strings.Join(out, ", ")
 }
 
 func (x *scratchFixture) entry(t *testing.T, name string, files map[string]string) string {
@@ -201,6 +214,14 @@ func TestScratchHonorsSkipAndRegenerableFromPolicy(t *testing.T) {
 	for _, path := range []string{skipped, regen, plain, file} {
 		if !exists(t, path) {
 			t.Fatalf("preview removed %s", path)
+		}
+	}
+	if preview.WouldArchive != 2 || preview.WouldDelete != 1 || preview.WouldFreeBytes <= 0 || preview.Archived != 0 || preview.Deleted != 0 || preview.FreedBytes != 0 {
+		t.Fatalf("preview summary = %+v, want 2 would_archive, 1 would_delete and nothing done", preview)
+	}
+	for _, name := range []string{"go-build123", "plain", "loose.log"} {
+		if reason := scratchStatus(t, preview, name).Reason; !strings.HasPrefix(reason, "would be") {
+			t.Errorf("preview reason for %s reads as done: %q", name, reason)
 		}
 	}
 	if entries, _ := os.ReadDir(x.archive); len(entries) != 0 {
@@ -483,5 +504,167 @@ func TestScratchMaxEntriesBoundsTheListing(t *testing.T) {
 	}
 	if refused.Archived != 0 || refused.Deleted != 0 || refused.Archive != nil {
 		t.Fatalf("a refused listing reports work: %+v", refused)
+	}
+}
+
+// A case-significant class in protect.name_patterns keeps protecting:
+// "[^a-z]*.DAT" (in the fixture) matches "Ledger.DAT" as written even
+// though the folded pattern never matches the folded name, and still does not
+// match "ledger.dat".
+func TestScratchCaseSignificantNamePatternsStillProtect(t *testing.T) {
+	x := newScratchFixture(t)
+	upper := x.entry(t, "books", map[string]string{"q3/Ledger.DAT": "1,2,3\n"})
+	lower := x.entry(t, "notes", map[string]string{"q3/ledger.dat": "1,2,3\n"})
+	report := x.mustCleanup(t, true)
+	if item := scratchStatus(t, report, "books"); item.Status != scratchKept || !strings.Contains(item.Reason, "Ledger.DAT") || !exists(t, upper) {
+		t.Fatalf("entry holding Ledger.DAT = %+v (exists=%v), want kept local", item, exists(t, upper))
+	}
+	if exists(t, lower) {
+		t.Fatal("ledger.dat matched the case-significant class pattern")
+	}
+}
+
+// The policy decides again, freshly loaded, right before deletion, for every
+// run shape: a KEEP, a protect.paths entry, a narrowed regenerable list or a
+// new name pattern written while the run is in flight keeps the affected
+// entries; untouched entries are still removed.
+func TestScratchPolicyChangeBeforeDeletionKeepsEntries(t *testing.T) {
+	t.Run("regenerable only", func(t *testing.T) {
+		x := newScratchFixture(t)
+		paths := map[string]string{}
+		for _, name := range []string{"go-build1", "go-build2", "go-build3", "go-build4"} {
+			paths[name] = x.entry(t, name, map[string]string{"o": name + "\n"})
+		}
+		previous := scratchBeforeDeletion
+		t.Cleanup(func() { scratchBeforeDeletion = previous })
+		scratchBeforeDeletion = func() {
+			x.extra = fmt.Sprintf("workspace_archive_keep:\n  - path: %s\n    owner: seat-b\n    reference: keep-msg-9\n", paths["go-build1"])
+			x.protect = []string{paths["go-build2"]}
+			x.regenerable = []string{"go-build1", "go-build2", "go-build4", "bunx-*"}
+			x.write(t)
+		}
+		report := x.mustCleanup(t, true)
+		if report.Archive != nil {
+			t.Fatalf("a regenerable-only run archived: %+v", report.Archive)
+		}
+		for name, fragment := range map[string]string{"go-build1": "workspace_archive_keep", "go-build2": "protect.paths", "go-build3": "regenerable"} {
+			item := scratchStatus(t, report, name)
+			if item.Status != scratchKept || !strings.Contains(item.Reason, fragment) || !exists(t, paths[name]) {
+				t.Errorf("%s = %+v (exists=%v), want kept for %q", name, item, exists(t, paths[name]), fragment)
+			}
+		}
+		if exists(t, paths["go-build4"]) || report.Deleted != 1 {
+			t.Fatalf("the unaffected regenerable entry was not deleted: %+v", report)
+		}
+	})
+	t.Run("archive run", func(t *testing.T) {
+		x := newScratchFixture(t)
+		kept := x.entry(t, "plain-keep", map[string]string{"a": "a\n"})
+		secret := x.entry(t, "plain-secret", map[string]string{"deep/x.late": "b\n"})
+		ok := x.entry(t, "plain-ok", map[string]string{"c": "c\n"})
+		previous := scratchBeforeDeletion
+		t.Cleanup(func() { scratchBeforeDeletion = previous })
+		scratchBeforeDeletion = func() {
+			x.extra = fmt.Sprintf("workspace_archive_keep:\n  - path: %s\n    owner: seat-b\n    reference: keep-msg-9\n", kept)
+			x.patterns = []string{"*.late"}
+			x.write(t)
+		}
+		report := x.mustCleanup(t, true)
+		if report.Archive == nil || len(report.Archive.Entries) != 3 {
+			t.Fatalf("archive = %+v, want all three entries archived before the change", report.Archive)
+		}
+		for path, fragment := range map[string]string{kept: "workspace_archive_keep", secret: "x.late"} {
+			item := scratchStatus(t, report, filepath.Base(path))
+			if item.Status != scratchKept || !strings.Contains(item.Reason, fragment) || !exists(t, path) {
+				t.Errorf("%s = %+v (exists=%v), want kept for %q", path, item, exists(t, path), fragment)
+			}
+		}
+		if exists(t, ok) || report.Archived != 1 {
+			t.Fatalf("the unaffected archived entry was not deleted: %+v", report)
+		}
+	})
+}
+
+// The report lists at most scratchListedMax items of any status, selected
+// entries included, and counts every entry, listed or not.
+func TestScratchReportListsAtMostTheBound(t *testing.T) {
+	x := newScratchFixture(t)
+	previous := scratchListedMax
+	t.Cleanup(func() { scratchListedMax = previous })
+	scratchListedMax = 3
+	x.entry(t, "keep-me-0", map[string]string{"a": "skip\n"})
+	for i := range 5 {
+		x.entry(t, fmt.Sprintf("entry-%d", i), map[string]string{"a": "xy\n"})
+	}
+	preview := x.mustCleanup(t, false)
+	if len(preview.Items) != 3 || preview.Unlisted != 3 || preview.WouldArchive != 5 || preview.Skipped != 1 || preview.WouldFreeBytes != 15 {
+		t.Fatalf("preview: %d items, unlisted %d, would_archive %d, skipped %d, would free %d", len(preview.Items), preview.Unlisted, preview.WouldArchive, preview.Skipped, preview.WouldFreeBytes)
+	}
+	report := x.mustCleanup(t, true)
+	if len(report.Items) != 3 || report.Unlisted != 3 || report.Archived != 5 || report.Skipped != 1 || report.FreedBytes != 15 || report.WouldArchive != 0 {
+		t.Fatalf("run: %d items, unlisted %d, archived %d, skipped %d, freed %d, would_archive %d", len(report.Items), report.Unlisted, report.Archived, report.Skipped, report.FreedBytes, report.WouldArchive)
+	}
+}
+
+// Verifying a restore only reads Janitor's state: the database file is
+// byte-identical afterwards, also when it predates the scratch receipts
+// (schema 12), which simply holds no scratch runs and is never migrated.
+func TestScratchRestoreVerifyLeavesStateUntouched(t *testing.T) {
+	x := newScratchFixture(t)
+	x.entry(t, "project", map[string]string{"notes.txt": "hello\n"})
+	report := x.mustCleanup(t, true)
+	dbPath := x.paths(t).DatabaseFile
+	before := fileDigest(t, dbPath)
+	if out, stderr, code := x.run(t, "scratch", "restore", report.RunID, "project"); code != ExitOK {
+		t.Fatalf("verify: exit=%d %s %s", code, out, stderr)
+	}
+	if after := fileDigest(t, dbPath); after != before {
+		t.Fatalf("a verify-only restore changed the database:\n before %s\n after  %s", before, after)
+	}
+
+	db, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{"DROP TABLE scratch_deletions", "DROP TABLE scratch_runs", "DELETE FROM schema_migrations WHERE version >= 13", "PRAGMA user_version = 12", "PRAGMA wal_checkpoint(TRUNCATE)"} {
+		if _, err := db.Exec(statement); err != nil {
+			_ = db.Close()
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before = fileDigest(t, dbPath)
+	out, stderr, code := x.run(t, "scratch", "restore", report.RunID, "project")
+	if code == ExitOK || !strings.Contains(stderr, "archived no entry") {
+		t.Fatalf("verify against a schema-12 database: exit=%d %s %s", code, out, stderr)
+	}
+	if after := fileDigest(t, dbPath); after != before || userVersion(t, dbPath) != 12 {
+		t.Fatalf("a verify-only restore migrated or changed a schema-12 database (version %d)", userVersion(t, dbPath))
+	}
+}
+
+// A writing restore serializes with apply and scratch runs on the state-dir
+// lock; a verify-only restore needs no lock.
+func TestScratchRestoreTakesTheLockOnlyWhenWriting(t *testing.T) {
+	x := newScratchFixture(t)
+	dir := x.entry(t, "project", map[string]string{"notes.txt": "hello\n"})
+	report := x.mustCleanup(t, true)
+	unlock, err := lockApply(x.paths(t).StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, stderr, code := x.run(t, "scratch", "restore", report.RunID, "project"); code != ExitOK {
+		unlock()
+		t.Fatalf("verify while locked: exit=%d %s %s", code, out, stderr)
+	}
+	out, stderr, code := x.run(t, "scratch", "restore", report.RunID, "project", "--dry-run=false", "--confirm")
+	unlock()
+	if code == ExitOK || !strings.Contains(stderr, "apply or restore is active") || exists(t, dir) {
+		t.Fatalf("restore while another mutation holds the lock: exit=%d %s %s (restored=%v)", code, out, stderr, exists(t, dir))
+	}
+	if out, stderr, code := x.run(t, "scratch", "restore", report.RunID, "project", "--dry-run=false", "--confirm"); code != ExitOK || !exists(t, dir) {
+		t.Fatalf("restore after the lock is released: exit=%d %s %s", code, out, stderr)
 	}
 }

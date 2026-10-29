@@ -66,3 +66,29 @@ func TestScratchCleanupRefusesUnsafeSettings(t *testing.T) {
 		})
 	}
 }
+
+// Two scratch directories may never claim the same entry: a nested,
+// enclosing or identical path is refused, a sibling is accepted.
+func TestScratchCleanupRefusesOverlappingPaths(t *testing.T) {
+	second := func(path string) string {
+		return "  - path: " + path + "\n    archive:\n      directory: /srv/archive/other\n"
+	}
+	for _, path := range []string{"/srv/tmp/build", "/srv/tmp", "/srv"} {
+		_, err := parse(t, fixturePaths(t), scratchBase+scratchEntry(second(path)))
+		cfgErr, ok := err.(*Error)
+		if !ok {
+			t.Errorf("scratch path %s overlapping /srv/tmp was accepted: %v", path, err)
+			continue
+		}
+		found := false
+		for _, fieldErr := range cfgErr.Errors {
+			found = found || fieldErr.Field == "scratch_cleanup[1].path" && strings.Contains(fieldErr.Message, "overlaps scratch_cleanup[0].path")
+		}
+		if !found {
+			t.Errorf("scratch path %s: no overlap error in %v", path, cfgErr)
+		}
+	}
+	if _, err := parse(t, fixturePaths(t), scratchBase+scratchEntry(second("/srv/tmp2"))); err != nil {
+		t.Fatalf("sibling scratch directories refused: %v", err)
+	}
+}

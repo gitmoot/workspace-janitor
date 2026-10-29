@@ -171,19 +171,20 @@ func (t *Tx) ScratchDeletions(ctx context.Context, runID string) ([]ScratchDelet
 	return out, rows.Err()
 }
 
-// ReadLastScratchRun reads the newest run start of path without creating,
-// migrating or writing the database. A missing database, or one from before
-// scratch receipts existed, has none. A newer schema is refused.
-func ReadLastScratchRun(ctx context.Context, dbPath, path string) (time.Time, error) {
+// readScratch runs fn on a read-only view of the database without creating,
+// migrating or writing it. A missing database, or one from before scratch
+// receipts existed, holds no scratch receipts: fn is not called and found is
+// false. A newer schema is refused.
+func readScratch(ctx context.Context, dbPath string, fn func(*Tx) error) (bool, error) {
 	if _, err := os.Stat(dbPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return time.Time{}, nil
+			return false, nil
 		}
-		return time.Time{}, fmt.Errorf("store: stat %s: %w", dbPath, err)
+		return false, fmt.Errorf("store: stat %s: %w", dbPath, err)
 	}
 	db, err := sql.Open("sqlite", readOnlyDSN(dbPath))
 	if err != nil {
-		return time.Time{}, fmt.Errorf("store: open %s read-only: %w", dbPath, err)
+		return false, fmt.Errorf("store: open %s read-only: %w", dbPath, err)
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
@@ -191,19 +192,39 @@ func ReadLastScratchRun(ctx context.Context, dbPath, path string) (time.Time, er
 	defer s.Close()
 	version, err := s.userVersion(ctx)
 	if err != nil {
-		return time.Time{}, err
+		return false, err
 	}
 	if version > SchemaVersion() {
-		return time.Time{}, fmt.Errorf("%w: database is at %d, this build expects %d", ErrSchemaMismatch, version, SchemaVersion())
+		return false, fmt.Errorf("%w: database is at %d, this build expects %d", ErrSchemaMismatch, version, SchemaVersion())
 	}
 	if version < scratchCleanupVersion {
-		return time.Time{}, nil
+		return false, nil
 	}
+	return true, s.Read(ctx, fn)
+}
+
+// ReadLastScratchRun reads the newest run start of path read-only; see
+// readScratch.
+func ReadLastScratchRun(ctx context.Context, dbPath, path string) (time.Time, error) {
 	var last time.Time
-	err = s.Read(ctx, func(tx *Tx) error {
+	_, err := readScratch(ctx, dbPath, func(tx *Tx) error {
 		var err error
 		last, err = tx.LastScratchRun(ctx, path)
 		return err
 	})
 	return last, err
+}
+
+// ReadScratchRun reads one run receipt read-only; see readScratch.
+func ReadScratchRun(ctx context.Context, dbPath, runID string) (ScratchRun, bool, error) {
+	var (
+		run   ScratchRun
+		found bool
+	)
+	_, err := readScratch(ctx, dbPath, func(tx *Tx) error {
+		var err error
+		run, found, err = tx.ScratchRunByID(ctx, runID)
+		return err
+	})
+	return run, found, err
 }

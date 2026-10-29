@@ -78,7 +78,7 @@ func (s *ScratchDir) Observe(ctx context.Context, name string, patterns []string
 		return entry, nil
 	}
 	top := w.inv.states[0]
-	entry.Type, entry.Identity = w.inv.members[0].Type, top.id
+	entry.Type, entry.Identity, entry.CtimeNS = w.inv.members[0].Type, top.id, top.ctimeNS
 	for i, st := range w.inv.states {
 		entry.NewestNS = max(entry.NewestNS, st.mtimeNS, st.ctimeNS)
 		if w.inv.members[i].Type == TypeFile {
@@ -97,6 +97,18 @@ func (s *ScratchDir) Observe(ctx context.Context, name string, patterns []string
 	}
 	entry.inv = w.inv
 	return entry, nil
+}
+
+// SensitiveMember re-applies the sensitive-name screen (built-in and
+// patterns) to every observed member name of entry, and returns the first
+// match or "".
+func (e ScratchEntry) SensitiveMember(dir string, patterns []string) string {
+	for _, member := range e.inv.members {
+		if secretLike(filepath.Base(member.Path), filepath.Join(dir, filepath.Dir(member.Path)), patterns) {
+			return member.Path
+		}
+	}
+	return ""
 }
 
 // Unchanged reports whether every member of entry still has the identity,

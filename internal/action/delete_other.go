@@ -19,6 +19,6 @@ func verifyDeletionTree(_ context.Context, _ string, _ core.FilesystemID) error 
 }
 
 // RemoveAnchored is unavailable off Linux.
-func RemoveAnchored(_ context.Context, _ string, _ core.FilesystemID) error {
+func RemoveAnchored(_ context.Context, _ string, _ core.FilesystemID, _ int64) error {
 	return errors.New("anchored removal is not supported on this platform")
 }

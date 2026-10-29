@@ -72,10 +72,15 @@ func secretLike(name, parent string, patterns []string) bool {
 		return true
 	}
 	// Policy patterns match case-insensitively, like the built-in screen:
-	// "*TOKEN*" and "*token*" keep the same names local.
+	// "*TOKEN*" and "*token*" keep the same names local. Folding alone would
+	// disarm case-significant classes ("[^a-z]*", "[A-z]"),
+	// so the pattern also matches the name as written; either hit keeps it.
 	low := strings.ToLower(name)
 	for _, pattern := range patterns {
 		// An unusable pattern is an unknown, not an all-clear.
+		if matched, err := filepath.Match(pattern, name); matched || err != nil {
+			return true
+		}
 		if matched, err := filepath.Match(strings.ToLower(pattern), low); matched || err != nil {
 			return true
 		}

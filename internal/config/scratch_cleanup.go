@@ -121,17 +121,20 @@ func (p *Policy) validateScratchCleanup(errs *core.FieldErrors) {
 	if !p.Collectors.Processes || !core.IsCanonicalPath(p.Collectors.ProcRoot) {
 		errs.Add("scratch_cleanup", "requires the process collector and a procfs root; live-use checks cannot be disabled")
 	}
-	seen := make(map[string]int, len(p.ScratchCleanup))
 	for i, scratch := range p.ScratchCleanup {
 		field := fmt.Sprintf("scratch_cleanup[%d]", i)
 		switch {
 		case !core.IsCanonicalPath(scratch.Path) || scratch.Path == "/":
 			errs.Add(field+".path", "must be a canonical absolute directory path other than /, got %q", scratch.Path)
 		default:
-			if first, dup := seen[scratch.Path]; dup {
-				errs.Add(field+".path", "duplicates scratch_cleanup[%d].path", first)
+			// No entry may be claimed by two scratch directories: an outer
+			// run would treat a nested directory as one entry and apply its
+			// own lists, idle and cadence to it.
+			for j, other := range p.ScratchCleanup[:i] {
+				if core.IsCanonicalPath(other.Path) && core.PathsOverlap(scratch.Path, other.Path) {
+					errs.Add(field+".path", "overlaps scratch_cleanup[%d].path %q", j, other.Path)
+				}
 			}
-			seen[scratch.Path] = i
 			p.validateScratchPath(errs, field+".path", scratch.Path)
 		}
 		if scratch.Idle.Duration() < minScratchInterval {
