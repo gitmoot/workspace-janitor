@@ -88,7 +88,7 @@ limits:
     regenerable: [%s]
     archive:
       directory: %s
-%s%s`, x.work, strings.Join(append([]string{x.archive}, x.protect...), ", "), quoted(append([]string{"*token*", "notes.private", "[[:upper:]]*.DAT"}, x.patterns...)),
+%s%s`, x.work, strings.Join(append([]string{x.archive}, x.protect...), ", "), quoted(append([]string{"*token*", "notes.private", "[^a-z]*.DAT"}, x.patterns...)),
 		x.proc, x.limits, x.scratch, quoted(x.regenerable), x.archive, x.options, x.extra))
 }
 
@@ -508,8 +508,8 @@ func TestScratchMaxEntriesBoundsTheListing(t *testing.T) {
 }
 
 // A case-significant class in protect.name_patterns keeps protecting:
-// "[[:upper:]]*.DAT" (in the fixture) matches "Ledger.DAT" as written even
-// though the folded pattern never matches a folded name, and still does not
+// "[^a-z]*.DAT" (in the fixture) matches "Ledger.DAT" as written even
+// though the folded pattern never matches the folded name, and still does not
 // match "ledger.dat".
 func TestScratchCaseSignificantNamePatternsStillProtect(t *testing.T) {
 	x := newScratchFixture(t)

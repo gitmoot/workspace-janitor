@@ -662,7 +662,7 @@ archived nor deleted, while any of these hold:
   names come only from the built-in secret screen and `protect.name_patterns`.
   Both match case-insensitively; `protect.name_patterns` use `filepath.Match`
   syntax. A pattern matches if it matches the name as written or both
-  lowercased, so case-significant classes such as `[[:upper:]]*` still
+  lowercased, so case-significant classes such as `[^a-z]*` still
   protect. This is the same screen workspace archives use, and it applies to
   regenerable entries too.
 - it is, or contains, a socket, fifo or device, a mount crossing, extended
