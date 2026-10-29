@@ -153,7 +153,10 @@ type ScratchEntry struct {
 	// Type is the entry's own member type (dir, file or symlink).
 	Type     string            `json:"type"`
 	Identity core.FilesystemID `json:"identity"`
-	Members  int               `json:"members"`
+	// CtimeNS is the entry's own ctime when observed; removal re-checks it
+	// so a replacement that reuses the inode is never deleted.
+	CtimeNS int64 `json:"ctime_ns"`
+	Members int   `json:"members"`
 	// SizeBytes sums the sizes of the regular files in the entry.
 	SizeBytes int64 `json:"size_bytes"`
 	// NewestNS is the newest mtime or ctime of any member.

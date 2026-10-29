@@ -26,6 +26,12 @@ func fileIdentity(info os.FileInfo) core.FilesystemID {
 // opened quarantine parent. A partial recursive deletion remains a recorded
 // quarantined item requiring investigation; it is never retried blindly.
 func deleteAnchored(path string, expected core.FilesystemID) error {
+	return deleteAnchoredAt(path, expected, 0)
+}
+
+// deleteAnchoredAt is deleteAnchored that, with a non-zero ctimeNS, also
+// requires the entry's ctime to be unchanged.
+func deleteAnchoredAt(path string, expected core.FilesystemID, ctimeNS int64) error {
 	parent, err := openExistingDirNoSymlinks(filepath.Dir(path))
 	if err != nil {
 		return err
@@ -39,6 +45,9 @@ func deleteAnchored(path string, expected core.FilesystemID) error {
 	if expected.Device != uint64(stat.Dev) || expected.Inode != stat.Ino {
 		return fmt.Errorf("quarantined identity changed")
 	}
+	if ctimeNS != 0 && int64(stat.Ctim.Sec)*1e9+int64(stat.Ctim.Nsec) != ctimeNS {
+		return fmt.Errorf("%s changed since it was observed (ctime differs); not removed", path)
+	}
 	if err := removeAt(parent, name, uint64(stat.Dev)); err != nil {
 		return err
 	}
@@ -46,14 +55,15 @@ func deleteAnchored(path string, expected core.FilesystemID) error {
 }
 
 // RemoveAnchored removes one file, symlink or directory tree at path while
-// it still has the expected identity. It never follows a symlink, never
+// it still has the expected identity and ctime. The ctime catches a
+// replacement that reuses the inode. It never follows a symlink, never
 // resolves a child outside the opened parent and never crosses into another
 // filesystem; a mount found mid-tree stops the removal there.
-func RemoveAnchored(ctx context.Context, path string, expected core.FilesystemID) error {
+func RemoveAnchored(ctx context.Context, path string, expected core.FilesystemID, ctimeNS int64) error {
 	if err := verifyDeletionTree(ctx, path, expected); err != nil {
 		return err
 	}
-	return deleteAnchored(path, expected)
+	return deleteAnchoredAt(path, expected, ctimeNS)
 }
 
 // verifyDeletionTree checks mount boundaries before mutation. It uses the

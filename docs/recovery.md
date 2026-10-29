@@ -167,9 +167,11 @@ the `janitor scratch` and `janitor cycle` reports. Regenerable entries were
 deleted without an archive and cannot be restored.
 
 - `janitor scratch restore <run> <entry>` re-reads the whole archive and
-  verifies it without writing anything.
+  verifies it without writing anything. Janitor's state is only read; a
+  database from before the scratch receipts holds no runs and is not
+  migrated.
 - `janitor scratch restore <run> <entry> --dry-run=false --confirm` restores
-  the entry to its original path. `--restore-to PATH` restores it elsewhere.
+  the entry to its original path under the apply/restore lock. `--restore-to PATH` restores it elsewhere.
   The destination must not exist; nothing is ever overwritten. The entry is
   extracted into a private staging directory next to the destination. Every
   file is checked against its manifest SHA-256 and the restored tree is
