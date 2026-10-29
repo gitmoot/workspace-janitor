@@ -344,6 +344,36 @@ var migrations = []migration{
 			 BEGIN SELECT RAISE(ABORT, 'stale report replies are immutable'); END`,
 		},
 	},
+	{
+		version: scratchCleanupVersion,
+		name:    "scratch_cleanup",
+		statements: []string{
+			`CREATE TABLE scratch_runs (
+				sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+				run_id TEXT NOT NULL UNIQUE,
+				path TEXT NOT NULL,
+				started_at TEXT NOT NULL,
+				document TEXT NOT NULL CHECK (length(document) <= 65536)
+			)`,
+			`CREATE INDEX scratch_runs_path ON scratch_runs(path, started_at)`,
+			`CREATE TRIGGER scratch_runs_no_update BEFORE UPDATE ON scratch_runs
+			 BEGIN SELECT RAISE(ABORT, 'scratch run receipts are immutable'); END`,
+			`CREATE TRIGGER scratch_runs_no_delete BEFORE DELETE ON scratch_runs
+			 BEGIN SELECT RAISE(ABORT, 'scratch run receipts are immutable'); END`,
+			`CREATE TABLE scratch_deletions (
+				sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+				run_id TEXT NOT NULL REFERENCES scratch_runs(run_id),
+				entry TEXT NOT NULL,
+				disposition TEXT NOT NULL CHECK (disposition IN ('archived', 'regenerable')),
+				document TEXT NOT NULL CHECK (length(document) <= 65536),
+				UNIQUE (run_id, entry)
+			)`,
+			`CREATE TRIGGER scratch_deletions_no_update BEFORE UPDATE ON scratch_deletions
+			 BEGIN SELECT RAISE(ABORT, 'scratch deletion receipts are immutable'); END`,
+			`CREATE TRIGGER scratch_deletions_no_delete BEFORE DELETE ON scratch_deletions
+			 BEGIN SELECT RAISE(ABORT, 'scratch deletion receipts are immutable'); END`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.

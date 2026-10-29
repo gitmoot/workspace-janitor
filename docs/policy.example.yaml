@@ -195,6 +195,35 @@ workspace_archive_keep: []
 #   archive:
 #     directory: /mnt/backup/janitor-categories
 workspace_archive_categories: []
+# Opt-in scratch directory cleanup; empty by default. Only depth-1 entries of
+# each path are candidates. Entries matching skip are never touched; idle,
+# unused entries matching regenerable are deleted without an archive; every
+# other idle, unused entry is archived (one verified archive per run) and
+# deleted only after the archive is read back. Sensitive names come only from
+# the built-in screen and protect.name_patterns: a match anywhere inside keeps
+# the whole entry local. The lists below are the reviewed /tmp lists of the
+# former host script; add its secret list to protect.name_patterns, e.g.
+#   name_patterns: ["*.env", "id_ecdsa*", "*secret*", "*.p12", "*.pfx",
+#     "*token*", ".netrc", ".pgpass", "*.keystore", "service-account*.json",
+#     "*passw*", "*_pw", "*.pw", "*apikey*", "*api_key*", "*api-key*",
+#     "*htpasswd*", "*.jks", "auth.json", "config.json.bak*"]
+# See policy-reference.md#scratch-cleanup and recovery.md#scratch-cleanup.
+# - path: /tmp                    # never inside an inventory root
+#   idle: 72h                     # newest mtime/ctime anywhere; minimum 24h
+#   every: 48h                    # janitor cycle runs it when due; minimum 24h
+#   skip: ["systemd-private-*", ".X*", ".ICE*", ".font*", ".Test*",
+#     "snap-private*", "tmux-*", "ssh-*", ".s.PGSQL*", "herdr*", "gitmoot*",
+#     "omp*", "jev*"]
+#   regenerable: ["go-build[0-9]*", "go-link*", "bunx-*", "pip-*",
+#     "node-compile-cache", "v8-compile-cache*", "gopls-*", "tsx-[0-9]*",
+#     "npm*", ".npm*", "yarn*", "pnpm*", "esbuild*", "vite*", "jiti",
+#     "deno*", "uv-*", "cargo*"]
+#   archive:
+#     directory: /mnt/backup/janitor-scratch   # protected, outside every root
+#     expect_mount_source: backup.example:/export
+#     expect_fstype: nfs4
+#   max_bytes_per_run: 0          # 0 = no bound
+scratch_cleanup: []
 
 # The Jev model classifier is optional and disabled by default: the tool must
 # be fully useful with no credentials and no network. When enabled, only

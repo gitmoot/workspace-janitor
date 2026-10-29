@@ -71,9 +71,12 @@ func secretLike(name, parent string, patterns []string) bool {
 	if builtinSecret(name, parent) {
 		return true
 	}
+	// Policy patterns match case-insensitively, like the built-in screen:
+	// "*TOKEN*" and "*token*" keep the same names local.
+	low := strings.ToLower(name)
 	for _, pattern := range patterns {
 		// An unusable pattern is an unknown, not an all-clear.
-		if matched, err := filepath.Match(pattern, name); matched || err != nil {
+		if matched, err := filepath.Match(strings.ToLower(pattern), low); matched || err != nil {
 			return true
 		}
 	}
@@ -178,76 +181,84 @@ func (w *walker) walk(dir *os.File, rel string, depth int) error {
 	if err != nil {
 		return fmt.Errorf("list %s: %w", rel, err)
 	}
-	fd := int(dir.Fd())
 	for _, name := range names {
-		if err := w.ctx.Err(); err != nil {
+		if err := w.visit(dir, rel, name, depth); err != nil {
 			return err
 		}
-		path := joinMember(rel, name)
-		st, err := statxAt(fd, name, 0)
+	}
+	return nil
+}
+
+// visit records one child of dir and, for a directory, walks it.
+func (w *walker) visit(dir *os.File, rel, name string, depth int) error {
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	fd := int(dir.Fd())
+	path := joinMember(rel, name)
+	st, err := statxAt(fd, name, 0)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if st.id.Device != w.rootState.id.Device || st.mountID != w.rootState.mountID {
+		w.refuse("%s: crosses a mount boundary inside the tree", path)
+		return nil
+	}
+	if w.screen {
+		if secretLike(name, filepath.Join(w.source, rel), w.patterns) && len(w.secrets) < maxReported {
+			w.secrets = append(w.secrets, path)
+		}
+		if hasXattrs(unix.Llistxattr(fmt.Sprintf("%s/%s", descriptorPath(dir), name), nil)) {
+			w.refuse("%s: extended attributes are unsupported", path)
+		}
+	}
+	m := Member{Path: path, Mode: st.mode & 07777, UID: st.uid, GID: st.gid, ModifiedNS: st.mtimeNS}
+	switch st.kind() {
+	case unix.S_IFDIR:
+		m.Type = TypeDirectory
+		if err := w.add(m, st); err != nil {
+			return err
+		}
+		child, err := openChild(dir, name, unix.O_RDONLY|unix.O_DIRECTORY)
 		if err != nil {
-			return fmt.Errorf("stat %s: %w", path, err)
+			return err
 		}
-		if st.id.Device != w.rootState.id.Device || st.mountID != w.rootState.mountID {
-			w.refuse("%s: crosses a mount boundary inside the tree", path)
-			continue
+		opened, err := fstate(child)
+		if err == nil && opened.id != st.id {
+			err = fmt.Errorf("%s changed while being inspected", path)
 		}
-		if w.screen {
-			if secretLike(name, filepath.Join(w.source, rel), w.patterns) && len(w.secrets) < maxReported {
-				w.secrets = append(w.secrets, path)
-			}
-			if hasXattrs(unix.Llistxattr(fmt.Sprintf("%s/%s", descriptorPath(dir), name), nil)) {
-				w.refuse("%s: extended attributes are unsupported", path)
+		if err == nil {
+			err = w.walk(child, path, depth+1)
+		}
+		child.Close()
+		if err != nil {
+			return err
+		}
+	case unix.S_IFREG:
+		m.Type, m.Size = TypeFile, st.size
+		if w.hash || (w.screen && (name == ".git" || name == "alternates")) {
+			if err := w.readRegular(dir, name, rel, &m, st); err != nil {
+				return err
 			}
 		}
-		m := Member{Path: path, Mode: st.mode & 07777, UID: st.uid, GID: st.gid, ModifiedNS: st.mtimeNS}
-		switch st.kind() {
-		case unix.S_IFDIR:
-			m.Type = TypeDirectory
-			if err := w.add(m, st); err != nil {
-				return err
-			}
-			child, err := openChild(dir, name, unix.O_RDONLY|unix.O_DIRECTORY)
-			if err != nil {
-				return err
-			}
-			opened, err := fstate(child)
-			if err == nil && opened.id != st.id {
-				err = fmt.Errorf("%s changed while being inspected", path)
-			}
-			if err == nil {
-				err = w.walk(child, path, depth+1)
-			}
-			child.Close()
-			if err != nil {
-				return err
-			}
-		case unix.S_IFREG:
-			m.Type, m.Size = TypeFile, st.size
-			if w.hash || (w.screen && (name == ".git" || name == "alternates")) {
-				if err := w.readRegular(dir, name, rel, &m, st); err != nil {
-					return err
-				}
-			}
-			if err := w.add(m, st); err != nil {
-				return err
-			}
-		case unix.S_IFLNK:
-			m.Type = TypeSymlink
-			target, err := readlinkAt(fd, name)
-			if err != nil {
-				return fmt.Errorf("readlink %s: %w", path, err)
-			}
-			m.Linkname = target
-			if name == ".git" && w.screen {
-				w.screenGitLink(path, rel, target)
-			}
-			if err := w.add(m, st); err != nil {
-				return err
-			}
-		default:
-			w.refuse("%s: unsupported file type (only directories, regular files and symlinks are archived)", path)
+		if err := w.add(m, st); err != nil {
+			return err
 		}
+	case unix.S_IFLNK:
+		m.Type = TypeSymlink
+		target, err := readlinkAt(fd, name)
+		if err != nil {
+			return fmt.Errorf("readlink %s: %w", path, err)
+		}
+		m.Linkname = target
+		if name == ".git" && w.screen {
+			w.screenGitLink(path, rel, target)
+		}
+		if err := w.add(m, st); err != nil {
+			return err
+		}
+	default:
+		w.refuse("%s: unsupported file type (only directories, regular files and symlinks are archived)", path)
 	}
 	return nil
 }
@@ -523,46 +534,73 @@ func checkMount(rule config.WorkspaceArchiveRule, root state) (source, fstype st
 	return source, fstype, nil
 }
 
-// liveReferences fails closed: any process whose cwd, root, executable or
-// open descriptor is inside source, or any process that cannot be inspected,
-// keeps the source local.
+// liveReferences fails closed: any process whose cwd, root, executable, open
+// descriptor or mapped file is inside source, or any process that cannot be
+// inspected, keeps the source local.
 func liveReferences(ctx context.Context, procRoot, source string) error {
+	var hits []string
+	unknown, err := processReferences(ctx, procRoot, func(pid, label, target string) bool {
+		if !core.PathWithin(target, source) {
+			return false
+		}
+		if len(hits) < maxReported {
+			hits = append(hits, fmt.Sprintf("pid %s %s", pid, label))
+		}
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	if len(hits) > 0 || unknown > 0 {
+		return fmt.Errorf("live process references keep %s local: [%s]; %d process(es) could not be inspected", source, strings.Join(hits, ", "), unknown)
+	}
+	return nil
+}
+
+// processReferences calls match with every absolute path a process holds:
+// its cwd, root and executable, each open descriptor and each mapped file.
+// match returns true once it has seen enough of that process. The count of
+// processes that could not be fully inspected is returned; a process that
+// exited meanwhile holds nothing and is not counted.
+func processReferences(ctx context.Context, procRoot string, match func(pid, label, target string) bool) (int, error) {
 	if procRoot == "" {
-		return errors.New("live process check requires a procfs root")
+		return 0, errors.New("live process check requires a procfs root")
 	}
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
-		return fmt.Errorf("live process check: %w", err)
+		return 0, fmt.Errorf("live process check: %w", err)
 	}
 	self := strconv.Itoa(os.Getpid())
-	var hits []string
-	unknown := 0
-	inside := func(target string) bool {
+	clean := func(target string) (string, bool) {
 		target = strings.TrimSuffix(target, " (deleted)")
-		return filepath.IsAbs(target) && core.PathWithin(filepath.Clean(target), source)
+		if !filepath.IsAbs(target) {
+			return "", false
+		}
+		return filepath.Clean(target), true
 	}
+	unknown := 0
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
-			return err
+			return unknown, err
 		}
 		pid := entry.Name()
 		if _, err := strconv.Atoi(pid); err != nil || pid == self {
 			continue
 		}
 		dir := filepath.Join(procRoot, pid)
-		found, unreadable := "", false
+		found, unreadable := false, false
 		for _, link := range []string{"cwd", "root", "exe"} {
 			target, err := os.Readlink(filepath.Join(dir, link))
 			if err != nil {
 				unreadable = unreadable || !errors.Is(err, os.ErrNotExist)
 				continue
 			}
-			if inside(target) {
-				found = link
+			if target, ok := clean(target); ok && match(pid, link, target) {
+				found = true
 				break
 			}
 		}
-		if found == "" {
+		if !found {
 			descriptors, err := os.ReadDir(filepath.Join(dir, "fd"))
 			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				unreadable = true
@@ -573,28 +611,57 @@ func liveReferences(ctx context.Context, procRoot, source string) error {
 					unreadable = unreadable || !errors.Is(err, os.ErrNotExist)
 					continue
 				}
-				if inside(target) {
-					found = "fd " + descriptor.Name()
+				if target, ok := clean(target); ok && match(pid, "fd "+descriptor.Name(), target) {
+					found = true
 					break
 				}
 			}
 		}
-		switch {
-		case found != "":
-			if len(hits) < maxReported {
-				hits = append(hits, fmt.Sprintf("pid %s %s", pid, found))
+		if !found {
+			mapped, err := mappedFiles(filepath.Join(dir, "maps"))
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				unreadable = true
 			}
-		case unreadable:
-			// A process that exited meanwhile holds nothing.
+			for _, target := range mapped {
+				if target, ok := clean(target); ok && match(pid, "mapped file", target) {
+					found = true
+					break
+				}
+			}
+		}
+		if !found && unreadable {
 			if _, err := os.Lstat(dir); err == nil {
 				unknown++
 			}
 		}
 	}
-	if len(hits) > 0 || unknown > 0 {
-		return fmt.Errorf("live process references keep %s local: [%s]; %d process(es) could not be inspected", source, strings.Join(hits, ", "), unknown)
+	return unknown, nil
+}
+
+// mappedFiles lists the file paths of a /proc/<pid>/maps file.
+func mappedFiles(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	defer f.Close()
+	var out []string
+	seen := map[string]bool{}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	for scanner.Scan() {
+		// address perms offset dev inode pathname
+		fields := strings.SplitN(scanner.Text(), " ", 6)
+		if len(fields) < 6 {
+			continue
+		}
+		name := strings.TrimLeft(fields[5], " ")
+		if strings.HasPrefix(name, "/") && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out, scanner.Err()
 }
 
 // externalDependents finds gitdir files, object alternates and symlinks

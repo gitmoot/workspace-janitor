@@ -194,6 +194,15 @@ With the default `release_action: none`, a release is only recorded. With
 through the verified category path. See
 [policy reference](docs/policy-reference.md#stale-workspace-report).
 
+Scratch cleanup (opt-in through `scratch_cleanup`): `janitor scratch` previews
+which idle, unused entries of a scratch directory such as `/tmp` would be
+skipped, deleted as regenerable, or archived and then deleted. The skip,
+regenerable and sensitive-name lists all come from the policy file.
+`--dry-run=false --confirm` acts, and `janitor cycle` runs each directory once
+per `every`. `janitor scratch restore <run> <entry>` verifies one archived
+entry, and with `--dry-run=false --confirm` restores it. See
+[policy reference](docs/policy-reference.md#scratch-cleanup).
+
 ### Exit codes
 
 | Code | Meaning |

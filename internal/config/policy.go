@@ -313,6 +313,10 @@ type Policy struct {
 	// Report is the opt-in weekly stale-workspace report and its replies.
 	Report StaleReport `yaml:"report" json:"report"`
 
+	// ScratchCleanup lists opt-in scratch directories whose idle entries
+	// Janitor archives (or, when regenerable, deletes) and removes.
+	ScratchCleanup []ScratchCleanup `yaml:"scratch_cleanup" json:"scratch_cleanup"`
+
 	Prevention     Prevention      `yaml:"prevention" json:"prevention"`
 	CanonicalRoots []CanonicalRoot `yaml:"canonical_roots" json:"canonical_roots"`
 	Classification Classification  `yaml:"classification" json:"classification"`
@@ -460,6 +464,11 @@ func (p Policy) clone() Policy {
 		out.WorkspaceArchiveCategories[i].Roots = append([]string(nil), p.WorkspaceArchiveCategories[i].Roots...)
 	}
 	out.Report.Roots = append([]string(nil), p.Report.Roots...)
+	out.ScratchCleanup = append([]ScratchCleanup(nil), p.ScratchCleanup...)
+	for i := range out.ScratchCleanup {
+		out.ScratchCleanup[i].Skip = append([]string(nil), p.ScratchCleanup[i].Skip...)
+		out.ScratchCleanup[i].Regenerable = append([]string(nil), p.ScratchCleanup[i].Regenerable...)
+	}
 	if p.SourceNameApprovals != nil {
 		approvals := *p.SourceNameApprovals
 		approvals.Reviewers = append([]string(nil), approvals.Reviewers...)
@@ -518,6 +527,7 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	p.normalizeWorkspaceArchives(expand)
 	p.normalizeWorkspaceArchiveCategories(expand)
 	p.normalizeStaleReport(expand)
+	p.normalizeScratchCleanup(expand)
 	if p.Gitmoot.Home != "" {
 		p.Gitmoot.Home = expand("gitmoot.home", p.Gitmoot.Home)
 	}
@@ -608,6 +618,7 @@ func (p *Policy) Validate() core.FieldErrors {
 	p.validateWorkspaceArchives(&errs)
 	p.validateWorkspaceArchiveCategories(&errs)
 	p.validateStaleReport(&errs)
+	p.validateScratchCleanup(&errs)
 	p.validateSourceNameApprovals(&errs)
 	if p.Version != PolicyVersion {
 		errs.Add("version", "must be %d, got %d", PolicyVersion, p.Version)

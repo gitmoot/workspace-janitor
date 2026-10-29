@@ -17,3 +17,8 @@ func deleteAnchored(_ string, _ core.FilesystemID) error {
 func verifyDeletionTree(_ context.Context, _ string, _ core.FilesystemID) error {
 	return errors.New("anchored quarantine deletion is not supported on this platform")
 }
+
+// RemoveAnchored is unavailable off Linux.
+func RemoveAnchored(_ context.Context, _ string, _ core.FilesystemID) error {
+	return errors.New("anchored removal is not supported on this platform")
+}

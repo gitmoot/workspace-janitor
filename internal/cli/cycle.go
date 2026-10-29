@@ -27,6 +27,7 @@ type cycleReport struct {
 	Capacity         *core.CapacitySnapshot `json:"capacity,omitempty"`
 	Recovery         *recoveryReport        `json:"recovery,omitempty"`
 	CategoryArchives *categoryArchiveReport `json:"category_archives,omitempty"`
+	ScratchCleanup   []scratchRunReport     `json:"scratch_cleanup,omitempty"`
 	Inventory        *inventoryReport       `json:"inventory_report"`
 }
 
@@ -69,6 +70,17 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 			return errors.Join(categoryErr, err)
 		}
 	}
+	// Scratch directories lie outside every inventory root, so their due
+	// runs are independent of the scan. Like category failures, scratch
+	// failures are reported and returned once the cycle has finished.
+	var scratch []scratchRunReport
+	if len(policy.ScratchCleanup) != 0 {
+		var scratchErr error
+		scratch, scratchErr = cycleScratchCleanup(ctx, paths, policy)
+		if scratchErr != nil {
+			categoryErr = errors.Join(categoryErr, fmt.Errorf("scheduled scratch cleanup: %w", scratchErr))
+		}
+	}
 	// Hold the scan lock from this scan through the quarantine apply, so no
 	// watcher scan lands between the plan and the apply's binding check.
 	unlockScan, err := lockScan(ctx, paths.StateDir)
@@ -105,6 +117,7 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	report := cycleReport{ScanID: scanID, Deep: deep, Quarantine: "disabled", Expiry: "disabled", DiskAlerts: alerts}
 	report.Capacity = capacity
 	report.CategoryArchives = categories
+	report.ScratchCleanup = scratch
 	reportDB, err := store.OpenExisting(ctx, paths.DatabaseFile)
 	if err != nil {
 		return err
