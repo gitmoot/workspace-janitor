@@ -15,6 +15,10 @@ const (
 	minScratchInterval  = 24 * time.Hour
 	maxScratchCleanups  = 16
 	maxScratchPatterns  = 256
+
+	// DefaultScratchMaxEntries bounds one scratch directory's listing,
+	// independently of limits.max_dir_entries.
+	DefaultScratchMaxEntries = 100000
 )
 
 // ScratchCleanup is one opt-in scratch directory (for example /tmp) whose
@@ -36,6 +40,9 @@ type ScratchCleanup struct {
 	// MaxBytesPerRun bounds the bytes one run removes (archived and
 	// regenerable together); 0 means no bound.
 	MaxBytesPerRun int64 `yaml:"max_bytes_per_run" json:"max_bytes_per_run"`
+	// MaxEntries bounds the depth-1 listing; a larger directory refuses the
+	// whole run rather than cleaning a partial listing.
+	MaxEntries int `yaml:"max_entries" json:"max_entries"`
 }
 
 // ScratchCleanupFor returns the configured scratch cleanup of path.
@@ -88,6 +95,9 @@ func (p *Policy) normalizeScratchCleanup(expand func(string, string) string) {
 		}
 		if scratch.Every == 0 {
 			scratch.Every = DefaultScratchEvery
+		}
+		if scratch.MaxEntries == 0 {
+			scratch.MaxEntries = DefaultScratchMaxEntries
 		}
 		if scratch.Skip == nil {
 			scratch.Skip = []string{}
@@ -158,6 +168,9 @@ func (p *Policy) validateScratchCleanup(errs *core.FieldErrors) {
 			if rawStateOrCredentialPath(dir) {
 				errs.Add(field+".archive.directory", "raw runtime/session stores and credential containers cannot be archive destinations")
 			}
+		}
+		if scratch.MaxEntries < 1 {
+			errs.Add(field+".max_entries", "must be at least 1, got %d", scratch.MaxEntries)
 		}
 		if scratch.MaxBytesPerRun < 0 {
 			errs.Add(field+".max_bytes_per_run", "must be zero (no bound) or positive, got %d", scratch.MaxBytesPerRun)

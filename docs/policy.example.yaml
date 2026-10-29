@@ -223,6 +223,7 @@ workspace_archive_categories: []
 #     expect_mount_source: backup.example:/export
 #     expect_fstype: nfs4
 #   max_bytes_per_run: 0          # 0 = no bound
+#   max_entries: 100000           # depth-1 listing bound; more refuses the run
 scratch_cleanup: []
 
 # The Jev model classifier is optional and disabled by default: the tool must

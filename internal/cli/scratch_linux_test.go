@@ -24,7 +24,9 @@ import (
 type scratchFixture struct {
 	*fixture
 	work, scratch, archive, proc string
-	extra                        string
+	// extra is appended at the top level, limits under limits: and
+	// options under the scratch_cleanup entry.
+	extra, limits, options string
 }
 
 func newScratchFixture(t *testing.T) *scratchFixture {
@@ -74,7 +76,7 @@ prevention:
   min_free_percent: 0
 limits:
   command_timeout: 30s
-scratch_cleanup:
+%sscratch_cleanup:
   - path: %s
     idle: 24h
     every: 48h
@@ -82,7 +84,7 @@ scratch_cleanup:
     regenerable: ["go-build*", "bunx-*"]
     archive:
       directory: %s
-%s`, x.work, x.archive, x.proc, x.scratch, x.archive, x.extra))
+%s%s`, x.work, x.archive, x.proc, x.limits, x.scratch, x.archive, x.options, x.extra))
 }
 
 func (x *scratchFixture) entry(t *testing.T, name string, files map[string]string) string {
@@ -440,5 +442,46 @@ func TestScratchRestoreRoundTrip(t *testing.T) {
 	}
 	if out, code := restore("never-archived", "--dry-run=false", "--confirm"); code == ExitOK {
 		t.Fatalf("restore of an unarchived entry: %s", out)
+	}
+}
+
+// A scratch directory has its own listing bound: one larger than
+// limits.max_dir_entries (which bounds inventory scans) is still cleaned,
+// and one larger than scratch max_entries is refused as a whole, with
+// nothing deleted, instead of cleaning a partial listing.
+func TestScratchMaxEntriesBoundsTheListing(t *testing.T) {
+	x := newScratchFixture(t)
+	x.limits, x.options = "  max_dir_entries: 3\n", "    max_entries: 10\n"
+	x.write(t)
+	var paths []string
+	for i := range 6 {
+		paths = append(paths, x.entry(t, fmt.Sprintf("entry-%d", i), map[string]string{"a": fmt.Sprintf("%d\n", i)}))
+	}
+	report := x.mustCleanup(t, true)
+	if report.Archived != 6 || report.Archive == nil || len(report.Archive.Entries) != 6 {
+		t.Fatalf("6 entries above limits.max_dir_entries 3 but within max_entries 10: %+v", report)
+	}
+	for _, path := range paths {
+		if exists(t, path) {
+			t.Fatalf("%s was not cleaned", path)
+		}
+	}
+
+	for i := range 6 {
+		paths[i] = x.entry(t, fmt.Sprintf("again-%d", i), map[string]string{"a": "again\n"})
+	}
+	x.options = "    max_entries: 4\n"
+	x.write(t)
+	refused, stderr, code := x.cleanup(t, true)
+	if code == ExitOK || refused.Status != "failed" || !strings.Contains(refused.Error, "4-entry bound") || !strings.Contains(stderr, "nothing is touched") {
+		t.Fatalf("6 entries above max_entries 4: exit=%d %s %+v", code, stderr, refused)
+	}
+	for _, path := range paths {
+		if !exists(t, path) {
+			t.Fatalf("a refused listing deleted %s", path)
+		}
+	}
+	if refused.Archived != 0 || refused.Deleted != 0 || refused.Archive != nil {
+		t.Fatalf("a refused listing reports work: %+v", refused)
 	}
 }

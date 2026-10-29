@@ -33,7 +33,7 @@ func TestScratchCleanupDefaults(t *testing.T) {
 		t.Fatalf("ParsePolicy: %v", err)
 	}
 	got := parsed.ScratchCleanup[0]
-	if got.Idle.Duration() != 72*time.Hour || got.Every.Duration() != 48*time.Hour || got.MaxBytesPerRun != 0 || got.Skip == nil || got.Regenerable == nil {
+	if got.Idle.Duration() != 72*time.Hour || got.Every.Duration() != 48*time.Hour || got.MaxBytesPerRun != 0 || got.MaxEntries != 100000 || got.Skip == nil || got.Regenerable == nil {
 		t.Fatalf("defaults = %+v", got)
 	}
 }
@@ -48,6 +48,7 @@ func TestScratchCleanupRefusesUnsafeSettings(t *testing.T) {
 		{"archive inside scratch", "roots:\n  - path: /srv/work\nprotect:\n  paths: [/srv/tmp/archive]\n" + strings.Replace(scratchEntry(""), "/srv/archive/tmp", "/srv/tmp/archive", 1), "scratch_cleanup[0].archive.directory", "scratch directory"},
 		{"protected scratch", "roots:\n  - path: /srv/work\nprotect:\n  paths: [/srv/archive, /srv]\n" + scratchEntry(""), "scratch_cleanup[0].path", "protect.paths"},
 		{"processes off", scratchBase + "collectors:\n  processes: false\n" + scratchEntry(""), "scratch_cleanup", "process collector"},
+		{"negative max entries", scratchBase + scratchEntry("    max_entries: -1\n"), "scratch_cleanup[0].max_entries", "at least 1"},
 		{"negative bound", scratchBase + scratchEntry("    max_bytes_per_run: -1\n"), "scratch_cleanup[0].max_bytes_per_run", "positive"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

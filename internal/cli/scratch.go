@@ -12,6 +12,7 @@ import (
 
 	"github.com/gitmoot/workspace-janitor/internal/action"
 	"github.com/gitmoot/workspace-janitor/internal/config"
+	"github.com/gitmoot/workspace-janitor/internal/core"
 	"github.com/gitmoot/workspace-janitor/internal/output"
 	"github.com/gitmoot/workspace-janitor/internal/store"
 	"github.com/gitmoot/workspace-janitor/internal/workspacearchive"
@@ -55,22 +56,28 @@ type scratchArchiveSummary struct {
 }
 
 type scratchRunReport struct {
-	Path        string                 `json:"path"`
-	RunID       string                 `json:"run_id,omitempty"`
-	DryRun      bool                   `json:"dry_run"`
-	Status      string                 `json:"status"`
-	Error       string                 `json:"error,omitempty"`
-	NextDue     *time.Time             `json:"next_due,omitempty"`
-	Archive     *scratchArchiveSummary `json:"archive,omitempty"`
-	FreedBytes  int64                  `json:"freed_bytes"`
-	Archived    int                    `json:"archived_deleted"`
-	Deleted     int                    `json:"regenerable_deleted"`
-	Kept        int                    `json:"kept"`
-	Skipped     int                    `json:"skipped"`
-	Deferred    int                    `json:"deferred"`
-	Failed      int                    `json:"failed"`
-	Items       []scratchItem          `json:"items"`
-	Attribution string                 `json:"attribution"`
+	Path       string                 `json:"path"`
+	RunID      string                 `json:"run_id,omitempty"`
+	DryRun     bool                   `json:"dry_run"`
+	Status     string                 `json:"status"`
+	Error      string                 `json:"error,omitempty"`
+	NextDue    *time.Time             `json:"next_due,omitempty"`
+	Archive    *scratchArchiveSummary `json:"archive,omitempty"`
+	FreedBytes int64                  `json:"freed_bytes"`
+	Archived   int                    `json:"archived_deleted"`
+	Deleted    int                    `json:"regenerable_deleted"`
+	Kept       int                    `json:"kept"`
+	Skipped    int                    `json:"skipped"`
+	Deferred   int                    `json:"deferred"`
+	Failed     int                    `json:"failed"`
+	Items      []scratchItem          `json:"items"`
+	// Unlisted counts kept, skipped and deferred entries left out of Items
+	// once scratchListedMax items are listed; they are in the counts above.
+	Unlisted    int    `json:"unlisted"`
+	Attribution string `json:"attribution"`
+
+	listed     int
+	unlistedBy map[string]int
 }
 
 type scratchReport struct {
@@ -86,8 +93,22 @@ type scratchCandidate struct {
 	regenerable bool
 }
 
+// scratchListedMax bounds the kept, skipped and deferred items one run
+// report lists; a scratch directory may hold many thousands of entries.
+const scratchListedMax = 1000
+
+func (r *scratchRunReport) unlisted(status string) {
+	if r.unlistedBy == nil {
+		r.unlistedBy = map[string]int{}
+	}
+	r.unlistedBy[status]++
+	r.Unlisted++
+}
+
 func (r *scratchRunReport) count() {
-	r.Archived, r.Deleted, r.Kept, r.Skipped, r.Deferred, r.Failed, r.FreedBytes = 0, 0, 0, 0, 0, 0, 0
+	// Unlisted entries are kept, skipped or deferred; listed ones are added.
+	r.Archived, r.Deleted, r.Failed, r.FreedBytes = 0, 0, 0, 0
+	r.Kept, r.Skipped, r.Deferred = r.unlistedBy[scratchKept], r.unlistedBy[scratchSkipped], r.unlistedBy[scratchDeferred]
 	for _, item := range r.Items {
 		switch item.Status {
 		case scratchArchived:
@@ -146,72 +167,90 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	if err != nil {
 		return fail(fmt.Errorf("nothing is touched: %w", err))
 	}
-	names, err := dir.Names(policy.Limits.MaxDirEntries)
+	// The name listing is the only structure that grows with the directory:
+	// a scratch directory may hold far more entries than an inventory scan
+	// directory, so it has its own bound, and exceeding it refuses the run
+	// rather than cleaning a partial listing.
+	names, err := dir.Names(scratch.MaxEntries)
 	if err != nil {
-		return fail(err)
+		return fail(fmt.Errorf("nothing is touched: %w", err))
 	}
-	var candidates []scratchCandidate
-	for _, name := range names {
-		item := scratchItem{Entry: name, Path: filepath.Join(scratch.Path, name), Status: scratchKept}
-		keep := func(reason string) {
-			item.Reason = reason
-			report.Items = append(report.Items, item)
+	// Pass 1 keeps only a fixed-size record per candidate. Kept, skipped and
+	// deferred entries are counted, and listed only up to a bound.
+	list := func(item scratchItem) {
+		if report.listed >= scratchListedMax {
+			report.unlisted(item.Status)
+			return
 		}
-		if reason := policy.ScratchRefusal(item.Path); reason != "" {
-			keep(reason)
-			continue
-		}
-		if config.MatchesAny(name, scratch.Skip) {
-			item.Status = scratchSkipped
-			keep("matches a skip pattern")
-			continue
-		}
-		if ref, ok := used[name]; ok {
-			keep("in use: " + ref)
-			continue
-		}
-		entry, err := dir.Observe(ctx, name, policy.Protect.NamePatterns, policy.Limits.DeepSizeMaxEntries)
-		if err != nil {
-			keep("could not be observed: " + err.Error())
-			continue
-		}
-		item.SizeBytes = entry.SizeBytes
-		idle := now.Sub(time.Unix(0, entry.NewestNS))
-		item.IdleFor = idle.Truncate(time.Second).String()
-		switch {
-		case entry.Refusal != "":
-			keep(entry.Refusal)
-			continue
-		case entry.Sensitive != "":
-			keep(fmt.Sprintf("sensitive name %s keeps the entry local", entry.Sensitive))
-			continue
-		case idle < scratch.Idle.Duration():
-			keep(fmt.Sprintf("changed %s ago; scratch entries must be unchanged for %s", item.IdleFor, scratch.Idle))
-			continue
-		}
-		candidates = append(candidates, scratchCandidate{item: len(report.Items), entry: entry, regenerable: config.MatchesAny(name, scratch.Regenerable)})
+		report.listed++
 		report.Items = append(report.Items, item)
 	}
-
-	// Oldest first: the bound keeps the longest-idle entries.
-	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].entry.NewestNS < candidates[j].entry.NewestNS })
-	var selected, archive []scratchCandidate
-	var total int64
-	for _, candidate := range candidates {
-		item := &report.Items[candidate.item]
-		if scratch.MaxBytesPerRun > 0 && total+candidate.entry.SizeBytes > scratch.MaxBytesPerRun {
-			item.Status, item.Reason = scratchDeferred, fmt.Sprintf("max_bytes_per_run %d reached; retried next run", scratch.MaxBytesPerRun)
+	type pending struct {
+		name        string
+		newestNS    int64
+		size        int64
+		identity    core.FilesystemID
+		regenerable bool
+	}
+	var found []pending
+	for _, name := range names {
+		item := scratchItem{Entry: name, Path: filepath.Join(scratch.Path, name), Status: scratchKept}
+		if config.MatchesAny(name, scratch.Skip) {
+			item.Status, item.Reason = scratchSkipped, "matches a skip pattern"
+			list(item)
 			continue
 		}
-		total += candidate.entry.SizeBytes
-		selected = append(selected, candidate)
+		entry, reason := scratchCheck(ctx, dir, policy, scratch, used, name, now)
+		item.SizeBytes = entry.SizeBytes
+		if entry.NewestNS != 0 {
+			item.IdleFor = now.Sub(time.Unix(0, entry.NewestNS)).Truncate(time.Second).String()
+		}
+		if reason != "" {
+			item.Reason = reason
+			list(item)
+			continue
+		}
+		found = append(found, pending{name: name, newestNS: entry.NewestNS, size: entry.SizeBytes, identity: entry.Identity,
+			regenerable: config.MatchesAny(name, scratch.Regenerable)})
+	}
+
+	names = nil
+	// Oldest first: the bound keeps the longest-idle entries. Pass 2 observes
+	// only the selected entries again; their member lists are the run's
+	// archive, bounded by max_bytes_per_run.
+	sort.SliceStable(found, func(i, j int) bool { return found[i].newestNS < found[j].newestNS })
+	var selected, archive []scratchCandidate
+	var total int64
+	for _, next := range found {
+		item := scratchItem{Entry: next.name, Path: filepath.Join(scratch.Path, next.name), SizeBytes: next.size,
+			IdleFor: now.Sub(time.Unix(0, next.newestNS)).Truncate(time.Second).String()}
+		if scratch.MaxBytesPerRun > 0 && total+next.size > scratch.MaxBytesPerRun {
+			item.Status, item.Reason = scratchDeferred, fmt.Sprintf("max_bytes_per_run %d reached; retried next run", scratch.MaxBytesPerRun)
+			list(item)
+			continue
+		}
+		entry, reason := scratchCheck(ctx, dir, policy, scratch, used, next.name, now)
+		if reason == "" && entry.Identity != next.identity {
+			reason = "replaced while the directory was being listed"
+		}
+		if reason != "" {
+			item.Status, item.Reason = scratchKept, reason
+			list(item)
+			continue
+		}
+		total += entry.SizeBytes
+		item.SizeBytes = entry.SizeBytes
+		candidate := scratchCandidate{item: len(report.Items), entry: entry, regenerable: next.regenerable}
 		if candidate.regenerable {
 			item.Status, item.Reason = scratchWouldDelete, "matches a regenerable pattern; deleted without an archive"
 		} else {
 			item.Status, item.Reason = scratchWouldArchive, "archived and verified before deletion"
 			archive = append(archive, candidate)
 		}
+		selected = append(selected, candidate)
+		report.Items = append(report.Items, item)
 	}
+	found = nil
 	if dryRun {
 		report.count()
 		return report, nil
@@ -298,6 +337,32 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	}
 	report.count()
 	return report, errors.Join(failures...)
+}
+
+// scratchCheck observes one entry and returns why it must stay, if it must:
+// policy, a process, an unobservable or unsupported member, a sensitive name
+// or a recent change. It never touches the entry.
+func scratchCheck(ctx context.Context, dir *workspacearchive.ScratchDir, policy config.Policy, scratch config.ScratchCleanup, used map[string]string, name string, now time.Time) (workspacearchive.ScratchEntry, string) {
+	if reason := policy.ScratchRefusal(filepath.Join(scratch.Path, name)); reason != "" {
+		return workspacearchive.ScratchEntry{Name: name}, reason
+	}
+	if ref, ok := used[name]; ok {
+		return workspacearchive.ScratchEntry{Name: name}, "in use: " + ref
+	}
+	entry, err := dir.Observe(ctx, name, policy.Protect.NamePatterns, policy.Limits.DeepSizeMaxEntries)
+	if err != nil {
+		return entry, "could not be observed: " + err.Error()
+	}
+	idle := now.Sub(time.Unix(0, entry.NewestNS))
+	switch {
+	case entry.Refusal != "":
+		return entry, entry.Refusal
+	case entry.Sensitive != "":
+		return entry, fmt.Sprintf("sensitive name %s keeps the entry local", entry.Sensitive)
+	case idle < scratch.Idle.Duration():
+		return entry, fmt.Sprintf("changed %s ago; scratch entries must be unchanged for %s", idle.Truncate(time.Second), scratch.Idle)
+	}
+	return entry, ""
 }
 
 // scratchPreflight re-reads the policy file before and after the slow copy:
@@ -467,6 +532,9 @@ func writeScratchReport(e *env, format output.Format, report scratchReport) erro
 		}
 		if run.Archive != nil {
 			fmt.Fprintf(&b, "archive: %s (%d files verified)\n", run.Archive.Manifest, run.Archive.Files)
+		}
+		if run.Unlisted != 0 {
+			fmt.Fprintf(&b, "%d kept, skipped or deferred entries are counted but not listed\n", run.Unlisted)
 		}
 		for _, item := range run.Items {
 			if item.Status == scratchSkipped {

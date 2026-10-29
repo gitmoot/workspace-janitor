@@ -649,6 +649,7 @@ entries Janitor removes. Entries that match no list are archived first.
 | `regenerable` | Globs on the entry name. An idle, unused match is deleted without an archive. |
 | `archive.directory`, `expect_mount_source`, `expect_fstype` | Every other idle, unused entry is archived here before deletion. The same approval rules apply as for `workspace_archives` destinations: covered by an independent `protect.paths` rule, outside every inventory root and scratch directory, and the mount expectations are checked before writing. |
 | `max_bytes_per_run` | Default `0` (no bound). The total local bytes one run may remove. Entries past the bound are `deferred`, oldest first. |
+| `max_entries` | Default `100000`, at least `1`. Bounds the depth-1 listing of this directory, independently of `limits.max_dir_entries` (which bounds inventory scans). A directory with more entries refuses the whole run before anything is touched; a partial listing is never cleaned. Only the names are held for every entry. Each entry is observed and then released, and member lists are kept only for the entries this run removes. The report lists up to 1000 kept, skipped and deferred entries and counts the rest under `unlisted`. |
 
 Scratch cleanup requires the process collector. An entry is kept, neither
 archived nor deleted, while any of these hold:
