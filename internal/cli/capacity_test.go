@@ -187,3 +187,53 @@ func TestCapacityMeasurementFailurePersistsUnknown(t *testing.T) {
 		t.Fatalf("failed measurement looked healthy: %s", out)
 	}
 }
+
+func TestCapacityZeroMarginReleasesPriorHoldWithoutPercentageFloor(t *testing.T) {
+	f := newFixture(t)
+	root := filepath.Join(f.home, "workspace")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	disk, err := measureDisk(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setPolicy := func(reserve, margin uint64) {
+		f.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  git: false\n  processes: false\n  services: false\nprevention:\n  min_free_percent: 0\n  targets:\n    - path: %s\n      target_free_bytes: %d\n      reserve_free_bytes: %d\n      recovery_margin_bytes: %d\n", root, root, disk.TotalBytes*3, reserve, margin))
+	}
+	setPolicy(disk.TotalBytes*2, 1)
+	if out, stderr, code := f.run(t, "scan"); code != ExitOK {
+		t.Fatalf("seed critical: %d %s %s", code, out, stderr)
+	}
+	setPolicy(1, 0)
+	if out, stderr, code := f.run(t, "scan"); code != ExitOK {
+		t.Fatalf("sample zero margin: %d %s %s", code, out, stderr)
+	}
+	out, stderr, code := f.run(t, "--format", "json", "status")
+	if code != ExitOK {
+		t.Fatalf("status: %d %s %s", code, out, stderr)
+	}
+	var report struct {
+		Data struct {
+			Capacity struct {
+				Volumes []struct {
+					State    string `json:"state"`
+					Hold     bool   `json:"admission_hold"`
+					Reserve  uint64 `json:"reserve_bytes"`
+					Recovery uint64 `json:"recovery_bytes"`
+				} `json:"volumes"`
+			} `json:"capacity"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatal(err)
+	}
+	volumes := report.Data.Capacity.Volumes
+	if len(volumes) != 1 {
+		t.Fatalf("missing measured device: %s", out)
+	}
+	v := volumes[0]
+	if v.State != "cleanup_needed" || v.Hold || v.Reserve != 1 || v.Recovery != 1 {
+		t.Fatalf("warning retained hold or hidden floor: %s", out)
+	}
+}

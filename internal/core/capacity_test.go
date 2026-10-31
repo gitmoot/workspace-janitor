@@ -60,4 +60,32 @@ func TestNoSafeReclaimRemainsHeldUntilRecovery(t *testing.T) {
 	}
 }
 
+func TestPressureWithoutHysteresisUsesExactDecimalBoundaries(t *testing.T) {
+	const reserve, warning = uint64(10_000_000_000), uint64(20_000_000_000)
+	total := uint64(467_909_804_032)
+	for _, prior := range []PressureState{PressureCritical, PressureUnknown, PressureNoSafeReclaim, PressureCleanupNeeded, PressureRecovered} {
+		previous := CapacityState{State: prior, AdmissionHold: true}
+		for _, tc := range []struct {
+			free  uint64
+			state PressureState
+			hold  bool
+		}{
+			{reserve - 1, PressureCritical, true},
+			{reserve, PressureCleanupNeeded, false},
+			{warning - 1, PressureCleanupNeeded, false},
+			{warning, PressureRecovered, false},
+			{warning + 1, PressureRecovered, false},
+		} {
+			got := AdvancePressure(CapacityState{AvailableBytes: capacityBytes(tc.free), TotalBytes: &total, TargetBytes: warning, ReserveBytes: reserve, RecoveryBytes: reserve}, previous)
+			if got.State != tc.state || got.AdmissionHold != tc.hold {
+				t.Fatalf("prior=%s free=%d: got %s hold=%t, want %s hold=%t", prior, tc.free, got.State, got.AdmissionHold, tc.state, tc.hold)
+			}
+		}
+		unknown := AdvancePressure(CapacityState{TotalBytes: &total, TargetBytes: warning, ReserveBytes: reserve, RecoveryBytes: reserve}, previous)
+		if unknown.State != PressureUnknown || !unknown.AdmissionHold {
+			t.Fatalf("unknown measurement released admission: %+v", unknown)
+		}
+	}
+}
+
 func capacityBytes(n uint64) *uint64 { return &n }

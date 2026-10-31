@@ -258,7 +258,7 @@ func runCapacityRecovery(ctx context.Context, e *env, paths config.Paths, policy
 			latest = latest.Expire(time.Now().UTC())
 			for i := range latest.Volumes {
 				volume := &latest.Volumes[i]
-				if volume.State != core.PressureRecovered && volume.State != core.PressureUnknown {
+				if volume.RecoveryBytes != volume.ReserveBytes && volume.State != core.PressureRecovered && volume.State != core.PressureUnknown {
 					volume.State = core.PressureNoSafeReclaim
 					volume.AdmissionHold = true
 					volume.Reason = "bounded recovery stopped: " + report.Stopped + "; inspect skipped owners and approval limits"

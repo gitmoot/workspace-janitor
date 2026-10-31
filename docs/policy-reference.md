@@ -28,9 +28,9 @@ filesystem combine the strongest thresholds, not their sum.
 | Field | Meaning |
 | --- | --- |
 | `path` | Root path, expanded using the same home/path rules as `roots`. |
-| `target_free_bytes` | Positive desired available bytes. For this host's planned 50 GiB target: `53687091200`; configuration does not establish achievement. |
-| `reserve_free_bytes` | Nonnegative critical reserve, no greater than the configured target. Effective reserve is at least 5% of filesystem capacity; effective target is at least the reserve. |
-| `recovery_margin_bytes` | Positive hysteresis margin above the effective target; target plus margin must fit a signed 64-bit byte count. |
+| `target_free_bytes` | Positive desired available bytes; with zero recovery margin this is the warning threshold, not an admission requirement. Decimal 20 GB is `20000000000`. |
+| `reserve_free_bytes` | Explicit nonnegative critical reserve, no greater than the configured target. There is no implicit percentage floor. Decimal 10 GB is `10000000000`. |
+| `recovery_margin_bytes` | Nonnegative hysteresis margin. Zero disables hysteresis: `recovery_bytes` equals `reserve_bytes`, and admission clears at the reserve itself. Positive margins retain target-plus-margin recovery; target plus margin must fit a signed 64-bit byte count. |
 
 `prevention.capacity_interval` defaults to `1m` and accepts `1s` through `1h`.
 Persisted scans, cycles, and watcher timer ticks share a serialized due check and
@@ -39,10 +39,13 @@ one SQLite row, survives restart, and expires after twice the interval.
 The watcher samples even without directory events; restart it after policy changes.
 
 States are `target_recovered`, `cleanup_needed`, `critical`,
-`no_safe_reclaim`, and `measurement_unknown`. Below reserve is critical; below
-target requests cleanup. Once pressure begins, recovery requires target plus
-margin. Critical, unknown, or exhausted bounded recovery sets `admission_hold`;
-the hold remains until verified hysteresis recovery.
+`no_safe_reclaim`, and `measurement_unknown`. Below reserve is critical.
+With zero recovery margin, below target is a warning (`cleanup_needed`,
+`admission_hold=false`); prior critical, unknown, or exhausted cleanup cannot
+keep admission held once a fresh observation reaches the reserve. Equality at
+the reserve is allowed, and equality at the target is not a warning.
+Positive recovery margins retain target-plus-margin hysteresis and exhausted
+recovery holds. Unknown observations hold admission in both modes.
 `available_bytes` excludes filesystem-reserved blocks. Unreadable roots,
 inconsistent volume observations, stale snapshots, and backward clocks cannot
 report healthy capacity. Unknown byte values are JSON `null`, never zero.
@@ -53,7 +56,11 @@ identity, thresholds, state, `admission_hold`, and reason. Status is read-only;
 missing data or a changed policy returns unknown until a fresh sample exists.
 `cycle`, stored `scan`, and watcher reports also include the snapshot. This is
 an advisory contract, not deletion authority or an enforced job admission gate.
-No target relaxes the existing independent 5% dispatch floor.
+Archive/restore allocations separately retain a decimal 10 GB destination
+reserve, rather than the old filesystem-size-dependent 5% floor. Consumers
+must enforce their own fresh admission and routing checks. For the 20 GB / 10 GB
+policy, read canonical `target_bytes` for warning/E2B-only routing and
+`reserve_bytes` for the hard floor; remote execution does not exempt local writes.
 
 ## Bounded cache recovery
 

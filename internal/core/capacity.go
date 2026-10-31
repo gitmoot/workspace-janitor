@@ -2,6 +2,10 @@ package core
 
 import "time"
 
+// MinimumAllocationReserveBytes is the decimal 10 GB floor retained after
+// archive/restore allocations. Equality is permitted.
+const MinimumAllocationReserveBytes uint64 = 10_000_000_000
+
 type PressureState string
 
 const (
@@ -13,8 +17,8 @@ const (
 )
 
 // CapacityState describes one filesystem, not one inventory root. Available
-// bytes are measured with the unprivileged reserve excluded. A hold survives
-// recovery above the critical floor until the recovery threshold is reached.
+// bytes exclude the filesystem's reserved blocks. RecoveryBytes equal to
+// ReserveBytes disables hysteresis; TargetBytes then only controls warnings.
 type CapacityState struct {
 	Key            string        `json:"filesystem_key"`
 	Device         uint64        `json:"device,omitempty"`
@@ -36,16 +40,30 @@ type CapacitySnapshot struct {
 	Volumes    []CapacityState `json:"volumes"`
 }
 
-// AdvancePressure applies hysteresis to a fresh observation. Unknown samples
-// never release an earlier hold, and are themselves a fail-closed hold. This
-// state is advisory until an admission consumer enforces it; it never authorizes
-// deletion or changes the existing dispatch floor.
+// AdvancePressure applies the configured recovery threshold to a fresh sample.
+// With hysteresis disabled, only space below reserve holds admission, regardless
+// of earlier critical, unknown, or exhausted-cleanup states. Unknown samples
+// remain fail-closed. This advisory state never authorizes deletion.
 func AdvancePressure(current, previous CapacityState) CapacityState {
 	if current.AvailableBytes == nil || current.TotalBytes == nil {
 		current.State, current.AdmissionHold = PressureUnknown, true
 		return current
 	}
 	available := *current.AvailableBytes
+	if current.RecoveryBytes == current.ReserveBytes {
+		switch {
+		case available < current.ReserveBytes:
+			current.State, current.AdmissionHold = PressureCritical, true
+			current.Reason = "available space is below the reserve"
+		case available < current.TargetBytes:
+			current.State, current.AdmissionHold = PressureCleanupNeeded, false
+			current.Reason = "available space is below the warning target"
+		default:
+			current.State, current.AdmissionHold = PressureRecovered, false
+			current.Reason = "fresh measurement satisfies the warning target"
+		}
+		return current
+	}
 	switch {
 	case available < current.ReserveBytes:
 		current.State, current.AdmissionHold = PressureCritical, true

@@ -81,22 +81,14 @@ func sampleCapacity(ctx context.Context, policy config.Policy, paths config.Path
 			}
 			volume.Roots = append(volume.Roots, target.Path)
 			reserve := uint64(target.ReserveFreeBytes)
-			if measureErr == nil {
-				// The independent dispatch guard is not changed. Capacity reporting
-				// is at least as conservative as a five-percent filesystem reserve.
-				floor := measured.TotalBytes / 20
-				if measured.TotalBytes%20 != 0 {
-					floor++
-				}
-				if floor > reserve {
-					reserve = floor
-				}
-			}
 			goal := uint64(target.TargetFreeBytes)
 			if reserve > goal {
 				goal = reserve
 			}
 			recovery := goal + uint64(target.RecoveryMarginBytes)
+			if target.RecoveryMarginBytes == 0 {
+				recovery = reserve
+			}
 			if goal > volume.TargetBytes {
 				volume.TargetBytes = goal
 			}
@@ -146,11 +138,15 @@ func unknownCapacity(policy config.Policy, reason string) *core.CapacitySnapshot
 	}
 	snapshot := &core.CapacitySnapshot{PolicyHash: capacityPolicyHash(policy)}
 	for _, target := range policy.Prevention.Targets {
+		recovery := uint64(target.TargetFreeBytes + target.RecoveryMarginBytes)
+		if target.RecoveryMarginBytes == 0 {
+			recovery = uint64(target.ReserveFreeBytes)
+		}
 		snapshot.Volumes = append(snapshot.Volumes, core.CapacityState{
 			Key: "root:" + target.Path, Roots: []string{target.Path}, State: core.PressureUnknown,
 			AdmissionHold: true, Reason: reason, TargetBytes: uint64(target.TargetFreeBytes),
 			ReserveBytes:  uint64(target.ReserveFreeBytes),
-			RecoveryBytes: uint64(target.TargetFreeBytes + target.RecoveryMarginBytes),
+			RecoveryBytes: recovery,
 		})
 	}
 	return snapshot
