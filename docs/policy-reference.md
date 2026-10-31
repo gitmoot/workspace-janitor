@@ -24,6 +24,9 @@ Safety is a first-precedence veto. Protected paths/canonical roots precede expli
 `prevention.targets` is empty by default. Each target names an existing configured
 inventory root exactly once; at most 64 targets are accepted. Targets on one
 filesystem combine the strongest thresholds, not their sum.
+Warning and recovery thresholds remain independent when roots share a device:
+a zero-margin root's larger warning target cannot delay another root's satisfied
+recovery threshold.
 
 | Field | Meaning |
 | --- | --- |

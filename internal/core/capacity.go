@@ -69,13 +69,13 @@ func AdvancePressure(current, previous CapacityState) CapacityState {
 		current.State, current.AdmissionHold = PressureCritical, true
 		current.Reason = "available space is below the reserve"
 	case available < current.TargetBytes || (previous.State != "" && previous.State != PressureRecovered && available < current.RecoveryBytes):
-		current.State, current.AdmissionHold = PressureCleanupNeeded, previous.AdmissionHold
-		current.Reason = "safe recovery is needed to reach the recovery threshold"
+		current.State, current.AdmissionHold = PressureCleanupNeeded, previous.AdmissionHold && available < current.RecoveryBytes
+		current.Reason = "available space is below the warning target or recovery threshold"
 	default:
 		current.State, current.AdmissionHold = PressureRecovered, false
 		current.Reason = "fresh measurement satisfies the target and hysteresis"
 	}
-	if previous.State == PressureNoSafeReclaim && current.State != PressureRecovered {
+	if previous.State == PressureNoSafeReclaim && current.State != PressureRecovered && available < current.RecoveryBytes {
 		current.State, current.Reason = previous.State, previous.Reason
 		current.AdmissionHold = true
 	}
