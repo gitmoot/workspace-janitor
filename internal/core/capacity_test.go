@@ -60,4 +60,51 @@ func TestNoSafeReclaimRemainsHeldUntilRecovery(t *testing.T) {
 	}
 }
 
+func TestPressureWithoutHysteresisUsesExactDecimalBoundaries(t *testing.T) {
+	const reserve, warning = uint64(10_000_000_000), uint64(20_000_000_000)
+	total := uint64(467_909_804_032)
+	for _, prior := range []PressureState{PressureCritical, PressureUnknown, PressureNoSafeReclaim, PressureCleanupNeeded, PressureRecovered} {
+		previous := CapacityState{State: prior, AdmissionHold: true}
+		for _, tc := range []struct {
+			free  uint64
+			state PressureState
+			hold  bool
+		}{
+			{reserve - 1, PressureCritical, true},
+			{reserve, PressureCleanupNeeded, false},
+			{warning - 1, PressureCleanupNeeded, false},
+			{warning, PressureRecovered, false},
+			{warning + 1, PressureRecovered, false},
+		} {
+			got := AdvancePressure(CapacityState{AvailableBytes: capacityBytes(tc.free), TotalBytes: &total, TargetBytes: warning, ReserveBytes: reserve, RecoveryBytes: reserve}, previous)
+			if got.State != tc.state || got.AdmissionHold != tc.hold {
+				t.Fatalf("prior=%s free=%d: got %s hold=%t, want %s hold=%t", prior, tc.free, got.State, got.AdmissionHold, tc.state, tc.hold)
+			}
+		}
+		unknown := AdvancePressure(CapacityState{TotalBytes: &total, TargetBytes: warning, ReserveBytes: reserve, RecoveryBytes: reserve}, previous)
+		if unknown.State != PressureUnknown || !unknown.AdmissionHold {
+			t.Fatalf("unknown measurement released admission: %+v", unknown)
+		}
+	}
+}
+
+func TestPressureMixedWarningAndRecoveryThresholds(t *testing.T) {
+	// A warning-only 40 GB target shares a device with a 15 GB target plus
+	// 1 GB hysteresis. Admission recovers at 16 GB, not the warning-only 40 GB.
+	for _, prior := range []PressureState{PressureCritical, PressureUnknown, PressureNoSafeReclaim} {
+		for _, free := range []uint64{15_999_999_999, 16_000_000_000, 26_600_157_184} {
+			got := AdvancePressure(CapacityState{
+				AvailableBytes: capacityBytes(free), TotalBytes: capacityBytes(467_909_804_032),
+				TargetBytes: 40_000_000_000, ReserveBytes: 10_000_000_000, RecoveryBytes: 16_000_000_000,
+			}, CapacityState{State: prior, AdmissionHold: true})
+			if got.AdmissionHold != (free < 16_000_000_000) {
+				t.Fatalf("prior=%s free=%d: warning target incorrectly controls admission: %+v", prior, free, got)
+			}
+			if free >= 16_000_000_000 && got.State != PressureCleanupNeeded {
+				t.Fatalf("recovered admission lost warning: %+v", got)
+			}
+		}
+	}
+}
+
 func capacityBytes(n uint64) *uint64 { return &n }

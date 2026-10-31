@@ -760,8 +760,8 @@ func (p *Policy) Validate() core.FieldErrors {
 		if target.TargetFreeBytes <= 0 || target.ReserveFreeBytes < 0 || target.ReserveFreeBytes > target.TargetFreeBytes {
 			errs.Add(field, "target_free_bytes must be positive and reserve_free_bytes between zero and target")
 		}
-		if target.RecoveryMarginBytes <= 0 || target.TargetFreeBytes > int64(^uint64(0)>>1)-target.RecoveryMarginBytes {
-			errs.Add(field+".recovery_margin_bytes", "must be positive and target plus margin must fit in int64")
+		if target.RecoveryMarginBytes < 0 || target.TargetFreeBytes > int64(^uint64(0)>>1)-target.RecoveryMarginBytes {
+			errs.Add(field+".recovery_margin_bytes", "must be nonnegative and target plus margin must fit in int64")
 		}
 	}
 

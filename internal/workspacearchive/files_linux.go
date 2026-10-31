@@ -221,9 +221,9 @@ func requireSpace(f *os.File, bytes uint64) error {
 	if err := unix.Fstatfs(int(f.Fd()), &stat); err != nil {
 		return err
 	}
-	available, total := stat.Bavail*uint64(stat.Bsize), stat.Blocks*uint64(stat.Bsize)
-	if available < bytes || available-bytes < total/20 {
-		return errors.New("archive/restore allocation would cross the independent 5% reserve")
+	available := stat.Bavail * uint64(stat.Bsize)
+	if available < bytes || available-bytes < core.MinimumAllocationReserveBytes {
+		return errors.New("archive/restore allocation would cross the 10 GB reserve")
 	}
 	return nil
 }
