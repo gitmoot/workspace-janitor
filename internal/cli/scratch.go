@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -265,6 +266,12 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	sort.SliceStable(found, func(i, j int) bool { return found[i].newestNS < found[j].newestNS })
 	var selected, archive []scratchCandidate
 	var total int64
+	// The run receipt names every archived entry and has a fixed size bound;
+	// entries that would overflow it are deferred before any archive exists.
+	// The manifest name and checksum are sized at their final lengths.
+	receipt := store.ScratchRunReceiptBytes(store.ScratchRun{RunID: report.RunID, Path: scratch.Path, StartedAt: now, RecordedAt: now,
+		ArchiveDirectory: scratch.Archive.Directory, ArchiveManifest: filepath.Join(scratch.Archive.Directory, workspacearchive.ScratchArchiveName(report.RunID)+".manifest.json"),
+		ArchiveManifestSHA256: strings.Repeat("0", 64)})
 	for _, next := range found {
 		item := scratchItem{Entry: next.name, Path: filepath.Join(scratch.Path, next.name), SizeBytes: next.size,
 			IdleFor: now.Sub(time.Unix(0, next.newestNS)).Truncate(time.Second).String()}
@@ -272,6 +279,14 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 			item.Status, item.Reason = scratchDeferred, fmt.Sprintf("max_bytes_per_run %d reached; retried next run", scratch.MaxBytesPerRun)
 			report.list(item)
 			continue
+		}
+		if !next.regenerable {
+			encoded, _ := json.Marshal(next.name)
+			if receipt+len(encoded)+1 > store.ScratchRunReceiptMaxBytes {
+				item.Status, item.Reason = scratchDeferred, "run receipt size bound reached; retried next run"
+				report.list(item)
+				continue
+			}
 		}
 		entry, reason := scratchCheck(ctx, dir, policy, scratch, used, next.name, now)
 		if reason == "" && entry.Identity != next.identity {
@@ -283,6 +298,10 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 			continue
 		}
 		total += entry.SizeBytes
+		if !next.regenerable {
+			encoded, _ := json.Marshal(next.name)
+			receipt += len(encoded) + 1
+		}
 		item.SizeBytes = entry.SizeBytes
 		item.Status, item.Reason = scratchWouldArchive, "would be archived, verified and then deleted"
 		if next.regenerable {

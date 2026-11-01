@@ -195,6 +195,34 @@ func (x *scratchFixture) paths(t *testing.T) config.Paths {
 	return paths
 }
 
+// A directory holding more idle entries than one run receipt can name must
+// still clean up: the overflow is deferred before archiving, and the next run
+// takes the rest. Formerly the run archived everything, then failed to record
+// its receipt and deleted nothing.
+func TestScratchDefersEntriesBeyondTheRunReceiptBound(t *testing.T) {
+	x := newScratchFixture(t)
+	const count = 400 // 400 encoded 200-byte names exceed the 64 KiB receipt
+	for i := 0; i < count; i++ {
+		x.entry(t, fmt.Sprintf("%04d-%s", i, strings.Repeat("n", 195)), nil)
+	}
+	first := x.mustCleanup(t, true)
+	if first.Status == "failed" || first.Archived == 0 || first.Deferred == 0 {
+		t.Fatalf("first run must archive some entries and defer the rest: %+v", first)
+	}
+	second := x.mustCleanup(t, true)
+	if second.Status == "failed" || first.Archived+second.Archived != count || second.Deferred != 0 {
+		t.Fatalf("second run must take the deferred remainder: first=%d second=%d deferred=%d status=%s",
+			first.Archived, second.Archived, second.Deferred, second.Status)
+	}
+	names, err := os.ReadDir(x.scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("%d entries left after two runs", len(names))
+	}
+}
+
 // Skip globs are never touched, regenerable globs are deleted without an
 // archive, everything else idle is archived and verified before deletion,
 // and the preview changes nothing.

@@ -20,6 +20,19 @@ const (
 	ScratchRegenerable = "regenerable"
 )
 
+// ScratchRunReceiptMaxBytes bounds one encoded run receipt. Runs select no
+// more archived entries than fit, before writing any archive.
+const ScratchRunReceiptMaxBytes = 65536
+
+// ScratchRunReceiptBytes is the encoded size of r with no archived entries.
+// Each archived entry adds its JSON-encoded name plus one separator byte.
+func ScratchRunReceiptBytes(r ScratchRun) int {
+	r.ArchivedEntries = []string{}
+	r.StartedAt, r.RecordedAt = r.StartedAt.UTC(), r.RecordedAt.UTC()
+	data, _ := json.Marshal(r)
+	return len(data)
+}
+
 // ScratchRun is the immutable receipt of one acting scratch cleanup run. It
 // is recorded once the run's archive (if any) is published and verified, and
 // before anything is deleted; its start time schedules the next run.
@@ -92,7 +105,7 @@ func (t *Tx) RecordScratchRun(ctx context.Context, r ScratchRun) error {
 	if err != nil {
 		return err
 	}
-	if len(data) > 65536 {
+	if len(data) > ScratchRunReceiptMaxBytes {
 		return errors.New("store: scratch run receipt exceeds its size bound")
 	}
 	if _, err := t.tx.ExecContext(ctx, `INSERT INTO scratch_runs (run_id, path, started_at, document) VALUES (?, ?, ?, ?)`,
