@@ -26,9 +26,12 @@ const ScratchRunReceiptMaxBytes = 65536
 
 // ScratchRunReceiptBytes is the encoded size of r with no archived entries.
 // Each archived entry adds its JSON-encoded name plus one separator byte.
+// RecordedAt is taken only after archiving, so it is sized at its longest
+// encoding: a nine-digit fraction, which RFC 3339 never trims.
 func ScratchRunReceiptBytes(r ScratchRun) int {
 	r.ArchivedEntries = []string{}
-	r.StartedAt, r.RecordedAt = r.StartedAt.UTC(), r.RecordedAt.UTC()
+	r.StartedAt = r.StartedAt.UTC()
+	r.RecordedAt = time.Date(9999, 12, 31, 23, 59, 59, 123456789, time.UTC)
 	data, _ := json.Marshal(r)
 	return len(data)
 }

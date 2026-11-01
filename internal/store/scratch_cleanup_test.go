@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -62,5 +63,24 @@ func TestScratchReceiptsAreAppendOnly(t *testing.T) {
 	}
 	if read, err := ReadLastScratchRun(ctx, db.path, "/tmp"); err != nil || !read.Equal(last) {
 		t.Fatalf("read-only last run = %s, %v", read, err)
+	}
+}
+
+// The run receipt is recorded after archiving, at a later time whose encoding
+// can be up to ten bytes longer than a whole-second start. The size estimate
+// used for selection must never be smaller than the receipt actually stored.
+func TestScratchRunReceiptBytesCoversALaterRecordedAt(t *testing.T) {
+	start := time.Date(2026, 11, 1, 16, 0, 0, 0, time.UTC)
+	r := ScratchRun{RunID: "20261101T160000Z", Path: "/tmp", StartedAt: start, RecordedAt: start,
+		ArchiveDirectory: "/a", ArchiveManifest: "/a/m.json", ArchiveManifestSHA256: strings.Repeat("0", 64)}
+	estimate := ScratchRunReceiptBytes(r)
+	r.RecordedAt = start.Add(987654321 * time.Nanosecond)
+	r.ArchivedEntries = []string{}
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) > estimate {
+		t.Fatalf("estimate %d bytes is below the recorded receipt %d bytes", estimate, len(data))
 	}
 }
