@@ -77,6 +77,10 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 			budget:          budget,
 			newest:          entry.ModifiedAt,
 		}
+		if entry.Kind == core.EntryKindDirectory && isGitDir(entry.Path) {
+			// A Git directory's own mtime moves with every lock file.
+			sum.newest = time.Time{}
+		}
 		switch {
 		case root.CrossFilesystem || (rd.err == nil && !rd.known):
 			// Crossing is allowed, or this platform exposes no device identity.
@@ -179,15 +183,33 @@ func (s *sizeSum) note(reason string) {
 	}
 }
 
-// gitBookkeeping names what read-only Git commands rewrite inside a
-// repository's .git directory: `git status` refreshes the index, `git fetch`
-// writes FETCH_HEAD, remote-tracking refs, new objects and reflogs. None of it
-// is the owner's unsaved work, so it is counted in size but never makes a tree
-// look recently changed. Local commits still move HEAD or refs/heads.
+// gitBookkeeping names what read-only Git commands rewrite inside a Git
+// directory: `git status` refreshes the index, `git fetch` writes FETCH_HEAD,
+// remote-tracking refs, new objects, reflogs and (for shallow clones) shallow.
+// None of it is the owner's unsaved work, so it is counted in size but never
+// makes a tree look recently changed. Local commits still move HEAD or
+// refs/heads. Tags still count: a fetched tag cannot be told from a local one.
+// The same rules apply inside each linked-worktree and submodule Git
+// directory (.git/worktrees/NAME, .git/modules/PATH) and to an entry that is
+// itself a Git directory, such as a bare repository.
 var gitBookkeeping = map[string]bool{
 	"index": true, "index.lock": true, "FETCH_HEAD": true, "ORIG_HEAD": true,
-	"logs": true, "objects": true, "packed-refs": true,
+	"logs": true, "objects": true, "packed-refs": true, "shallow": true,
 	filepath.Join("refs", "remotes"): true,
+}
+
+// isGitDir reports whether dir is a Git directory: a HEAD file plus either an
+// object store (a repository) or a commondir file (a linked worktree).
+func isGitDir(dir string) bool {
+	head, err := os.Lstat(filepath.Join(dir, "HEAD"))
+	if err != nil || !head.Mode().IsRegular() {
+		return false
+	}
+	if objects, err := os.Lstat(filepath.Join(dir, "objects")); err == nil && objects.IsDir() {
+		return true
+	}
+	common, err := os.Lstat(filepath.Join(dir, "commondir"))
+	return err == nil && common.Mode().IsRegular()
 }
 
 // bookkeeping reports whether rel, a path relative to a .git directory, is
@@ -203,7 +225,11 @@ func bookkeeping(rel string) bool {
 }
 
 func (s *sizeSum) walk(ctx context.Context, dir string, depth int) {
-	s.walkIn(ctx, dir, depth, "")
+	gitDir := ""
+	if isGitDir(dir) {
+		gitDir = dir
+	}
+	s.walkIn(ctx, dir, depth, gitDir)
 }
 
 // walkIn walks dir; gitDir is the enclosing .git directory, if any.
@@ -245,7 +271,11 @@ func (s *sizeSum) walkIn(ctx context.Context, dir string, depth int, gitDir stri
 		s.budget--
 		s.visited++
 		inGit := gitDir
-		if inGit == "" && name == ".git" && info.IsDir() {
+		switch {
+		case inGit == "" && name == ".git" && info.IsDir():
+			inGit = path
+		case inGit != "" && info.IsDir() && isGitDir(path):
+			// A linked-worktree or submodule Git directory nested in this one.
 			inGit = path
 		}
 		counts := true
