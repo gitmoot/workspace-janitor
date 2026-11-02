@@ -95,12 +95,12 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		// Sampling needs an initialized database. Create or migrate it here,
 		// without the scan lock, so a cycle holding that lock on a fresh
 		// installation cannot make the first sample fail.
-		db, err := store.Open(ctx, paths.DatabaseFile)
-		if err != nil {
-			return err
+		db, openErr := store.Open(ctx, paths.DatabaseFile)
+		if openErr != nil {
+			return openErr
 		}
-		if err := db.Close(); err != nil {
-			return err
+		if closeErr := db.Close(); closeErr != nil {
+			return closeErr
 		}
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(ctx)

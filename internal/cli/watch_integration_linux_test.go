@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -660,5 +661,43 @@ func TestWatchShutdownWithACancellationCauseSucceeds(t *testing.T) {
 	cancel(errors.New("terminated signal received"))
 	if err := <-done; err != nil {
 		t.Fatalf("normal shutdown returned %v, want nil", err)
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("no space left on device") }
+
+// A sampler failure (here: the capacity report cannot be written) must end
+// the watcher with that error, even while the startup reconcile waits on a
+// scan lock held by a cycle, so systemd records and restarts it.
+func TestWatchReturnsTheSamplerFailure(t *testing.T) {
+	f, root, _ := watchFixture(t)
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: false\nprevention:\n  min_free_percent: 0\n  min_free_bytes: 0\n  capacity_interval: 1s\n  targets:\n    - path: "+root+"\n      target_free_bytes: 1\n      reserve_free_bytes: 0\n      recovery_margin_bytes: 0\n")
+	e := &env{opts: &globalOpts{format: "json"}, stdout: failingWriter{}, stderr: io.Discard, lookup: config.MapLookup(f.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := lockScan(context.Background(), paths.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(context.Background(), e, paths, policy, func() (eventWatcher, error) { return &scriptedWatcher{}, nil }, watchChurnInterval)
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "no space left on device") {
+			t.Fatalf("sampler failure was not returned: %v", err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("watcher kept running after its sampler failed")
 	}
 }
