@@ -82,6 +82,15 @@ type eventWatcher interface {
 
 func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Policy,
 	open func() (eventWatcher, error), churnInterval time.Duration) (err error) {
+	// A stop request (SIGTERM) cancels whatever reconcile or sample is in
+	// flight. That cancellation is a clean shutdown, not a watcher failure;
+	// any other error still ends the watcher with that error.
+	stopping := ctx
+	defer func() {
+		if stopping.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			err = nil
+		}
+	}()
 	// Capacity sampling needs only the database, never the scan lock that a
 	// daily cycle holds through apply. It runs on its own so a long cycle or a
 	// slow reconcile cannot let the published sample go stale (live
