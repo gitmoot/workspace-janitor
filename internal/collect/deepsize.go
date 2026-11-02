@@ -179,7 +179,35 @@ func (s *sizeSum) note(reason string) {
 	}
 }
 
+// gitBookkeeping names what read-only Git commands rewrite inside a
+// repository's .git directory: `git status` refreshes the index, `git fetch`
+// writes FETCH_HEAD, remote-tracking refs, new objects and reflogs. None of it
+// is the owner's unsaved work, so it is counted in size but never makes a tree
+// look recently changed. Local commits still move HEAD or refs/heads.
+var gitBookkeeping = map[string]bool{
+	"index": true, "index.lock": true, "FETCH_HEAD": true, "ORIG_HEAD": true,
+	"logs": true, "objects": true, "packed-refs": true,
+	filepath.Join("refs", "remotes"): true,
+}
+
+// bookkeeping reports whether rel, a path relative to a .git directory, is
+// Git bookkeeping or lies beneath it. The .git directory itself ("." here)
+// is bookkeeping too: its mtime moves whenever a lock file is created.
+func bookkeeping(rel string) bool {
+	for p := rel; p != "." && p != string(filepath.Separator) && p != ""; p = filepath.Dir(p) {
+		if gitBookkeeping[p] {
+			return true
+		}
+	}
+	return rel == "." || rel == filepath.Join("refs")
+}
+
 func (s *sizeSum) walk(ctx context.Context, dir string, depth int) {
+	s.walkIn(ctx, dir, depth, "")
+}
+
+// walkIn walks dir; gitDir is the enclosing .git directory, if any.
+func (s *sizeSum) walkIn(ctx context.Context, dir string, depth int, gitDir string) {
 	if ctx.Err() != nil {
 		s.blind = true
 		s.note("collection was cancelled")
@@ -216,7 +244,16 @@ func (s *sizeSum) walk(ctx context.Context, dir string, depth int) {
 		}
 		s.budget--
 		s.visited++
-		if info.ModTime().After(s.newest) {
+		inGit := gitDir
+		if inGit == "" && name == ".git" && info.IsDir() {
+			inGit = path
+		}
+		counts := true
+		if inGit != "" {
+			rel, err := filepath.Rel(inGit, path)
+			counts = err != nil || !bookkeeping(rel)
+		}
+		if counts && info.ModTime().After(s.newest) {
 			s.newest = info.ModTime()
 		}
 		s.bytes += info.Size()
@@ -229,7 +266,7 @@ func (s *sizeSum) walk(ctx context.Context, dir string, depth int) {
 			s.note(fmt.Sprintf("stopped at mount boundary %s", path))
 			continue
 		}
-		s.walk(ctx, path, depth+1)
+		s.walkIn(ctx, path, depth+1, inGit)
 	}
 }
 
