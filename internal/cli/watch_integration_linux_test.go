@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -581,5 +582,83 @@ func TestWatchKeepsSamplingCapacityWhileTheScanLockIsHeld(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// On a fresh installation the database does not exist yet. A cycle holding
+// the scan lock must not make the watcher's first capacity sample fail; the
+// watcher keeps running and publishes samples.
+func TestWatchSamplesOnAFreshInstallWhileTheScanLockIsHeld(t *testing.T) {
+	f, root, _ := watchFixture(t)
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: false\nprevention:\n  min_free_percent: 0\n  min_free_bytes: 0\n  capacity_interval: 1s\n  targets:\n    - path: "+root+"\n      target_free_bytes: 1\n      reserve_free_bytes: 0\n      recovery_margin_bytes: 0\n")
+	sink := &watchSink{reports: make(chan watchReport, 32)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard, lookup: config.MapLookup(f.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paths.DatabaseFile); !os.IsNotExist(err) {
+		t.Fatalf("fixture database already exists: %v", err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := lockScan(context.Background(), paths.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(ctx, e, paths, policy, func() (eventWatcher, error) { return &scriptedWatcher{}, nil }, watchChurnInterval)
+	}()
+	select {
+	case report := <-sink.reports:
+		if report.Reason != "capacity" || report.Capacity == nil {
+			t.Fatalf("unexpected report: %+v", report)
+		}
+	case err := <-done:
+		t.Fatalf("watch loop exited on a fresh installation: %v", err)
+	case <-time.After(6 * time.Second):
+		t.Fatal("no capacity sample on a fresh installation")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A normal shutdown (SIGTERM through signal.NotifyContext gives the context a
+// cause other than context.Canceled) must end the watcher successfully.
+func TestWatchShutdownWithACancellationCauseSucceeds(t *testing.T) {
+	f, root, _ := watchFixture(t)
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: false\nprevention:\n  min_free_percent: 0\n  min_free_bytes: 0\n  capacity_interval: 1s\n  targets:\n    - path: "+root+"\n      target_free_bytes: 1\n      reserve_free_bytes: 0\n      recovery_margin_bytes: 0\n")
+	sink := &watchSink{reports: make(chan watchReport, 32)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard, lookup: config.MapLookup(f.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(ctx, e, paths, policy, func() (eventWatcher, error) { return &scriptedWatcher{}, nil }, watchChurnInterval)
+	}()
+	select {
+	case <-sink.reports:
+	case err := <-done:
+		t.Fatalf("watch loop exited early: %v", err)
+	case <-time.After(6 * time.Second):
+		t.Fatal("watcher produced no report")
+	}
+	cancel(errors.New("terminated signal received"))
+	if err := <-done; err != nil {
+		t.Fatalf("normal shutdown returned %v, want nil", err)
 	}
 }

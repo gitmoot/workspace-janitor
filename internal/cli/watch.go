@@ -87,29 +87,42 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 	// slow reconcile cannot let the published sample go stale (live
 	// 2026-11-02: a 12-minute cycle starved sampling and Gitmoot refused all
 	// new reviews on a measurement_unknown hold). Reports share one writer.
-	ctx, stop := context.WithCancelCause(ctx)
-	defer stop(nil)
 	quiet := *e
 	quiet.stdout = &lockedWriter{w: e.stdout}
 	e = &quiet
 	sampling := make(chan struct{})
 	if len(policy.Prevention.Targets) > 0 {
+		// Sampling needs an initialized database. Create or migrate it here,
+		// without the scan lock, so a cycle holding that lock on a fresh
+		// installation cannot make the first sample fail.
+		db, err := store.Open(ctx, paths.DatabaseFile)
+		if err != nil {
+			return err
+		}
+		if err := db.Close(); err != nil {
+			return err
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		// A sampler failure is recorded here, apart from the parent context,
+		// so a normal signal-driven shutdown keeps its successful exit status.
+		var samplerErr error
 		go func() {
 			defer close(sampling)
-			if err := sampleCapacityLoop(ctx, e, paths, policy); err != nil {
-				stop(err)
+			if samplerErr = sampleCapacityLoop(ctx, e, paths, policy); samplerErr != nil {
+				cancel()
+			}
+		}()
+		defer func() {
+			cancel()
+			<-sampling
+			if err == nil && samplerErr != nil {
+				err = samplerErr
 			}
 		}()
 	} else {
 		close(sampling)
 	}
-	defer func() {
-		stop(nil)
-		<-sampling
-		if cause := context.Cause(ctx); err == nil && cause != nil && !errors.Is(cause, context.Canceled) {
-			err = cause
-		}
-	}()
 	watcher, err := open()
 	if err != nil {
 		return err
