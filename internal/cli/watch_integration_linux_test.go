@@ -701,3 +701,61 @@ func TestWatchReturnsTheSamplerFailure(t *testing.T) {
 		t.Fatal("watcher kept running after its sampler failed")
 	}
 }
+
+// A stop that arrives while a change reconcile is in flight (here: waiting
+// for the scan lock a cycle holds) is a clean shutdown. Live 2026-11-03: a
+// restart during a settle scan logged "store: begin transaction: context
+// canceled" and systemd recorded the watcher as failed.
+func TestWatchStopDuringReconcileSucceeds(t *testing.T) {
+	f, root, _ := watchFixture(t)
+	sink := &watchSink{reports: make(chan watchReport, 32)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard, lookup: config.MapLookup(f.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "new-clone"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	locked := make(chan func(), 1)
+	watcher := &scriptedWatcher{
+		events: []watchEvent{{Root: root, Name: "new-clone"}},
+		before: func() {
+			release, err := lockScan(context.Background(), paths.StateDir)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			locked <- release
+		},
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(ctx, e, paths, policy, func() (eventWatcher, error) { return watcher, nil }, watchChurnInterval)
+	}()
+	var release func()
+	select {
+	case release = <-locked:
+	case err := <-done:
+		t.Fatalf("watch loop exited before the change: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("startup reconcile never finished")
+	}
+	defer release()
+	// The change reconcile is now waiting for the scan lock.
+	time.Sleep(500 * time.Millisecond)
+	cancel(errors.New("terminated signal received"))
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("stop during reconcile returned %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("watch loop did not stop")
+	}
+}
