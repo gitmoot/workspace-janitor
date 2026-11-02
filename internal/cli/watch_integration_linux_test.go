@@ -529,3 +529,57 @@ func TestWatchBoundsProtectedChurnWithoutLosingRealDirectories(t *testing.T) {
 		t.Fatal("watch did not stop on cancellation")
 	}
 }
+
+// A daily cycle holds the scan lock through apply. The watcher must keep
+// publishing fresh capacity samples meanwhile, even before its own startup
+// reconcile can run (live 2026-11-02: a 12-minute cycle let the sample go
+// stale and Gitmoot refused every new review on a measurement_unknown hold).
+func TestWatchKeepsSamplingCapacityWhileTheScanLockIsHeld(t *testing.T) {
+	f, root, _ := watchFixture(t)
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: false\nprevention:\n  min_free_percent: 0\n  min_free_bytes: 0\n  capacity_interval: 1s\n  targets:\n    - path: "+root+"\n      target_free_bytes: 1\n      reserve_free_bytes: 0\n      recovery_margin_bytes: 0\n")
+	sink := &watchSink{reports: make(chan watchReport, 32)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard, lookup: config.MapLookup(f.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, stderr, code := f.run(t, "scan"); code != ExitOK {
+		t.Fatalf("seed database: %d %s %s", code, out, stderr)
+	}
+	release, err := lockScan(context.Background(), paths.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(ctx, e, paths, policy, func() (eventWatcher, error) { return &scriptedWatcher{}, nil }, watchChurnInterval)
+	}()
+	var stamps []string
+	deadline := time.After(6 * time.Second)
+	for len(stamps) < 2 {
+		select {
+		case report := <-sink.reports:
+			if report.Reason != "capacity" || report.Capacity == nil {
+				t.Fatalf("report while the scan lock is held: %+v", report)
+			}
+			stamp := report.Capacity.SampledAt.String()
+			if len(stamps) == 0 || stamps[len(stamps)-1] != stamp {
+				stamps = append(stamps, stamp)
+			}
+		case err := <-done:
+			t.Fatalf("watch loop exited: %v", err)
+		case <-deadline:
+			t.Fatalf("capacity sampling starved by the scan lock: %d fresh samples", len(stamps))
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/collect"
@@ -80,7 +81,35 @@ type eventWatcher interface {
 }
 
 func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Policy,
-	open func() (eventWatcher, error), churnInterval time.Duration) error {
+	open func() (eventWatcher, error), churnInterval time.Duration) (err error) {
+	// Capacity sampling needs only the database, never the scan lock that a
+	// daily cycle holds through apply. It runs on its own so a long cycle or a
+	// slow reconcile cannot let the published sample go stale (live
+	// 2026-11-02: a 12-minute cycle starved sampling and Gitmoot refused all
+	// new reviews on a measurement_unknown hold). Reports share one writer.
+	ctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+	quiet := *e
+	quiet.stdout = &lockedWriter{w: e.stdout}
+	e = &quiet
+	sampling := make(chan struct{})
+	if len(policy.Prevention.Targets) > 0 {
+		go func() {
+			defer close(sampling)
+			if err := sampleCapacityLoop(ctx, e, paths, policy); err != nil {
+				stop(err)
+			}
+		}()
+	} else {
+		close(sampling)
+	}
+	defer func() {
+		stop(nil)
+		<-sampling
+		if cause := context.Cause(ctx); err == nil && cause != nil && !errors.Is(cause, context.Canceled) {
+			err = cause
+		}
+	}()
 	watcher, err := open()
 	if err != nil {
 		return err
@@ -90,33 +119,18 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 	// queued during reconciliation still expose new, removed or replaced paths.
 	protected := newProtectedWatchDirs(policy)
 	if err := reconcileWatch(ctx, e, paths, policy, "startup", nil, true, 0); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	pendingSettle := map[string]bool{}
 	var settleAt, churnAt time.Time
 	var deferred uint64
-	var capacityAt time.Time
-	if len(policy.Prevention.Targets) > 0 {
-		capacityAt = time.Now().Add(policy.Prevention.CapacityInterval.Duration())
-	}
 	for {
-		if !capacityAt.IsZero() && !time.Now().Before(capacityAt) {
-			now := time.Now().UTC()
-			capacity, err := sampleCapacity(ctx, policy, paths, now, false)
-			if err != nil {
-				return err
-			}
-			if err := writeWatchReport(e, watchReport{Reason: "capacity", Capacity: capacity}); err != nil {
-				return err
-			}
-			capacityAt = now.Add(policy.Prevention.CapacityInterval.Duration())
-		}
 		deadline := settleAt
 		if !churnAt.IsZero() && (deadline.IsZero() || churnAt.Before(deadline)) {
 			deadline = churnAt
-		}
-		if !capacityAt.IsZero() && (deadline.IsZero() || capacityAt.Before(deadline)) {
-			deadline = capacityAt
 		}
 		eventCtx := ctx
 		cancelWait := func() {}
@@ -228,6 +242,46 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 			}
 		}
 	}
+}
+
+// sampleCapacityLoop publishes a capacity sample every capacity interval
+// until ctx ends. sampleCapacity serializes with other samplers in the
+// database and reuses a sample that is still within its interval.
+func sampleCapacityLoop(ctx context.Context, e *env, paths config.Paths, policy config.Policy) error {
+	interval := policy.Prevention.CapacityInterval.Duration()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+		}
+		now := time.Now().UTC()
+		capacity, err := sampleCapacity(ctx, policy, paths, now, false)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if err := writeWatchReport(e, watchReport{Reason: "capacity", Capacity: capacity}); err != nil {
+			return err
+		}
+		timer.Reset(time.Until(now.Add(interval)))
+	}
+}
+
+// lockedWriter serializes whole report lines from concurrent writers.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 // Only explicitly protected directories immediately below a watched root
