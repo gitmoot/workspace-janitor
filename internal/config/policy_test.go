@@ -508,3 +508,34 @@ func TestJevProviderSettingsAreValidated(t *testing.T) {
 		t.Errorf("a key in the policy must be rejected, got %v", err)
 	}
 }
+
+// Standing cache trims are a deletion authority, so anything but the two
+// supported kinds with an absolute binary and positive bound is refused.
+func TestCacheTrimsRejectUnsupportedOrUnbounded(t *testing.T) {
+	paths := fixturePaths(t)
+	_, err := parse(t, paths, `prevention:
+  cache_trims:
+    - kind: go-build
+      path: relative/go-build
+      binary: go
+      max_bytes: 0
+    - kind: docker-builder
+      path: /var/lib/docker
+      binary: /usr/bin/docker
+      max_bytes: 1
+    - kind: docker-images
+      binary: /usr/bin/docker
+      max_bytes: 1
+`)
+	if err == nil {
+		t.Fatal("invalid cache trims were accepted")
+	}
+	for _, field := range []string{"cache_trims[0].path", "cache_trims[0].binary", "cache_trims[0].max_bytes", "cache_trims[1].path", "cache_trims[2].kind"} {
+		if !strings.Contains(err.Error(), field) {
+			t.Errorf("error %q does not identify %s", err, field)
+		}
+	}
+	if _, err := parse(t, paths, "prevention:\n  cache_trims:\n    - kind: go-build\n      path: /root/.cache/go-build\n      binary: /usr/local/go/bin/go\n      max_bytes: 2147483648\n    - kind: docker-builder\n      binary: /usr/bin/docker\n      max_bytes: 2147483648\n"); err != nil {
+		t.Fatalf("valid cache trims rejected: %v", err)
+	}
+}

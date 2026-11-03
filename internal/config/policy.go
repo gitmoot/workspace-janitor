@@ -271,6 +271,27 @@ type Prevention struct {
 	CapacityInterval Duration         `yaml:"capacity_interval" json:"capacity_interval"`
 	Targets          []CapacityTarget `yaml:"targets" json:"targets"`
 	Recovery         RecoveryPolicy   `yaml:"recovery" json:"recovery"`
+	// CacheTrims are owner-approved standing trims of live shared build
+	// caches, run by each cycle with the cache's official command.
+	CacheTrims []CacheTrim `yaml:"cache_trims" json:"cache_trims"`
+}
+
+// Supported cache trim kinds.
+const (
+	CacheTrimGoBuild       = "go-build"
+	CacheTrimDockerBuilder = "docker-builder"
+)
+
+// CacheTrim bounds one live shared build cache. go-build runs
+// `go clean -cache` for Path when its allocated size exceeds MaxBytes and no
+// Go build is running; docker-builder runs `docker builder prune
+// --keep-storage MaxBytes`, which removes only unused build cache and never
+// images, containers or volumes, and only when no image build is running.
+type CacheTrim struct {
+	Kind     string `yaml:"kind" json:"kind"`
+	Path     string `yaml:"path,omitempty" json:"path,omitempty"`
+	Binary   string `yaml:"binary" json:"binary"`
+	MaxBytes int64  `yaml:"max_bytes" json:"max_bytes"`
 }
 
 // CapacityTarget names an inventory root whose filesystem needs headroom.
@@ -537,6 +558,12 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	if p.Retention.QuarantineDir != "" {
 		p.Retention.QuarantineDir = expand("retention.quarantine_dir", p.Retention.QuarantineDir)
 	}
+	for i := range p.Prevention.CacheTrims {
+		if p.Prevention.CacheTrims[i].Path != "" {
+			p.Prevention.CacheTrims[i].Path = expand(fmt.Sprintf("prevention.cache_trims[%d].path", i), p.Prevention.CacheTrims[i].Path)
+		}
+		p.Prevention.CacheTrims[i].Binary = expand(fmt.Sprintf("prevention.cache_trims[%d].binary", i), p.Prevention.CacheTrims[i].Binary)
+	}
 	if p.Collectors.ProcRoot != "" {
 		p.Collectors.ProcRoot = expand("collectors.proc_root", p.Collectors.ProcRoot)
 	}
@@ -745,6 +772,32 @@ func (p *Policy) Validate() core.FieldErrors {
 	}
 	if len(p.Prevention.Targets) > 64 {
 		errs.Add("prevention.targets", "at most 64 roots may have capacity targets")
+	}
+	trimKinds := map[string]bool{}
+	for i, trim := range p.Prevention.CacheTrims {
+		field := fmt.Sprintf("prevention.cache_trims[%d]", i)
+		switch trim.Kind {
+		case CacheTrimGoBuild:
+			if !core.IsCanonicalPath(trim.Path) || trim.Path == "/" {
+				errs.Add(field+".path", "go-build requires the absolute cache directory")
+			}
+		case CacheTrimDockerBuilder:
+			if trim.Path != "" {
+				errs.Add(field+".path", "docker-builder takes no path; Docker owns its build cache location")
+			}
+		default:
+			errs.Add(field+".kind", "must be go-build or docker-builder")
+		}
+		if trimKinds[trim.Kind+"\x00"+trim.Path] {
+			errs.Add(field, "duplicates an earlier cache trim")
+		}
+		trimKinds[trim.Kind+"\x00"+trim.Path] = true
+		if !core.IsCanonicalPath(trim.Binary) {
+			errs.Add(field+".binary", "must be an absolute executable path")
+		}
+		if trim.MaxBytes <= 0 {
+			errs.Add(field+".max_bytes", "must be positive")
+		}
 	}
 	targetPaths := make(map[string]bool, len(p.Prevention.Targets))
 	for i, target := range p.Prevention.Targets {
