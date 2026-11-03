@@ -28,6 +28,7 @@ type cycleReport struct {
 	Recovery         *recoveryReport        `json:"recovery,omitempty"`
 	CategoryArchives *categoryArchiveReport `json:"category_archives,omitempty"`
 	ScratchCleanup   []scratchRunReport     `json:"scratch_cleanup,omitempty"`
+	CacheTrims       []cacheTrimReport      `json:"cache_trims,omitempty"`
 	Inventory        *inventoryReport       `json:"inventory_report"`
 }
 
@@ -153,6 +154,12 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	}
 	// Expiry does not depend on the latest scan; the watcher may resume.
 	releaseScan()
+	// Standing trims of live shared build caches. They need no scan: each
+	// checks for live users at the moment it runs. A failed trim does not
+	// stop expiry; it is reported and fails the cycle at the end.
+	var trimErr error
+	report.CacheTrims, trimErr = runCacheTrims(ctx, policy)
+	categoryErr = errors.Join(categoryErr, trimErr)
 	if policy.Prevention.AutoExpire {
 		// Reuse the interactive path and retain its item-level outcome.
 		var expiryOutput bytes.Buffer

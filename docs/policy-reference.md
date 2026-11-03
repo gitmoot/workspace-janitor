@@ -65,6 +65,39 @@ must enforce their own fresh admission and routing checks. For the 20 GB / 10 GB
 policy, read canonical `target_bytes` for warning/E2B-only routing and
 `reserve_bytes` for the hard floor; remote execution does not exempt local writes.
 
+## Standing cache trims
+
+`prevention.cache_trims` keeps live shared build caches within a bound. Each
+cycle runs every trim once, after its scan and before expiry. This is a
+deletion authority; configure it only with the owner's approval.
+
+| Field | Meaning |
+| --- | --- |
+| `kind` | `go-build` or `docker-builder`; nothing else is accepted. |
+| `path` | `go-build` only: the absolute shared `GOCACHE` directory. |
+| `binary` | Absolute path of the official `go` or `docker` executable. |
+| `max_bytes` | Positive bound. |
+
+- `go-build`: when the cache's allocated size exceeds `max_bytes`, runs
+  `go clean -cache` with that exact `GOCACHE`, `GOTOOLCHAIN=local`,
+  `GOENV=off` and `GOPROXY=off`.
+- `docker-builder`: runs `docker builder prune --force --max-used-space
+  <max_bytes>`. Docker removes only unused build cache, never images,
+  containers or volumes.
+
+Immediately before running, the trim checks the process table
+(`collectors.proc_root`). A Go toolchain command (`go build/test/vet/run/
+install/generate/list/tool/get/mod`, `compile`, `link`, `asm`, `cgo`, `vet`,
+`cover`), or any open handle under the Go cache, postpones the Go trim. An
+image build (`docker build`, `docker buildx build`, `bake`, `buildctl build`)
+postpones the Docker prune. A postponed trim is reported as `skipped_in_use`
+and retried next cycle; it is not an error. A trim command that fails is
+reported and makes the cycle exit non-zero. Results appear as `cache_trims`
+in the cycle report.
+
+Do not also configure a `caches` quarantine rule for a cache that has a
+trim: the quarantine is refused whenever a build writes the cache.
+
 ## Bounded cache recovery
 
 Automatic official pruning is off by default. `prevention.recovery.enabled`
