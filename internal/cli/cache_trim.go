@@ -136,8 +136,9 @@ func trimFilesystem(trim config.CacheTrim) string {
 
 // cacheUsers lists processes that may be using the cache right now: Go
 // toolchain commands for go-build (plus any handle open under the cache), or
-// image builds for Docker. The check is conservative; a false positive only
-// postpones the trim to the next cycle.
+// image builds for Docker. It fails closed: a process that cannot be
+// inspected counts as a possible user. A false positive only postpones the
+// trim to the next cycle.
 func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
@@ -150,14 +151,29 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 			continue
 		}
 		raw, err := os.ReadFile(filepath.Join(procRoot, pid, "cmdline"))
-		if err != nil || len(raw) == 0 {
+		if processGone(err) {
 			continue
+		}
+		if err != nil {
+			users = append(users, fmt.Sprintf("%s (cannot inspect: %v)", pid, err))
+			continue
+		}
+		if len(raw) == 0 {
+			continue // kernel thread or exiting process
 		}
 		argv := strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
 		var busy bool
 		switch trim.Kind {
 		case config.CacheTrimGoBuild:
-			busy = goToolchainBusy(argv) || holdsHandleUnder(filepath.Join(procRoot, pid, "fd"), trim.Path)
+			busy = goToolchainBusy(argv)
+			if !busy {
+				holds, err := holdsHandleUnder(filepath.Join(procRoot, pid, "fd"), trim.Path)
+				if err != nil {
+					users = append(users, fmt.Sprintf("%s (cannot inspect handles: %v)", pid, err))
+					continue
+				}
+				busy = holds
+			}
 		case config.CacheTrimDockerBuilder:
 			busy = dockerBuildBusy(argv)
 		}
@@ -169,20 +185,25 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 	return users
 }
 
+// processGone reports an error that means the process exited while it was
+// being inspected.
+func processGone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH)
+}
+
+// goToolchainBusy reports a Go toolchain process. For the go command any
+// build-like subcommand anywhere in its arguments counts, so global flags
+// such as `-C dir` cannot hide the subcommand.
 func goToolchainBusy(argv []string) bool {
 	switch filepath.Base(argv[0]) {
 	case "compile", "link", "asm", "cgo", "vet", "cover":
 		return true
 	case "go":
 		for _, arg := range argv[1:] {
-			if strings.HasPrefix(arg, "-") {
-				continue
-			}
 			switch arg {
 			case "build", "test", "vet", "run", "install", "generate", "list", "tool", "get", "mod":
 				return true
 			}
-			return false
 		}
 	}
 	return false
@@ -201,18 +222,30 @@ func dockerBuildBusy(argv []string) bool {
 	return false
 }
 
-func holdsHandleUnder(fdDir, root string) bool {
+// holdsHandleUnder reports whether any descriptor in fdDir resolves below
+// root. An unreadable descriptor table or link is an error, not "no".
+func holdsHandleUnder(fdDir, root string) (bool, error) {
 	fds, err := os.ReadDir(fdDir)
+	if processGone(err) {
+		return false, nil
+	}
 	if err != nil {
-		return false
+		return false, err
 	}
 	prefix := filepath.Clean(root) + string(filepath.Separator)
 	for _, fd := range fds {
-		if target, err := os.Readlink(filepath.Join(fdDir, fd.Name())); err == nil && strings.HasPrefix(target, prefix) {
-			return true
+		target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
+		if processGone(err) {
+			continue // descriptor closed meanwhile
+		}
+		if err != nil {
+			return false, err
+		}
+		if strings.HasPrefix(target, prefix) || target == filepath.Clean(root) {
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // allocatedBytes is the allocated size of every regular file below dir.

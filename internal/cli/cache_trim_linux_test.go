@@ -171,3 +171,50 @@ func TestCycleSkipsBuildCachesInLiveUse(t *testing.T) {
 		t.Fatalf("live cache was touched: %v", err)
 	}
 }
+
+// Review of #142: `go -C dir build` must count as a live build, and a process
+// that cannot be inspected must postpone the Go trim instead of allowing it.
+func TestCycleGoTrimFailsClosedOnHiddenOrUninspectableBuilds(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, x *trimFixture)
+	}{
+		{"global -C flag", func(t *testing.T, x *trimFixture) {
+			x.process(t, "300", "/usr/local/go/bin/go", "-C", "/workspace", "build", "./...")
+		}},
+		{"global -C= flag", func(t *testing.T, x *trimFixture) {
+			x.process(t, "301", "/usr/local/go/bin/go", "-C=/workspace", "test", "./...")
+		}},
+		{"unreadable cmdline", func(t *testing.T, x *trimFixture) {
+			// A directory where cmdline should be makes the read fail.
+			if err := os.MkdirAll(filepath.Join(x.proc, "302", "cmdline"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"unreadable descriptor table", func(t *testing.T, x *trimFixture) {
+			x.process(t, "303", "/usr/bin/python3", "worker.py")
+			// A regular file where the fd directory should be.
+			if err := os.WriteFile(filepath.Join(x.proc, "303", "fd"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := newTrimFixture(t)
+			x.fill(t, 1<<20)
+			tc.setup(t, x)
+			goTrim := x.cycle(t)[0]
+			if goTrim.Status != "skipped_in_use" || len(goTrim.ActiveUsers) == 0 {
+				t.Fatalf("go-build trimmed: %+v", goTrim)
+			}
+			for _, call := range x.calls(t) {
+				if strings.HasPrefix(call, "go|") {
+					t.Fatalf("go clean ran: %s", call)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(x.cache, "ab", "obj-d")); err != nil {
+				t.Fatalf("cache was touched: %v", err)
+			}
+		})
+	}
+}
