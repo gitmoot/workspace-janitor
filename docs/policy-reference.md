@@ -75,7 +75,10 @@ manifest, restore command). Once the archive exactly binds the local tree,
 the protection lifts for that tree only and the ordinary quarantine and expiry
 flow removes it. `archive_only` cannot be combined with `report_only`, and no
 explicit `workspace_archives` rule or `prevention.cache_trims` path may overlap
-an archive-only root. Protection follows path containment in any
+an archive-only root (a `docker-builder` trim is checked against
+`/var/lib/docker`). Before running a provider, the cycle and the watcher also
+resolve symlinks in the trim path and in every archive-only root and refuse a
+trim that reaches one. Protection follows path containment in any
 archive-only root, not which root a scan walked from, so an ordinary ancestor
 root cannot bypass it.
 
@@ -89,9 +92,9 @@ root whose base name matches `match`, a pattern with exactly one `*`. The
 leading digits of the text the `*` matches are the version, so
 `admin-v*-work` reads `admin-v0116-reset-r5-work` as 116. Every folder of the
 `keep_newest` highest versions present stays local; older ones are archived.
-This is re-checked against the folders present now before any archived
-version is quarantined or expires, so a version that becomes one of the
-newest (for example after `keep_newest` is raised) stays local.
+This is re-checked before any archived version is quarantined or expires: a
+version counts as kept while fewer than `keep_newest` higher versions are
+present, even if its own folder is already in quarantine.
 Minimum `idle` is `1d`, so a folder written today is still kept. Folders in
 the root that do not match fall under any other category for that root.
 
