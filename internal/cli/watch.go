@@ -36,6 +36,8 @@ type watchReport struct {
 	NextReconcileAt *time.Time             `json:"next_reconcile_at,omitempty"`
 	DiskAlerts      []diskAlert            `json:"disk_alerts,omitempty"`
 	Capacity        *core.CapacitySnapshot `json:"capacity,omitempty"`
+	CacheTrims      []cacheTrimReport      `json:"cache_trims,omitempty"`
+	Error           string                 `json:"error,omitempty"`
 }
 
 type watchGuidance struct {
@@ -131,6 +133,18 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		}()
 	} else {
 		close(sampling)
+	}
+	if len(policy.Prevention.CacheTrims) > 0 {
+		trimCtx, stopTrims := context.WithCancel(ctx)
+		trimming := make(chan struct{})
+		go func() {
+			defer close(trimming)
+			cacheTrimLoop(trimCtx, e, paths, policy)
+		}()
+		defer func() {
+			stopTrims()
+			<-trimming
+		}()
 	}
 	watcher, err := open()
 	if err != nil {

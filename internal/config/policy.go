@@ -274,6 +274,9 @@ type Prevention struct {
 	// CacheTrims are owner-approved standing trims of live shared build
 	// caches, run by each cycle with the cache's official command.
 	CacheTrims []CacheTrim `yaml:"cache_trims" json:"cache_trims"`
+	// CacheTrimInterval is how often the watcher re-checks the cache trims
+	// between daily cycles. Each check trims only a cache over its bound.
+	CacheTrimInterval Duration `yaml:"cache_trim_interval" json:"cache_trim_interval"`
 }
 
 // Supported cache trim kinds.
@@ -432,11 +435,12 @@ func DefaultPolicy(p Paths) Policy {
 			DependentIndexMaxEntries: 5000000,
 		},
 		Prevention: Prevention{
-			DeepInterval:     Duration(7 * 24 * time.Hour),
-			MinFreePercent:   10,
-			AlertInterval:    Duration(24 * time.Hour),
-			CapacityInterval: Duration(time.Minute),
-			Recovery:         RecoveryPolicy{MaxStores: 1, MaxBytes: 1 << 30, Interval: Duration(24 * time.Hour), TimeBudget: Duration(time.Minute)},
+			DeepInterval:      Duration(7 * 24 * time.Hour),
+			MinFreePercent:    10,
+			AlertInterval:     Duration(24 * time.Hour),
+			CapacityInterval:  Duration(time.Minute),
+			CacheTrimInterval: Duration(15 * time.Minute),
+			Recovery:          RecoveryPolicy{MaxStores: 1, MaxBytes: 1 << 30, Interval: Duration(24 * time.Hour), TimeBudget: Duration(time.Minute)},
 		},
 		Report:   defaultStaleReport(),
 		Source:   "built-in defaults",
@@ -766,6 +770,9 @@ func (p *Policy) Validate() core.FieldErrors {
 	}
 	if p.Prevention.AlertInterval.Duration() <= 0 {
 		errs.Add("prevention.alert_interval", "must be greater than zero")
+	}
+	if p.Prevention.CacheTrimInterval.Duration() < time.Minute || p.Prevention.CacheTrimInterval.Duration() > 2*time.Hour {
+		errs.Add("prevention.cache_trim_interval", "must be between 1m and 2h")
 	}
 	if p.Prevention.CapacityInterval.Duration() < time.Second || p.Prevention.CapacityInterval.Duration() > time.Hour {
 		errs.Add("prevention.capacity_interval", "must be between 1s and 1h")
