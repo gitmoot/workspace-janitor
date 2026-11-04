@@ -5,6 +5,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -330,5 +331,46 @@ func TestWatchTrimSkipsWhileAnotherTrimRuns(t *testing.T) {
 	}
 	if calls := x.calls(t); len(calls) != 0 {
 		t.Fatalf("official commands ran concurrently: %v", calls)
+	}
+}
+
+// trimReportFailer accepts every report except a cache_trim one, as if the
+// output filled up exactly when a trim reported its deletion.
+type trimReportFailer struct{}
+
+func (trimReportFailer) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), `"reason":"cache_trim"`) {
+		return 0, errors.New("file too large")
+	}
+	return len(p), nil
+}
+
+// A trim that deleted bytes must not lose its only report while the watcher
+// stays healthy: the write failure ends the watcher with that error.
+func TestWatchFailsWhenATrimReportCannotBeWritten(t *testing.T) {
+	x := newTrimFixture(t)
+	x.fill(t, 1<<20)
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n    - kind: go-build\n      path: %s\n      binary: %s\n      max_bytes: 65536\n", x.root, x.proc, x.cache, x.gobin))
+	e := &env{opts: &globalOpts{format: "json"}, stdout: trimReportFailer{}, stderr: io.Discard, lookup: config.MapLookup(x.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.Prevention.CacheTrimInterval = config.Duration(200 * time.Millisecond)
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(context.Background(), e, paths, policy, func() (eventWatcher, error) { return &scriptedWatcher{}, nil }, watchChurnInterval)
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "file too large") {
+			t.Fatalf("lost trim report not returned: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("watcher kept running after losing a trim report")
 	}
 }

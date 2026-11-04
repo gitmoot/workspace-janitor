@@ -20,28 +20,31 @@ import (
 // cacheTrimLoop re-runs the standing cache trims every cache_trim_interval
 // between daily cycles, so a busy shared cache cannot regrow to the disk
 // floor. Each run trims only a cache over its bound with no live user. A
-// failed trim is reported and retried next interval; it never stops the
-// watcher.
-func cacheTrimLoop(ctx context.Context, e *env, paths config.Paths, policy config.Policy) {
+// failed trim command is reported and retried next interval. A report that
+// cannot be written is returned: a trim that deleted bytes must not lose its
+// only record while the watcher looks healthy.
+func cacheTrimLoop(ctx context.Context, e *env, paths config.Paths, policy config.Policy) error {
 	interval := policy.Prevention.CacheTrimInterval.Duration()
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-timer.C:
 		}
 		reports, err := runCacheTrims(ctx, policy, paths.StateDir)
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
 		report := watchReport{Reason: "cache_trim", CacheTrims: reports}
 		if err != nil {
 			report.Error = err.Error()
 		}
 		if acted(reports) || err != nil {
-			_ = writeWatchReport(e, report)
+			if writeErr := writeWatchReport(e, report); writeErr != nil {
+				return fmt.Errorf("cache trim report: %w", writeErr)
+			}
 		}
 		timer.Reset(interval)
 	}
