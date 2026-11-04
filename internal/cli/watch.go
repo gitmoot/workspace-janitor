@@ -36,6 +36,8 @@ type watchReport struct {
 	NextReconcileAt *time.Time             `json:"next_reconcile_at,omitempty"`
 	DiskAlerts      []diskAlert            `json:"disk_alerts,omitempty"`
 	Capacity        *core.CapacitySnapshot `json:"capacity,omitempty"`
+	CacheTrims      []cacheTrimReport      `json:"cache_trims,omitempty"`
+	Error           string                 `json:"error,omitempty"`
 }
 
 type watchGuidance struct {
@@ -131,6 +133,27 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		}()
 	} else {
 		close(sampling)
+	}
+	if len(policy.Prevention.CacheTrims) > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		trimming := make(chan struct{})
+		// Like a sampler failure, a lost trim report ends the watcher with
+		// that error instead of a clean exit.
+		var trimErr error
+		go func() {
+			defer close(trimming)
+			if trimErr = cacheTrimLoop(ctx, e, paths, policy); trimErr != nil {
+				cancel()
+			}
+		}()
+		defer func() {
+			cancel()
+			<-trimming
+			if err == nil && trimErr != nil {
+				err = trimErr
+			}
+		}()
 	}
 	watcher, err := open()
 	if err != nil {

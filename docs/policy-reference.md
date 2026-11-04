@@ -92,7 +92,14 @@ the root that do not match fall under any other category for that root.
 ## Standing cache trims
 
 `prevention.cache_trims` keeps live shared build caches within a bound. Each
-cycle runs every trim once, after its scan and before expiry. This is a
+cycle runs every trim once, after its scan and before expiry, and the watcher
+re-runs them every `prevention.cache_trim_interval` (default `15m`, accepted
+`1m` through `2h`) so a busy cache cannot regrow to the disk floor between
+cycles. A run trims only a cache over its bound. The cycle and the watcher
+share a lock (`trim.lock` in the state directory); a run that finds another
+trim in progress is reported as `skipped_trim_running`. The watcher emits a
+`cache_trim` report only when a trim acted, was skipped or failed; a failed
+trim is retried next interval and never stops the watcher. This is a
 deletion authority; configure it only with the owner's approval.
 
 | Field | Meaning |

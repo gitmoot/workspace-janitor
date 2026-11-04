@@ -158,7 +158,7 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	// checks for live users at the moment it runs. A failed trim does not
 	// stop expiry; it is reported and fails the cycle at the end.
 	var trimErr error
-	report.CacheTrims, trimErr = runCacheTrims(ctx, policy)
+	report.CacheTrims, trimErr = runCacheTrims(ctx, policy, paths.StateDir)
 	categoryErr = errors.Join(categoryErr, trimErr)
 	if policy.Prevention.AutoExpire {
 		// Reuse the interactive path and retain its item-level outcome.

@@ -3,12 +3,18 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/gitmoot/workspace-janitor/internal/config"
 )
 
 // trimFixture runs the real `janitor cycle` with fake go and docker binaries
@@ -216,5 +222,155 @@ func TestCycleGoTrimFailsClosedOnHiddenOrUninspectableBuilds(t *testing.T) {
 				t.Fatalf("cache was touched: %v", err)
 			}
 		})
+	}
+}
+
+// watchTrims runs the real watcher loop with the trim fixture's policy and a
+// short trim interval, and returns the first cache_trim report.
+func (x *trimFixture) watchTrims(t *testing.T) []trimResult {
+	t.Helper()
+	x.writePolicy(t, fmt.Sprintf(`roots:
+  - path: %s
+collectors:
+  deep_size: false
+  git: false
+  processes: false
+  services: false
+  proc_root: %s
+prevention:
+  min_free_percent: 0
+  cache_trims:
+    - kind: go-build
+      path: %s
+      binary: %s
+      max_bytes: 65536
+    - kind: docker-builder
+      binary: %s
+      max_bytes: 2147483648
+`, x.root, x.proc, x.cache, x.gobin, x.dockerbin))
+	sink := &watchSink{reports: make(chan watchReport, 32)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard, lookup: config.MapLookup(x.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.Prevention.CacheTrimInterval = config.Duration(200 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(ctx, e, paths, policy, func() (eventWatcher, error) { return &scriptedWatcher{}, nil }, watchChurnInterval)
+	}()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case report := <-sink.reports:
+			if report.Reason != "cache_trim" {
+				continue
+			}
+			raw, err := json.Marshal(report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded struct {
+				CacheTrims []trimResult `json:"cache_trims"`
+			}
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatalf("watch loop: %v", err)
+			}
+			return decoded.CacheTrims
+		case err := <-done:
+			t.Fatalf("watch loop exited: %v", err)
+		case <-deadline:
+			t.Fatal("watcher never ran the cache trims")
+		}
+	}
+}
+
+// Between daily cycles the watcher trims an oversized shared Go cache on its
+// own interval (owner 394189: the cache regrows ~1 GB/h).
+func TestWatchTrimsOversizedBuildCachesBetweenCycles(t *testing.T) {
+	x := newTrimFixture(t)
+	x.fill(t, 1<<20)
+	trims := x.watchTrims(t)
+	if len(trims) != 2 || trims[0].Status != "trimmed" {
+		t.Fatalf("watcher did not trim the oversized cache: %+v", trims)
+	}
+	if _, err := os.Stat(filepath.Join(x.cache, "ab", "obj-d")); !os.IsNotExist(err) {
+		t.Fatalf("cache payload survived the watcher trim: %v", err)
+	}
+}
+
+// A trim already running elsewhere (the daily cycle) makes the watcher's
+// attempt a reported no-op: two official trims never run at once.
+func TestWatchTrimSkipsWhileAnotherTrimRuns(t *testing.T) {
+	x := newTrimFixture(t)
+	x.fill(t, 1<<20)
+	paths, err := config.ResolvePaths(config.MapLookup(x.env), config.Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, held, err := tryLockTrim(paths.StateDir)
+	if err != nil || !held {
+		t.Fatalf("could not hold the trim lock: %v %v", held, err)
+	}
+	defer release()
+	trims := x.watchTrims(t)
+	for _, trim := range trims {
+		if trim.Status != "skipped_trim_running" {
+			t.Fatalf("trim ran while another held the lock: %+v", trim)
+		}
+	}
+	if calls := x.calls(t); len(calls) != 0 {
+		t.Fatalf("official commands ran concurrently: %v", calls)
+	}
+}
+
+// trimReportFailer accepts every report except a cache_trim one, as if the
+// output filled up exactly when a trim reported its deletion.
+type trimReportFailer struct{}
+
+func (trimReportFailer) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), `"reason":"cache_trim"`) {
+		return 0, errors.New("file too large")
+	}
+	return len(p), nil
+}
+
+// A trim that deleted bytes must not lose its only report while the watcher
+// stays healthy: the write failure ends the watcher with that error.
+func TestWatchFailsWhenATrimReportCannotBeWritten(t *testing.T) {
+	x := newTrimFixture(t)
+	x.fill(t, 1<<20)
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n    - kind: go-build\n      path: %s\n      binary: %s\n      max_bytes: 65536\n", x.root, x.proc, x.cache, x.gobin))
+	e := &env{opts: &globalOpts{format: "json"}, stdout: trimReportFailer{}, stderr: io.Discard, lookup: config.MapLookup(x.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.Prevention.CacheTrimInterval = config.Duration(200 * time.Millisecond)
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(context.Background(), e, paths, policy, func() (eventWatcher, error) { return &scriptedWatcher{}, nil }, watchChurnInterval)
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "file too large") {
+			t.Fatalf("lost trim report not returned: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("watcher kept running after losing a trim report")
 	}
 }
