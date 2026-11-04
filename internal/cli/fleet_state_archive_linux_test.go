@@ -193,8 +193,19 @@ func TestArchiveOnlyRootBlocksOrdinaryCleanupUntilArchived(t *testing.T) {
 	x := newFleetStateFixture(t)
 	idle := filepath.Join(x.state, "old-run")
 	x.folder(t, idle, 20*24*time.Hour, map[string]string{"out.txt": "ok"})
+	// An ordinary cache rule that would quarantine the folder on sight.
+	cache := filepath.Join(x.state, "old-cache")
+	x.folder(t, cache, 20*24*time.Hour, map[string]string{"blob": "cached"})
 	x.policy(t)
+	s, err := os.ReadFile(filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, strings.Replace(string(s), "retention:\n", "caches:\n  - name: state-cache\n    path: "+cache+"\n    action: quarantine\n    retention: none\nretention:\n", 1))
 	x.source = idle
+	if _, action := x.action(t, cache); action.Kind == core.ActionQuarantine || action.Kind == core.ActionDeleteCandidate {
+		t.Fatalf("cache rule acted on an archive_only entry: %+v", action)
+	}
 	if _, action := x.action(t, idle); action.Kind == core.ActionQuarantine || action.Kind == core.ActionDeleteCandidate {
 		t.Fatalf("archive_only entry proposed for cleanup before archiving: %+v", action)
 	}
