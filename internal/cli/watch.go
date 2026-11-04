@@ -118,12 +118,14 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		// A sampler failure is recorded here, apart from the parent context,
 		// so a normal signal-driven shutdown keeps its successful exit status.
 		var samplerErr error
-		go func() {
+		// The goroutine gets its own copy of ctx: watchLoop reassigns the
+		// variable below when it starts the trim loop.
+		go func(ctx context.Context) {
 			defer close(sampling)
 			if samplerErr = sampleCapacityLoop(ctx, e, paths, policy); samplerErr != nil {
 				cancel()
 			}
-		}()
+		}(ctx)
 		defer func() {
 			cancel()
 			<-sampling
@@ -141,12 +143,12 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		// Like a sampler failure, a lost trim report ends the watcher with
 		// that error instead of a clean exit.
 		var trimErr error
-		go func() {
+		go func(ctx context.Context) {
 			defer close(trimming)
 			if trimErr = cacheTrimLoop(ctx, e, paths, policy); trimErr != nil {
 				cancel()
 			}
-		}()
+		}(ctx)
 		defer func() {
 			cancel()
 			<-trimming
