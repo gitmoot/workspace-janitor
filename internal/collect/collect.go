@@ -49,6 +49,7 @@ type RootSpec struct {
 	FollowSymlinks  bool
 	CrossFilesystem bool
 	ReportOnly      bool
+	ArchiveOnly     bool
 	// Only, when set, restricts the returned entries to these exact paths
 	// directly inside Path; it requires MaxDepth 1. The root is still listed
 	// and every child is still lstat'd under the same bounds, so the

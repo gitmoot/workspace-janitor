@@ -68,6 +68,10 @@ type Root struct {
 	FollowSymlinks  bool   `yaml:"follow_symlinks" json:"follow_symlinks"`
 	CrossFilesystem bool   `yaml:"cross_filesystem" json:"cross_filesystem"`
 	ReportOnly      bool   `yaml:"report_only" json:"report_only"`
+	// ArchiveOnly is report-only for every ordinary rule, but lets an
+	// owner-approved archive category archive a direct child with a verified
+	// copy, then quarantine and expire exactly that archived tree.
+	ArchiveOnly bool `yaml:"archive_only" json:"archive_only"`
 }
 
 // Protect lists paths and name patterns that may never be mutated.
@@ -665,6 +669,9 @@ func (p *Policy) Validate() core.FieldErrors {
 		}
 		if root.MaxDepth < 0 {
 			errs.Add(field+".max_depth", "must not be negative, got %d", root.MaxDepth)
+		}
+		if root.ArchiveOnly && root.ReportOnly {
+			errs.Add(field+".archive_only", "cannot be combined with report_only; archive_only is already report-only for every ordinary rule")
 		}
 		if root.MaxDepth > 64 {
 			errs.Add(field+".max_depth", "must be at most 64, got %d", root.MaxDepth)

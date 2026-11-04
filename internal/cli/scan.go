@@ -70,6 +70,7 @@ type scanRootRef struct {
 	FollowSymlinks  bool   `json:"follow_symlinks"`
 	CrossFilesystem bool   `json:"cross_filesystem"`
 	ReportOnly      bool   `json:"report_only"`
+	ArchiveOnly     bool   `json:"archive_only,omitempty"`
 }
 
 // runScan collects the inventory for the configured or requested roots.
@@ -287,6 +288,7 @@ func rootSpec(root config.Root, opts scanOptions) collect.RootSpec {
 		FollowSymlinks:  root.FollowSymlinks,
 		CrossFilesystem: root.CrossFilesystem,
 		ReportOnly:      root.ReportOnly,
+		ArchiveOnly:     root.ArchiveOnly,
 	}
 }
 
@@ -374,6 +376,7 @@ func rootRefs(roots []collect.RootSpec) []scanRootRef {
 			FollowSymlinks:  root.FollowSymlinks,
 			CrossFilesystem: root.CrossFilesystem,
 			ReportOnly:      root.ReportOnly,
+			ArchiveOnly:     root.ArchiveOnly,
 		})
 	}
 	sort.SliceStable(refs, func(i, j int) bool { return refs[i].Path < refs[j].Path })

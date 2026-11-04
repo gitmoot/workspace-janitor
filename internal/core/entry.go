@@ -99,6 +99,10 @@ const (
 	ProtectCrossFilesystem    ProtectionKind = "cross_filesystem"
 	ProtectCollectorFailure   ProtectionKind = "collector_failure"
 	ProtectPolicyProtected    ProtectionKind = "policy_protected"
+	// ProtectArchiveOnlyRoot marks an entry of an archive_only root: no
+	// ordinary cleanup may act on it; only an owner-approved archive category
+	// may, and only once its verified archive exactly binds the entry.
+	ProtectArchiveOnlyRoot ProtectionKind = "archive_only_root"
 )
 
 var protectionKinds = []ProtectionKind{
@@ -106,7 +110,7 @@ var protectionKinds = []ProtectionKind{
 	ProtectStashedWork, ProtectUnpublishedCommits, ProtectBrokenGitMetadata, ProtectLockHeld,
 	ProtectServiceReference, ProtectSensitiveContent, ProtectLiveDatabase, ProtectDurableEvidence,
 	ProtectSymlinkEscape, ProtectIdentityChanged, ProtectInsufficientSpace, ProtectCrossFilesystem,
-	ProtectCollectorFailure, ProtectPolicyProtected,
+	ProtectCollectorFailure, ProtectPolicyProtected, ProtectArchiveOnlyRoot,
 }
 
 // ProtectionKinds returns every protection kind in the contract. The safety

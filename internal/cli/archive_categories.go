@@ -219,6 +219,11 @@ func categoryRefusals(policy config.Policy, category config.WorkspaceArchiveCate
 	seen := map[string]bool{}
 	gitRefused := false
 	for _, protection := range verdict.Protections {
+		if protection.Kind == core.ProtectArchiveOnlyRoot && slices.Contains(category.Roots, filepath.Dir(entry.Path)) {
+			// The owner approved this category for its archive_only root;
+			// every other protection still refuses.
+			continue
+		}
 		gitRefused = gitRefused || protection.Source == core.SourceGit
 		reason := fmt.Sprintf("%s: %s", protection.Kind, protection.Reason)
 		if !seen[reason] {
@@ -240,6 +245,38 @@ func categoryRefusals(policy config.Policy, category config.WorkspaceArchiveCate
 		out = append(out, "newest modification in the tree is unknown; the bounded deep walk did not finish")
 	case idle < category.Idle.Duration():
 		out = append(out, fmt.Sprintf("changed %s ago; %s requires %s idle", idle.Truncate(time.Second), category.Kind, category.Idle))
+	}
+	return out
+}
+
+// versionedKeeps returns, per versioned_work category, the KeepNewest highest
+// versions present among the plain directories directly inside its roots.
+// Every folder of a kept version stays local.
+func versionedKeeps(policy config.Policy, entries []core.Entry) map[string]map[int64]bool {
+	out := map[string]map[int64]bool{}
+	for _, category := range policy.WorkspaceArchiveCategories {
+		if category.Kind != config.CategoryVersionedWork {
+			continue
+		}
+		seen := map[int64]bool{}
+		for _, entry := range entries {
+			if kind, _ := categoryKindOf(entry); kind != config.CategoryRootScratch || !slices.Contains(category.Roots, filepath.Dir(entry.Path)) {
+				continue
+			}
+			if version, ok := category.Version(filepath.Base(entry.Path)); ok {
+				seen[version] = true
+			}
+		}
+		versions := make([]int64, 0, len(seen))
+		for version := range seen {
+			versions = append(versions, version)
+		}
+		slices.Sort(versions)
+		kept := map[int64]bool{}
+		for i := len(versions) - 1; i >= 0 && len(kept) < category.KeepNewest; i-- {
+			kept[versions[i]] = true
+		}
+		out[category.Name] = kept
 	}
 	return out
 }
@@ -354,6 +391,7 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 		category config.WorkspaceArchiveCategory
 		release  *store.ReportReply
 	}
+	keptVersions := versionedKeeps(policy, observed.Entries)
 	queues := map[string][]pending{}
 	for _, entry := range observed.Entries {
 		parent := filepath.Dir(entry.Path)
@@ -379,8 +417,18 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			if len(matching) == 0 {
 				continue
 			}
+			// A versioned_work pattern is more specific than root_scratch
+			// for the same plain directory, so it is matched first.
+			if kind == config.CategoryRootScratch {
+				for i := range matching {
+					if _, ok := matching[i].Version(filepath.Base(entry.Path)); ok && matching[i].Kind == config.CategoryVersionedWork {
+						category, kind = &matching[i], config.CategoryVersionedWork
+						break
+					}
+				}
+			}
 			for i := range matching {
-				if kind != "" && matching[i].Kind == kind {
+				if category == nil && kind != "" && matching[i].Kind == kind {
 					category = &matching[i]
 					break
 				}
@@ -401,6 +449,14 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			continue
 		}
 		item.Category, item.Kind = category.Name, string(category.Kind)
+		if category.Kind == config.CategoryVersionedWork {
+			version, _ := category.Version(filepath.Base(entry.Path))
+			if keptVersions[category.Name][version] {
+				item.Reasons = []string{fmt.Sprintf("version %d is among the %d newest versions, which are kept", version, category.KeepNewest)}
+				report.Items = append(report.Items, item)
+				continue
+			}
+		}
 		if record, ok := recorded[entry.Path]; ok && record.Unchanged(entry.LatestModifiedAt) {
 			item.Status, item.Name = categoryAlreadyArchived, record.Name
 			follow := "its local retention and quarantine follow that archive"

@@ -539,3 +539,41 @@ func TestCacheTrimsRejectUnsupportedOrUnbounded(t *testing.T) {
 		t.Fatalf("valid cache trims rejected: %v", err)
 	}
 }
+
+// versioned_work needs a one-star base-name pattern and a keep count;
+// archive_only cannot be combined with report_only.
+func TestVersionedWorkAndArchiveOnlyValidation(t *testing.T) {
+	paths := fixturePaths(t)
+	_, err := parse(t, paths, `roots:
+  - path: /srv/state
+    archive_only: true
+    report_only: true
+workspace_archive_categories:
+  - name: bad
+    kind: versioned_work
+    roots: [/srv/state]
+    match: "admin-*-v*"
+    keep_newest: 0
+    archive:
+      directory: /mnt/archive
+`)
+	if err == nil {
+		t.Fatal("invalid versioned_work/archive_only accepted")
+	}
+	for _, field := range []string{"roots[0].archive_only", ".match", ".keep_newest"} {
+		if !strings.Contains(err.Error(), field) {
+			t.Errorf("error %q does not identify %s", err, field)
+		}
+	}
+	c := WorkspaceArchiveCategory{Kind: CategoryVersionedWork, Match: "admin-v*-work", KeepNewest: 3}
+	for name, want := range map[string]int64{"admin-v0116-work": 116, "admin-v0116-reset-r5-work": 116, "admin-v0130-work": 130} {
+		if got, ok := c.Version(name); !ok || got != want {
+			t.Errorf("Version(%q) = %d %v, want %d", name, got, ok, want)
+		}
+	}
+	for _, name := range []string{"enrollment-work", "admin-vX-work", "admin-v0116"} {
+		if _, ok := c.Version(name); ok {
+			t.Errorf("Version(%q) matched", name)
+		}
+	}
+}

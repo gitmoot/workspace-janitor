@@ -174,6 +174,9 @@ func (p *Policy) validateWorkspaceArchiveSource(errs *core.FieldErrors, index in
 		if root.ReportOnly && core.PathsOverlap(rule.Path, root.Path) {
 			errs.Add(field+".path", "overlaps report_only root %q", root.Path)
 		}
+		if root.ArchiveOnly && core.PathsOverlap(rule.Path, root.Path) {
+			errs.Add(field+".path", "overlaps archive_only root %q; only workspace_archive_categories may archive there", root.Path)
+		}
 	}
 	if !inRoot {
 		errs.Add(field+".path", "must be inside a configured inventory root")
