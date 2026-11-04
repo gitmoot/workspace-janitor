@@ -90,10 +90,18 @@ const (
 	CategoryPushedClones WorkspaceArchiveCategoryKind = "pushed_clones"
 	// CategoryRootScratch selects non-Git directories directly inside a root.
 	CategoryRootScratch WorkspaceArchiveCategoryKind = "root_scratch"
+	// CategoryVersionedWork selects non-Git directories directly inside a
+	// root whose names match Match and whose version is older than the
+	// KeepNewest newest versions present (owner, 2026-11-04: Mac admin work
+	// folders beyond the 3 newest versions).
+	CategoryVersionedWork WorkspaceArchiveCategoryKind = "versioned_work"
 )
 
 // DefaultIdle is the idle period used when a category sets none.
 func (k WorkspaceArchiveCategoryKind) DefaultIdle() time.Duration {
+	if k == CategoryVersionedWork {
+		return day
+	}
 	if k == CategoryMergedWorktrees {
 		return 14 * 24 * time.Hour
 	}
@@ -103,6 +111,11 @@ func (k WorkspaceArchiveCategoryKind) DefaultIdle() time.Duration {
 // MinIdle is the shortest idle period the owner approved for the kind
 // (owner, 2026-10-29: merged worktrees 7d, other kinds 14d).
 func (k WorkspaceArchiveCategoryKind) MinIdle() time.Duration {
+	// Versioned work is selected by version, not age; one quiet day still
+	// keeps a folder that is being written right now.
+	if k == CategoryVersionedWork {
+		return day
+	}
 	if k == CategoryMergedWorktrees {
 		return 7 * 24 * time.Hour
 	}
@@ -112,7 +125,7 @@ func (k WorkspaceArchiveCategoryKind) MinIdle() time.Duration {
 // Valid reports whether k is a known category kind.
 func (k WorkspaceArchiveCategoryKind) Valid() bool {
 	switch k {
-	case CategoryMergedWorktrees, CategoryPushedClones, CategoryRootScratch:
+	case CategoryMergedWorktrees, CategoryPushedClones, CategoryRootScratch, CategoryVersionedWork:
 		return true
 	}
 	return false
@@ -145,6 +158,31 @@ type WorkspaceArchiveCategory struct {
 	LocalRetention   core.Retention `yaml:"local_retention" json:"local_retention"`
 	MaxItemsPerCycle int            `yaml:"max_items_per_cycle" json:"max_items_per_cycle"`
 	MaxBytesPerItem  int64          `yaml:"max_bytes_per_item" json:"max_bytes_per_item"`
+	// Match and KeepNewest apply to versioned_work only. Match is a base-name
+	// glob with exactly one '*'; the leading digits of the text it matches
+	// are the version (admin-v*-work: "admin-v0116-reset-r5-work" is 116).
+	// Every folder of the KeepNewest highest versions is kept.
+	Match      string `yaml:"match,omitempty" json:"match,omitempty"`
+	KeepNewest int    `yaml:"keep_newest,omitempty" json:"keep_newest,omitempty"`
+}
+
+// Version returns the version a versioned_work Match assigns to name, and
+// whether name matches with a numeric version at all.
+func (c WorkspaceArchiveCategory) Version(name string) (int64, bool) {
+	prefix, suffix, ok := strings.Cut(c.Match, "*")
+	if !ok || len(name) < len(prefix)+len(suffix) || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+		return 0, false
+	}
+	middle := name[len(prefix) : len(name)-len(suffix)]
+	digits := 0
+	for digits < len(middle) && middle[digits] >= '0' && middle[digits] <= '9' {
+		digits++
+	}
+	if digits == 0 || digits > 18 {
+		return 0, false
+	}
+	version, err := strconv.ParseInt(middle[:digits], 10, 64)
+	return version, err == nil
 }
 
 // WorkspaceArchiveCategoryDestination is the category's archive directory.
@@ -306,9 +344,19 @@ func (p *Policy) validateWorkspaceArchiveCategories(errs *core.FieldErrors) {
 			names[category.Name] = i
 		}
 		if !category.Kind.Valid() {
-			errs.Add(field+".kind", "must be merged_worktrees, pushed_clones or root_scratch, got %q", category.Kind)
+			errs.Add(field+".kind", "must be merged_worktrees, pushed_clones, root_scratch or versioned_work, got %q", category.Kind)
 		} else if category.Idle.Duration() < category.Kind.MinIdle() {
 			errs.Add(field+".idle", "must be at least %s for %s, got %s", IdleDuration(category.Kind.MinIdle()), category.Kind, category.Idle)
+		}
+		if category.Kind == CategoryVersionedWork {
+			if strings.Count(category.Match, "*") != 1 || strings.ContainsAny(category.Match, "/?[\\") || category.Match == "*" {
+				errs.Add(field+".match", "must be a base-name pattern with exactly one '*' and a fixed prefix or suffix, got %q", category.Match)
+			}
+			if category.KeepNewest < 1 || category.KeepNewest > 100 {
+				errs.Add(field+".keep_newest", "must be between 1 and 100, got %d", category.KeepNewest)
+			}
+		} else if category.Match != "" || category.KeepNewest != 0 {
+			errs.Add(field, "match and keep_newest apply to versioned_work only")
 		}
 		if len(category.Roots) == 0 {
 			errs.Add(field+".roots", "must name at least one configured inventory root")

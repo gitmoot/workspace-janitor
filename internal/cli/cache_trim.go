@@ -34,17 +34,19 @@ func cacheTrimLoop(ctx context.Context, e *env, paths config.Paths, policy confi
 		case <-timer.C:
 		}
 		reports, err := runCacheTrims(ctx, policy, paths.StateDir)
-		if ctx.Err() != nil {
-			return nil
-		}
+		// Report before honouring cancellation: an earlier trim in this run
+		// may already have deleted bytes.
 		report := watchReport{Reason: "cache_trim", CacheTrims: reports}
-		if err != nil {
+		if err != nil && ctx.Err() == nil {
 			report.Error = err.Error()
 		}
-		if acted(reports) || err != nil {
+		if acted(reports) || report.Error != "" {
 			if writeErr := writeWatchReport(e, report); writeErr != nil {
 				return fmt.Errorf("cache trim report: %w", writeErr)
 			}
+		}
+		if ctx.Err() != nil {
+			return nil
 		}
 		timer.Reset(interval)
 	}
@@ -111,7 +113,22 @@ func runCacheTrims(ctx context.Context, policy config.Policy, stateDir string) (
 	var reports []cacheTrimReport
 	var errs []error
 	for _, trim := range policy.Prevention.CacheTrims {
+		// Validation refuses a lexical overlap; this also resolves symlinks,
+		// and the provider then runs on the resolved path it checked.
+		written := trim.Path
+		if trim.Path != "" {
+			if resolved, err := filepath.EvalSymlinks(trim.Path); err == nil {
+				trim.Path = resolved
+			}
+		}
+		if refusal := archiveOnlyTrimRefusal(ctx, &policy, trim); refusal != "" {
+			reports = append(reports, cacheTrimReport{Kind: trim.Kind, Path: written, MaxBytes: trim.MaxBytes,
+				Status: cacheTrimFailed, Error: refusal})
+			errs = append(errs, fmt.Errorf("cache trim %s %s: %s", trim.Kind, written, refusal))
+			continue
+		}
 		report := trimCache(ctx, policy.Collectors.ProcRoot, trim)
+		report.Path = written
 		if report.Status == cacheTrimFailed {
 			errs = append(errs, fmt.Errorf("cache trim %s %s: %s", trim.Kind, trim.Path, report.Error))
 		}
@@ -156,7 +173,7 @@ func trimCache(ctx context.Context, procRoot string, trim config.CacheTrim) cach
 		// Docker enforces the bound itself and removes only unused build
 		// cache: never images, containers or volumes.
 		args = []string{"builder", "prune", "--force", "--max-used-space", strconv.FormatInt(trim.MaxBytes, 10)}
-		env = []string{"HOME=" + os.Getenv("HOME"), "PATH=/usr/bin:/bin"}
+		env = dockerEnv()
 	default:
 		return fail(fmt.Errorf("unsupported cache trim kind %q", trim.Kind))
 	}
@@ -188,10 +205,7 @@ func trimCache(ctx context.Context, procRoot string, trim config.CacheTrim) cach
 }
 
 func trimFilesystem(trim config.CacheTrim) string {
-	if trim.Path != "" {
-		return trim.Path
-	}
-	return "/var/lib/docker"
+	return trim.TrimTarget()
 }
 
 // cacheUsers lists processes that may be using the cache right now: Go
@@ -354,4 +368,52 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// archiveOnlyTrimRefusal says why trim may not run because its physical
+// target is, or cannot be shown not to be, inside an archive_only root. A
+// docker-builder trim is checked against the data root the daemon reports,
+// not only the default one.
+func archiveOnlyTrimRefusal(ctx context.Context, policy *config.Policy, trim config.CacheTrim) string {
+	targets := []string{trim.TrimTarget()}
+	if trim.Kind == config.CacheTrimDockerBuilder {
+		root, err := dockerDataRoot(ctx, trim.Binary)
+		if err != nil {
+			return fmt.Sprintf("docker data root unknown, so it cannot be shown to be outside every archive_only root: %v", err)
+		}
+		targets = append(targets, root)
+	}
+	for _, target := range targets {
+		inside, err := config.ResolvesIntoArchiveOnlyRoot(policy, target)
+		switch {
+		case err != nil:
+			return fmt.Sprintf("cannot be shown to be outside every archive_only root: %v", err)
+		case inside:
+			return fmt.Sprintf("%s resolves into an archive_only root", target)
+		}
+	}
+	return ""
+}
+
+// dockerDataRoot asks the Docker daemon for its data root.
+func dockerDataRoot(ctx context.Context, binary string) (string, error) {
+	runCtx, cancel := context.WithTimeout(ctx, cacheTrimTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, binary, "info", "--format", "{{.DockerRootDir}}")
+	cmd.Env = dockerEnv()
+	cmd.Dir = "/"
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	root := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("docker info reported data root %q", root)
+	}
+	return filepath.Clean(root), nil
+}
+
+// dockerEnv is the environment every Docker provider command runs with.
+func dockerEnv() []string {
+	return []string{"HOME=" + os.Getenv("HOME"), "PATH=/usr/bin:/bin"}
 }

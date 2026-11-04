@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/url"
 	"path/filepath"
@@ -68,6 +70,10 @@ type Root struct {
 	FollowSymlinks  bool   `yaml:"follow_symlinks" json:"follow_symlinks"`
 	CrossFilesystem bool   `yaml:"cross_filesystem" json:"cross_filesystem"`
 	ReportOnly      bool   `yaml:"report_only" json:"report_only"`
+	// ArchiveOnly is report-only for every ordinary rule, but lets an
+	// owner-approved archive category archive a direct child with a verified
+	// copy, then quarantine and expire exactly that archived tree.
+	ArchiveOnly bool `yaml:"archive_only" json:"archive_only"`
 }
 
 // Protect lists paths and name patterns that may never be mutated.
@@ -277,6 +283,82 @@ type Prevention struct {
 	// CacheTrimInterval is how often the watcher re-checks the cache trims
 	// between daily cycles. Each check trims only a cache over its bound.
 	CacheTrimInterval Duration `yaml:"cache_trim_interval" json:"cache_trim_interval"`
+}
+
+// InArchiveOnlyRoot reports whether path is, or lies inside, any archive_only
+// root of policy. Protection follows this containment, never which root a
+// scan happened to walk from, so overlapping or nested roots cannot bypass it.
+func InArchiveOnlyRoot(policy *Policy, path string) bool {
+	if policy == nil {
+		return false
+	}
+	for _, root := range policy.Roots {
+		if root.ArchiveOnly && core.PathWithin(path, root.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+// DockerDataRoot is Docker's default data root. Validation checks a
+// docker-builder trim against it; before each run the trim asks the daemon
+// for its actual data root and checks that too.
+const DockerDataRoot = "/var/lib/docker"
+
+// TrimTarget is the directory a standing cache trim acts on, as far as
+// policy alone can tell (Docker's default data root for docker-builder).
+func (t CacheTrim) TrimTarget() string {
+	if t.Kind == CacheTrimDockerBuilder {
+		return DockerDataRoot
+	}
+	return t.Path
+}
+
+// ResolvesIntoArchiveOnlyRoot reports whether path, as written or with every
+// symlink resolved, lies in or contains any archive_only root as written or
+// resolved. It fails closed: a path or root that exists but cannot be
+// resolved (for example an unsearchable ancestor) is an error, never a
+// lexical guess. Only a path that does not exist is compared as written,
+// since nothing can be removed through it. It touches the filesystem, so it
+// is for one-off guards such as standing cache trims, not per-entry
+// collection.
+func ResolvesIntoArchiveOnlyRoot(policy *Policy, path string) (bool, error) {
+	if policy == nil || path == "" {
+		return false, nil
+	}
+	forms := func(p string) ([]string, error) {
+		out := []string{filepath.Clean(p)}
+		resolved, err := filepath.EvalSymlinks(p)
+		switch {
+		case err == nil:
+			out = append(out, resolved)
+		case errors.Is(err, fs.ErrNotExist):
+		default:
+			return nil, fmt.Errorf("resolve %s: %w", p, err)
+		}
+		return out, nil
+	}
+	targets, err := forms(path)
+	if err != nil {
+		return false, err
+	}
+	for _, root := range policy.Roots {
+		if !root.ArchiveOnly {
+			continue
+		}
+		roots, err := forms(root.Path)
+		if err != nil {
+			return false, fmt.Errorf("archive_only root: %w", err)
+		}
+		for _, r := range roots {
+			for _, p := range targets {
+				if core.PathsOverlap(p, r) {
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
 }
 
 // Supported cache trim kinds.
@@ -670,6 +752,9 @@ func (p *Policy) Validate() core.FieldErrors {
 		if root.MaxDepth < 0 {
 			errs.Add(field+".max_depth", "must not be negative, got %d", root.MaxDepth)
 		}
+		if root.ArchiveOnly && root.ReportOnly {
+			errs.Add(field+".archive_only", "cannot be combined with report_only; archive_only is already report-only for every ordinary rule")
+		}
 		if root.MaxDepth > 64 {
 			errs.Add(field+".max_depth", "must be at most 64, got %d", root.MaxDepth)
 		}
@@ -794,6 +879,11 @@ func (p *Policy) Validate() core.FieldErrors {
 			}
 		default:
 			errs.Add(field+".kind", "must be go-build or docker-builder")
+		}
+		for _, root := range p.Roots {
+			if root.ArchiveOnly && core.PathsOverlap(trim.TrimTarget(), root.Path) {
+				errs.Add(field+".path", "overlaps archive_only root %q; only an archive category may remove data there", root.Path)
+			}
 		}
 		if trimKinds[trim.Kind+"\x00"+trim.Path] {
 			errs.Add(field, "duplicates an earlier cache trim")

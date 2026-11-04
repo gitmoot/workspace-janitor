@@ -65,6 +65,42 @@ must enforce their own fresh admission and routing checks. For the 20 GB / 10 GB
 policy, read canonical `target_bytes` for warning/E2B-only routing and
 `reserve_bytes` for the hard floor; remote execution does not exempt local writes.
 
+## Archive-only roots and versioned work
+
+A root with `archive_only: true` is report-only for every ordinary rule: no
+cache, worktree, scratch or quarantine rule may act on its entries. Only an
+owner-approved `workspace_archive_categories` entry for that root may archive
+a direct child, using the normal verified copy (copy, read every member back,
+manifest, restore command). Once the archive exactly binds the local tree,
+the protection lifts for that tree only and the ordinary quarantine and expiry
+flow removes it. `archive_only` cannot be combined with `report_only`, and no
+explicit `workspace_archives` rule or `prevention.cache_trims` path may overlap
+an archive-only root (a `docker-builder` trim is checked against
+`/var/lib/docker`). Before running a provider, the cycle and the watcher also
+resolve symlinks in the trim path and in every archive-only root and refuse a
+trim that reaches one; a path or root that exists but cannot be resolved also
+refuses the trim. A `docker-builder` trim additionally asks the daemon for its
+data root (`docker info --format {{.DockerRootDir}}`) and is refused when that
+root is inside an archive-only root or cannot be determined. Protection follows path containment in any
+archive-only root, not which root a scan walked from, so an ordinary ancestor
+root cannot bypass it.
+
+Every category safety check still applies to archive-only entries, including
+the in-tree secret screen (built-in names plus `protect.name_patterns`): a
+tree containing credential material is refused and stays in place, so it is
+never copied off-host.
+
+Category kind `versioned_work` selects plain directories directly inside a
+root whose base name matches `match`, a pattern with exactly one `*`. The
+leading digits of the text the `*` matches are the version, so
+`admin-v*-work` reads `admin-v0116-reset-r5-work` as 116. Every folder of the
+`keep_newest` highest versions present stays local; older ones are archived.
+This is re-checked before any archived version is quarantined or expires: a
+version counts as kept while fewer than `keep_newest` higher versions are
+present, even if its own folder is already in quarantine.
+Minimum `idle` is `1d`, so a folder written today is still kept. Folders in
+the root that do not match fall under any other category for that root.
+
 ## Standing cache trims
 
 `prevention.cache_trims` keeps live shared build caches within a bound. Each

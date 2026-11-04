@@ -3,6 +3,7 @@ package collect
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -42,7 +43,11 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 				continue
 			}
 			protected := protectedExportPath(original, policy)
+			category := strings.HasPrefix(rule.Owner, config.CategoryOwnerPrefix)
 			for _, protection := range entries[i].Protections {
+				if category && protection.Kind == core.ProtectArchiveOnlyRoot {
+					continue // lifted below only if the archive exactly binds
+				}
 				protected = protected || protection.Blocking
 			}
 			candidates = append(candidates, candidate{i, entries[i].Path, entries[i].Kind, protected, rule})
@@ -103,6 +108,13 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 			continue
 		}
 		entries[item.index].WorkspaceArchive = ref.WorkspaceArchive
+		if ref.WorkspaceArchive != nil && strings.HasPrefix(item.rule.Owner, config.CategoryOwnerPrefix) {
+			// An exact verified category archive is the one authority an
+			// archive_only root accepts: lift that protection for this tree.
+			entries[item.index].Protections = slices.DeleteFunc(entries[item.index].Protections, func(p core.Protection) bool {
+				return p.Kind == core.ProtectArchiveOnlyRoot
+			})
+		}
 		addEvidence(&entries[item.index], core.Evidence{Source: ref.Source, Signal: ref.Signal, Detail: ref.Detail, ObservedAt: now})
 		if ref.Protection != "" {
 			addProtection(&entries[item.index], core.Protection{Kind: ref.Protection, Source: ref.Source, Blocking: true, Reason: ref.Detail})

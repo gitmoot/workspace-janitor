@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
 
@@ -161,6 +162,20 @@ func (w *metadataWalk) entryFor(path string, dirBounded bool) (core.Entry, bool)
 			Signal:     "unknown:directory_truncated",
 			Detail:     fmt.Sprintf("sibling listing was truncated at %d entries", w.opts.Limits.MaxDirEntries),
 			ObservedAt: w.now,
+		})
+	}
+	if w.root.ArchiveOnly || config.InArchiveOnlyRoot(w.opts.WorktreePolicy, entry.Path) {
+		addEvidence(&entry, core.Evidence{
+			Source:     core.SourcePolicy,
+			Signal:     "archive_only_root",
+			Detail:     fmt.Sprintf("root %s is archive-only", w.root.Path),
+			ObservedAt: w.now,
+		})
+		addProtection(&entry, core.Protection{
+			Kind:     core.ProtectArchiveOnlyRoot,
+			Reason:   fmt.Sprintf("root %s is archive-only: only an owner-approved archive category may remove its entries", w.root.Path),
+			Source:   core.SourcePolicy,
+			Blocking: true,
 		})
 	}
 	if w.root.ReportOnly {
