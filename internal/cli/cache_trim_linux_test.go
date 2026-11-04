@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -372,5 +373,99 @@ func TestWatchFailsWhenATrimReportCannotBeWritten(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("watcher kept running after losing a trim report")
+	}
+}
+
+// Review #147 round 2 P1: a trim path that reaches an archive_only root
+// through a symlinked ancestor is refused before any provider runs.
+func TestTrimThroughSymlinkIntoArchiveOnlyRootIsRefused(t *testing.T) {
+	x := newTrimFixture(t)
+	protected := filepath.Join(x.root, "go-build")
+	if err := os.MkdirAll(filepath.Join(protected, "ab"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(protected, "ab", "obj-d")
+	if err := os.WriteFile(payload, make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(x.home, "cache-alias")
+	if err := os.Symlink(x.root, alias); err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\n    archive_only: true\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n    - kind: go-build\n      path: %s\n      binary: %s\n      max_bytes: 65536\n", x.root, x.proc, filepath.Join(alias, "go-build"), x.gobin))
+	_, _, _ = x.run(t, "cycle")
+	if calls := x.calls(t); len(calls) != 0 {
+		t.Fatalf("provider ran on an archive_only cache through a symlink: %v", calls)
+	}
+	if _, err := os.Stat(payload); err != nil {
+		t.Fatalf("unarchived payload deleted: %v", err)
+	}
+}
+
+// lockedBuffer is a report sink the trim loop and the test share.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Review #147 round 2 P2: shutdown arriving during a later provider command
+// must not drop the report of a trim that already deleted bytes.
+func TestWatchReportsCompletedTrimWhenCancelledMidRun(t *testing.T) {
+	x := newTrimFixture(t)
+	x.fill(t, 1<<20)
+	started := filepath.Join(x.home, "docker-started")
+	slow := filepath.Join(x.home, "slow-docker")
+	if err := os.WriteFile(slow, []byte("#!/bin/sh\n: > "+started+"\nexec sleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n    - kind: go-build\n      path: %s\n      binary: %s\n      max_bytes: 65536\n    - kind: docker-builder\n      binary: %s\n      max_bytes: 2147483648\n", x.root, x.proc, x.cache, x.gobin, slow))
+	out := &lockedBuffer{}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: out, stderr: io.Discard, lookup: config.MapLookup(x.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.Prevention.CacheTrimInterval = config.Duration(100 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- cacheTrimLoop(ctx, e, paths, policy) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second trim never started")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("cancelled loop returned %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("loop did not stop on cancellation")
+	}
+	if got := out.String(); !strings.Contains(got, `"reason":"cache_trim"`) || !strings.Contains(got, `"status":"trimmed"`) {
+		t.Fatalf("completed trim not reported on shutdown: %q", got)
 	}
 }

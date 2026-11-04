@@ -298,6 +298,47 @@ func InArchiveOnlyRoot(policy *Policy, path string) bool {
 	return false
 }
 
+// DockerDataRoot is the Docker data root a docker-builder trim acts on.
+const DockerDataRoot = "/var/lib/docker"
+
+// TrimTarget is the directory a standing cache trim acts on.
+func (t CacheTrim) TrimTarget() string {
+	if t.Kind == CacheTrimDockerBuilder {
+		return DockerDataRoot
+	}
+	return t.Path
+}
+
+// ResolvesIntoArchiveOnlyRoot reports whether path, as written or with every
+// symlink resolved, lies in or contains any archive_only root as written or
+// resolved. It touches the filesystem, so it is for one-off guards such as
+// standing cache trims, not per-entry collection.
+func ResolvesIntoArchiveOnlyRoot(policy *Policy, path string) bool {
+	if policy == nil || path == "" {
+		return false
+	}
+	forms := func(p string) []string {
+		out := []string{filepath.Clean(p)}
+		if resolved, err := filepath.EvalSymlinks(p); err == nil {
+			out = append(out, resolved)
+		}
+		return out
+	}
+	for _, root := range policy.Roots {
+		if !root.ArchiveOnly {
+			continue
+		}
+		for _, r := range forms(root.Path) {
+			for _, p := range forms(path) {
+				if core.PathsOverlap(p, r) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // Supported cache trim kinds.
 const (
 	CacheTrimGoBuild       = "go-build"
@@ -818,7 +859,7 @@ func (p *Policy) Validate() core.FieldErrors {
 			errs.Add(field+".kind", "must be go-build or docker-builder")
 		}
 		for _, root := range p.Roots {
-			if trim.Path != "" && root.ArchiveOnly && core.PathsOverlap(trim.Path, root.Path) {
+			if root.ArchiveOnly && core.PathsOverlap(trim.TrimTarget(), root.Path) {
 				errs.Add(field+".path", "overlaps archive_only root %q; only an archive category may remove data there", root.Path)
 			}
 		}

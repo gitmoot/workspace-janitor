@@ -257,12 +257,10 @@ func categoryRefusals(policy config.Policy, category config.WorkspaceArchiveCate
 	return out
 }
 
-// keptVersions is the KeepNewest highest versions present right now among
-// the directories directly inside a versioned_work category's roots. It reads
-// the directories themselves, so archive selection and later quarantine or
-// expiry authority always agree on the current answer. Any directory counts,
+// presentVersions lists the distinct versions of the directories directly
+// inside a versioned_work category's roots right now. Any directory counts,
 // so a Git checkout of a newer version also protects older plain folders.
-func keptVersions(category config.WorkspaceArchiveCategory) (map[int64]bool, error) {
+func presentVersions(category config.WorkspaceArchiveCategory) (map[int64]bool, error) {
 	seen := map[int64]bool{}
 	for _, root := range category.Roots {
 		entries, err := os.ReadDir(root)
@@ -278,16 +276,7 @@ func keptVersions(category config.WorkspaceArchiveCategory) (map[int64]bool, err
 			}
 		}
 	}
-	versions := make([]int64, 0, len(seen))
-	for version := range seen {
-		versions = append(versions, version)
-	}
-	slices.Sort(versions)
-	kept := map[int64]bool{}
-	for i := len(versions) - 1; i >= 0 && len(kept) < category.KeepNewest; i-- {
-		kept[versions[i]] = true
-	}
-	return kept, nil
+	return seen, nil
 }
 
 // versionedRetention reports why a versioned_work path must stay local now,
@@ -297,11 +286,19 @@ func versionedRetention(category config.WorkspaceArchiveCategory, path string) s
 	if !ok {
 		return "its name no longer matches the category pattern"
 	}
-	kept, err := keptVersions(category)
+	present, err := presentVersions(category)
 	if err != nil {
 		return fmt.Sprintf("current versions could not be listed: %v", err)
 	}
-	if kept[version] {
+	// Rank this version among those present plus itself, so a quarantined
+	// version whose source is gone is still judged against the current keep.
+	higher := 0
+	for v := range present {
+		if v > version {
+			higher++
+		}
+	}
+	if higher < category.KeepNewest {
 		return fmt.Sprintf("version %d is among the %d newest versions, which are kept", version, category.KeepNewest)
 	}
 	return ""

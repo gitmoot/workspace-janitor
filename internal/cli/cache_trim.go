@@ -34,17 +34,19 @@ func cacheTrimLoop(ctx context.Context, e *env, paths config.Paths, policy confi
 		case <-timer.C:
 		}
 		reports, err := runCacheTrims(ctx, policy, paths.StateDir)
-		if ctx.Err() != nil {
-			return nil
-		}
+		// Report before honouring cancellation: an earlier trim in this run
+		// may already have deleted bytes.
 		report := watchReport{Reason: "cache_trim", CacheTrims: reports}
-		if err != nil {
+		if err != nil && ctx.Err() == nil {
 			report.Error = err.Error()
 		}
-		if acted(reports) || err != nil {
+		if acted(reports) || report.Error != "" {
 			if writeErr := writeWatchReport(e, report); writeErr != nil {
 				return fmt.Errorf("cache trim report: %w", writeErr)
 			}
+		}
+		if ctx.Err() != nil {
+			return nil
 		}
 		timer.Reset(interval)
 	}
@@ -111,14 +113,22 @@ func runCacheTrims(ctx context.Context, policy config.Policy, stateDir string) (
 	var reports []cacheTrimReport
 	var errs []error
 	for _, trim := range policy.Prevention.CacheTrims {
-		if trim.Path != "" && config.InArchiveOnlyRoot(&policy, trim.Path) {
-			// Validation refuses this; never run a provider inside one anyway.
-			reports = append(reports, cacheTrimReport{Kind: trim.Kind, Path: trim.Path, MaxBytes: trim.MaxBytes,
-				Status: cacheTrimFailed, Error: "cache lies inside an archive_only root"})
-			errs = append(errs, fmt.Errorf("cache trim %s %s: inside an archive_only root", trim.Kind, trim.Path))
+		// Validation refuses a lexical overlap; this also resolves symlinks,
+		// and the provider then runs on the resolved path it checked.
+		written := trim.Path
+		if trim.Path != "" {
+			if resolved, err := filepath.EvalSymlinks(trim.Path); err == nil {
+				trim.Path = resolved
+			}
+		}
+		if config.ResolvesIntoArchiveOnlyRoot(&policy, trim.TrimTarget()) {
+			reports = append(reports, cacheTrimReport{Kind: trim.Kind, Path: written, MaxBytes: trim.MaxBytes,
+				Status: cacheTrimFailed, Error: "cache resolves into an archive_only root"})
+			errs = append(errs, fmt.Errorf("cache trim %s %s: resolves into an archive_only root", trim.Kind, trim.TrimTarget()))
 			continue
 		}
 		report := trimCache(ctx, policy.Collectors.ProcRoot, trim)
+		report.Path = written
 		if report.Status == cacheTrimFailed {
 			errs = append(errs, fmt.Errorf("cache trim %s %s: %s", trim.Kind, trim.Path, report.Error))
 		}
@@ -195,10 +205,7 @@ func trimCache(ctx context.Context, procRoot string, trim config.CacheTrim) cach
 }
 
 func trimFilesystem(trim config.CacheTrim) string {
-	if trim.Path != "" {
-		return trim.Path
-	}
-	return "/var/lib/docker"
+	return trim.TrimTarget()
 }
 
 // cacheUsers lists processes that may be using the cache right now: Go

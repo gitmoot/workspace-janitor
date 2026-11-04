@@ -3,14 +3,17 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
 
@@ -311,5 +314,56 @@ func TestVersionThatBecomesKeptLosesExpiryAuthority(t *testing.T) {
 	x.source = old
 	if _, action := x.action(t, old); action.Kind == core.ActionQuarantine || action.Kind == core.ActionDeleteCandidate {
 		t.Fatalf("a now-kept version kept quarantine authority: %+v", action)
+	}
+}
+
+// Review #147 round 2 P2: a version archived and then quarantined (its
+// source gone) must lose expiry authority once it ranks among the newest.
+func TestQuarantinedVersionThatBecomesKeptLosesExpiryAuthority(t *testing.T) {
+	x := newFleetStateFixture(t)
+	for _, name := range []string{"admin-v0001-work", "admin-v0002-work", "admin-v0003-work"} {
+		x.folder(t, filepath.Join(x.mac, name), 3*24*time.Hour, map[string]string{"log.txt": name})
+	}
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	setKeep := func(n int) {
+		t.Helper()
+		raw, err := os.ReadFile(policyFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(raw)
+		for _, k := range []string{"keep_newest: 1\n", "keep_newest: 3\n"} {
+			s = strings.Replace(s, k, fmt.Sprintf("keep_newest: %d\n", n), 1)
+		}
+		x.writePolicy(t, s)
+	}
+	setKeep(1)
+	old := filepath.Join(x.mac, "admin-v0001-work")
+	if item := x.item(t, x.categories(t, false), old); item.Status != categoryArchived {
+		t.Fatalf("old version not archived under keep_newest 1: %+v", item)
+	}
+	// Quarantine moved the source away.
+	if err := os.Rename(old, filepath.Join(x.home, "quarantined-v0001")); err != nil {
+		t.Fatal(err)
+	}
+	setKeep(3)
+	e := &env{opts: &globalOpts{format: "json"}, stdout: io.Discard, stderr: io.Discard, lookup: config.MapLookup(x.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := withCategoryArchives(context.Background(), paths, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rule := range active.WorkspaceArchives {
+		if rule.Path == old && rule.LocalExpiryEnabled {
+			t.Fatal("a quarantined version now among the 3 newest kept expiry authority")
+		}
 	}
 }
