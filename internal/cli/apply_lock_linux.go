@@ -60,6 +60,27 @@ func lockScan(ctx context.Context, stateDir string) (func(), error) {
 	}
 }
 
+// tryLockTrim serializes standing cache trims between the daily cycle and
+// the watcher. It never waits: a trim already running elsewhere makes this
+// one a no-op, reported as skipped.
+func tryLockTrim(stateDir string) (func(), bool, error) {
+	if err := config.EnsureDir(stateDir); err != nil {
+		return nil, false, err
+	}
+	fd, file, err := openLockFile(filepath.Join(stateDir, "trim.lock"), "trim lock")
+	if err != nil {
+		return nil, false, err
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("trim lock: %w", err)
+	}
+	return func() { _ = syscall.Flock(fd, syscall.LOCK_UN); _ = file.Close() }, true, nil
+}
+
 // openLockFile opens a lock file that only the current user can have created.
 func openLockFile(path, name string) (int, *os.File, error) {
 	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)

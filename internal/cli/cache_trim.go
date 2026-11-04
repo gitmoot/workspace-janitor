@@ -17,6 +17,47 @@ import (
 	"github.com/gitmoot/workspace-janitor/internal/config"
 )
 
+// cacheTrimLoop re-runs the standing cache trims every cache_trim_interval
+// between daily cycles, so a busy shared cache cannot regrow to the disk
+// floor. Each run trims only a cache over its bound with no live user. A
+// failed trim is reported and retried next interval; it never stops the
+// watcher.
+func cacheTrimLoop(ctx context.Context, e *env, paths config.Paths, policy config.Policy) {
+	interval := policy.Prevention.CacheTrimInterval.Duration()
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		reports, err := runCacheTrims(ctx, policy, paths.StateDir)
+		if ctx.Err() != nil {
+			return
+		}
+		report := watchReport{Reason: "cache_trim", CacheTrims: reports}
+		if err != nil {
+			report.Error = err.Error()
+		}
+		if acted(reports) || err != nil {
+			_ = writeWatchReport(e, report)
+		}
+		timer.Reset(interval)
+	}
+}
+
+// acted reports whether any trim did or attempted something worth logging;
+// routine under-bound checks stay quiet.
+func acted(reports []cacheTrimReport) bool {
+	for _, r := range reports {
+		if r.Status != cacheUnderBound && r.Status != cacheTrimNotFound {
+			return true
+		}
+	}
+	return false
+}
+
 // cacheTrimTimeout bounds one official trim command.
 const cacheTrimTimeout = 10 * time.Minute
 
@@ -27,6 +68,7 @@ const (
 	cacheInUse        = "skipped_in_use"
 	cacheTrimFailed   = "failed"
 	cacheTrimNotFound = "absent"
+	cacheTrimBusy     = "skipped_trim_running"
 )
 
 type cacheTrimReport struct {
@@ -47,7 +89,22 @@ type cacheTrimReport struct {
 // runCacheTrims applies every configured standing cache trim once. A cache in
 // live use is skipped, not an error; the next cycle retries it. Only a trim
 // command that fails is returned as an error.
-func runCacheTrims(ctx context.Context, policy config.Policy) ([]cacheTrimReport, error) {
+func runCacheTrims(ctx context.Context, policy config.Policy, stateDir string) ([]cacheTrimReport, error) {
+	if len(policy.Prevention.CacheTrims) == 0 {
+		return nil, nil
+	}
+	release, held, err := tryLockTrim(stateDir)
+	if err != nil {
+		return nil, err
+	}
+	if !held {
+		var reports []cacheTrimReport
+		for _, trim := range policy.Prevention.CacheTrims {
+			reports = append(reports, cacheTrimReport{Kind: trim.Kind, Path: trim.Path, MaxBytes: trim.MaxBytes, Status: cacheTrimBusy})
+		}
+		return reports, nil
+	}
+	defer release()
 	var reports []cacheTrimReport
 	var errs []error
 	for _, trim := range policy.Prevention.CacheTrims {
