@@ -169,11 +169,12 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 		report.Expiry = "checked"
 		report.ExpiryReport = strings.TrimSpace(expiryOutput.String())
 		if err != nil {
-			return errors.Join(quarantineErr, categoryErr, fmt.Errorf("scheduled expiry: %w; %s", err, report.ExpiryReport))
+			// A refusal fails the cycle without discarding what it did.
+			return errors.Join(quarantineErr, categoryErr, fmt.Errorf("scheduled expiry: %w; %s", err, report.ExpiryReport), writeCycleReport(e.stdout, report))
 		}
 	}
 	if quarantineErr != nil {
-		return errors.Join(quarantineErr, categoryErr)
+		return errors.Join(quarantineErr, categoryErr, writeCycleReport(e.stdout, report))
 	}
 	if policy.Prevention.Recovery.Enabled && policy.Prevention.AutoExpire {
 		report.Capacity, err = sampleCapacity(ctx, policy, paths, time.Now().UTC(), true)
