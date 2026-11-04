@@ -173,8 +173,12 @@ func TestCycleSkipsBuildCachesInLiveUse(t *testing.T) {
 			t.Fatalf("%s trimmed while in use: %+v", trim.Kind, trim)
 		}
 	}
-	if calls := x.calls(t); len(calls) != 0 {
-		t.Fatalf("trim commands ran during live builds: %v", calls)
+	// The archive_only guard's read-only `docker info` query may run; no
+	// trimming command may.
+	for _, call := range x.calls(t) {
+		if !strings.HasPrefix(call, "docker|info ") {
+			t.Fatalf("trim commands ran during live builds: %v", x.calls(t))
+		}
 	}
 	if _, err := os.Stat(filepath.Join(x.cache, "ab", "obj-d")); err != nil {
 		t.Fatalf("live cache was touched: %v", err)
