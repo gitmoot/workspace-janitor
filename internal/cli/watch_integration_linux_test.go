@@ -806,6 +806,11 @@ func TestWatchExitsWhenItsCapacitySampleGoesStale(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	// The sampler may be mid-write right now; wait for the lock rather than
+	// failing on SQLITE_BUSY (CI flake on #157).
+	if _, err := conn.ExecContext(context.Background(), "PRAGMA busy_timeout = 10000"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
 		t.Fatal(err)
 	}
