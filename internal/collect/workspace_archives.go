@@ -86,6 +86,8 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 			rule := item.rule
 			ref := Reference{Path: item.path, Source: core.SourcePolicy, Protection: core.ProtectDurableEvidence, Signal: "workspace_archive", Detail: "released workspace remains retained"}
 			switch {
+			case opts.ArchiveBindPaths != nil && !opts.ArchiveBindPaths[item.path]:
+				ref.Detail = "not the path being revalidated; its archive is not bound in this observation"
 			case ctx.Err() != nil:
 				ref.Detail = "archive observation deadline expired"
 			case budgetCtx.Err() != nil && !item.protected:
