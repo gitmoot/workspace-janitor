@@ -280,6 +280,21 @@ type Prevention struct {
 	CacheTrims []CacheTrim `yaml:"cache_trims" json:"cache_trims"`
 }
 
+// InArchiveOnlyRoot reports whether path is, or lies inside, any archive_only
+// root of policy. Protection follows this containment, never which root a
+// scan happened to walk from, so overlapping or nested roots cannot bypass it.
+func InArchiveOnlyRoot(policy *Policy, path string) bool {
+	if policy == nil {
+		return false
+	}
+	for _, root := range policy.Roots {
+		if root.ArchiveOnly && core.PathWithin(path, root.Path) {
+			return true
+		}
+	}
+	return false
+}
+
 // Supported cache trim kinds.
 const (
 	CacheTrimGoBuild       = "go-build"
@@ -794,6 +809,11 @@ func (p *Policy) Validate() core.FieldErrors {
 			}
 		default:
 			errs.Add(field+".kind", "must be go-build or docker-builder")
+		}
+		for _, root := range p.Roots {
+			if trim.Path != "" && root.ArchiveOnly && core.PathsOverlap(trim.Path, root.Path) {
+				errs.Add(field+".path", "overlaps archive_only root %q; only an archive category may remove data there", root.Path)
+			}
 		}
 		if trimKinds[trim.Kind+"\x00"+trim.Path] {
 			errs.Add(field, "duplicates an earlier cache trim")

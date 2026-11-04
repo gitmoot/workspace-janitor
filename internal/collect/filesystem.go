@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
 
@@ -163,7 +164,7 @@ func (w *metadataWalk) entryFor(path string, dirBounded bool) (core.Entry, bool)
 			ObservedAt: w.now,
 		})
 	}
-	if w.root.ArchiveOnly {
+	if w.root.ArchiveOnly || config.InArchiveOnlyRoot(w.opts.WorktreePolicy, entry.Path) {
 		addEvidence(&entry, core.Evidence{
 			Source:     core.SourcePolicy,
 			Signal:     "archive_only_root",

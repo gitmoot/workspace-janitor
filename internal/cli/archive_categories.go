@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -117,6 +118,13 @@ func activeCategoryRule(policy config.Policy, record store.CategoryArchive) (con
 	}
 	if refusals := policy.CategoryArchiveRefusals(record.Path); len(refusals) != 0 {
 		return config.WorkspaceArchiveRule{}, strings.Join(refusals, "; ")
+	}
+	// A version that became one of the newest after it was archived keeps
+	// no quarantine or expiry authority.
+	if category.Kind == config.CategoryVersionedWork {
+		if reason := versionedRetention(category, record.Path); reason != "" {
+			return config.WorkspaceArchiveRule{}, reason
+		}
 	}
 	rule := categoryRule(category, record.Name, record.Path, record.Owner, record.Release)
 	rule.LocalExpiryEnabled = true
@@ -249,36 +257,54 @@ func categoryRefusals(policy config.Policy, category config.WorkspaceArchiveCate
 	return out
 }
 
-// versionedKeeps returns, per versioned_work category, the KeepNewest highest
-// versions present among the plain directories directly inside its roots.
-// Every folder of a kept version stays local.
-func versionedKeeps(policy config.Policy, entries []core.Entry) map[string]map[int64]bool {
-	out := map[string]map[int64]bool{}
-	for _, category := range policy.WorkspaceArchiveCategories {
-		if category.Kind != config.CategoryVersionedWork {
-			continue
+// keptVersions is the KeepNewest highest versions present right now among
+// the directories directly inside a versioned_work category's roots. It reads
+// the directories themselves, so archive selection and later quarantine or
+// expiry authority always agree on the current answer. Any directory counts,
+// so a Git checkout of a newer version also protects older plain folders.
+func keptVersions(category config.WorkspaceArchiveCategory) (map[int64]bool, error) {
+	seen := map[int64]bool{}
+	for _, root := range category.Roots {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			return nil, err
 		}
-		seen := map[int64]bool{}
 		for _, entry := range entries {
-			if kind, _ := categoryKindOf(entry); kind != config.CategoryRootScratch || !slices.Contains(category.Roots, filepath.Dir(entry.Path)) {
+			if !entry.IsDir() {
 				continue
 			}
-			if version, ok := category.Version(filepath.Base(entry.Path)); ok {
+			if version, ok := category.Version(entry.Name()); ok {
 				seen[version] = true
 			}
 		}
-		versions := make([]int64, 0, len(seen))
-		for version := range seen {
-			versions = append(versions, version)
-		}
-		slices.Sort(versions)
-		kept := map[int64]bool{}
-		for i := len(versions) - 1; i >= 0 && len(kept) < category.KeepNewest; i-- {
-			kept[versions[i]] = true
-		}
-		out[category.Name] = kept
 	}
-	return out
+	versions := make([]int64, 0, len(seen))
+	for version := range seen {
+		versions = append(versions, version)
+	}
+	slices.Sort(versions)
+	kept := map[int64]bool{}
+	for i := len(versions) - 1; i >= 0 && len(kept) < category.KeepNewest; i-- {
+		kept[versions[i]] = true
+	}
+	return kept, nil
+}
+
+// versionedRetention reports why a versioned_work path must stay local now,
+// or "" when it may be archived or expire.
+func versionedRetention(category config.WorkspaceArchiveCategory, path string) string {
+	version, ok := category.Version(filepath.Base(path))
+	if !ok {
+		return "its name no longer matches the category pattern"
+	}
+	kept, err := keptVersions(category)
+	if err != nil {
+		return fmt.Sprintf("current versions could not be listed: %v", err)
+	}
+	if kept[version] {
+		return fmt.Sprintf("version %d is among the %d newest versions, which are kept", version, category.KeepNewest)
+	}
+	return ""
 }
 
 // categoryPreflight re-reads the policy file before and after the slow copy:
@@ -391,7 +417,6 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 		category config.WorkspaceArchiveCategory
 		release  *store.ReportReply
 	}
-	keptVersions := versionedKeeps(policy, observed.Entries)
 	queues := map[string][]pending{}
 	for _, entry := range observed.Entries {
 		parent := filepath.Dir(entry.Path)
@@ -450,9 +475,8 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 		}
 		item.Category, item.Kind = category.Name, string(category.Kind)
 		if category.Kind == config.CategoryVersionedWork {
-			version, _ := category.Version(filepath.Base(entry.Path))
-			if keptVersions[category.Name][version] {
-				item.Reasons = []string{fmt.Sprintf("version %d is among the %d newest versions, which are kept", version, category.KeepNewest)}
+			if reason := versionedRetention(*category, entry.Path); reason != "" {
+				item.Reasons = []string{reason}
 				report.Items = append(report.Items, item)
 				continue
 			}

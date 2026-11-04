@@ -51,6 +51,13 @@ func runCacheTrims(ctx context.Context, policy config.Policy) ([]cacheTrimReport
 	var reports []cacheTrimReport
 	var errs []error
 	for _, trim := range policy.Prevention.CacheTrims {
+		if trim.Path != "" && config.InArchiveOnlyRoot(&policy, trim.Path) {
+			// Validation refuses this; never run a provider inside one anyway.
+			reports = append(reports, cacheTrimReport{Kind: trim.Kind, Path: trim.Path, MaxBytes: trim.MaxBytes,
+				Status: cacheTrimFailed, Error: "cache lies inside an archive_only root"})
+			errs = append(errs, fmt.Errorf("cache trim %s %s: inside an archive_only root", trim.Kind, trim.Path))
+			continue
+		}
 		report := trimCache(ctx, policy.Collectors.ProcRoot, trim)
 		if report.Status == cacheTrimFailed {
 			errs = append(errs, fmt.Errorf("cache trim %s %s: %s", trim.Kind, trim.Path, report.Error))
