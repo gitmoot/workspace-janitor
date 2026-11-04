@@ -6,6 +6,11 @@ import "time"
 // archive/restore allocations. Equality is permitted.
 const MinimumAllocationReserveBytes uint64 = 10_000_000_000
 
+// AllocationReserveBytes is the floor archive/restore writes enforce. It is
+// MinimumAllocationReserveBytes in production; tests lower it so archive
+// fixtures do not depend on the runner's free space (issue #143).
+var AllocationReserveBytes = MinimumAllocationReserveBytes
+
 type PressureState string
 
 const (
