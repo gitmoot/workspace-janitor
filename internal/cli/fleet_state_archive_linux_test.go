@@ -418,3 +418,47 @@ func TestSlowArchiveBindingStillBindsSomeItemsEachScan(t *testing.T) {
 		t.Fatalf("want some but not all of %d slow bindings bound within the budget, got %d", len(folders), bound)
 	}
 }
+
+// Review #154 P2: with the state root walked to depth 2, every Mac work
+// folder is listed twice (once per root). A deferred later copy must not
+// erase an earlier copy's binding.
+func TestSlowArchiveBindingSurvivesOverlappingRoots(t *testing.T) {
+	x := newFleetStateFixture(t)
+	var archived []string
+	for v := 1; v <= 8; v++ {
+		path := filepath.Join(x.mac, fmt.Sprintf("admin-v%04d-work", v))
+		x.folder(t, path, 3*24*time.Hour, map[string]string{"log.txt": path})
+		if v <= 5 {
+			archived = append(archived, path)
+		}
+	}
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	raw, err := os.ReadFile(policyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlapping := strings.Replace(string(raw), "command_timeout: 30s", "command_timeout: 3s", 1)
+	overlapping = strings.Replace(overlapping, "max_depth: 1", "max_depth: 2", 1)
+	x.writePolicy(t, overlapping)
+	report := x.categories(t, false)
+	for _, path := range archived {
+		if item := x.item(t, report, path); item.Status != categoryArchived {
+			t.Fatalf("%s not archived: %+v", path, item)
+		}
+	}
+	collect.BeforeWorkspaceArchiveBind = func() { time.Sleep(700 * time.Millisecond) }
+	defer func() { collect.BeforeWorkspaceArchiveBind = nil }()
+	x.data(t, "scan")
+	var plan core.Plan
+	field(t, x.data(t, "plan", "--no-jev"), "plan", &plan)
+	bound := map[string]bool{}
+	for _, action := range plan.Actions {
+		if slices.Contains(archived, action.Path) && action.Kind == core.ActionQuarantine {
+			bound[action.Path] = true
+		}
+	}
+	if len(bound) == 0 {
+		t.Fatalf("no binding survived duplicate listing under overlapping roots")
+	}
+}

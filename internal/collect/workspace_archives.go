@@ -68,7 +68,21 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 		// snapshot walk serves all of them in this collection instead of one
 		// bounded walk per item. Explicit rules keep their own walk.
 		var categoryDependents *workspacearchive.DependentIndex
+		// Overlapping roots list one path more than once. Bind each path
+		// once; its reference applies to every occurrence below, so a later
+		// deferred duplicate cannot erase an earlier binding.
+		// A path counts as protected if any of its occurrences is.
+		seen := make(map[string]bool, len(candidates))
+		protectedPath := make(map[string]bool, len(candidates))
 		for _, item := range candidates {
+			protectedPath[item.path] = protectedPath[item.path] || item.protected
+		}
+		for _, item := range candidates {
+			if seen[item.path] {
+				continue
+			}
+			seen[item.path] = true
+			item.protected = protectedPath[item.path]
 			rule := item.rule
 			ref := Reference{Path: item.path, Source: core.SourcePolicy, Protection: core.ProtectDurableEvidence, Signal: "workspace_archive", Detail: "released workspace remains retained"}
 			switch {
