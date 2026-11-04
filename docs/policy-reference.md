@@ -74,7 +74,10 @@ a direct child, using the normal verified copy (copy, read every member back,
 manifest, restore command). Once the archive exactly binds the local tree,
 the protection lifts for that tree only and the ordinary quarantine and expiry
 flow removes it. `archive_only` cannot be combined with `report_only`, and no
-explicit `workspace_archives` rule may overlap an archive-only root.
+explicit `workspace_archives` rule or `prevention.cache_trims` path may overlap
+an archive-only root. Protection follows path containment in any
+archive-only root, not which root a scan walked from, so an ordinary ancestor
+root cannot bypass it.
 
 Every category safety check still applies to archive-only entries, including
 the in-tree secret screen (built-in names plus `protect.name_patterns`): a
@@ -86,6 +89,9 @@ root whose base name matches `match`, a pattern with exactly one `*`. The
 leading digits of the text the `*` matches are the version, so
 `admin-v*-work` reads `admin-v0116-reset-r5-work` as 116. Every folder of the
 `keep_newest` highest versions present stays local; older ones are archived.
+This is re-checked against the folders present now before any archived
+version is quarantined or expires, so a version that becomes one of the
+newest (for example after `keep_newest` is raised) stays local.
 Minimum `idle` is `1d`, so a folder written today is still kept. Folders in
 the root that do not match fall under any other category for that root.
 
