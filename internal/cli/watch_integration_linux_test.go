@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -757,5 +758,82 @@ func TestWatchStopDuringReconcileSucceeds(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("watch loop did not stop")
+	}
+}
+
+// Live 2026-11-04: sampling stalled 16 minutes while the watcher stayed up,
+// then the exit blamed the scan ("context canceled"). With the database
+// write-locked by another process, sampling cannot publish; once the newest
+// sample expires the watcher must report capacity_stale and exit with that
+// cause, so its supervisor restarts it.
+func TestWatchExitsWhenItsCapacitySampleGoesStale(t *testing.T) {
+	f, root, _ := watchFixture(t)
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: false\nprevention:\n  min_free_percent: 0\n  min_free_bytes: 0\n  capacity_interval: 1s\n  targets:\n    - path: "+root+"\n      target_free_bytes: 1\n      reserve_free_bytes: 0\n      recovery_margin_bytes: 0\n")
+	sink := &watchSink{reports: make(chan watchReport, 64)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard, lookup: config.MapLookup(f.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, stderr, code := f.run(t, "scan"); code != ExitOK {
+		t.Fatalf("seed database: %d %s %s", code, out, stderr)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(context.Background(), e, paths, policy, func() (eventWatcher, error) { return &scriptedWatcher{}, nil }, watchChurnInterval)
+	}()
+	for first := false; !first; {
+		select {
+		case report := <-sink.reports:
+			first = report.Reason == "capacity" && report.Capacity != nil
+		case err := <-done:
+			t.Fatalf("watch loop exited before sampling: %v", err)
+		case <-time.After(6 * time.Second):
+			t.Fatal("no first capacity sample")
+		}
+	}
+	db, err := sql.Open("sqlite", paths.DatabaseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = conn.ExecContext(context.Background(), "ROLLBACK") }()
+	staleReported := false
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case report := <-sink.reports:
+			staleReported = staleReported || report.Reason == "capacity_stale"
+		case err := <-done:
+			if err == nil || !strings.Contains(err.Error(), "capacity sample stale") {
+				t.Fatalf("watcher did not exit on its stale sample: %v", err)
+			}
+			for drained := false; !drained; {
+				select {
+				case report := <-sink.reports:
+					staleReported = staleReported || report.Reason == "capacity_stale"
+				default:
+					drained = true
+				}
+			}
+			if !staleReported {
+				t.Fatal("no capacity_stale report before exit")
+			}
+			return
+		case <-deadline:
+			t.Fatal("watcher kept running with a stale capacity sample")
+		}
 	}
 }
