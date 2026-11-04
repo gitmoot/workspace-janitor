@@ -135,15 +135,24 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		close(sampling)
 	}
 	if len(policy.Prevention.CacheTrims) > 0 {
-		trimCtx, stopTrims := context.WithCancel(ctx)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
 		trimming := make(chan struct{})
+		// Like a sampler failure, a lost trim report ends the watcher with
+		// that error instead of a clean exit.
+		var trimErr error
 		go func() {
 			defer close(trimming)
-			cacheTrimLoop(trimCtx, e, paths, policy)
+			if trimErr = cacheTrimLoop(ctx, e, paths, policy); trimErr != nil {
+				cancel()
+			}
 		}()
 		defer func() {
-			stopTrims()
+			cancel()
 			<-trimming
+			if err == nil && trimErr != nil {
+				err = trimErr
+			}
 		}()
 	}
 	watcher, err := open()
