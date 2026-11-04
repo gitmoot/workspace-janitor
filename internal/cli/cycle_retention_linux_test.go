@@ -85,8 +85,15 @@ func TestScheduledExpiryRechecksOriginalReferences(t *testing.T) {
 	if err := os.WriteFile(unit, []byte("[Service]\nWorkingDirectory="+cache+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, code := f.run(t, "cycle"); code == ExitOK {
+	refusedOut, _, code := f.run(t, "cycle")
+	if code == ExitOK {
 		t.Fatal("scheduled expiry bypassed a newly protected original path")
+	}
+	// A refused expiry still fails the cycle, but must not discard the rest of
+	// its report (live 2026-11-04: a nightly refusal hid every cache trim).
+	var refused cycleReport
+	if err := json.Unmarshal([]byte(refusedOut), &refused); err != nil || refused.Expiry != "checked" || refused.ScanID == "" || !strings.Contains(refused.ExpiryReport, "refused") {
+		t.Fatalf("refused cycle lost its report: %+v %v %q", refused, err, refusedOut)
 	}
 	if _, err := os.Stat(receipt.Destination); err != nil {
 		t.Fatalf("protected receipt was deleted: %v", err)
