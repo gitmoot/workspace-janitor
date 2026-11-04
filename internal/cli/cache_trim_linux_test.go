@@ -374,3 +374,44 @@ func TestWatchFailsWhenATrimReportCannotBeWritten(t *testing.T) {
 		t.Fatal("watcher kept running after losing a trim report")
 	}
 }
+
+// Issue #150: with capacity sampling and cache trims both configured, the
+// watcher's goroutines must not share a reassigned context. The race
+// detector (CI's -race step) reports the old code; a plain run checks the
+// combination starts, trims and stops cleanly.
+func TestWatchSamplesAndTrimsTogether(t *testing.T) {
+	x := newTrimFixture(t)
+	x.fill(t, 1<<20)
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_bytes: 0\n  min_free_percent: 0\n  capacity_interval: 1h\n  targets:\n    - path: %s\n      target_free_bytes: 1\n      recovery_margin_bytes: 1\n  cache_trims:\n    - kind: go-build\n      path: %s\n      binary: %s\n      max_bytes: 65536\n", x.root, x.proc, x.root, x.cache, x.gobin))
+	out := &lockedBuffer{}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: out, stderr: io.Discard, lookup: config.MapLookup(x.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.Prevention.CacheTrimInterval = config.Duration(100 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(ctx, e, paths, policy, func() (eventWatcher, error) { return &scriptedWatcher{}, nil }, watchChurnInterval)
+	}()
+	deadline := time.After(10 * time.Second)
+	for !strings.Contains(out.String(), `"status":"trimmed"`) {
+		select {
+		case err := <-done:
+			t.Fatalf("watcher exited early: %v", err)
+		case <-deadline:
+			t.Fatalf("watcher never trimmed: %q", out.String())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("clean shutdown returned %v", err)
+	}
+}
