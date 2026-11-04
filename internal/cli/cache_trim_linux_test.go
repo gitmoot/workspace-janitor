@@ -45,7 +45,8 @@ func newTrimFixture(t *testing.T) *trimFixture {
 		return path
 	}
 	x.gobin = write("go", "rm -rf \"$GOCACHE\"/*\n")
-	x.dockerbin = write("docker", "")
+	// The fake daemon reports the default data root to the trim guard.
+	x.dockerbin = write("docker", "if [ \"$1\" = info ]; then echo /var/lib/docker; fi\n")
 	return x
 }
 
@@ -145,6 +146,7 @@ func TestCycleTrimsOversizedBuildCaches(t *testing.T) {
 	calls := x.calls(t)
 	want := []string{
 		"go|clean -cache|GOCACHE=" + x.cache,
+		"docker|info --format {{.DockerRootDir}}|GOCACHE=",
 		"docker|builder prune --force --max-used-space 2147483648|GOCACHE=",
 	}
 	if strings.Join(calls, "\n") != strings.Join(want, "\n") {
@@ -152,7 +154,7 @@ func TestCycleTrimsOversizedBuildCaches(t *testing.T) {
 	}
 	// Under its bound the Go cache is left alone.
 	x.cycle(t)
-	for _, call := range x.calls(t)[2:] {
+	for _, call := range x.calls(t)[len(want):] {
 		if strings.HasPrefix(call, "go|") {
 			t.Fatalf("under-bound cache trimmed again: %s", call)
 		}
@@ -467,5 +469,43 @@ func TestWatchReportsCompletedTrimWhenCancelledMidRun(t *testing.T) {
 	}
 	if got := out.String(); !strings.Contains(got, `"reason":"cache_trim"`) || !strings.Contains(got, `"status":"trimmed"`) {
 		t.Fatalf("completed trim not reported on shutdown: %q", got)
+	}
+}
+
+// Review #147 round 3 P1: when an archive_only root cannot be resolved the
+// trim guard must refuse, not fall back to comparing the paths as written.
+func TestTrimRefusedWhenAnArchiveOnlyRootCannotBeResolved(t *testing.T) {
+	x := newTrimFixture(t)
+	x.fill(t, 1<<20)
+	loop := filepath.Join(x.home, "loop")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\n  - path: %s\n    archive_only: true\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n    - kind: go-build\n      path: %s\n      binary: %s\n      max_bytes: 65536\n", x.root, filepath.Join(loop, "state"), x.proc, x.cache, x.gobin))
+	_, _, _ = x.run(t, "cycle")
+	if calls := x.calls(t); len(calls) != 0 {
+		t.Fatalf("provider ran although an archive_only root could not be resolved: %v", calls)
+	}
+}
+
+// Review #147 round 3 P1: a docker-builder trim is checked against the data
+// root the daemon reports, not only Docker's default.
+func TestDockerTrimRefusedWhenItsDataRootIsArchiveOnly(t *testing.T) {
+	x := newTrimFixture(t)
+	relocated := filepath.Join(x.root, "docker-data")
+	if err := os.MkdirAll(relocated, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	docker := filepath.Join(x.home, "relocated-docker")
+	script := "#!/bin/sh\nprintf 'docker|%s\\n' \"$*\" >> " + x.log + "\nif [ \"$1\" = info ]; then echo " + relocated + "; fi\n"
+	if err := os.WriteFile(docker, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\n    archive_only: true\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n    - kind: docker-builder\n      binary: %s\n      max_bytes: 2147483648\n", x.root, x.proc, docker))
+	_, _, _ = x.run(t, "cycle")
+	for _, call := range x.calls(t) {
+		if strings.Contains(call, "builder prune") {
+			t.Fatalf("docker pruned a data root inside an archive_only root: %v", x.calls(t))
+		}
 	}
 }

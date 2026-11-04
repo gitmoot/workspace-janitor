@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/url"
 	"path/filepath"
@@ -298,10 +300,13 @@ func InArchiveOnlyRoot(policy *Policy, path string) bool {
 	return false
 }
 
-// DockerDataRoot is the Docker data root a docker-builder trim acts on.
+// DockerDataRoot is Docker's default data root. Validation checks a
+// docker-builder trim against it; before each run the trim asks the daemon
+// for its actual data root and checks that too.
 const DockerDataRoot = "/var/lib/docker"
 
-// TrimTarget is the directory a standing cache trim acts on.
+// TrimTarget is the directory a standing cache trim acts on, as far as
+// policy alone can tell (Docker's default data root for docker-builder).
 func (t CacheTrim) TrimTarget() string {
 	if t.Kind == CacheTrimDockerBuilder {
 		return DockerDataRoot
@@ -311,32 +316,49 @@ func (t CacheTrim) TrimTarget() string {
 
 // ResolvesIntoArchiveOnlyRoot reports whether path, as written or with every
 // symlink resolved, lies in or contains any archive_only root as written or
-// resolved. It touches the filesystem, so it is for one-off guards such as
-// standing cache trims, not per-entry collection.
-func ResolvesIntoArchiveOnlyRoot(policy *Policy, path string) bool {
+// resolved. It fails closed: a path or root that exists but cannot be
+// resolved (for example an unsearchable ancestor) is an error, never a
+// lexical guess. Only a path that does not exist is compared as written,
+// since nothing can be removed through it. It touches the filesystem, so it
+// is for one-off guards such as standing cache trims, not per-entry
+// collection.
+func ResolvesIntoArchiveOnlyRoot(policy *Policy, path string) (bool, error) {
 	if policy == nil || path == "" {
-		return false
+		return false, nil
 	}
-	forms := func(p string) []string {
+	forms := func(p string) ([]string, error) {
 		out := []string{filepath.Clean(p)}
-		if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		resolved, err := filepath.EvalSymlinks(p)
+		switch {
+		case err == nil:
 			out = append(out, resolved)
+		case errors.Is(err, fs.ErrNotExist):
+		default:
+			return nil, fmt.Errorf("resolve %s: %w", p, err)
 		}
-		return out
+		return out, nil
+	}
+	targets, err := forms(path)
+	if err != nil {
+		return false, err
 	}
 	for _, root := range policy.Roots {
 		if !root.ArchiveOnly {
 			continue
 		}
-		for _, r := range forms(root.Path) {
-			for _, p := range forms(path) {
+		roots, err := forms(root.Path)
+		if err != nil {
+			return false, fmt.Errorf("archive_only root: %w", err)
+		}
+		for _, r := range roots {
+			for _, p := range targets {
 				if core.PathsOverlap(p, r) {
-					return true
+					return true, nil
 				}
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 // Supported cache trim kinds.

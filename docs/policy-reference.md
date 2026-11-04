@@ -78,7 +78,10 @@ explicit `workspace_archives` rule or `prevention.cache_trims` path may overlap
 an archive-only root (a `docker-builder` trim is checked against
 `/var/lib/docker`). Before running a provider, the cycle and the watcher also
 resolve symlinks in the trim path and in every archive-only root and refuse a
-trim that reaches one. Protection follows path containment in any
+trim that reaches one; a path or root that exists but cannot be resolved also
+refuses the trim. A `docker-builder` trim additionally asks the daemon for its
+data root (`docker info --format {{.DockerRootDir}}`) and is refused when that
+root is inside an archive-only root or cannot be determined. Protection follows path containment in any
 archive-only root, not which root a scan walked from, so an ordinary ancestor
 root cannot bypass it.
 
