@@ -44,6 +44,11 @@ jobs:
       - name: go test
         run: go test -v ./...
 
+      - name: go test -race (watcher goroutines)
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 -run 'Watch' ./internal/cli
+
       - name: go.mod and go.sum are tidy
         run: |
           go mod tidy

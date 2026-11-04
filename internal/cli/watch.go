@@ -118,16 +118,20 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		// A sampler failure is recorded here, apart from the parent context,
 		// so a normal signal-driven shutdown keeps its successful exit status.
 		var samplerErr error
-		go func() {
+		// The goroutine gets its own copy of ctx: watchLoop reassigns the
+		// variable below when it starts the trim loop.
+		go func(ctx context.Context) {
 			defer close(sampling)
 			if samplerErr = sampleCapacityLoop(ctx, e, paths, policy); samplerErr != nil {
 				cancel()
 			}
-		}()
+		}(ctx)
 		defer func() {
 			cancel()
 			<-sampling
-			if err == nil && samplerErr != nil {
+			// The main loop then fails with the resulting cancellation;
+			// report the cause instead.
+			if samplerErr != nil && (err == nil || errors.Is(err, context.Canceled)) {
 				err = samplerErr
 			}
 		}()
@@ -141,16 +145,16 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		// Like a sampler failure, a lost trim report ends the watcher with
 		// that error instead of a clean exit.
 		var trimErr error
-		go func() {
+		go func(ctx context.Context) {
 			defer close(trimming)
 			if trimErr = cacheTrimLoop(ctx, e, paths, policy); trimErr != nil {
 				cancel()
 			}
-		}()
+		}(ctx)
 		defer func() {
 			cancel()
 			<-trimming
-			if err == nil && trimErr != nil {
+			if trimErr != nil && (err == nil || errors.Is(err, context.Canceled)) {
 				err = trimErr
 			}
 		}()
@@ -289,13 +293,24 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 	}
 }
 
-// sampleCapacityLoop publishes a capacity sample every capacity interval
-// until ctx ends. sampleCapacity serializes with other samplers in the
-// database and reuses a sample that is still within its interval.
+// sampleCapacityLoop publishes a capacity sample every capacity_interval.
+// Each attempt runs apart from the loop and is bounded by the interval, so a
+// store write or measurement that hangs cannot hold the loop. A failed
+// attempt is reported and retried next interval. The loop watches its own
+// published sample: once the newest one is past valid_until (live
+// 2026-11-04: a host thrashing on swap stalled sampling 16 minutes while
+// the watcher looked healthy), it reports reason capacity_stale and returns
+// an error, so the watcher exits and its supervisor restarts it.
 func sampleCapacityLoop(ctx context.Context, e *env, paths config.Paths, policy config.Policy) error {
 	interval := policy.Prevention.CapacityInterval.Duration()
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	// Until a first sample succeeds, allow one validity window from start.
+	validUntil := time.Now().Add(2 * interval)
+	type attempt struct {
+		capacity *core.CapacitySnapshot
+		err      error
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -303,19 +318,48 @@ func sampleCapacityLoop(ctx context.Context, e *env, paths config.Paths, policy 
 		case <-timer.C:
 		}
 		now := time.Now().UTC()
-		capacity, err := sampleCapacity(ctx, policy, paths, now, false)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return err
+		attemptCtx, cancel := context.WithTimeout(ctx, interval)
+		done := make(chan attempt, 1)
+		go func() {
+			capacity, err := sampleCapacity(attemptCtx, policy, paths, now, false)
+			done <- attempt{capacity, err}
+		}()
+		stale := time.NewTimer(time.Until(validUntil))
+		var result attempt
+		select {
+		case result = <-done:
+		case <-stale.C:
+			result.err = errCapacityStale
+		case <-ctx.Done():
 		}
-		if err := writeWatchReport(e, watchReport{Reason: "capacity", Capacity: capacity}); err != nil {
+		stale.Stop()
+		cancel()
+		if ctx.Err() != nil {
+			return nil
+		}
+		if result.err == nil {
+			if err := writeWatchReport(e, watchReport{Reason: "capacity", Capacity: result.capacity}); err != nil {
+				return err
+			}
+			if result.capacity != nil {
+				validUntil = result.capacity.ValidUntil
+			}
+		} else if !time.Now().Before(validUntil) {
+			staleErr := fmt.Errorf("capacity sample stale since %s: %w", validUntil.UTC().Format(time.RFC3339), result.err)
+			if err := writeWatchReport(e, watchReport{Reason: "capacity_stale", Error: staleErr.Error()}); err != nil {
+				return errors.Join(staleErr, err)
+			}
+			return staleErr
+		} else if err := writeWatchReport(e, watchReport{Reason: "capacity", Error: "capacity sample failed: " + result.err.Error()}); err != nil {
 			return err
 		}
 		timer.Reset(time.Until(now.Add(interval)))
 	}
 }
+
+// errCapacityStale marks an attempt still unfinished when the published
+// sample expired.
+var errCapacityStale = errors.New("sampling attempt did not finish")
 
 // lockedWriter serializes whole report lines from concurrent writers.
 type lockedWriter struct {
