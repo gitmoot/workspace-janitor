@@ -108,6 +108,12 @@ type Options struct {
 	ArchiveCreationPath string
 	// VerifyArchiveContents is required for mutation-time recollection.
 	VerifyArchiveContents bool
+	// ArchiveBindPaths, when non-nil, limits workspace archive binding to
+	// these paths. Mutation-time recollection observes the target's whole
+	// parent directory but uses only the target, so binding (and fully
+	// verifying) every sibling's archive is wasted work; unbound siblings
+	// stay protected. Nil binds every candidate.
+	ArchiveBindPaths map[string]bool
 
 	DeepSize bool
 	// DeepSizePerEntry gives every sized directory its own

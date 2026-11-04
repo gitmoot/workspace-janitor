@@ -46,6 +46,8 @@ func (e *Engine) observeAround(ctx context.Context, path string, deep bool) (col
 	opts := e.Collect
 	opts.DeepSize = deep
 	opts.VerifyArchiveContents = true
+	// Only path is used; bind (and fully verify) its archive alone.
+	opts.ArchiveBindPaths = map[string]bool{path: true}
 	// Resolve a live source symlink only to check containment; quarantine
 	// snapshots never follow links because a relative target may be absent
 	// until restore. In both cases the filesystem move operates on the link.

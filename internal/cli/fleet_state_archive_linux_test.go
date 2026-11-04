@@ -5,6 +5,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -460,5 +461,41 @@ func TestSlowArchiveBindingSurvivesOverlappingRoots(t *testing.T) {
 	}
 	if len(bound) == 0 {
 		t.Fatalf("no binding survived duplicate listing under overlapping roots")
+	}
+}
+
+// Live 2026-11-04: quarantining one archived state folder re-observed its
+// whole parent and fully re-verified every sibling's archive, so 60 actions
+// made no progress in an hour. Revalidation must bind only its target.
+func TestQuarantineRevalidationBindsOnlyItsTarget(t *testing.T) {
+	x := newFleetStateFixture(t)
+	var folders []string
+	for i := range 4 {
+		path := filepath.Join(x.state, fmt.Sprintf("old-%d", i))
+		x.folder(t, path, 20*24*time.Hour, map[string]string{"log.txt": path})
+		folders = append(folders, path)
+	}
+	x.policy(t)
+	report := x.categories(t, false)
+	for _, path := range folders {
+		if item := x.item(t, report, path); item.Status != categoryArchived {
+			t.Fatalf("%s not archived: %+v", path, item)
+		}
+	}
+	x.source = folders[0]
+	plan, action := x.action(t, folders[0])
+	if action.Kind != core.ActionQuarantine {
+		t.Fatalf("archived folder not proposed for quarantine: %+v", action)
+	}
+	x.data(t, "plan", "--plan", plan.ID, "--approve", action.ID, "--no-jev")
+	binds := 0
+	collect.BeforeWorkspaceArchiveBind = func() { binds++ }
+	defer func() { collect.BeforeWorkspaceArchiveBind = nil }()
+	x.data(t, "apply", "--quarantine", "--action", action.ID, "--dry-run=false", "--confirm")
+	if _, err := os.Lstat(folders[0]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("target not quarantined: %v", err)
+	}
+	if binds > 2 {
+		t.Fatalf("revalidating one target bound %d archives; its %d siblings must not be re-verified", binds, len(folders)-1)
 	}
 }
