@@ -56,6 +56,14 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 	refs, report := runBounded(ctx, opts, CollectorWorkspaceArchives, func(ctx context.Context, _ *Options) ([]Reference, core.CollectorReport) {
 		report := core.CollectorReport{Name: CollectorWorkspaceArchives, Status: core.CollectorRan}
 		refs := make([]Reference, 0, len(candidates))
+		// The collector's result is dropped whole if it misses its deadline,
+		// so stop starting binds at a budget short of it and answer the rest
+		// as deferred (still protected). Each scan then binds what it can
+		// and a later scan continues, instead of every scan timing out with
+		// nothing bound (live 2026-11-04: 155 binds at ~0.6 s against 60 s).
+		budgetCtx, cancelBudget := context.WithDeadline(ctx, bindingBudget(ctx))
+		defer cancelBudget()
+		deferred := 0
 		// Category archives search every inventory root for dependents; one
 		// snapshot walk serves all of them in this collection instead of one
 		// bounded walk per item. Explicit rules keep their own walk.
@@ -66,6 +74,9 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 			switch {
 			case ctx.Err() != nil:
 				ref.Detail = "archive observation deadline expired"
+			case budgetCtx.Err() != nil && !item.protected:
+				deferred++
+				ref.Detail = "archive binding deferred: this scan's binding budget is spent; a later scan binds it"
 			case item.protected:
 				ref.Detail = "existing protection prevents binding or expiring this released workspace"
 			case item.kind != core.EntryKindDirectory:
@@ -77,11 +88,14 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 				scope.ProcRoot = opts.ProcRoot
 				if strings.HasPrefix(rule.Owner, config.CategoryOwnerPrefix) {
 					if categoryDependents == nil {
-						categoryDependents = workspacearchive.BuildDependentIndex(ctx, scope.SearchRoots, policy.Limits.DependentIndexMaxEntries)
+						categoryDependents = workspacearchive.BuildDependentIndex(budgetCtx, scope.SearchRoots, policy.Limits.DependentIndexMaxEntries)
 					}
 					scope.Dependents = categoryDependents
 				}
-				binding, err := workspacearchive.Bind(ctx, rule, scope, item.path, opts.VerifyArchiveContents)
+				if BeforeWorkspaceArchiveBind != nil {
+					BeforeWorkspaceArchiveBind()
+				}
+				binding, err := workspacearchive.Bind(budgetCtx, rule, scope, item.path, opts.VerifyArchiveContents)
 				switch {
 				case err != nil:
 					ref.Detail = fmt.Sprintf("verified workspace archive does not bind the local tree: %v", err)
@@ -94,6 +108,9 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 				}
 			}
 			refs = append(refs, ref)
+		}
+		if deferred > 0 {
+			report.Detail = fmt.Sprintf("%d archive binding(s) deferred to a later scan by the binding budget", deferred)
 		}
 		return refs, report
 	})
@@ -123,3 +140,21 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 	}
 	return report
 }
+
+// bindingBudget is when workspace archive binding stops starting new work:
+// a fifth of the remaining collector time (at least 2 s, at most 15 s)
+// before its deadline, so the collector publishes in time. A bind or index
+// walk cut off by it fails, which refuses that tree, never binds it.
+func bindingBudget(ctx context.Context) time.Time {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return time.Now().Add(24 * time.Hour)
+	}
+	remaining := time.Until(deadline)
+	margin := min(max(remaining/5, 2*time.Second), 15*time.Second, remaining/2)
+	return deadline.Add(-margin)
+}
+
+// BeforeWorkspaceArchiveBind is a test seam called before each archive
+// bind, so a test can make binding slow. Nil outside tests.
+var BeforeWorkspaceArchiveBind func()

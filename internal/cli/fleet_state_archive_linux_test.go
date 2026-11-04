@@ -9,10 +9,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gitmoot/workspace-janitor/internal/collect"
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
@@ -365,5 +367,54 @@ func TestQuarantinedVersionThatBecomesKeptLosesExpiryAuthority(t *testing.T) {
 		if rule.Path == old && rule.LocalExpiryEnabled {
 			t.Fatal("a quarantined version now among the 3 newest kept expiry authority")
 		}
+	}
+}
+
+// Live 2026-11-04: 155 verified category archives each needed ~0.6 s to bind,
+// the collector missed its 60 s command timeout, and a missed deadline drops
+// the whole result, so no item was ever bound and nothing could be freed,
+// scan after scan. Binding must stop at its budget and publish what it bound.
+func TestSlowArchiveBindingStillBindsSomeItemsEachScan(t *testing.T) {
+	x := newFleetStateFixture(t)
+	var folders []string
+	for i := range 5 {
+		path := filepath.Join(x.state, fmt.Sprintf("old-%d", i))
+		x.folder(t, path, 20*24*time.Hour, map[string]string{"log.txt": path})
+		folders = append(folders, path)
+	}
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	raw, err := os.ReadFile(policyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, strings.Replace(string(raw), "command_timeout: 30s", "command_timeout: 3s", 1))
+	report := x.categories(t, false)
+	for _, path := range folders {
+		if item := x.item(t, report, path); item.Status != categoryArchived {
+			t.Fatalf("%s not archived: %+v", path, item)
+		}
+	}
+	collect.BeforeWorkspaceArchiveBind = func() { time.Sleep(700 * time.Millisecond) }
+	defer func() { collect.BeforeWorkspaceArchiveBind = nil }()
+	x.data(t, "scan")
+	var plan core.Plan
+	field(t, x.data(t, "plan", "--no-jev"), "plan", &plan)
+	bound := 0
+	for _, action := range plan.Actions {
+		if !slices.Contains(folders, action.Path) {
+			continue
+		}
+		if action.Kind == core.ActionQuarantine {
+			bound++
+		}
+		for _, reason := range action.Reasons {
+			if strings.Contains(reason, "collector_failure") {
+				t.Fatalf("%s: binding result lost to the collector deadline: %v", action.Path, action.Reasons)
+			}
+		}
+	}
+	if bound == 0 || bound == len(folders) {
+		t.Fatalf("want some but not all of %d slow bindings bound within the budget, got %d", len(folders), bound)
 	}
 }
