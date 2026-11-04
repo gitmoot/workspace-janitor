@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -820,15 +822,23 @@ func TestRunBoundedDropsLateResultBeforeContextCancellationLands(t *testing.T) {
 	// judged against reports a moment past the deadline — the cancellation
 	// lag the context check could not see. The first reading arms the
 	// deadline; every later reading is past it.
-	var armed bool
+	var armed atomic.Bool
+	mu := &sync.Mutex{}
+	mu.Lock()
 	nowFunc = func() time.Time {
-		if !armed {
-			armed = true
+		mu.Lock()
+		defer mu.Unlock()
+		if armed.CompareAndSwap(false, true) {
 			return start
 		}
 		return start.Add(time.Hour)
 	}
-	t.Cleanup(func() { nowFunc = time.Now })
+	t.Cleanup(func() {
+		mu.Lock()
+		nowFunc = time.Now
+		mu.Unlock()
+	})
+	mu.Unlock()
 
 	gather := func(ctx context.Context, _ *Options) ([]Reference, core.CollectorReport) {
 		if ctx.Err() != nil {
