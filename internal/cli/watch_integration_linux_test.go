@@ -1065,3 +1065,78 @@ func TestWatchSettleScansDoNotChain(t *testing.T) {
 		t.Fatal("no full scans observed")
 	}
 }
+
+// Issue #164: a directory created while another directory's settle revisit
+// is pending is carried by that settle scan, and must still get its own
+// revisit, so a clone finishing after it is reclassified.
+func TestWatchDirectoryCarriedBySettleStillGetsItsRevisit(t *testing.T) {
+	f, root, _ := watchFixture(t)
+	saved := watchChangeGap
+	watchChangeGap = 20 * time.Second
+	defer func() { watchChangeGap = saved }()
+	sink := &watchSink{reports: make(chan watchReport, 64)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard, lookup: config.MapLookup(f.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	watcher := &chanWatcher{events: make(chan watchEvent)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- watchLoop(ctx, e, paths, policy, func() (eventWatcher, error) { return watcher, nil }, watchChurnInterval)
+	}()
+	lists := func(r watchReport, name string) bool {
+		for _, g := range r.Paths {
+			if filepath.Base(g.Path) == name {
+				return true
+			}
+		}
+		return false
+	}
+	next := func(within time.Duration, match func(watchReport) bool) (watchReport, bool) {
+		deadline := time.After(within)
+		for {
+			select {
+			case r := <-sink.reports:
+				if match(r) {
+					return r, true
+				}
+			case err := <-done:
+				t.Fatalf("watch loop exited: %v", err)
+			case <-deadline:
+				return watchReport{}, false
+			}
+		}
+	}
+	if _, ok := next(20*time.Second, func(r watchReport) bool { return r.Reason == "startup" }); !ok {
+		t.Fatal("no startup report")
+	}
+	// The first change after the gap since startup scans at once and
+	// schedules a's settle revisit.
+	time.Sleep(time.Until(start.Add(watchChangeGap)))
+	if err := os.Mkdir(filepath.Join(root, "a"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	watcher.events <- watchEvent{Root: root, Name: "a"}
+	if _, ok := next(10*time.Second, func(r watchReport) bool { return r.Reason == "change" }); !ok {
+		t.Fatal("no change scan for a")
+	}
+	// b appears inside the gap, before a's settle: held back, then carried.
+	if err := os.Mkdir(filepath.Join(root, "b"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	watcher.events <- watchEvent{Root: root, Name: "b"}
+	if _, ok := next(5*time.Second, func(r watchReport) bool { return r.Reason == "settled" && lists(r, "b") }); !ok {
+		t.Fatal("a's settle scan did not carry b")
+	}
+	if _, ok := next(5*time.Second, func(r watchReport) bool { return lists(r, "b") }); !ok {
+		t.Fatal("b, first carried by a's settle scan, never got its own revisit")
+	}
+}

@@ -189,6 +189,12 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 	pendingOverflow := false
 	var changeAt, lastScan time.Time
 	lastScan = time.Now()
+	// revisitedAt records when each directory last had its settle revisit.
+	// A directory gets at most one revisit per watchChangeGap: enough for a
+	// fresh clone to settle, and a path rewritten every few seconds cannot
+	// chain settle scans past the gap (live 2026-11-05: 165 settle scans in
+	// 2 h before #163; issue #164 for the revisit #163 then dropped).
+	revisitedAt := map[string]time.Time{}
 	// fullScan runs one full reconciliation. Every full scan also carries
 	// the change work held back by watchChangeGap, including a pending
 	// overflow, so an intervening settle or churn scan cannot persist new
@@ -205,20 +211,29 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		if err := reconcileWatch(ctx, e, paths, policy, reason, changed, overflow || pendingOverflow, deferred); err != nil {
 			return err
 		}
-		lastScan = time.Now()
+		now := time.Now()
+		lastScan = now
 		churnAt, deferred = time.Time{}, 0
+		if reason == "settled" {
+			for path := range extra {
+				revisitedAt[path] = now
+			}
+		}
+		for path, at := range revisitedAt {
+			if now.Sub(at) >= watchChangeGap {
+				delete(revisitedAt, path)
+			}
+		}
 		// A direct clone first creates an empty directory and fills .git
 		// below our top-level watch. Revisit newly seen directories after
-		// they settle; the watcher itself never acts on them. A settle scan
-		// is that revisit and never schedules another: otherwise a path
-		// rewritten every few seconds would chain settle scans forever and
-		// bypass watchChangeGap (live 2026-11-05: 165 settle scans in 2 h).
-		if reason != "settled" {
-			for path := range pendingChanged {
-				if info, err := os.Lstat(path); err == nil && info.IsDir() {
-					pendingSettle[path] = true
-					settleAt = time.Now().Add(2 * time.Second)
-				}
+		// they settle, once per gap; the watcher itself never acts on them.
+		for path := range pendingChanged {
+			if _, recent := revisitedAt[path]; recent {
+				continue
+			}
+			if info, err := os.Lstat(path); err == nil && info.IsDir() {
+				pendingSettle[path] = true
+				settleAt = now.Add(2 * time.Second)
 			}
 		}
 		pendingChanged, pendingOverflow, changeAt = map[string]bool{}, false, time.Time{}
