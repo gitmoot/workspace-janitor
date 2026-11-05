@@ -280,6 +280,11 @@ collectors:
     - /etc/cron.d
   pm2_dumps:
     - ~/.pm2/dump.pm2
+  # Configuration files whose absolute-path values (outside comment lines)
+  # name something a service uses; each such path is a blocking service
+  # reference. Default: gitmoot's config.toml.
+  config_files:
+    - ~/.gitmoot/config.toml
 
 # Destination checks of the safety engine. Nothing here disables a core
 # invariant: the protections themselves are not configurable.
