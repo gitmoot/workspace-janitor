@@ -998,3 +998,70 @@ func TestWatchSettleScanCarriesAPendingOverflow(t *testing.T) {
 		}
 	}
 }
+
+// Live 2026-11-05, after #162: a directory rewritten every ~30 s chained
+// settle scans (165 in 2 h), because each settle carried the held-back
+// change and scheduled another settle for it. A settle revisit always
+// follows a change scan, never another settle scan.
+func TestWatchSettleScansDoNotChain(t *testing.T) {
+	f, root, _ := watchFixture(t)
+	saved := watchChangeGap
+	watchChangeGap = 4 * time.Second
+	defer func() { watchChangeGap = saved }()
+	sink := &watchSink{reports: make(chan watchReport, 128)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard, lookup: config.MapLookup(f.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	watcher := &chanWatcher{events: make(chan watchEvent)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(ctx, e, paths, policy, func() (eventWatcher, error) { return watcher, nil }, watchChurnInterval)
+	}()
+	busy := filepath.Join(root, "busy")
+	if err := os.Mkdir(busy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var reasons []string
+	record := func(r watchReport) {
+		if r.Reason == "change" || r.Reason == "settled" {
+			reasons = append(reasons, r.Reason)
+		}
+	}
+	stop := time.Now().Add(9 * time.Second)
+	for time.Now().Before(stop) {
+		select {
+		case watcher.events <- watchEvent{Root: root, Name: "busy"}:
+		case err := <-done:
+			t.Fatalf("watch loop exited: %v", err)
+		case r := <-sink.reports:
+			record(r)
+			continue
+		}
+		drain := time.After(300 * time.Millisecond)
+	wait:
+		for {
+			select {
+			case r := <-sink.reports:
+				record(r)
+			case <-drain:
+				break wait
+			}
+		}
+	}
+	for i := 1; i < len(reasons); i++ {
+		if reasons[i] == "settled" && reasons[i-1] == "settled" {
+			t.Fatalf("settle scans chained without a change scan between them: %v", reasons)
+		}
+	}
+	if len(reasons) == 0 {
+		t.Fatal("no full scans observed")
+	}
+}
