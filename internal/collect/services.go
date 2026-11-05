@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -35,7 +36,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		return nil, report
 	}
 	sources := opts.ServiceSources
-	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 {
+	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 && len(sources.ConfigFiles) == 0 {
 		report.Status = core.CollectorSkipped
 		report.Detail = "no service definition locations are configured"
 		return nil, report
@@ -46,6 +47,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		gatherSystemd,
 		gatherCron,
 		gatherPM2,
+		gatherConfigFiles,
 	} {
 		if err := ctx.Err(); err != nil {
 			report.Status = core.CollectorPartial
@@ -469,6 +471,51 @@ func gatherPM2(ctx context.Context, opts *Options, report *core.CollectorReport)
 					Protection: core.ProtectServiceReference,
 					Signal:     candidate.signal,
 					Detail:     fmt.Sprintf("pm2 process %q %s (%s)", process.Name, candidate.label, dump),
+				})
+			}
+		}
+	}
+	return refs
+}
+
+// configPathToken finds absolute paths in a configuration value: after
+// start of line, whitespace, a quote, "=", ":", "," or "[".
+var configPathToken = regexp.MustCompile(`(?:^|[\s"'=:,\[])(/[^\s"',\]#;]+)`)
+
+// gatherConfigFiles reports every absolute path named in a configured
+// configuration file, skipping comment lines. Only the path and its line
+// number become evidence, never the surrounding value.
+func gatherConfigFiles(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
+	var refs []Reference
+	for _, file := range opts.ServiceSources.ConfigFiles {
+		if ctx.Err() != nil {
+			return refs
+		}
+		content, err := readFileBounded(file, maxPM2DumpBytes)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			noteUnreadable(report, fmt.Sprintf("could not read %s: %v", file, err))
+			continue
+		}
+		report.Visited++
+		for number, line := range strings.Split(content, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") || strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			for _, match := range configPathToken.FindAllStringSubmatch(line, -1) {
+				path := filepath.Clean(match[1])
+				if path == "/" {
+					continue
+				}
+				refs = append(refs, Reference{
+					Path:       path,
+					Source:     core.SourceService,
+					Protection: core.ProtectServiceReference,
+					Signal:     "config_file_path",
+					Detail:     fmt.Sprintf("named at %s:%d", file, number+1),
 				})
 			}
 		}

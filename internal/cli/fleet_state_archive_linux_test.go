@@ -499,3 +499,38 @@ func TestQuarantineRevalidationBindsOnlyItsTarget(t *testing.T) {
 		t.Fatalf("revalidating one target bound %d archives; its %d siblings must not be re-verified", binds, len(folders)-1)
 	}
 }
+
+// Live 2026-11-05: an idle state folder holding gitmoot's remote_exec
+// binaries was archived and quarantined although gitmoot's config.toml named
+// a file inside it. A path named in a configured config file is in use; a
+// path named only in a comment is not.
+func TestConfigFileReferenceKeepsAnIdleFolderLocal(t *testing.T) {
+	x := newFleetStateFixture(t)
+	used := filepath.Join(x.state, "sandboxd-omp")
+	mentioned := filepath.Join(x.state, "old-notes")
+	x.folder(t, used, 20*24*time.Hour, map[string]string{"omp-linux-arm64": "binary"})
+	x.folder(t, mentioned, 20*24*time.Hour, map[string]string{"notes.txt": "old"})
+	config := filepath.Join(x.home, "gitmoot-config.toml")
+	body := fmt.Sprintf("[remote_exec.sandboxd]\nomp_linux_arm64_file = \"%s\"\n# Notes: %s/\n", filepath.Join(used, "omp-linux-arm64"), mentioned)
+	if err := os.WriteFile(config, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	raw, err := os.ReadFile(policyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  config_files: ["+config+"]\n", 1))
+	report := x.categories(t, false)
+	item := x.item(t, report, used)
+	if item.Status == categoryArchived || !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
+		t.Fatalf("folder named in a config value was not kept as a service reference: %+v", item)
+	}
+	if _, err := os.Stat(filepath.Join(used, "omp-linux-arm64")); err != nil {
+		t.Fatalf("referenced folder moved: %v", err)
+	}
+	if got := x.item(t, report, mentioned); got.Status != categoryArchived {
+		t.Fatalf("a path named only in a comment blocked archiving: %+v", got)
+	}
+}

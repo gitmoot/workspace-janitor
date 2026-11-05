@@ -199,6 +199,11 @@ type Collectors struct {
 	SystemdDirs []string `yaml:"systemd_dirs" json:"systemd_dirs"`
 	CronPaths   []string `yaml:"cron_paths" json:"cron_paths"`
 	PM2Dumps    []string `yaml:"pm2_dumps" json:"pm2_dumps"`
+	// ConfigFiles are configuration files (TOML, YAML, INI and similar)
+	// whose absolute-path values name paths that a service uses, such as
+	// gitmoot's remote_exec binaries. Every absolute path outside a comment
+	// line is a blocking service reference.
+	ConfigFiles []string `yaml:"config_files" json:"config_files"`
 }
 
 // CanonicalRoot declares where entries of a class are supposed to live.
@@ -487,8 +492,9 @@ func DefaultPolicy(p Paths) Policy {
 				"/etc/systemd/system",
 				"/usr/lib/systemd/system",
 			},
-			CronPaths: []string{"/etc/crontab", "/etc/cron.d"},
-			PM2Dumps:  []string{},
+			CronPaths:   []string{"/etc/crontab", "/etc/cron.d"},
+			PM2Dumps:    []string{},
+			ConfigFiles: []string{},
 		},
 		Classification: Classification{
 			ProjectMarkers:   []string{".git", "go.mod", "package.json", "Cargo.toml", "pyproject.toml"},
@@ -538,6 +544,7 @@ func DefaultPolicy(p Paths) Policy {
 		policy.Protect.Paths = append(policy.Protect.Paths, policy.Gitmoot.Home)
 		policy.Collectors.SystemdDirs = append(policy.Collectors.SystemdDirs, filepath.Join(p.Home, ".config", "systemd", "user"))
 		policy.Collectors.PM2Dumps = append(policy.Collectors.PM2Dumps, filepath.Join(p.Home, ".pm2", "dump.pm2"))
+		policy.Collectors.ConfigFiles = append(policy.Collectors.ConfigFiles, filepath.Join(policy.Gitmoot.Home, "config.toml"))
 	} else {
 		policy.Roots = []Root{}
 		policy.Protect.Paths = []string{}
