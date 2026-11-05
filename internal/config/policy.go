@@ -595,6 +595,7 @@ func (p Policy) clone() Policy {
 	out.Collectors.SystemdDirs = append([]string(nil), p.Collectors.SystemdDirs...)
 	out.Collectors.CronPaths = append([]string(nil), p.Collectors.CronPaths...)
 	out.Collectors.PM2Dumps = append([]string(nil), p.Collectors.PM2Dumps...)
+	out.Collectors.ConfigFiles = append([]string(nil), p.Collectors.ConfigFiles...)
 	out.CanonicalRoots = append([]CanonicalRoot(nil), p.CanonicalRoots...)
 	out.Classification = p.Classification.clone()
 	return out
@@ -666,6 +667,9 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	for i := range p.Collectors.CronPaths {
 		p.Collectors.CronPaths[i] = expand(fmt.Sprintf("collectors.cron_paths[%d]", i), p.Collectors.CronPaths[i])
 	}
+	for i := range p.Collectors.ConfigFiles {
+		p.Collectors.ConfigFiles[i] = expand(fmt.Sprintf("collectors.config_files[%d]", i), p.Collectors.ConfigFiles[i])
+	}
 	for i := range p.Collectors.PM2Dumps {
 		p.Collectors.PM2Dumps[i] = expand(fmt.Sprintf("collectors.pm2_dumps[%d]", i), p.Collectors.PM2Dumps[i])
 	}
@@ -700,6 +704,9 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	}
 	if p.Collectors.CronPaths == nil {
 		p.Collectors.CronPaths = []string{}
+	}
+	if p.Collectors.ConfigFiles == nil {
+		p.Collectors.ConfigFiles = []string{}
 	}
 	if p.Collectors.PM2Dumps == nil {
 		p.Collectors.PM2Dumps = []string{}
@@ -1022,6 +1029,7 @@ func (p *Policy) Validate() core.FieldErrors {
 		{"collectors.systemd_dirs", p.Collectors.SystemdDirs},
 		{"collectors.cron_paths", p.Collectors.CronPaths},
 		{"collectors.pm2_dumps", p.Collectors.PM2Dumps},
+		{"collectors.config_files", p.Collectors.ConfigFiles},
 	} {
 		for i, value := range group.values {
 			if !core.IsCanonicalPath(value) {

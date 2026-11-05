@@ -3,14 +3,16 @@ package collect
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 
+	"github.com/BurntSushi/toml"
 	"github.com/gitmoot/workspace-janitor/internal/core"
+	"gopkg.in/yaml.v3"
 )
 
 // Bounds for the small definition files the reference collectors parse.
@@ -478,13 +480,12 @@ func gatherPM2(ctx context.Context, opts *Options, report *core.CollectorReport)
 	return refs
 }
 
-// configPathToken finds absolute paths in a configuration value: after
-// start of line, whitespace, a quote, "=", ":", "," or "[".
-var configPathToken = regexp.MustCompile(`(?:^|[\s"'=:,\[])(/[^\s"',\]#;]+)`)
-
-// gatherConfigFiles reports every absolute path named in a configured
-// configuration file, skipping comment lines. Only the path and its line
-// number become evidence, never the surrounding value.
+// gatherConfigFiles reports every absolute path held in any string value of
+// a configured configuration file. Files are decoded with a real parser
+// (TOML, YAML or JSON by extension), so quoting, escapes and comments follow
+// the format exactly; an unknown format or a file that does not parse is
+// reported unreadable, which leaves this source unknown rather than empty.
+// Only the path and the file become evidence, never other values.
 func gatherConfigFiles(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
 	var refs []Reference
 	for _, file := range opts.ServiceSources.ConfigFiles {
@@ -499,28 +500,69 @@ func gatherConfigFiles(ctx context.Context, opts *Options, report *core.Collecto
 			noteUnreadable(report, fmt.Sprintf("could not read %s: %v", file, err))
 			continue
 		}
-		report.Visited++
-		for number, line := range strings.Split(content, "\n") {
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") || strings.HasPrefix(trimmed, "//") {
-				continue
-			}
-			for _, match := range configPathToken.FindAllStringSubmatch(line, -1) {
-				path := filepath.Clean(match[1])
-				if path == "/" {
-					continue
-				}
-				refs = append(refs, Reference{
-					Path:       path,
-					Source:     core.SourceService,
-					Protection: core.ProtectServiceReference,
-					Signal:     "config_file_path",
-					Detail:     fmt.Sprintf("named at %s:%d", file, number+1),
-				})
-			}
+		var doc any
+		switch strings.ToLower(filepath.Ext(file)) {
+		case ".toml":
+			var table map[string]any
+			_, err = toml.Decode(content, &table)
+			doc = table
+		case ".yaml", ".yml":
+			err = yaml.Unmarshal([]byte(content), &doc)
+		case ".json":
+			err = json.Unmarshal([]byte(content), &doc)
+		default:
+			err = errors.New("unsupported format; use .toml, .yaml, .yml or .json")
 		}
+		if err != nil {
+			noteUnreadable(report, fmt.Sprintf("could not parse %s: %v", file, err))
+			continue
+		}
+		report.Visited++
+		walkConfigStrings(doc, func(value string) {
+			if !filepath.IsAbs(value) {
+				return
+			}
+			path := filepath.Clean(value)
+			if path == "/" {
+				return
+			}
+			refs = append(refs, Reference{
+				Path:       path,
+				Source:     core.SourceService,
+				Protection: core.ProtectServiceReference,
+				Signal:     "config_file_path",
+				Detail:     "named in " + file,
+			})
+		})
 	}
 	return refs
+}
+
+// walkConfigStrings calls visit with every string value (and map key) in a
+// decoded configuration document.
+func walkConfigStrings(node any, visit func(string)) {
+	switch value := node.(type) {
+	case string:
+		visit(value)
+	case map[string]any:
+		for key, child := range value {
+			visit(key)
+			walkConfigStrings(child, visit)
+		}
+	case map[any]any:
+		for key, child := range value {
+			walkConfigStrings(key, visit)
+			walkConfigStrings(child, visit)
+		}
+	case []any:
+		for _, child := range value {
+			walkConfigStrings(child, visit)
+		}
+	case []map[string]any:
+		for _, child := range value {
+			walkConfigStrings(child, visit)
+		}
+	}
 }
 
 // firstAbsolutePath returns the first absolute path in a directive value,
