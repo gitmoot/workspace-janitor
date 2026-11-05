@@ -929,3 +929,72 @@ func TestWatchCoalescesChangesWithinTheGap(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 }
+
+// Review #160 P2 (issue #161): an overflow held back by watchChangeGap must
+// not be lost to a settle scan that runs first. A directory created without
+// its own event is discovered by that scan and must be reported.
+func TestWatchSettleScanCarriesAPendingOverflow(t *testing.T) {
+	f, root, _ := watchFixture(t)
+	saved := watchChangeGap
+	watchChangeGap = 3 * time.Second
+	defer func() { watchChangeGap = saved }()
+	sink := &watchSink{reports: make(chan watchReport, 64)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard, lookup: config.MapLookup(f.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	watcher := &chanWatcher{events: make(chan watchEvent)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(ctx, e, paths, policy, func() (eventWatcher, error) { return watcher, nil }, watchChurnInterval)
+	}()
+	waitFor := func(reason string, within time.Duration) watchReport {
+		t.Helper()
+		deadline := time.After(within)
+		for {
+			select {
+			case report := <-sink.reports:
+				if report.Reason == reason {
+					return report
+				}
+			case err := <-done:
+				t.Fatalf("watch loop exited: %v", err)
+			case <-deadline:
+				t.Fatalf("no %s report", reason)
+			}
+		}
+	}
+	waitFor("startup", 20*time.Second)
+	time.Sleep(watchChangeGap) // the next change scans at once
+	if err := os.Mkdir(filepath.Join(root, "a"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	watcher.events <- watchEvent{Root: root, Name: "a"}
+	waitFor("change", 20*time.Second) // schedules a settle revisit of a in 2 s
+	if err := os.Mkdir(filepath.Join(root, "b"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	watcher.events <- watchEvent{Root: root, Overflow: true} // held back by the gap
+	deadline := time.After(8 * time.Second)
+	for {
+		select {
+		case report := <-sink.reports:
+			for _, guidance := range report.Paths {
+				if filepath.Base(guidance.Path) == "b" {
+					return
+				}
+			}
+		case err := <-done:
+			t.Fatalf("watch loop exited: %v", err)
+		case <-deadline:
+			t.Fatal("directory b, found only through the held-back overflow, was never reported")
+		}
+	}
+}

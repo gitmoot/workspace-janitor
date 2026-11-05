@@ -189,10 +189,20 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 	pendingOverflow := false
 	var changeAt, lastScan time.Time
 	lastScan = time.Now()
-	// scanChanges runs the coalesced change reconciliation and schedules
-	// the settle revisit of directories it saw.
-	scanChanges := func() error {
-		if err := reconcileWatch(ctx, e, paths, policy, "change", pendingChanged, pendingOverflow, deferred); err != nil {
+	// fullScan runs one full reconciliation. Every full scan also carries
+	// the change work held back by watchChangeGap, including a pending
+	// overflow, so an intervening settle or churn scan cannot persist new
+	// paths without reporting them (review of #160). It then schedules the
+	// settle revisit of directories it saw.
+	fullScan := func(reason string, extra map[string]bool, overflow bool) error {
+		changed := make(map[string]bool, len(extra)+len(pendingChanged))
+		for path := range extra {
+			changed[path] = true
+		}
+		for path := range pendingChanged {
+			changed[path] = true
+		}
+		if err := reconcileWatch(ctx, e, paths, policy, reason, changed, overflow || pendingOverflow, deferred); err != nil {
 			return err
 		}
 		lastScan = time.Now()
@@ -209,6 +219,7 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		pendingChanged, pendingOverflow, changeAt = map[string]bool{}, false, time.Time{}
 		return nil
 	}
+	scanChanges := func() error { return fullScan("change", nil, false) }
 	for {
 		deadline := settleAt
 		for _, at := range []time.Time{churnAt, changeAt} {
@@ -230,21 +241,19 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 					return err
 				}
 			} else if !settleAt.IsZero() && !now.Before(settleAt) {
-				// Settling is a full scan too; it satisfies any deferred churn.
-				if err := reconcileWatch(ctx, e, paths, policy, "settled", pendingSettle, false, deferred); err != nil {
+				// Settling is a full scan too; it satisfies any deferred churn
+				// and any held-back change work.
+				settling := pendingSettle
+				pendingSettle, settleAt = map[string]bool{}, time.Time{}
+				if err := fullScan("settled", settling, false); err != nil {
 					return err
 				}
-				pendingSettle = map[string]bool{}
-				settleAt, churnAt, deferred = time.Time{}, time.Time{}, 0
-				lastScan = time.Now()
 			} else if !churnAt.IsZero() && !now.Before(churnAt) {
 				// Full reconciliation recovers even a top-level event lost
 				// during protected churn or an inotify overflow.
-				if err := reconcileWatch(ctx, e, paths, policy, "churn", nil, true, deferred); err != nil {
+				if err := fullScan("churn", nil, true); err != nil {
 					return err
 				}
-				churnAt, deferred = time.Time{}, 0
-				lastScan = time.Now()
 			}
 			continue
 		}
