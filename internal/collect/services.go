@@ -507,7 +507,21 @@ func gatherConfigFiles(ctx context.Context, opts *Options, report *core.Collecto
 			_, err = toml.Decode(content, &table)
 			doc = table
 		case ".yaml", ".yml":
-			err = yaml.Unmarshal([]byte(content), &doc)
+			// Every document of the stream; a bad later document fails
+			// the whole file rather than being silently skipped.
+			var docs []any
+			decoder := yaml.NewDecoder(strings.NewReader(content))
+			for {
+				var one any
+				if err = decoder.Decode(&one); err != nil {
+					break
+				}
+				docs = append(docs, one)
+			}
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+			doc = docs
 		case ".json":
 			err = json.Unmarshal([]byte(content), &doc)
 		default:

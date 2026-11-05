@@ -566,3 +566,41 @@ func TestConfigFileReferenceKeepsAnIdleFolderLocal(t *testing.T) {
 		t.Fatalf("quarantined while a configured config file could not be parsed: %v", err)
 	}
 }
+
+// Review #158 round 2 P1: every document of a YAML stream is a reference
+// source, and a malformed later document is not silently skipped.
+func TestConfigFileReferencesCoverEveryYAMLDocument(t *testing.T) {
+	x := newFleetStateFixture(t)
+	first := filepath.Join(x.state, "first-doc")
+	second := filepath.Join(x.state, "second-doc")
+	for _, path := range []string{first, second} {
+		x.folder(t, path, 20*24*time.Hour, map[string]string{"file": "data"})
+	}
+	config := filepath.Join(x.home, "service.yaml")
+	if err := os.WriteFile(config, []byte(fmt.Sprintf("a: %s\n---\nb: %s\n", first, second)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	raw, err := os.ReadFile(policyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  config_files: ["+config+"]\n", 1))
+	report := x.categories(t, true)
+	for _, path := range []string{first, second} {
+		if item := x.item(t, report, path); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
+			t.Fatalf("%s named in a YAML document was not kept: %+v", path, item)
+		}
+	}
+	if err := os.WriteFile(config, []byte(fmt.Sprintf("a: %s\n---\nb: [unclosed\n", first)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var scan core.Scan
+	field(t, x.data(t, "scan"), "scan", &scan)
+	for _, report := range scan.Collectors {
+		if report.Name == "services" && report.Status == core.CollectorRan {
+			t.Fatalf("a malformed later YAML document left services complete: %+v", report)
+		}
+	}
+}
