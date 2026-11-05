@@ -75,6 +75,7 @@ type ServiceSources struct {
 	SystemdDirs []string
 	CronPaths   []string
 	PM2Dumps    []string
+	ConfigFiles []string
 }
 
 // AgentRef is one directory a registered agent is using.

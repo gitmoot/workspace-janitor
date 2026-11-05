@@ -499,3 +499,108 @@ func TestQuarantineRevalidationBindsOnlyItsTarget(t *testing.T) {
 		t.Fatalf("revalidating one target bound %d archives; its %d siblings must not be re-verified", binds, len(folders)-1)
 	}
 }
+
+// Live 2026-11-05: an idle state folder holding gitmoot's remote_exec
+// binaries was archived and quarantined although gitmoot's config.toml named
+// a file inside it. Every path held in a value of a configured config file
+// is in use, however it is quoted or escaped; a path named only in a comment
+// is not; a config file that does not parse leaves nothing safe to remove.
+func TestConfigFileReferenceKeepsAnIdleFolderLocal(t *testing.T) {
+	x := newFleetStateFixture(t)
+	plain := filepath.Join(x.state, "sandboxd-omp")
+	spaced := filepath.Join(x.state, "service bundle")
+	hashed := filepath.Join(x.state, "used#current")
+	semi := filepath.Join(x.state, "used;current")
+	escaped := filepath.Join(x.state, "escaped-slash")
+	mentioned := filepath.Join(x.state, "old-notes")
+	for _, path := range []string{plain, spaced, hashed, semi, escaped, mentioned} {
+		x.folder(t, path, 20*24*time.Hour, map[string]string{"file": "data"})
+	}
+	configDir := filepath.Join(x.home, ".gitmoot")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	escapedValue := strings.Replace(filepath.Join(escaped, "file"), "/", `\u002f`, 1)
+	body := fmt.Sprintf("[remote_exec.sandboxd]\nomp_linux_arm64_file = %q\nbundle = %q\nlist = [%q, %q]\nescaped = \"%s\"\n# Notes: %s/\n",
+		filepath.Join(plain, "file"), filepath.Join(spaced, "file"), filepath.Join(hashed, "file"), filepath.Join(semi, "file"), escapedValue, mentioned)
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	raw, err := os.ReadFile(policyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Written with ~, as documented: the list must be expanded like the others.
+	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  config_files: [~/.gitmoot/config.toml]\n", 1))
+	report := x.categories(t, false)
+	for _, path := range []string{plain, spaced, hashed, semi, escaped} {
+		item := x.item(t, report, path)
+		if item.Status == categoryArchived || !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
+			t.Fatalf("%s is named in a config value but was not kept as a service reference: %+v", path, item)
+		}
+	}
+	if got := x.item(t, report, mentioned); got.Status != categoryArchived {
+		t.Fatalf("a path named only in a comment blocked archiving: %+v", got)
+	}
+
+	// An unparseable config file leaves its references unknown: a folder
+	// may still be copied to its archive, but never removed locally.
+	late := filepath.Join(x.state, "late-folder")
+	x.folder(t, late, 20*24*time.Hour, map[string]string{"file": "data"})
+	if got := x.item(t, x.categories(t, false), late); got.Status != categoryArchived {
+		t.Fatalf("late folder not archived: %+v", got)
+	}
+	x.source = late
+	plan, action := x.action(t, late)
+	if action.Kind != core.ActionQuarantine {
+		t.Fatalf("archived folder not proposed for quarantine: %+v", action)
+	}
+	x.data(t, "plan", "--plan", plan.ID, "--approve", action.ID, "--no-jev")
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte("this is [not toml"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _ = x.run(t, "apply", "--quarantine", "--action", action.ID, "--dry-run=false", "--confirm")
+	if _, err := os.Stat(filepath.Join(late, "file")); err != nil {
+		t.Fatalf("quarantined while a configured config file could not be parsed: %v", err)
+	}
+}
+
+// Review #158 round 2 P1: every document of a YAML stream is a reference
+// source, and a malformed later document is not silently skipped.
+func TestConfigFileReferencesCoverEveryYAMLDocument(t *testing.T) {
+	x := newFleetStateFixture(t)
+	first := filepath.Join(x.state, "first-doc")
+	second := filepath.Join(x.state, "second-doc")
+	for _, path := range []string{first, second} {
+		x.folder(t, path, 20*24*time.Hour, map[string]string{"file": "data"})
+	}
+	config := filepath.Join(x.home, "service.yaml")
+	if err := os.WriteFile(config, []byte(fmt.Sprintf("a: %s\n---\nb: %s\n", first, second)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	raw, err := os.ReadFile(policyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  config_files: ["+config+"]\n", 1))
+	report := x.categories(t, true)
+	for _, path := range []string{first, second} {
+		if item := x.item(t, report, path); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
+			t.Fatalf("%s named in a YAML document was not kept: %+v", path, item)
+		}
+	}
+	if err := os.WriteFile(config, []byte(fmt.Sprintf("a: %s\n---\nb: [unclosed\n", first)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var scan core.Scan
+	field(t, x.data(t, "scan"), "scan", &scan)
+	for _, report := range scan.Collectors {
+		if report.Name == "services" && report.Status == core.CollectorRan {
+			t.Fatalf("a malformed later YAML document left services complete: %+v", report)
+		}
+	}
+}

@@ -199,6 +199,11 @@ type Collectors struct {
 	SystemdDirs []string `yaml:"systemd_dirs" json:"systemd_dirs"`
 	CronPaths   []string `yaml:"cron_paths" json:"cron_paths"`
 	PM2Dumps    []string `yaml:"pm2_dumps" json:"pm2_dumps"`
+	// ConfigFiles are configuration files (TOML, YAML, INI and similar)
+	// whose absolute-path values name paths that a service uses, such as
+	// gitmoot's remote_exec binaries. Every absolute path outside a comment
+	// line is a blocking service reference.
+	ConfigFiles []string `yaml:"config_files" json:"config_files"`
 }
 
 // CanonicalRoot declares where entries of a class are supposed to live.
@@ -487,8 +492,9 @@ func DefaultPolicy(p Paths) Policy {
 				"/etc/systemd/system",
 				"/usr/lib/systemd/system",
 			},
-			CronPaths: []string{"/etc/crontab", "/etc/cron.d"},
-			PM2Dumps:  []string{},
+			CronPaths:   []string{"/etc/crontab", "/etc/cron.d"},
+			PM2Dumps:    []string{},
+			ConfigFiles: []string{},
 		},
 		Classification: Classification{
 			ProjectMarkers:   []string{".git", "go.mod", "package.json", "Cargo.toml", "pyproject.toml"},
@@ -538,6 +544,7 @@ func DefaultPolicy(p Paths) Policy {
 		policy.Protect.Paths = append(policy.Protect.Paths, policy.Gitmoot.Home)
 		policy.Collectors.SystemdDirs = append(policy.Collectors.SystemdDirs, filepath.Join(p.Home, ".config", "systemd", "user"))
 		policy.Collectors.PM2Dumps = append(policy.Collectors.PM2Dumps, filepath.Join(p.Home, ".pm2", "dump.pm2"))
+		policy.Collectors.ConfigFiles = append(policy.Collectors.ConfigFiles, filepath.Join(policy.Gitmoot.Home, "config.toml"))
 	} else {
 		policy.Roots = []Root{}
 		policy.Protect.Paths = []string{}
@@ -588,6 +595,7 @@ func (p Policy) clone() Policy {
 	out.Collectors.SystemdDirs = append([]string(nil), p.Collectors.SystemdDirs...)
 	out.Collectors.CronPaths = append([]string(nil), p.Collectors.CronPaths...)
 	out.Collectors.PM2Dumps = append([]string(nil), p.Collectors.PM2Dumps...)
+	out.Collectors.ConfigFiles = append([]string(nil), p.Collectors.ConfigFiles...)
 	out.CanonicalRoots = append([]CanonicalRoot(nil), p.CanonicalRoots...)
 	out.Classification = p.Classification.clone()
 	return out
@@ -659,6 +667,9 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	for i := range p.Collectors.CronPaths {
 		p.Collectors.CronPaths[i] = expand(fmt.Sprintf("collectors.cron_paths[%d]", i), p.Collectors.CronPaths[i])
 	}
+	for i := range p.Collectors.ConfigFiles {
+		p.Collectors.ConfigFiles[i] = expand(fmt.Sprintf("collectors.config_files[%d]", i), p.Collectors.ConfigFiles[i])
+	}
 	for i := range p.Collectors.PM2Dumps {
 		p.Collectors.PM2Dumps[i] = expand(fmt.Sprintf("collectors.pm2_dumps[%d]", i), p.Collectors.PM2Dumps[i])
 	}
@@ -693,6 +704,9 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	}
 	if p.Collectors.CronPaths == nil {
 		p.Collectors.CronPaths = []string{}
+	}
+	if p.Collectors.ConfigFiles == nil {
+		p.Collectors.ConfigFiles = []string{}
 	}
 	if p.Collectors.PM2Dumps == nil {
 		p.Collectors.PM2Dumps = []string{}
@@ -1015,6 +1029,7 @@ func (p *Policy) Validate() core.FieldErrors {
 		{"collectors.systemd_dirs", p.Collectors.SystemdDirs},
 		{"collectors.cron_paths", p.Collectors.CronPaths},
 		{"collectors.pm2_dumps", p.Collectors.PM2Dumps},
+		{"collectors.config_files", p.Collectors.ConfigFiles},
 	} {
 		for i, value := range group.values {
 			if !core.IsCanonicalPath(value) {

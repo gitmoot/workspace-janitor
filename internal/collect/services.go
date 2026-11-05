@@ -3,13 +3,16 @@ package collect
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/BurntSushi/toml"
 	"github.com/gitmoot/workspace-janitor/internal/core"
+	"gopkg.in/yaml.v3"
 )
 
 // Bounds for the small definition files the reference collectors parse.
@@ -35,7 +38,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		return nil, report
 	}
 	sources := opts.ServiceSources
-	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 {
+	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 && len(sources.ConfigFiles) == 0 {
 		report.Status = core.CollectorSkipped
 		report.Detail = "no service definition locations are configured"
 		return nil, report
@@ -46,6 +49,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		gatherSystemd,
 		gatherCron,
 		gatherPM2,
+		gatherConfigFiles,
 	} {
 		if err := ctx.Err(); err != nil {
 			report.Status = core.CollectorPartial
@@ -474,6 +478,105 @@ func gatherPM2(ctx context.Context, opts *Options, report *core.CollectorReport)
 		}
 	}
 	return refs
+}
+
+// gatherConfigFiles reports every absolute path held in any string value of
+// a configured configuration file. Files are decoded with a real parser
+// (TOML, YAML or JSON by extension), so quoting, escapes and comments follow
+// the format exactly; an unknown format or a file that does not parse is
+// reported unreadable, which leaves this source unknown rather than empty.
+// Only the path and the file become evidence, never other values.
+func gatherConfigFiles(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
+	var refs []Reference
+	for _, file := range opts.ServiceSources.ConfigFiles {
+		if ctx.Err() != nil {
+			return refs
+		}
+		content, err := readFileBounded(file, maxPM2DumpBytes)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			noteUnreadable(report, fmt.Sprintf("could not read %s: %v", file, err))
+			continue
+		}
+		var doc any
+		switch strings.ToLower(filepath.Ext(file)) {
+		case ".toml":
+			var table map[string]any
+			_, err = toml.Decode(content, &table)
+			doc = table
+		case ".yaml", ".yml":
+			// Every document of the stream; a bad later document fails
+			// the whole file rather than being silently skipped.
+			var docs []any
+			decoder := yaml.NewDecoder(strings.NewReader(content))
+			for {
+				var one any
+				if err = decoder.Decode(&one); err != nil {
+					break
+				}
+				docs = append(docs, one)
+			}
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+			doc = docs
+		case ".json":
+			err = json.Unmarshal([]byte(content), &doc)
+		default:
+			err = errors.New("unsupported format; use .toml, .yaml, .yml or .json")
+		}
+		if err != nil {
+			noteUnreadable(report, fmt.Sprintf("could not parse %s: %v", file, err))
+			continue
+		}
+		report.Visited++
+		walkConfigStrings(doc, func(value string) {
+			if !filepath.IsAbs(value) {
+				return
+			}
+			path := filepath.Clean(value)
+			if path == "/" {
+				return
+			}
+			refs = append(refs, Reference{
+				Path:       path,
+				Source:     core.SourceService,
+				Protection: core.ProtectServiceReference,
+				Signal:     "config_file_path",
+				Detail:     "named in " + file,
+			})
+		})
+	}
+	return refs
+}
+
+// walkConfigStrings calls visit with every string value (and map key) in a
+// decoded configuration document.
+func walkConfigStrings(node any, visit func(string)) {
+	switch value := node.(type) {
+	case string:
+		visit(value)
+	case map[string]any:
+		for key, child := range value {
+			visit(key)
+			walkConfigStrings(child, visit)
+		}
+	case map[any]any:
+		for key, child := range value {
+			walkConfigStrings(key, visit)
+			walkConfigStrings(child, visit)
+		}
+	case []any:
+		for _, child := range value {
+			walkConfigStrings(child, visit)
+		}
+	case []map[string]any:
+		for _, child := range value {
+			walkConfigStrings(child, visit)
+		}
+	}
 }
 
 // firstAbsolutePath returns the first absolute path in a directive value,
