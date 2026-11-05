@@ -209,11 +209,16 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		churnAt, deferred = time.Time{}, 0
 		// A direct clone first creates an empty directory and fills .git
 		// below our top-level watch. Revisit newly seen directories after
-		// they settle; the watcher itself never acts on them.
-		for path := range pendingChanged {
-			if info, err := os.Lstat(path); err == nil && info.IsDir() {
-				pendingSettle[path] = true
-				settleAt = time.Now().Add(2 * time.Second)
+		// they settle; the watcher itself never acts on them. A settle scan
+		// is that revisit and never schedules another: otherwise a path
+		// rewritten every few seconds would chain settle scans forever and
+		// bypass watchChangeGap (live 2026-11-05: 165 settle scans in 2 h).
+		if reason != "settled" {
+			for path := range pendingChanged {
+				if info, err := os.Lstat(path); err == nil && info.IsDir() {
+					pendingSettle[path] = true
+					settleAt = time.Now().Add(2 * time.Second)
+				}
 			}
 		}
 		pendingChanged, pendingOverflow, changeAt = map[string]bool{}, false, time.Time{}
