@@ -184,7 +184,9 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 	pendingSettle := map[string]bool{}
 	var settleAt, churnAt time.Time
 	var deferred uint64
-	// Changes held back by watchChangeGap, and when they are due.
+	// Read once: the gap is fixed for this loop's lifetime.
+	gap := watchChangeGap
+	// Changes held back by the gap, and when they are due.
 	pendingChanged := map[string]bool{}
 	pendingOverflow := false
 	var changeAt, lastScan time.Time
@@ -220,7 +222,7 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 			}
 		}
 		for path, at := range revisitedAt {
-			if now.Sub(at) >= watchChangeGap {
+			if now.Sub(at) >= gap {
 				delete(revisitedAt, path)
 			}
 		}
@@ -351,7 +353,7 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 			pendingChanged[path] = true
 		}
 		pendingOverflow = pendingOverflow || overflow
-		if due := lastScan.Add(watchChangeGap); time.Now().Before(due) {
+		if due := lastScan.Add(gap); time.Now().Before(due) {
 			if changeAt.IsZero() {
 				changeAt = due
 			}
