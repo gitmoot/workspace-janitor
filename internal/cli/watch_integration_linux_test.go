@@ -842,3 +842,90 @@ func TestWatchExitsWhenItsCapacitySampleGoesStale(t *testing.T) {
 		}
 	}
 }
+
+// chanWatcher delivers events when the test sends them.
+type chanWatcher struct{ events chan watchEvent }
+
+func (w *chanWatcher) next(ctx context.Context) (watchEvent, error) {
+	select {
+	case event := <-w.events:
+		return event, nil
+	case <-ctx.Done():
+		return watchEvent{}, ctx.Err()
+	}
+}
+func (w *chanWatcher) close() error { return nil }
+
+// Live 2026-11-05: one path rewritten every ~30 s triggered a full scan of
+// every root each time and kept the watcher at 0.7 of a core. Changes inside
+// watchChangeGap of the previous scan coalesce into one scan when it ends,
+// and that scan still reports every changed path.
+func TestWatchCoalescesChangesWithinTheGap(t *testing.T) {
+	f, root, _ := watchFixture(t)
+	saved := watchChangeGap
+	watchChangeGap = 1500 * time.Millisecond
+	defer func() { watchChangeGap = saved }()
+	sink := &watchSink{reports: make(chan watchReport, 32)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard, lookup: config.MapLookup(f.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	watcher := &chanWatcher{events: make(chan watchEvent)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- watchLoop(ctx, e, paths, policy, func() (eventWatcher, error) { return watcher, nil }, watchChurnInterval)
+	}()
+	waitFor := func(reason string) watchReport {
+		t.Helper()
+		deadline := time.After(20 * time.Second)
+		for {
+			select {
+			case report := <-sink.reports:
+				if report.Reason == reason {
+					return report
+				}
+			case err := <-done:
+				t.Fatalf("watch loop exited: %v", err)
+			case <-deadline:
+				t.Fatalf("no %s report", reason)
+			}
+		}
+	}
+	waitFor("startup")
+	start := time.Now()
+	names := []string{"a", "b", "c"}
+	for _, name := range names {
+		if err := os.Mkdir(filepath.Join(root, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		watcher.events <- watchEvent{Root: root, Name: name}
+		time.Sleep(100 * time.Millisecond)
+	}
+	report := waitFor("change")
+	if elapsed := time.Since(start); elapsed < time.Second {
+		t.Fatalf("change scan ran %s after the first change, inside the gap", elapsed)
+	}
+	got := map[string]bool{}
+	for _, guidance := range report.Paths {
+		got[filepath.Base(guidance.Path)] = true
+	}
+	for _, name := range names {
+		if !got[name] {
+			t.Fatalf("coalesced scan did not report %s: %+v", name, report.Paths)
+		}
+	}
+	select {
+	case extra := <-sink.reports:
+		if extra.Reason == "change" {
+			t.Fatalf("three changes inside the gap produced more than one scan: %+v", extra)
+		}
+	case <-time.After(300 * time.Millisecond):
+	}
+}

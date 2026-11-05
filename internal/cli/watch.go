@@ -24,6 +24,14 @@ import (
 // indefinitely, without persisting a scan for each operational state write.
 const watchChurnInterval = time.Hour
 
+// watchChangeGap is the minimum time between full reconciliation scans that
+// ordinary changes trigger. Changes inside the gap are coalesced into one
+// scan when it ends. A full scan of every root costs ~25 CPU-seconds on the
+// live host; one path rewritten every ~30 s made the watcher use 0.7 of a
+// core (live 2026-11-05). The watcher never acts on its scans, so a fresher
+// inventory buys nothing a few minutes' delay loses.
+var watchChangeGap = 5 * time.Minute
+
 // watchReport describes a persisted inventory reconciliation or a deferred
 // incomplete observation. It never authorizes a filesystem action.
 type watchReport struct {
@@ -176,10 +184,37 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 	pendingSettle := map[string]bool{}
 	var settleAt, churnAt time.Time
 	var deferred uint64
+	// Changes held back by watchChangeGap, and when they are due.
+	pendingChanged := map[string]bool{}
+	pendingOverflow := false
+	var changeAt, lastScan time.Time
+	lastScan = time.Now()
+	// scanChanges runs the coalesced change reconciliation and schedules
+	// the settle revisit of directories it saw.
+	scanChanges := func() error {
+		if err := reconcileWatch(ctx, e, paths, policy, "change", pendingChanged, pendingOverflow, deferred); err != nil {
+			return err
+		}
+		lastScan = time.Now()
+		churnAt, deferred = time.Time{}, 0
+		// A direct clone first creates an empty directory and fills .git
+		// below our top-level watch. Revisit newly seen directories after
+		// they settle; the watcher itself never acts on them.
+		for path := range pendingChanged {
+			if info, err := os.Lstat(path); err == nil && info.IsDir() {
+				pendingSettle[path] = true
+				settleAt = time.Now().Add(2 * time.Second)
+			}
+		}
+		pendingChanged, pendingOverflow, changeAt = map[string]bool{}, false, time.Time{}
+		return nil
+	}
 	for {
 		deadline := settleAt
-		if !churnAt.IsZero() && (deadline.IsZero() || churnAt.Before(deadline)) {
-			deadline = churnAt
+		for _, at := range []time.Time{churnAt, changeAt} {
+			if !at.IsZero() && (deadline.IsZero() || at.Before(deadline)) {
+				deadline = at
+			}
 		}
 		eventCtx := ctx
 		cancelWait := func() {}
@@ -190,13 +225,18 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		cancelWait()
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			now := time.Now()
-			if !settleAt.IsZero() && !now.Before(settleAt) {
+			if !changeAt.IsZero() && !now.Before(changeAt) {
+				if err := scanChanges(); err != nil {
+					return err
+				}
+			} else if !settleAt.IsZero() && !now.Before(settleAt) {
 				// Settling is a full scan too; it satisfies any deferred churn.
 				if err := reconcileWatch(ctx, e, paths, policy, "settled", pendingSettle, false, deferred); err != nil {
 					return err
 				}
 				pendingSettle = map[string]bool{}
 				settleAt, churnAt, deferred = time.Time{}, time.Time{}, 0
+				lastScan = time.Now()
 			} else if !churnAt.IsZero() && !now.Before(churnAt) {
 				// Full reconciliation recovers even a top-level event lost
 				// during protected churn or an inotify overflow.
@@ -204,6 +244,7 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 					return err
 				}
 				churnAt, deferred = time.Time{}, 0
+				lastScan = time.Now()
 			}
 			continue
 		}
@@ -277,18 +318,18 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 		if !overflow && len(changed) == 0 {
 			continue
 		}
-		if err := reconcileWatch(ctx, e, paths, policy, "change", changed, overflow, deferred); err != nil {
-			return err
-		}
-		churnAt, deferred = time.Time{}, 0
-		// A direct clone first creates an empty directory and fills .git
-		// below our top-level watch. Revisit newly seen directories after
-		// they settle; the watcher itself never acts on them.
 		for path := range changed {
-			if info, err := os.Lstat(path); err == nil && info.IsDir() {
-				pendingSettle[path] = true
-				settleAt = time.Now().Add(2 * time.Second)
+			pendingChanged[path] = true
+		}
+		pendingOverflow = pendingOverflow || overflow
+		if due := lastScan.Add(watchChangeGap); time.Now().Before(due) {
+			if changeAt.IsZero() {
+				changeAt = due
 			}
+			continue
+		}
+		if err := scanChanges(); err != nil {
+			return err
 		}
 	}
 }
