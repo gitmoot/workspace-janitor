@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -606,10 +608,13 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 			return refs
 		}
 		report.Visited++
-		found, err := specPathReferences(spec, "gitmoot_pipeline_path", "used by enabled Gitmoot pipeline "+name)
+		found, unresolved, err := specPathReferences(spec, "gitmoot_pipeline_path", "used by enabled Gitmoot pipeline "+name)
 		if err != nil {
 			noteUnreadable(report, fmt.Sprintf("could not parse Gitmoot pipeline %s: %v", name, err))
 			continue
+		}
+		if len(unresolved) > 0 {
+			noteUnreadable(report, fmt.Sprintf("Gitmoot pipeline %s uses paths that cannot be resolved: %s", name, strings.Join(unresolved, " ")))
 		}
 		refs = append(refs, found...)
 	}
@@ -620,15 +625,25 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 }
 
 // specPathReferences parses a pipeline spec (YAML, every document) and
-// returns a blocking service reference for each absolute path it names. A
-// string value that is itself an absolute path counts whole, spaces
-// included. Otherwise the value is split into shell words (quotes and
-// backslashes honoured; ; & | < > ( ) separate words), and each word counts,
-// as does the value after any = (A=/x, --chdir=/x) and each :-separated
-// part of that value. Paths built only from variables the spec does not
-// assign are not resolved. A quoted word that is itself a command
-// (sh -c '...') is split again.
-func specPathReferences(spec, signal, detail string) ([]Reference, error) {
+// returns a blocking service reference for each path it names.
+//
+//   - A string value that is itself an absolute path counts whole, spaces
+//     included.
+//   - Otherwise the value is split into shell words (quotes and backslashes
+//     honoured; whitespace and ; & | < > ( ) separate words). A quoted word
+//     that is itself a command (sh -c '...') is split again.
+//   - Variables are expanded from what the spec states: NAME=value words
+//     anywhere in it, string entries of YAML maps (env: blocks), and
+//     ${NAME:-default} fallbacks. HOME is the janitor's own HOME: pipelines
+//     on this host run as the same user.
+//   - Each expanded word counts, as does the value after every = and each
+//     :-separated part of it.
+//   - A word still holding an unresolved expansion ($x, $(...), `...`) and a
+//     / is a path whose exact location is unknown. If it starts with an
+//     absolute literal directory, that directory and everything under it is
+//     protected (Subtree). Otherwise the word is returned as unresolved, and
+//     the caller must treat the whole source as unknown.
+func specPathReferences(spec, signal, detail string) ([]Reference, []string, error) {
 	var docs []any
 	decoder := yaml.NewDecoder(strings.NewReader(spec))
 	var err error
@@ -640,47 +655,167 @@ func specPathReferences(spec, signal, detail string) ([]Reference, error) {
 		docs = append(docs, one)
 	}
 	if !errors.Is(err, io.EOF) {
-		return nil, err
+		return nil, nil, err
 	}
+	vars := map[string][]string{}
+	setVar := func(name, value string) {
+		if !shellName.MatchString(name) || slices.Contains(vars[name], value) || len(vars[name]) >= 8 {
+			return
+		}
+		vars[name] = append(vars[name], value)
+	}
+	if home := os.Getenv("HOME"); filepath.IsAbs(home) {
+		setVar("HOME", home)
+	}
+	walkConfigMaps(docs, func(key, value string) { setVar(key, value) })
+	walkConfigStrings(docs, func(value string) {
+		forEachWord(value, 0, func(word string) {
+			if name, val, ok := strings.Cut(word, "="); ok {
+				setVar(name, val)
+			}
+		})
+	})
 	var refs []Reference
-	add := func(candidate string) {
+	var unresolved []string
+	add := func(candidate string, subtree bool) {
 		if !filepath.IsAbs(candidate) {
 			return
 		}
 		if p := filepath.Clean(candidate); p != "/" {
-			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail})
+			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail, Subtree: subtree})
+		}
+	}
+	consider := func(word string) {
+		for _, expanded := range expandWord(word, vars) {
+			if loc := unresolvedExpansion.FindStringIndex(expanded); loc != nil {
+				if !strings.Contains(expanded, "/") {
+					continue
+				}
+				prefix := expanded[:loc[0]]
+				if _, after, ok := strings.Cut(prefix, "="); ok && !strings.HasPrefix(prefix, "/") {
+					prefix = after
+				}
+				if dir := prefix[:strings.LastIndex(prefix, "/")+1]; filepath.IsAbs(dir) && filepath.Clean(dir) != "/" {
+					add(dir, true)
+				} else {
+					unresolved = append(unresolved, word)
+				}
+				continue
+			}
+			add(expanded, false)
+			rest := expanded
+			for {
+				_, after, ok := strings.Cut(rest, "=")
+				if !ok {
+					break
+				}
+				add(after, false)
+				for _, part := range strings.Split(after, ":") {
+					add(part, false)
+				}
+				rest = after
+			}
 		}
 	}
 	walkConfigStrings(docs, func(value string) {
-		if whole := strings.TrimSpace(value); !strings.ContainsAny(whole, "\n") {
-			add(whole)
+		// A value that is itself one path may contain spaces.
+		if whole := strings.TrimSpace(value); strings.HasPrefix(whole, "/") && !strings.Contains(whole, "\n") {
+			consider(whole)
 		}
-		var visitWords func(text string, depth int)
-		visitWords = func(text string, depth int) {
-			for _, word := range shellWords(text) {
-				add(word)
-				rest := word
-				for {
-					_, after, ok := strings.Cut(rest, "=")
-					if !ok {
-						break
-					}
-					add(after)
-					for _, part := range strings.Split(after, ":") {
-						add(part)
-					}
-					rest = after
-				}
-				// A quoted word holding a whole command (sh -c '...') is
-				// split again, a few levels deep.
-				if depth < 3 && strings.ContainsAny(word, " \t\n;&|<>()") {
-					visitWords(word, depth+1)
+		forEachWord(value, 0, consider)
+	})
+	return refs, unresolved, nil
+}
+
+var (
+	shellName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// shellParam matches ${NAME}, ${NAME:-default}, ${NAME-default},
+	// ${NAME:=default} and $NAME.
+	shellParam = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-=]([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)`)
+	// unresolvedExpansion is anything a shell would still expand.
+	unresolvedExpansion = regexp.MustCompile("\\$|`")
+)
+
+// forEachWord calls visit with every shell word of text, splitting quoted
+// words that are themselves commands again, a few levels deep.
+func forEachWord(text string, depth int, visit func(string)) {
+	for _, word := range shellWords(text) {
+		visit(word)
+		if depth < 3 && strings.ContainsAny(word, " \t\n;&|<>()") {
+			forEachWord(word, depth+1, visit)
+		}
+	}
+}
+
+// expandWord returns word with every expansion of a known variable replaced
+// by each of its values (at most 16 results). An unknown variable with a
+// ${NAME:-default} fallback takes the fallback; any other unknown expansion
+// is left in place for the caller to treat as unresolved.
+func expandWord(word string, vars map[string][]string) []string {
+	results := []string{word}
+	for round := 0; round < 4; round++ {
+		changed := false
+		var next []string
+		for _, current := range results {
+			loc := shellParam.FindStringSubmatchIndex(current)
+			if loc == nil {
+				next = append(next, current)
+				continue
+			}
+			name := ""
+			if loc[2] >= 0 {
+				name = current[loc[2]:loc[3]]
+			} else {
+				name = current[loc[6]:loc[7]]
+			}
+			values := vars[name]
+			if len(values) == 0 && loc[4] >= 0 {
+				values = []string{current[loc[4]:loc[5]]}
+			}
+			if len(values) == 0 {
+				next = append(next, current)
+				continue
+			}
+			changed = true
+			for _, value := range values {
+				if len(next) < 16 {
+					next = append(next, current[:loc[0]]+value+current[loc[1]:])
 				}
 			}
 		}
-		visitWords(value, 0)
-	})
-	return refs, nil
+		results = next
+		if !changed {
+			break
+		}
+	}
+	return results
+}
+
+// walkConfigMaps calls visit with every string-valued entry of every map in
+// a decoded configuration document.
+func walkConfigMaps(node any, visit func(key, value string)) {
+	switch value := node.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if text, ok := child.(string); ok {
+				visit(key, text)
+			}
+			walkConfigMaps(child, visit)
+		}
+	case map[any]any:
+		for key, child := range value {
+			if name, ok := key.(string); ok {
+				if text, ok := child.(string); ok {
+					visit(name, text)
+				}
+			}
+			walkConfigMaps(child, visit)
+		}
+	case []any:
+		for _, child := range value {
+			walkConfigMaps(child, visit)
+		}
+	}
 }
 
 // shellWords splits s into words the way a POSIX shell would before
