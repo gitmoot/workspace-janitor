@@ -80,7 +80,9 @@ func (e *Engine) originalReferences(ctx context.Context, source string) error {
 	}
 	var found []string
 	for _, ref := range result.References {
-		if core.PathWithin(ref.Path, source) {
+		// A Subtree reference protects everything inside its path, so it
+		// covers a source anywhere below it as well.
+		if core.PathWithin(ref.Path, source) || (ref.Subtree && core.PathWithin(source, ref.Path)) {
 			found = append(found, fmt.Sprintf("%s (%s)", ref.Protection, ref.Detail))
 		}
 	}
