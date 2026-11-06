@@ -4,6 +4,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -602,5 +603,64 @@ func TestConfigFileReferencesCoverEveryYAMLDocument(t *testing.T) {
 		if report.Name == "services" && report.Status == core.CollectorRan {
 			t.Fatalf("a malformed later YAML document left services complete: %+v", report)
 		}
+	}
+}
+
+// Live 2026-11-06: /root/keephair-pipelines was archived and quarantined as
+// idle scratch while the enabled Gitmoot pipeline keephair-geo ran a script
+// in it every hour. A path named by an enabled pipeline's spec is in use;
+// one named only by a disabled pipeline is not.
+func TestEnabledGitmootPipelineKeepsItsFolderLocal(t *testing.T) {
+	x := newFleetStateFixture(t)
+	used := filepath.Join(x.state, "pipelines-used")
+	idle := filepath.Join(x.state, "pipelines-disabled")
+	for _, path := range []string{used, idle} {
+		x.folder(t, path, 20*24*time.Hour, map[string]string{"run.sh": "#!/bin/sh\n"})
+	}
+	home := filepath.Join(x.home, ".gitmoot")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(home, "gitmoot.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE jobs(id TEXT, state TEXT, payload TEXT, updated_at TEXT)`,
+		`CREATE TABLE tasks(state TEXT, worktree_path TEXT)`,
+		`CREATE TABLE cleanup_obligations(owner_job_id TEXT, expected_path TEXT, resource_kind TEXT, state TEXT, created_at TEXT, updated_at TEXT)`,
+		`CREATE TABLE pipelines(name TEXT, spec_yaml TEXT, enabled INTEGER)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert := `INSERT INTO pipelines VALUES(?, ?, ?)`
+	if _, err := db.Exec(insert, "geo", fmt.Sprintf("steps:\n  - name: collect\n    cmd: bash %s/run.sh --top 20\n", used), 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(insert, "old", fmt.Sprintf("steps:\n  - cwd: %s\n", idle), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	raw, err := os.ReadFile(policyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, string(raw)+fmt.Sprintf("gitmoot:\n  home: %s\n  database: %s\n", home, dbPath))
+	report := x.categories(t, false)
+	if item := x.item(t, report, used); item.Status == categoryArchived || !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
+		t.Fatalf("folder run by an enabled Gitmoot pipeline was not kept: %+v", item)
+	}
+	if _, err := os.Stat(filepath.Join(used, "run.sh")); err != nil {
+		t.Fatalf("pipeline folder moved: %v", err)
+	}
+	if item := x.item(t, report, idle); item.Status != categoryArchived {
+		t.Fatalf("a disabled pipeline blocked archiving: %+v", item)
 	}
 }

@@ -76,6 +76,9 @@ type ServiceSources struct {
 	CronPaths   []string
 	PM2Dumps    []string
 	ConfigFiles []string
+	// GitmootPipelines is the Gitmoot database whose enabled pipelines'
+	// specs name paths those pipelines run from. Empty skips it.
+	GitmootPipelines string
 }
 
 // AgentRef is one directory a registered agent is using.

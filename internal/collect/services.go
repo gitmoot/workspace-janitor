@@ -2,10 +2,12 @@ package collect
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,7 +40,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		return nil, report
 	}
 	sources := opts.ServiceSources
-	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 && len(sources.ConfigFiles) == 0 {
+	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 && len(sources.ConfigFiles) == 0 && sources.GitmootPipelines == "" {
 		report.Status = core.CollectorSkipped
 		report.Detail = "no service definition locations are configured"
 		return nil, report
@@ -50,6 +52,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		gatherCron,
 		gatherPM2,
 		gatherConfigFiles,
+		gatherGitmootPipelines,
 	} {
 		if err := ctx.Err(); err != nil {
 			report.Status = core.CollectorPartial
@@ -548,6 +551,81 @@ func gatherConfigFiles(ctx context.Context, opts *Options, report *core.Collecto
 				Detail:     "named in " + file,
 			})
 		})
+	}
+	return refs
+}
+
+// gatherGitmootPipelines reports every absolute path in the spec of an
+// enabled Gitmoot pipeline (its commands, working directories and any other
+// value). A scheduled pipeline runs from those paths whether or not anything
+// else references them (live 2026-11-06: keephair-geo ran
+// /root/keephair-pipelines/current/geo-collect.sh hourly and failed after
+// that folder was archived as idle scratch). A missing database is skipped;
+// one that cannot be read, or a spec that does not parse, leaves this source
+// unknown, which refuses removals.
+func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
+	path := opts.ServiceSources.GitmootPipelines
+	if path == "" {
+		return nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		noteUnreadable(report, fmt.Sprintf("could not stat %s: %v", path, err))
+		return nil
+	}
+	uri := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&_pragma=query_only(1)"}).String()
+	db, err := sql.Open("sqlite", uri)
+	if err != nil {
+		noteUnreadable(report, fmt.Sprintf("could not open %s: %v", path, err))
+		return nil
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, `SELECT name, spec_yaml FROM pipelines WHERE enabled != 0`)
+	if err != nil {
+		noteUnreadable(report, fmt.Sprintf("could not read Gitmoot pipelines: %v", err))
+		return nil
+	}
+	defer rows.Close()
+	var refs []Reference
+	for rows.Next() {
+		var name, spec string
+		if err := rows.Scan(&name, &spec); err != nil {
+			noteUnreadable(report, fmt.Sprintf("could not read a Gitmoot pipeline: %v", err))
+			return refs
+		}
+		report.Visited++
+		var docs []any
+		decoder := yaml.NewDecoder(strings.NewReader(spec))
+		for {
+			var one any
+			if err = decoder.Decode(&one); err != nil {
+				break
+			}
+			docs = append(docs, one)
+		}
+		if !errors.Is(err, io.EOF) {
+			noteUnreadable(report, fmt.Sprintf("could not parse Gitmoot pipeline %s: %v", name, err))
+			continue
+		}
+		walkConfigStrings(docs, func(value string) {
+			for _, field := range strings.Fields(value) {
+				field = strings.Trim(field, `"'();`)
+				if !filepath.IsAbs(field) {
+					continue
+				}
+				if p := filepath.Clean(field); p != "/" {
+					refs = append(refs, Reference{
+						Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference,
+						Signal: "gitmoot_pipeline_path", Detail: "used by enabled Gitmoot pipeline " + name,
+					})
+				}
+			}
+		})
+	}
+	if err := rows.Err(); err != nil {
+		noteUnreadable(report, fmt.Sprintf("could not read Gitmoot pipelines: %v", err))
 	}
 	return refs
 }
