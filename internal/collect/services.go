@@ -658,8 +658,19 @@ func specPathReferences(spec, signal, detail string) ([]Reference, []string, err
 		return nil, nil, err
 	}
 	vars := map[string][]string{}
+	// A variable with more values than this is not expanded at all: words
+	// using it are then unresolved and protected conservatively, never
+	// expanded from a silently truncated list.
+	const maxValues = 8
 	setVar := func(name, value string) {
-		if !shellName.MatchString(name) || slices.Contains(vars[name], value) || len(vars[name]) >= 8 {
+		if !shellName.MatchString(name) || slices.Contains(vars[name], value) {
+			return
+		}
+		if values, seen := vars[name]; seen && values == nil {
+			return // already too many
+		}
+		if len(vars[name]) >= maxValues {
+			vars[name] = nil
 			return
 		}
 		vars[name] = append(vars[name], value)
@@ -748,10 +759,13 @@ func forEachWord(text string, depth int, visit func(string)) {
 }
 
 // expandWord returns word with every expansion of a known variable replaced
-// by each of its values (at most 16 results). A ${NAME:-default} fallback
-// is always one of the candidates, set or not; any other unknown expansion
-// is left in place for the caller to treat as unresolved.
+// by each of its values. A ${NAME:-default} fallback is always one of the
+// candidates, set or not. An unknown expansion, a variable recorded with too
+// many values (nil in vars), or a word whose expansions would exceed 16 is
+// returned unexpanded, for the caller to treat as unresolved: candidates are
+// never silently dropped.
 func expandWord(word string, vars map[string][]string) []string {
+	const maxResults = 16
 	results := []string{word}
 	for round := 0; round < 4; round++ {
 		changed := false
@@ -768,10 +782,14 @@ func expandWord(word string, vars map[string][]string) []string {
 			} else {
 				name = current[loc[6]:loc[7]]
 			}
+			known, recorded := vars[name]
+			if recorded && known == nil {
+				return []string{word}
+			}
 			// A written fallback is always a candidate as well: POSIX uses it
 			// when NAME is unset and, for :- and :=, when NAME is empty, and
 			// the spec cannot tell us which applies at run time.
-			values := slices.Clone(vars[name])
+			values := slices.Clone(known)
 			if loc[4] >= 0 {
 				if fallback := current[loc[4]:loc[5]]; !slices.Contains(values, fallback) {
 					values = append(values, fallback)
@@ -781,11 +799,12 @@ func expandWord(word string, vars map[string][]string) []string {
 				next = append(next, current)
 				continue
 			}
+			if len(next)+len(values) > maxResults {
+				return []string{word}
+			}
 			changed = true
 			for _, value := range values {
-				if len(next) < 16 {
-					next = append(next, current[:loc[0]]+value+current[loc[1]:])
-				}
+				next = append(next, current[:loc[0]]+value+current[loc[1]:])
 			}
 		}
 		results = next

@@ -67,3 +67,24 @@ func TestSpecPathReferencesReportsUnresolvablePaths(t *testing.T) {
 		t.Fatalf("unresolvable path not reported: %q", unresolved)
 	}
 }
+
+// Review of #166 round 4: expansions beyond the result cap, or a variable
+// with more values than recorded, must never drop a candidate silently. The
+// word stays unresolved and its literal directory is protected as a subtree.
+func TestSpecPathReferencesNeverTruncatesExpansions(t *testing.T) {
+	for name, spec := range map[string]string{
+		"cap":    `cmd: A=a0; A=a1; A=a2; A=a3; B=b0; B=b1; B=b2; B=b3; bash "/work/${A:-fa}-${B:-fb}/run.sh"`,
+		"values": `cmd: X=1; X=2; X=3; X=4; X=5; X=6; X=7; X=8; X=9; bash "/work/x$X/run.sh"`,
+	} {
+		refs, unresolved, err := specPathReferences(spec+"\n", "s", "d")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(unresolved) != 0 {
+			t.Fatalf("%s: unexpected unresolved %q", name, unresolved)
+		}
+		if !slices.ContainsFunc(refs, func(r Reference) bool { return r.Subtree && r.Path == "/work" }) {
+			t.Fatalf("%s: over-limit expansion did not protect /work as a subtree: %+v", name, refs)
+		}
+	}
+}
