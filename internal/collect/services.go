@@ -768,6 +768,13 @@ func forEachWord(text string, depth int, visit func(string)) {
 // or too many matches. The caller treats that word as unresolved.
 func expandPathname(word string) ([]string, bool) {
 	const maxPaths = 64
+	// Only a word that can become an absolute path is a candidate: one that
+	// starts with /, ~, or a brace group holding a /. Other words (options,
+	// JSON-like text, relative names) are left alone.
+	if !strings.HasPrefix(word, "/") && !strings.HasPrefix(word, "~") &&
+		!(strings.HasPrefix(word, "{") && strings.Contains(word, "/")) {
+		return nil, true
+	}
 	words, ok := expandBraces(word, maxPaths)
 	if !ok {
 		return nil, false

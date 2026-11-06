@@ -118,6 +118,10 @@ func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
 			t.Errorf("%s: %s not protected: %+v", cmd, pipelines, refs)
 		}
 	}
+	// Text that is not a path, however brace-rich, is not a candidate.
+	if _, unresolved, err := specPathReferences(`cmd: echo '[{id:1,q:What {id:2}' --flag={x`+"\n", "s", "d"); err != nil || len(unresolved) != 0 {
+		t.Errorf("non-path text reported unresolved: err=%v %q", err, unresolved)
+	}
 	for _, cmd := range []string{
 		"bash " + dir + "/work/{a,{b,c}}/run.sh",
 		"bash " + dir + "/work/{1..3}/run.sh",
