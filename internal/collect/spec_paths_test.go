@@ -1,6 +1,10 @@
 package collect
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // Review of #166: every valid pipeline path form must protect its folder.
 // A miss reads as "not in use" and lets the folder be removed.
@@ -78,6 +82,49 @@ func TestSpecPathReferencesNeverTruncatesExpansions(t *testing.T) {
 		}
 		if len(unresolved) == 0 {
 			t.Fatalf("%s: over-limit expansion was not reported unresolved", name)
+		}
+	}
+}
+
+// Post-merge review of #166: a shell expands globs, braces and a leading ~
+// in a command's paths, so a pattern naming an existing directory protects
+// it. A pattern that cannot be expanded safely is unresolved.
+func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
+	dir := t.TempDir()
+	pipelines := filepath.Join(dir, "work", "pipelines")
+	if err := os.MkdirAll(pipelines, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pipelines, "run.sh"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+	for _, cmd := range []string{
+		"bash " + dir + "/work/pipeline[s]/run.sh",
+		"bash " + dir + "/work/pipelines*/run.sh",
+		"bash " + dir + "/work/pipeline?/run.sh",
+		"bash " + dir + "/work/{pipelines,elsewhere}/run.sh",
+		"bash ~/work/pipelines/run.sh",
+	} {
+		refs, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d")
+		if err != nil || len(unresolved) != 0 {
+			t.Fatalf("%s: err=%v unresolved=%q", cmd, err, unresolved)
+		}
+		found := false
+		for _, ref := range refs {
+			found = found || ref.Path == filepath.Join(pipelines, "run.sh")
+		}
+		if !found {
+			t.Errorf("%s: %s not protected: %+v", cmd, pipelines, refs)
+		}
+	}
+	for _, cmd := range []string{
+		"bash " + dir + "/work/{a,{b,c}}/run.sh",
+		"bash " + dir + "/work/{1..3}/run.sh",
+	} {
+		_, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d")
+		if err != nil || len(unresolved) == 0 {
+			t.Errorf("%s: not reported unresolved (err=%v)", cmd, err)
 		}
 	}
 }

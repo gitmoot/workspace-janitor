@@ -687,12 +687,22 @@ func specPathReferences(spec, signal, detail string) ([]Reference, []string, err
 	})
 	var refs []Reference
 	var unresolved []string
+	addOne := func(path string) {
+		if p := filepath.Clean(path); filepath.IsAbs(p) && p != "/" {
+			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail})
+		}
+	}
+	// add applies the shell's pathname expansions to one candidate: braces,
+	// a leading ~, then globs against the filesystem as it is now. A pattern
+	// that cannot be expanded safely is unresolved.
 	add := func(candidate string) {
-		if !filepath.IsAbs(candidate) {
+		paths, ok := expandPathname(candidate)
+		if !ok {
+			unresolved = append(unresolved, candidate)
 			return
 		}
-		if p := filepath.Clean(candidate); p != "/" {
-			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail})
+		for _, path := range paths {
+			addOne(path)
 		}
 	}
 	consider := func(word string) {
@@ -748,6 +758,97 @@ func forEachWord(text string, depth int, visit func(string)) {
 			forEachWord(word, depth+1, visit)
 		}
 	}
+}
+
+// expandPathname performs, for one word, the pathname expansions a shell
+// applies after parameter expansion: brace expansion ({a,b}), a leading ~
+// (the janitor's own HOME), and globbing (* ? [...]) against the filesystem
+// now. The literal word is always kept too. It reports false when a pattern
+// cannot be expanded safely: nested or oversized braces, a malformed glob,
+// or too many matches. The caller treats that word as unresolved.
+func expandPathname(word string) ([]string, bool) {
+	const maxPaths = 64
+	words, ok := expandBraces(word, maxPaths)
+	if !ok {
+		return nil, false
+	}
+	var out []string
+	for _, w := range words {
+		if w == "~" || strings.HasPrefix(w, "~/") {
+			home := os.Getenv("HOME")
+			if !filepath.IsAbs(home) {
+				return nil, false
+			}
+			w = home + strings.TrimPrefix(w, "~")
+		}
+		if !filepath.IsAbs(w) {
+			continue
+		}
+		out = append(out, w)
+		if !strings.ContainsAny(w, "*?[") {
+			continue
+		}
+		matches, err := filepath.Glob(w)
+		if err != nil || len(out)+len(matches) > maxPaths {
+			return nil, false
+		}
+		out = append(out, matches...)
+	}
+	return out, true
+}
+
+// expandBraces expands one level of {a,b,...} groups, innermost-free: a
+// nested group, an unbalanced brace, or more than limit results reports
+// false. A {..} range or a group without a comma is left literal, as in
+// sh; bash range expansion ({1..3}) is reported false.
+func expandBraces(word string, limit int) ([]string, bool) {
+	results := []string{word}
+	for round := 0; round < 8; round++ {
+		changed := false
+		var next []string
+		for _, w := range results {
+			open := strings.IndexByte(w, '{')
+			if open < 0 {
+				next = append(next, w)
+				continue
+			}
+			end := strings.IndexByte(w[open:], '}')
+			if end < 0 {
+				return nil, false
+			}
+			end += open
+			body := w[open+1 : end]
+			if strings.ContainsRune(body, '{') {
+				return nil, false
+			}
+			if strings.Contains(body, "..") {
+				return nil, false
+			}
+			if !strings.Contains(body, ",") {
+				// Not a brace group; keep it literal and look past it.
+				rest, ok := expandBraces(w[end+1:], limit)
+				if !ok {
+					return nil, false
+				}
+				for _, r := range rest {
+					next = append(next, w[:end+1]+r)
+				}
+				continue
+			}
+			changed = true
+			for _, alt := range strings.Split(body, ",") {
+				next = append(next, w[:open]+alt+w[end+1:])
+			}
+			if len(next) > limit {
+				return nil, false
+			}
+		}
+		results = next
+		if !changed {
+			return results, true
+		}
+	}
+	return nil, false
 }
 
 // expandWord returns word with every expansion of a known variable replaced
