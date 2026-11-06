@@ -582,6 +582,16 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 		return nil
 	}
 	defer db.Close()
+	// A Gitmoot schema without a pipelines table has no pipelines. Any
+	// other read failure still leaves this source unknown.
+	var tables int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'pipelines'`).Scan(&tables); err != nil {
+		noteUnreadable(report, fmt.Sprintf("could not read Gitmoot schema: %v", err))
+		return nil
+	}
+	if tables == 0 {
+		return nil
+	}
 	rows, err := db.QueryContext(ctx, `SELECT name, spec_yaml FROM pipelines WHERE enabled != 0`)
 	if err != nil {
 		noteUnreadable(report, fmt.Sprintf("could not read Gitmoot pipelines: %v", err))
