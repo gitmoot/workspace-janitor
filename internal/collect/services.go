@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -761,11 +762,15 @@ func forEachWord(text string, depth int, visit func(string)) {
 }
 
 // expandPathname performs, for one word, the pathname expansions a shell
-// applies after parameter expansion: brace expansion ({a,b}), a leading ~
-// (the janitor's own HOME), and globbing (* ? [...]) against the filesystem
-// now. The literal word is always kept too. It reports false when a pattern
-// cannot be expanded safely: nested or oversized braces, a malformed glob,
-// or too many matches. The caller treats that word as unresolved.
+// applies after parameter expansion: brace expansion ({a,b}), tilde
+// expansion (~, ~/..., ~user/...), and globbing (* ? [...]) against the
+// filesystem now. Quoting is gone by this point, so the literal word is
+// always kept as well: a quoted '/a/{b,c}' or '/a/*' names itself. It
+// reports false when a form cannot be expanded faithfully: nested or
+// oversized braces, ~+ and ~-, an unknown user, a bracket expression whose
+// meaning differs between Go and the shell ([!...], [^...], [[:class:]]), a
+// malformed glob, or too many matches. The caller treats that word as
+// unresolved.
 func expandPathname(word string) ([]string, bool) {
 	const maxPaths = 64
 	// Only a word that can become an absolute path is a candidate: one that
@@ -775,25 +780,46 @@ func expandPathname(word string) ([]string, bool) {
 		!(strings.HasPrefix(word, "{") && strings.Contains(word, "/")) {
 		return nil, true
 	}
+	var out []string
+	if filepath.IsAbs(word) {
+		out = append(out, word)
+	}
 	words, ok := expandBraces(word, maxPaths)
 	if !ok {
 		return nil, false
 	}
-	var out []string
 	for _, w := range words {
-		if w == "~" || strings.HasPrefix(w, "~/") {
-			home := os.Getenv("HOME")
+		if strings.HasPrefix(w, "~") {
+			name, rest, _ := strings.Cut(w[1:], "/")
+			var home string
+			switch name {
+			case "":
+				home = os.Getenv("HOME")
+			case "+", "-":
+				return nil, false
+			default:
+				account, err := user.Lookup(name)
+				if err != nil {
+					return nil, false
+				}
+				home = account.HomeDir
+			}
 			if !filepath.IsAbs(home) {
 				return nil, false
 			}
-			w = home + strings.TrimPrefix(w, "~")
+			w = filepath.Join(home, rest)
 		}
 		if !filepath.IsAbs(w) {
 			continue
 		}
-		out = append(out, w)
+		if w != word {
+			out = append(out, w)
+		}
 		if !strings.ContainsAny(w, "*?[") {
 			continue
+		}
+		if !shellCompatibleGlob(w) {
+			return nil, false
 		}
 		matches, err := filepath.Glob(w)
 		if err != nil || len(out)+len(matches) > maxPaths {
@@ -802,6 +828,22 @@ func expandPathname(word string) ([]string, bool) {
 		out = append(out, matches...)
 	}
 	return out, true
+}
+
+// shellCompatibleGlob reports whether Go's filepath.Match reads pattern the
+// way a POSIX shell does. *, ? and simple bracket sets and ranges agree; a
+// bracket expression starting with ! or ^, or holding a [: class, does not.
+func shellCompatibleGlob(pattern string) bool {
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] != '[' {
+			continue
+		}
+		rest := pattern[i+1:]
+		if strings.HasPrefix(rest, "!") || strings.HasPrefix(rest, "^") || strings.Contains(rest, "[:") {
+			return false
+		}
+	}
+	return true
 }
 
 // expandBraces expands one level of {a,b,...} groups, innermost-free: a

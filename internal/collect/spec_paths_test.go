@@ -2,6 +2,7 @@ package collect
 
 import (
 	"os"
+	"os/user"
 	"path/filepath"
 	"testing"
 )
@@ -122,13 +123,48 @@ func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
 	if _, unresolved, err := specPathReferences(`cmd: echo '[{id:1,q:What {id:2}' --flag={x`+"\n", "s", "d"); err != nil || len(unresolved) != 0 {
 		t.Errorf("non-path text reported unresolved: err=%v %q", err, unresolved)
 	}
+	// Quoting is gone before expansion, so the literal word must stay a
+	// candidate: a quoted '/work/{a,b}' names that directory itself.
+	literal := filepath.Join(dir, "work", "{a,b}")
+	refs, _, _ := specPathReferences("cmd: bash '"+literal+"/run.sh'\n", "s", "d")
+	keptLiteral := false
+	for _, ref := range refs {
+		keptLiteral = keptLiteral || ref.Path == filepath.Join(literal, "run.sh")
+	}
+	if !keptLiteral {
+		t.Errorf("literal brace path dropped: %+v", refs)
+	}
 	for _, cmd := range []string{
 		"bash " + dir + "/work/{a,{b,c}}/run.sh",
 		"bash " + dir + "/work/{1..3}/run.sh",
+		"bash " + dir + "/work/pipeline[!b]/run.sh",
+		"bash " + dir + "/work/pipeline[^b]/run.sh",
+		"bash " + dir + "/work/[[:alpha:]]ipelines/run.sh",
+		"bash ~no-such-user-janitor/pipelines/run.sh",
+		"bash ~+/pipelines/run.sh",
 	} {
 		_, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d")
 		if err != nil || len(unresolved) == 0 {
 			t.Errorf("%s: not reported unresolved (err=%v)", cmd, err)
 		}
 	}
+}
+
+// ~user takes that account's home from the user database, as a shell does.
+func TestSpecPathReferencesExpandsNamedUserHome(t *testing.T) {
+	account, err := user.Current()
+	if err != nil || !filepath.IsAbs(account.HomeDir) {
+		t.Skip("no current user home")
+	}
+	refs, unresolved, err := specPathReferences("cmd: bash ~"+account.Username+"/pipelines/run.sh\n", "s", "d")
+	if err != nil || len(unresolved) != 0 {
+		t.Fatalf("err=%v unresolved=%q", err, unresolved)
+	}
+	want := filepath.Join(account.HomeDir, "pipelines", "run.sh")
+	for _, ref := range refs {
+		if ref.Path == want {
+			return
+		}
+	}
+	t.Fatalf("~%s/pipelines/run.sh did not resolve to %s: %+v", account.Username, want, refs)
 }
