@@ -140,6 +140,9 @@ func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
 		"bash " + dir + "/work/pipeline[!b]/run.sh",
 		"bash " + dir + "/work/pipeline[^b]/run.sh",
 		"bash " + dir + "/work/[[:alpha:]]ipelines/run.sh",
+		"bash " + dir + "/work/[[=p=]]ipelines/run.sh",
+		"bash " + dir + "/work/[[.p.]]ipelines/run.sh",
+		"bash " + dir + "/work/[]p]ipelines/run.sh",
 		"bash ~no-such-user-janitor/pipelines/run.sh",
 		"bash ~+/pipelines/run.sh",
 	} {

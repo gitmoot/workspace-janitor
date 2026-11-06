@@ -831,17 +831,27 @@ func expandPathname(word string) ([]string, bool) {
 }
 
 // shellCompatibleGlob reports whether Go's filepath.Match reads pattern the
-// way a POSIX shell does. *, ? and simple bracket sets and ranges agree; a
-// bracket expression starting with ! or ^, or holding a [: class, does not.
+// way a POSIX shell does. *, ? and plain bracket sets and ranges ([ab],
+// [a-z]) agree. Any bracket expression holding a second [ (character
+// classes [:x:], equivalence classes [=x=], collating symbols [.x.]), or one
+// that starts with ! or ^, does not, and neither does a backslash inside a
+// bracket expression.
 func shellCompatibleGlob(pattern string) bool {
 	for i := 0; i < len(pattern); i++ {
 		if pattern[i] != '[' {
 			continue
 		}
-		rest := pattern[i+1:]
-		if strings.HasPrefix(rest, "!") || strings.HasPrefix(rest, "^") || strings.Contains(rest, "[:") {
+		end := strings.IndexByte(pattern[i+1:], ']')
+		if end < 0 {
 			return false
 		}
+		body := pattern[i+1 : i+1+end]
+		// "[]...]" and "[!]...]" put ] in the set; treat both as unsupported.
+		if end == 0 || strings.HasPrefix(body, "!") || strings.HasPrefix(body, "^") ||
+			strings.ContainsAny(body, "[\\") {
+			return false
+		}
+		i += end + 1
 	}
 	return true
 }
