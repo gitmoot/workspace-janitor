@@ -101,9 +101,6 @@ func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
 	}
 	t.Setenv("HOME", dir)
 	for _, cmd := range []string{
-		"bash " + dir + "/work/pipeline[s]/run.sh",
-		"bash " + dir + "/work/pipelines*/run.sh",
-		"bash " + dir + "/work/pipeline?/run.sh",
 		"bash " + dir + "/work/{pipelines,elsewhere}/run.sh",
 		"bash ~/work/pipelines/run.sh",
 	} {
@@ -134,12 +131,21 @@ func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
 	if !keptLiteral {
 		t.Errorf("literal brace path dropped: %+v", refs)
 	}
+	// Globs are never resolved: any glob character in a path word blocks.
 	for _, cmd := range []string{
+		"bash " + dir + "/work/pipeline[s]/run.sh",
+		"bash " + dir + "/work/pipelines*/run.sh",
+		"bash " + dir + "/work/pipeline?/run.sh",
+		"bash " + dir + "/work/pipe\\[l]ines/run.sh",
+		"bash '" + dir + "/work/pipeline?/run.sh'",
 		"bash " + dir + "/work/{a,{b,c}}/run.sh",
 		"bash " + dir + "/work/{1..3}/run.sh",
 		"bash " + dir + "/work/pipeline[!b]/run.sh",
 		"bash " + dir + "/work/pipeline[^b]/run.sh",
 		"bash " + dir + "/work/[[:alpha:]]ipelines/run.sh",
+		"bash " + dir + "/work/[[=p=]]ipelines/run.sh",
+		"bash " + dir + "/work/[[.p.]]ipelines/run.sh",
+		"bash " + dir + "/work/[]p]ipelines/run.sh",
 		"bash ~no-such-user-janitor/pipelines/run.sh",
 		"bash ~+/pipelines/run.sh",
 	} {
