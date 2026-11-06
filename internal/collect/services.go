@@ -43,7 +43,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		return nil, report
 	}
 	sources := opts.ServiceSources
-	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 && len(sources.ConfigFiles) == 0 && sources.GitmootPipelines == "" {
+	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 && len(sources.ConfigFiles) == 0 && sources.GitmootPipelines == "" && len(sources.StagehandDirs) == 0 {
 		report.Status = core.CollectorSkipped
 		report.Detail = "no service definition locations are configured"
 		return nil, report
@@ -56,6 +56,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		gatherPM2,
 		gatherConfigFiles,
 		gatherGitmootPipelines,
+		gatherStagehand,
 	} {
 		if err := ctx.Err(); err != nil {
 			report.Status = core.CollectorPartial
@@ -609,7 +610,7 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 			return refs
 		}
 		report.Visited++
-		found, unresolved, err := specPathReferences(spec, "gitmoot_pipeline_path", "used by enabled Gitmoot pipeline "+name)
+		found, unresolved, err := specPathReferences(spec, "gitmoot_pipeline_path", "used by enabled Gitmoot pipeline "+name, nil)
 		if err != nil {
 			noteUnreadable(report, fmt.Sprintf("could not parse Gitmoot pipeline %s: %v", name, err))
 			continue
@@ -625,6 +626,83 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 	return refs
 }
 
+// stagehandRunPlaceholder stands for a stagehand run id while expanding
+// $STAGEHAND_WORK. Like the integer it replaces, it holds no "/" or "..".
+const stagehandRunPlaceholder = "STAGEHAND-RUN-ID"
+
+// gatherStagehand reports every absolute path in each stagehand pipeline
+// spec (*.yaml, *.yml) in the configured directories: commands, working
+// directories, env and prompt files, and any other value. Disabled specs
+// count too. A missing directory is skipped; one that cannot be listed, or
+// a spec that cannot be read or parsed, leaves this source unknown, which
+// refuses removals.
+func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
+	var refs []Reference
+	// Stagehand sets $STAGEHAND_WORK to <state>/runs/<run id>/work and
+	// $STAGEHAND_RUN_ID to that run id, an integer it assigns. A placeholder
+	// stands for it;
+	// references through it are folded into <state>/runs, unless the spec
+	// itself climbs out of that directory with a literal "..".
+	var runtime map[string]string
+	var runsDir string
+	if state := opts.ServiceSources.StagehandStateDir; filepath.IsAbs(state) {
+		runsDir = filepath.Join(state, "runs")
+		runtime = map[string]string{
+			"STAGEHAND_WORK":   runsDir + "/" + stagehandRunPlaceholder + "/work",
+			"STAGEHAND_RUN_ID": stagehandRunPlaceholder,
+		}
+	}
+	for _, dir := range opts.ServiceSources.StagehandDirs {
+		if ctx.Err() != nil {
+			return refs
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			noteUnreadable(report, fmt.Sprintf("could not list %s: %v", dir, err))
+			continue
+		}
+		for _, entry := range entries {
+			ext := strings.ToLower(filepath.Ext(entry.Name()))
+			if entry.IsDir() || (ext != ".yaml" && ext != ".yml") {
+				continue
+			}
+			file := filepath.Join(dir, entry.Name())
+			content, err := readFileBounded(file, maxPM2DumpBytes)
+			if err != nil {
+				noteUnreadable(report, fmt.Sprintf("could not read %s: %v", file, err))
+				continue
+			}
+			report.Visited++
+			found, unresolved, err := specPathReferences(content, "stagehand_path", "used by stagehand pipeline "+file, runtime)
+			if err != nil {
+				noteUnreadable(report, fmt.Sprintf("could not parse %s: %v", file, err))
+				continue
+			}
+			if len(unresolved) > 0 {
+				noteUnreadable(report, fmt.Sprintf("stagehand pipeline %s uses paths that cannot be resolved: %s", file, strings.Join(unresolved, " ")))
+			}
+			for _, ref := range found {
+				if !strings.Contains(ref.Path, stagehandRunPlaceholder) {
+					refs = append(refs, ref)
+					continue
+				}
+				// filepath.Clean has already applied any literal "..": a path
+				// that left <state>/runs is reported, not folded.
+				if !core.PathWithin(ref.Path, runsDir) {
+					noteUnreadable(report, fmt.Sprintf("stagehand pipeline %s builds a path outside its run directory: %s", file, ref.Path))
+					continue
+				}
+				ref.Path, ref.Subtree = runsDir, true
+				refs = append(refs, ref)
+			}
+		}
+	}
+	return refs
+}
+
 // specPathReferences parses a pipeline spec (YAML, every document) and
 // returns a blocking service reference for each path it names.
 //
@@ -636,14 +714,15 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 //   - Variables are expanded from what the spec states: NAME=value words
 //     anywhere in it, string entries of YAML maps (env: blocks), and
 //     ${NAME:-default} fallbacks. HOME is the janitor's own HOME: pipelines
-//     on this host run as the same user.
+//     on this host run as the same user. runtime adds variables the runner
+//     itself sets.
 //   - Each expanded word counts, as does the value after every = and each
 //     :-separated part of it.
 //   - A word still holding an unresolved expansion ($x, $(...), `...`) and a
 //     / is a path whose location is unknown: the value may hold anything,
 //     "..", included. It is returned as unresolved, and the caller must
 //     treat the whole source as unknown.
-func specPathReferences(spec, signal, detail string) ([]Reference, []string, error) {
+func specPathReferences(spec, signal, detail string, runtime map[string]string) ([]Reference, []string, error) {
 	var docs []any
 	decoder := yaml.NewDecoder(strings.NewReader(spec))
 	var err error
@@ -677,6 +756,9 @@ func specPathReferences(spec, signal, detail string) ([]Reference, []string, err
 	}
 	if home := os.Getenv("HOME"); filepath.IsAbs(home) {
 		setVar("HOME", home)
+	}
+	for name, value := range runtime {
+		setVar(name, value)
 	}
 	walkConfigMaps(docs, func(key, value string) { setVar(key, value) })
 	walkConfigStrings(docs, func(value string) {
@@ -731,9 +813,11 @@ func specPathReferences(spec, signal, detail string) ([]Reference, []string, err
 			}
 		}
 	}
-	walkConfigStrings(docs, func(value string) {
-		// A value that is itself one path may contain spaces.
-		if whole := strings.TrimSpace(value); strings.HasPrefix(whole, "/") && !strings.Contains(whole, "\n") {
+	// A path field's whole value is one path and may contain spaces
+	// (cwd: /a b). A command field is shell text: only its words count, or a
+	// whole command line would be read as one long path.
+	walkConfigKeyedStrings(docs, "", func(key, value string) {
+		if whole := strings.TrimSpace(value); !commandKeys[strings.ToLower(key)] && strings.HasPrefix(whole, "/") && !strings.Contains(whole, "\n") {
 			consider(whole)
 		}
 		forEachWord(value, 0, consider)
@@ -933,6 +1017,37 @@ func expandWord(word string, vars map[string][]string) []string {
 		}
 	}
 	return results
+}
+
+// commandKeys name spec fields whose values are shell commands.
+var commandKeys = map[string]bool{
+	"cmd": true, "command": true, "commands": true, "run": true, "script": true,
+	"shell": true, "sh": true, "bash": true, "exec": true, "entrypoint": true, "args": true,
+}
+
+// walkConfigKeyedStrings calls visit with every string value (and map key)
+// in a decoded configuration document and the map key it sits under; list
+// items inherit their list's key.
+func walkConfigKeyedStrings(node any, key string, visit func(key, value string)) {
+	switch value := node.(type) {
+	case string:
+		visit(key, value)
+	case map[string]any:
+		for name, child := range value {
+			visit("", name)
+			walkConfigKeyedStrings(child, name, visit)
+		}
+	case map[any]any:
+		for name, child := range value {
+			text, _ := name.(string)
+			walkConfigKeyedStrings(name, "", visit)
+			walkConfigKeyedStrings(child, text, visit)
+		}
+	case []any:
+		for _, child := range value {
+			walkConfigKeyedStrings(child, key, visit)
+		}
+	}
 }
 
 // walkConfigMaps calls visit with every string-valued entry of every map in

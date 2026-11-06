@@ -664,3 +664,125 @@ func TestEnabledGitmootPipelineKeepsItsFolderLocal(t *testing.T) {
 		t.Fatalf("a disabled pipeline blocked archiving: %+v", item)
 	}
 }
+
+// gitmoot 409437: pipelines are moving to stagehand, whose specs live in
+// /etc/stagehand/pipelines/*.yaml. Every absolute path in a spec (cmd with
+// assignments, cwd, env_file, prompt_file) is in use; a spec that does not
+// parse blocks removals.
+func TestStagehandSpecKeepsItsFoldersLocal(t *testing.T) {
+	x := newFleetStateFixture(t)
+	script := filepath.Join(x.state, "radar")
+	work := filepath.Join(x.state, "radar-work")
+	envs := filepath.Join(x.state, "radar-env")
+	prompts := filepath.Join(x.state, "radar-prompts")
+	free := filepath.Join(x.state, "unrelated")
+	for _, path := range []string{script, work, envs, prompts, free} {
+		x.folder(t, path, 20*24*time.Hour, map[string]string{"f": "x"})
+	}
+	specs := filepath.Join(x.home, "stagehand", "pipelines")
+	if err := os.MkdirAll(specs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	spec := fmt.Sprintf("name: radar\nstages:\n  - id: run\n    cmd: HOME=/root CONF=%s/f /usr/bin/python3 %s/f --top 20\n    cwd: %s\n    env_file: %s/f\n  - id: think\n    prompt_file: %s/f\n",
+		work, script, work, envs, prompts)
+	if err := os.WriteFile(filepath.Join(specs, "radar.yaml"), []byte(spec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	raw, err := os.ReadFile(policyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  stagehand_dirs: ["+specs+"]\n", 1))
+	report := x.categories(t, true)
+	for _, path := range []string{script, work, envs, prompts} {
+		if item := x.item(t, report, path); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
+			t.Fatalf("%s is used by a stagehand spec but was not kept: %+v", path, item)
+		}
+	}
+	if item := x.item(t, report, free); item.Status != "would_archive" {
+		t.Fatalf("an unreferenced folder was blocked: %+v", item)
+	}
+	if err := os.WriteFile(filepath.Join(specs, "broken.yaml"), []byte("stages: [unclosed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var scan core.Scan
+	field(t, x.data(t, "scan"), "scan", &scan)
+	for _, collector := range scan.Collectors {
+		if collector.Name == "services" && collector.Status == core.CollectorRan {
+			t.Fatalf("an unparseable stagehand spec left services complete: %+v", collector)
+		}
+	}
+}
+
+// Review of #167: a stagehand spec that writes to $STAGEHAND_WORK protects
+// every run under <state>/runs. A run already in quarantine when that spec
+// appears must not expire either: expiry's re-check of the original path
+// has to honour the folded subtree reference.
+func TestExpiryRefusesARunCoveredByAStagehandSubtreeReference(t *testing.T) {
+	x := newFleetStateFixture(t)
+	state := filepath.Join(x.home, "stagehand")
+	runs := filepath.Join(state, "runs")
+	run := filepath.Join(runs, "42")
+	x.folder(t, run, 20*24*time.Hour, map[string]string{"rows.json": "[]"})
+	specs := filepath.Join(x.home, "stagehand-specs")
+	if err := os.MkdirAll(specs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, fmt.Sprintf(`roots:
+  - path: %s
+    max_depth: 1
+collectors:
+  deep_size: false
+  git: false
+  processes: true
+  services: true
+  proc_root: %s
+  systemd_dirs: []
+  cron_paths: []
+  pm2_dumps: []
+  stagehand_dirs: [%s]
+  stagehand_state_dir: %s
+caches:
+  - name: old-run
+    path: %s
+    action: quarantine
+    retention: none
+retention:
+  default: none
+  delete_enabled: true
+prevention:
+  min_free_bytes: 0
+  min_free_percent: 0
+`, runs, x.proc, specs, state, run))
+	x.data(t, "scan")
+	var plan core.Plan
+	field(t, x.data(t, "plan", "--no-jev"), "plan", &plan)
+	var action core.Action
+	for _, a := range plan.Actions {
+		if a.Path == run {
+			action = a
+		}
+	}
+	if action.Kind != core.ActionQuarantine {
+		t.Fatalf("run not proposed for quarantine: %+v", action)
+	}
+	x.data(t, "plan", "--plan", plan.ID, "--approve", action.ID, "--no-jev")
+	x.data(t, "apply", "--quarantine", "--action", action.ID, "--dry-run=false", "--confirm")
+	if _, err := os.Lstat(run); !os.IsNotExist(err) {
+		t.Fatalf("run not quarantined: %v", err)
+	}
+	spec := "stages:\n  - cmd: /usr/bin/tool --out \"$STAGEHAND_WORK/rows.json\"\n"
+	if err := os.WriteFile(filepath.Join(specs, "p.yaml"), []byte(spec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, _ := x.run(t, "apply", "--expire", "--dry-run=false", "--confirm")
+	if !strings.Contains(stderr, "new protected references") {
+		t.Fatalf("expiry did not refuse a run covered by a stagehand subtree reference: %s", stderr)
+	}
+	quarantined, err := filepath.Glob(filepath.Join(x.home, ".local", "state", "workspace-janitor", "quarantine", "*", "*", "item", "rows.json"))
+	if err != nil || len(quarantined) == 0 {
+		t.Fatalf("quarantined run was deleted (err=%v, found=%v)", err, quarantined)
+	}
+}

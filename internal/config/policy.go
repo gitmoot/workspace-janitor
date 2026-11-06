@@ -204,6 +204,12 @@ type Collectors struct {
 	// gitmoot's remote_exec binaries. Every absolute path outside a comment
 	// line is a blocking service reference.
 	ConfigFiles []string `yaml:"config_files" json:"config_files"`
+	// StagehandDirs hold stagehand pipeline specs (*.yaml, *.yml); every
+	// absolute path in a spec is a blocking service reference.
+	StagehandDirs []string `yaml:"stagehand_dirs" json:"stagehand_dirs"`
+	// StagehandStateDir is stagehand's state directory; $STAGEHAND_WORK in
+	// a spec is a run's work directory under it.
+	StagehandStateDir string `yaml:"stagehand_state_dir" json:"stagehand_state_dir"`
 }
 
 // CanonicalRoot declares where entries of a class are supposed to live.
@@ -492,9 +498,11 @@ func DefaultPolicy(p Paths) Policy {
 				"/etc/systemd/system",
 				"/usr/lib/systemd/system",
 			},
-			CronPaths:   []string{"/etc/crontab", "/etc/cron.d"},
-			PM2Dumps:    []string{},
-			ConfigFiles: []string{},
+			CronPaths:         []string{"/etc/crontab", "/etc/cron.d"},
+			PM2Dumps:          []string{},
+			ConfigFiles:       []string{},
+			StagehandDirs:     []string{"/etc/stagehand/pipelines"},
+			StagehandStateDir: "/var/lib/stagehand",
 		},
 		Classification: Classification{
 			ProjectMarkers:   []string{".git", "go.mod", "package.json", "Cargo.toml", "pyproject.toml"},
@@ -596,6 +604,7 @@ func (p Policy) clone() Policy {
 	out.Collectors.CronPaths = append([]string(nil), p.Collectors.CronPaths...)
 	out.Collectors.PM2Dumps = append([]string(nil), p.Collectors.PM2Dumps...)
 	out.Collectors.ConfigFiles = append([]string(nil), p.Collectors.ConfigFiles...)
+	out.Collectors.StagehandDirs = append([]string(nil), p.Collectors.StagehandDirs...)
 	out.CanonicalRoots = append([]CanonicalRoot(nil), p.CanonicalRoots...)
 	out.Classification = p.Classification.clone()
 	return out
@@ -667,6 +676,10 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	for i := range p.Collectors.CronPaths {
 		p.Collectors.CronPaths[i] = expand(fmt.Sprintf("collectors.cron_paths[%d]", i), p.Collectors.CronPaths[i])
 	}
+	p.Collectors.StagehandStateDir = expand("collectors.stagehand_state_dir", p.Collectors.StagehandStateDir)
+	for i := range p.Collectors.StagehandDirs {
+		p.Collectors.StagehandDirs[i] = expand(fmt.Sprintf("collectors.stagehand_dirs[%d]", i), p.Collectors.StagehandDirs[i])
+	}
 	for i := range p.Collectors.ConfigFiles {
 		p.Collectors.ConfigFiles[i] = expand(fmt.Sprintf("collectors.config_files[%d]", i), p.Collectors.ConfigFiles[i])
 	}
@@ -707,6 +720,9 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	}
 	if p.Collectors.ConfigFiles == nil {
 		p.Collectors.ConfigFiles = []string{}
+	}
+	if p.Collectors.StagehandDirs == nil {
+		p.Collectors.StagehandDirs = []string{}
 	}
 	if p.Collectors.PM2Dumps == nil {
 		p.Collectors.PM2Dumps = []string{}
@@ -1030,6 +1046,7 @@ func (p *Policy) Validate() core.FieldErrors {
 		{"collectors.cron_paths", p.Collectors.CronPaths},
 		{"collectors.pm2_dumps", p.Collectors.PM2Dumps},
 		{"collectors.config_files", p.Collectors.ConfigFiles},
+		{"collectors.stagehand_dirs", p.Collectors.StagehandDirs},
 	} {
 		for i, value := range group.values {
 			if !core.IsCanonicalPath(value) {

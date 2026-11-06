@@ -285,6 +285,14 @@ collectors:
   # reference. A file that does not parse blocks every removal. Default: gitmoot's config.toml.
   config_files:
     - ~/.gitmoot/config.toml
+  # Stagehand pipeline spec directories; every absolute path in a spec
+  # (cmd, cwd, env_file, prompt_file, ...) is a blocking service reference,
+  # and a spec that does not parse blocks every removal.
+  stagehand_dirs:
+    - /etc/stagehand/pipelines
+  # Stagehand state directory: $STAGEHAND_WORK in a spec is a run's work
+  # directory under <dir>/runs, protected as a whole.
+  stagehand_state_dir: /var/lib/stagehand
 
 # Destination checks of the safety engine. Nothing here disables a core
 # invariant: the protections themselves are not configurable.

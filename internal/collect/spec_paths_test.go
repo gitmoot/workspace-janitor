@@ -1,10 +1,13 @@
 package collect
 
 import (
+	"context"
+	"github.com/gitmoot/workspace-janitor/internal/core"
 	"os"
 	"os/user"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // Review of #166: every valid pipeline path form must protect its folder.
@@ -25,7 +28,7 @@ stages:
   - cmd: cat "$PIPE_HOME/conf"
     description: "Prose that isn't a path: don't match it"
 `
-	refs, unresolved, err := specPathReferences(spec, "s", "d")
+	refs, unresolved, err := specPathReferences(spec, "s", "d", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +60,7 @@ func TestSpecPathReferencesReportsUnresolvablePaths(t *testing.T) {
 		`cmd: ls /work/runs/$(date +%F)/out`,
 		`cmd: bash "/work/$UNSET/../../pipelines/run.sh"`,
 	} {
-		_, unresolved, err := specPathReferences(spec+"\n", "s", "d")
+		_, unresolved, err := specPathReferences(spec+"\n", "s", "d", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -77,7 +80,7 @@ func TestSpecPathReferencesNeverTruncatesExpansions(t *testing.T) {
 		"values":  `cmd: X=1; X=2; X=3; X=4; X=5; X=6; X=7; X=8; X=9; bash "/work/x$X/run.sh"`,
 		"escapes": `cmd: A=a0; A=a1; A=a2; A=a3; B=b0; B=b1; B=b2; B=b3; bash "/work/${A:-fa}-${B:-fb}/../../pipelines/run.sh"`,
 	} {
-		_, unresolved, err := specPathReferences(spec+"\n", "s", "d")
+		_, unresolved, err := specPathReferences(spec+"\n", "s", "d", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -104,7 +107,7 @@ func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
 		"bash " + dir + "/work/{pipelines,elsewhere}/run.sh",
 		"bash ~/work/pipelines/run.sh",
 	} {
-		refs, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d")
+		refs, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d", nil)
 		if err != nil || len(unresolved) != 0 {
 			t.Fatalf("%s: err=%v unresolved=%q", cmd, err, unresolved)
 		}
@@ -117,13 +120,13 @@ func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
 		}
 	}
 	// Text that is not a path, however brace-rich, is not a candidate.
-	if _, unresolved, err := specPathReferences(`cmd: echo '[{id:1,q:What {id:2}' --flag={x`+"\n", "s", "d"); err != nil || len(unresolved) != 0 {
+	if _, unresolved, err := specPathReferences(`cmd: echo '[{id:1,q:What {id:2}' --flag={x`+"\n", "s", "d", nil); err != nil || len(unresolved) != 0 {
 		t.Errorf("non-path text reported unresolved: err=%v %q", err, unresolved)
 	}
 	// Quoting is gone before expansion, so the literal word must stay a
 	// candidate: a quoted '/work/{a,b}' names that directory itself.
 	literal := filepath.Join(dir, "work", "{a,b}")
-	refs, _, _ := specPathReferences("cmd: bash '"+literal+"/run.sh'\n", "s", "d")
+	refs, _, _ := specPathReferences("cmd: bash '"+literal+"/run.sh'\n", "s", "d", nil)
 	keptLiteral := false
 	for _, ref := range refs {
 		keptLiteral = keptLiteral || ref.Path == filepath.Join(literal, "run.sh")
@@ -149,7 +152,7 @@ func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
 		"bash ~no-such-user-janitor/pipelines/run.sh",
 		"bash ~+/pipelines/run.sh",
 	} {
-		_, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d")
+		_, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d", nil)
 		if err != nil || len(unresolved) == 0 {
 			t.Errorf("%s: not reported unresolved (err=%v)", cmd, err)
 		}
@@ -162,7 +165,7 @@ func TestSpecPathReferencesExpandsNamedUserHome(t *testing.T) {
 	if err != nil || !filepath.IsAbs(account.HomeDir) {
 		t.Skip("no current user home")
 	}
-	refs, unresolved, err := specPathReferences("cmd: bash ~"+account.Username+"/pipelines/run.sh\n", "s", "d")
+	refs, unresolved, err := specPathReferences("cmd: bash ~"+account.Username+"/pipelines/run.sh\n", "s", "d", nil)
 	if err != nil || len(unresolved) != 0 {
 		t.Fatalf("err=%v unresolved=%q", err, unresolved)
 	}
@@ -173,4 +176,68 @@ func TestSpecPathReferencesExpandsNamedUserHome(t *testing.T) {
 		}
 	}
 	t.Fatalf("~%s/pipelines/run.sh did not resolve to %s: %+v", account.Username, want, refs)
+}
+
+// Stagehand sets $STAGEHAND_WORK to <state>/runs/<run id>/work: expanding it
+// with the placeholder lets the collector fold the reference into
+// <state>/runs. A literal ".." that leaves that directory is still visible.
+func TestSpecPathReferencesUsesRunnerVariables(t *testing.T) {
+	runtime := map[string]string{
+		"STAGEHAND_WORK":   "/state/runs/" + stagehandRunPlaceholder + "/work",
+		"STAGEHAND_RUN_ID": stagehandRunPlaceholder,
+	}
+	refs, unresolved, err := specPathReferences("cmd: tool --out \"$STAGEHAND_WORK/rows.json\"\n", "s", "d", runtime)
+	if err != nil || len(unresolved) != 0 {
+		t.Fatalf("err=%v unresolved=%q", err, unresolved)
+	}
+	if len(refs) == 0 || refs[0].Path != "/state/runs/"+stagehandRunPlaceholder+"/work/rows.json" {
+		t.Fatalf("run work path not expanded: %+v", refs)
+	}
+	refs, unresolved, _ = specPathReferences("cmd: tool --run \"$STAGEHAND_RUN_ID\" --log \"/state/runs/$STAGEHAND_RUN_ID/log\"\n", "s", "d", runtime)
+	if len(unresolved) != 0 {
+		t.Fatalf("run id reported unresolved: %q", unresolved)
+	}
+	refs, _, _ = specPathReferences("cmd: cat \"$STAGEHAND_WORK/../../../etc/x\"\n", "s", "d", runtime)
+	if len(refs) == 0 || refs[0].Path != "/state/etc/x" {
+		t.Fatalf("escape from the run directory not visible after Clean: %+v", refs)
+	}
+}
+
+// Review of #167: references folded into <state>/runs must protect every
+// run below it, and a stagehand state directory with a space in its path is
+// still a path. A one-line command in a cmd field is not one long path.
+func TestStagehandRunReferencesProtectRunsAndSurviveSpaces(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "stagehand state")
+	specs := filepath.Join(root, "specs")
+	if err := os.MkdirAll(specs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	spec := "stages:\n  - cmd: /usr/bin/tool --out \"$STAGEHAND_WORK/rows.json\" --run \"$STAGEHAND_RUN_ID\"\n"
+	if err := os.WriteFile(filepath.Join(specs, "p.yaml"), []byte(spec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts := &Options{ServiceSources: ServiceSources{StagehandDirs: []string{specs}, StagehandStateDir: state}}
+	report := &core.CollectorReport{Status: core.CollectorRan}
+	refs := gatherStagehand(context.Background(), opts, report)
+	if report.Status != core.CollectorRan || report.Unknowns != 0 {
+		t.Fatalf("spec should resolve completely: %+v", report)
+	}
+	runs := filepath.Join(state, "runs")
+	var folded *Reference
+	for i := range refs {
+		if refs[i].Path == runs {
+			folded = &refs[i]
+		}
+	}
+	if folded == nil {
+		t.Fatalf("run work path with a space in the state dir was dropped: %+v", refs)
+	}
+	entries := []core.Entry{{Path: runs}, {Path: filepath.Join(runs, "42")}, {Path: filepath.Join(runs, "42", "work")}}
+	attachReferences(entries, []Reference{*folded}, time.Now())
+	for _, entry := range entries {
+		if !entry.Protected() {
+			t.Errorf("%s not protected by the folded run reference", entry.Path)
+		}
+	}
 }
