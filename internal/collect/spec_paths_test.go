@@ -179,13 +179,20 @@ func TestSpecPathReferencesExpandsNamedUserHome(t *testing.T) {
 // with the placeholder lets the collector fold the reference into
 // <state>/runs. A literal ".." that leaves that directory is still visible.
 func TestSpecPathReferencesUsesRunnerVariables(t *testing.T) {
-	runtime := map[string]string{"STAGEHAND_WORK": "/state/runs/" + stagehandRunPlaceholder + "/work"}
+	runtime := map[string]string{
+		"STAGEHAND_WORK":   "/state/runs/" + stagehandRunPlaceholder + "/work",
+		"STAGEHAND_RUN_ID": stagehandRunPlaceholder,
+	}
 	refs, unresolved, err := specPathReferences("cmd: tool --out \"$STAGEHAND_WORK/rows.json\"\n", "s", "d", runtime)
 	if err != nil || len(unresolved) != 0 {
 		t.Fatalf("err=%v unresolved=%q", err, unresolved)
 	}
 	if len(refs) == 0 || refs[0].Path != "/state/runs/"+stagehandRunPlaceholder+"/work/rows.json" {
 		t.Fatalf("run work path not expanded: %+v", refs)
+	}
+	refs, unresolved, _ = specPathReferences("cmd: tool --run \"$STAGEHAND_RUN_ID\" --log \"/state/runs/$STAGEHAND_RUN_ID/log\"\n", "s", "d", runtime)
+	if len(unresolved) != 0 {
+		t.Fatalf("run id reported unresolved: %q", unresolved)
 	}
 	refs, _, _ = specPathReferences("cmd: cat \"$STAGEHAND_WORK/../../../etc/x\"\n", "s", "d", runtime)
 	if len(refs) == 0 || refs[0].Path != "/state/etc/x" {

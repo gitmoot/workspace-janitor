@@ -638,15 +638,19 @@ const stagehandRunPlaceholder = "STAGEHAND-RUN-ID"
 // refuses removals.
 func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
 	var refs []Reference
-	// Stagehand sets $STAGEHAND_WORK to <state>/runs/<run id>/work, where the
-	// run id is an integer stagehand assigns. A placeholder stands for it;
+	// Stagehand sets $STAGEHAND_WORK to <state>/runs/<run id>/work and
+	// $STAGEHAND_RUN_ID to that run id, an integer it assigns. A placeholder
+	// stands for it;
 	// references through it are folded into <state>/runs, unless the spec
 	// itself climbs out of that directory with a literal "..".
 	var runtime map[string]string
 	var runsDir string
 	if state := opts.ServiceSources.StagehandStateDir; filepath.IsAbs(state) {
 		runsDir = filepath.Join(state, "runs")
-		runtime = map[string]string{"STAGEHAND_WORK": runsDir + "/" + stagehandRunPlaceholder + "/work"}
+		runtime = map[string]string{
+			"STAGEHAND_WORK":   runsDir + "/" + stagehandRunPlaceholder + "/work",
+			"STAGEHAND_RUN_ID": stagehandRunPlaceholder,
+		}
 	}
 	for _, dir := range opts.ServiceSources.StagehandDirs {
 		if ctx.Err() != nil {
@@ -683,6 +687,11 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 			for _, ref := range found {
 				if !strings.Contains(ref.Path, stagehandRunPlaceholder) {
 					refs = append(refs, ref)
+					continue
+				}
+				// A whole command line that mentions the run id is not a path;
+				// its words were each considered on their own.
+				if strings.ContainsAny(ref.Path, " \t\n") {
 					continue
 				}
 				// filepath.Clean has already applied any literal "..": a path
