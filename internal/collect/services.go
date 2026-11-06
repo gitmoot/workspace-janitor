@@ -748,8 +748,8 @@ func forEachWord(text string, depth int, visit func(string)) {
 }
 
 // expandWord returns word with every expansion of a known variable replaced
-// by each of its values (at most 16 results). An unknown variable with a
-// ${NAME:-default} fallback takes the fallback; any other unknown expansion
+// by each of its values (at most 16 results). A ${NAME:-default} fallback
+// is always one of the candidates, set or not; any other unknown expansion
 // is left in place for the caller to treat as unresolved.
 func expandWord(word string, vars map[string][]string) []string {
 	results := []string{word}
@@ -768,9 +768,14 @@ func expandWord(word string, vars map[string][]string) []string {
 			} else {
 				name = current[loc[6]:loc[7]]
 			}
-			values := vars[name]
-			if len(values) == 0 && loc[4] >= 0 {
-				values = []string{current[loc[4]:loc[5]]}
+			// A written fallback is always a candidate as well: POSIX uses it
+			// when NAME is unset and, for :- and :=, when NAME is empty, and
+			// the spec cannot tell us which applies at run time.
+			values := slices.Clone(vars[name])
+			if loc[4] >= 0 {
+				if fallback := current[loc[4]:loc[5]]; !slices.Contains(values, fallback) {
+					values = append(values, fallback)
+				}
 			}
 			if len(values) == 0 {
 				next = append(next, current)

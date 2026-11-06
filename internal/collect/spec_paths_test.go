@@ -19,6 +19,7 @@ stages:
   - cmd: python3 /work/plain/run.py;echo done|tee /work/tee.txt
   - cmd: base=/work/base; bash "$base/pipelines/run.sh"
   - cmd: bash "${PIPELINE_DIR:-/work/fallback/pipelines}/run.sh"
+  - cmd: EMPTY_DIR=; bash "${EMPTY_DIR:-/work/empty-fallback}/run.sh"
   - cmd: cat "$PIPE_HOME/conf"
   - cmd: ls /work/runs/$(date +%F)/out
     description: "Prose that isn't a path: don't match it"
@@ -43,6 +44,7 @@ stages:
 		"/work/pipeline bundle", "/work/quoted dir/run.sh", "/work/chdir", "/work/assigned",
 		"/work/bin1", "/work/bin2", "/work/out.log", "/work/plain/run.py", "/work/tee.txt",
 		"/work/single", "/work/base/pipelines/run.sh", "/work/fallback/pipelines/run.sh", "/work/env-home/conf",
+		"/work/empty-fallback/run.sh",
 	} {
 		if !exact[want] {
 			t.Errorf("missing %q", want)
