@@ -1,6 +1,11 @@
 package collect
 
-import "testing"
+import (
+	"os"
+	"os/user"
+	"path/filepath"
+	"testing"
+)
 
 // Review of #166: every valid pipeline path form must protect its folder.
 // A miss reads as "not in use" and lets the folder be removed.
@@ -80,4 +85,86 @@ func TestSpecPathReferencesNeverTruncatesExpansions(t *testing.T) {
 			t.Fatalf("%s: over-limit expansion was not reported unresolved", name)
 		}
 	}
+}
+
+// Post-merge review of #166: a shell expands globs, braces and a leading ~
+// in a command's paths, so a pattern naming an existing directory protects
+// it. A pattern that cannot be expanded safely is unresolved.
+func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
+	dir := t.TempDir()
+	pipelines := filepath.Join(dir, "work", "pipelines")
+	if err := os.MkdirAll(pipelines, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pipelines, "run.sh"), []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", dir)
+	for _, cmd := range []string{
+		"bash " + dir + "/work/pipeline[s]/run.sh",
+		"bash " + dir + "/work/pipelines*/run.sh",
+		"bash " + dir + "/work/pipeline?/run.sh",
+		"bash " + dir + "/work/{pipelines,elsewhere}/run.sh",
+		"bash ~/work/pipelines/run.sh",
+	} {
+		refs, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d")
+		if err != nil || len(unresolved) != 0 {
+			t.Fatalf("%s: err=%v unresolved=%q", cmd, err, unresolved)
+		}
+		found := false
+		for _, ref := range refs {
+			found = found || ref.Path == filepath.Join(pipelines, "run.sh")
+		}
+		if !found {
+			t.Errorf("%s: %s not protected: %+v", cmd, pipelines, refs)
+		}
+	}
+	// Text that is not a path, however brace-rich, is not a candidate.
+	if _, unresolved, err := specPathReferences(`cmd: echo '[{id:1,q:What {id:2}' --flag={x`+"\n", "s", "d"); err != nil || len(unresolved) != 0 {
+		t.Errorf("non-path text reported unresolved: err=%v %q", err, unresolved)
+	}
+	// Quoting is gone before expansion, so the literal word must stay a
+	// candidate: a quoted '/work/{a,b}' names that directory itself.
+	literal := filepath.Join(dir, "work", "{a,b}")
+	refs, _, _ := specPathReferences("cmd: bash '"+literal+"/run.sh'\n", "s", "d")
+	keptLiteral := false
+	for _, ref := range refs {
+		keptLiteral = keptLiteral || ref.Path == filepath.Join(literal, "run.sh")
+	}
+	if !keptLiteral {
+		t.Errorf("literal brace path dropped: %+v", refs)
+	}
+	for _, cmd := range []string{
+		"bash " + dir + "/work/{a,{b,c}}/run.sh",
+		"bash " + dir + "/work/{1..3}/run.sh",
+		"bash " + dir + "/work/pipeline[!b]/run.sh",
+		"bash " + dir + "/work/pipeline[^b]/run.sh",
+		"bash " + dir + "/work/[[:alpha:]]ipelines/run.sh",
+		"bash ~no-such-user-janitor/pipelines/run.sh",
+		"bash ~+/pipelines/run.sh",
+	} {
+		_, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d")
+		if err != nil || len(unresolved) == 0 {
+			t.Errorf("%s: not reported unresolved (err=%v)", cmd, err)
+		}
+	}
+}
+
+// ~user takes that account's home from the user database, as a shell does.
+func TestSpecPathReferencesExpandsNamedUserHome(t *testing.T) {
+	account, err := user.Current()
+	if err != nil || !filepath.IsAbs(account.HomeDir) {
+		t.Skip("no current user home")
+	}
+	refs, unresolved, err := specPathReferences("cmd: bash ~"+account.Username+"/pipelines/run.sh\n", "s", "d")
+	if err != nil || len(unresolved) != 0 {
+		t.Fatalf("err=%v unresolved=%q", err, unresolved)
+	}
+	want := filepath.Join(account.HomeDir, "pipelines", "run.sh")
+	for _, ref := range refs {
+		if ref.Path == want {
+			return
+		}
+	}
+	t.Fatalf("~%s/pipelines/run.sh did not resolve to %s: %+v", account.Username, want, refs)
 }

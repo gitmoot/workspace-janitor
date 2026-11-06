@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -687,12 +688,22 @@ func specPathReferences(spec, signal, detail string) ([]Reference, []string, err
 	})
 	var refs []Reference
 	var unresolved []string
+	addOne := func(path string) {
+		if p := filepath.Clean(path); filepath.IsAbs(p) && p != "/" {
+			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail})
+		}
+	}
+	// add applies the shell's pathname expansions to one candidate: braces,
+	// a leading ~, then globs against the filesystem as it is now. A pattern
+	// that cannot be expanded safely is unresolved.
 	add := func(candidate string) {
-		if !filepath.IsAbs(candidate) {
+		paths, ok := expandPathname(candidate)
+		if !ok {
+			unresolved = append(unresolved, candidate)
 			return
 		}
-		if p := filepath.Clean(candidate); p != "/" {
-			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail})
+		for _, path := range paths {
+			addOne(path)
 		}
 	}
 	consider := func(word string) {
@@ -748,6 +759,145 @@ func forEachWord(text string, depth int, visit func(string)) {
 			forEachWord(word, depth+1, visit)
 		}
 	}
+}
+
+// expandPathname performs, for one word, the pathname expansions a shell
+// applies after parameter expansion: brace expansion ({a,b}), tilde
+// expansion (~, ~/..., ~user/...), and globbing (* ? [...]) against the
+// filesystem now. Quoting is gone by this point, so the literal word is
+// always kept as well: a quoted '/a/{b,c}' or '/a/*' names itself. It
+// reports false when a form cannot be expanded faithfully: nested or
+// oversized braces, ~+ and ~-, an unknown user, a bracket expression whose
+// meaning differs between Go and the shell ([!...], [^...], [[:class:]]), a
+// malformed glob, or too many matches. The caller treats that word as
+// unresolved.
+func expandPathname(word string) ([]string, bool) {
+	const maxPaths = 64
+	// Only a word that can become an absolute path is a candidate: one that
+	// starts with /, ~, or a brace group holding a /. Other words (options,
+	// JSON-like text, relative names) are left alone.
+	if !strings.HasPrefix(word, "/") && !strings.HasPrefix(word, "~") &&
+		!(strings.HasPrefix(word, "{") && strings.Contains(word, "/")) {
+		return nil, true
+	}
+	var out []string
+	if filepath.IsAbs(word) {
+		out = append(out, word)
+	}
+	words, ok := expandBraces(word, maxPaths)
+	if !ok {
+		return nil, false
+	}
+	for _, w := range words {
+		if strings.HasPrefix(w, "~") {
+			name, rest, _ := strings.Cut(w[1:], "/")
+			var home string
+			switch name {
+			case "":
+				home = os.Getenv("HOME")
+			case "+", "-":
+				return nil, false
+			default:
+				account, err := user.Lookup(name)
+				if err != nil {
+					return nil, false
+				}
+				home = account.HomeDir
+			}
+			if !filepath.IsAbs(home) {
+				return nil, false
+			}
+			w = filepath.Join(home, rest)
+		}
+		if !filepath.IsAbs(w) {
+			continue
+		}
+		if w != word {
+			out = append(out, w)
+		}
+		if !strings.ContainsAny(w, "*?[") {
+			continue
+		}
+		if !shellCompatibleGlob(w) {
+			return nil, false
+		}
+		matches, err := filepath.Glob(w)
+		if err != nil || len(out)+len(matches) > maxPaths {
+			return nil, false
+		}
+		out = append(out, matches...)
+	}
+	return out, true
+}
+
+// shellCompatibleGlob reports whether Go's filepath.Match reads pattern the
+// way a POSIX shell does. *, ? and simple bracket sets and ranges agree; a
+// bracket expression starting with ! or ^, or holding a [: class, does not.
+func shellCompatibleGlob(pattern string) bool {
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] != '[' {
+			continue
+		}
+		rest := pattern[i+1:]
+		if strings.HasPrefix(rest, "!") || strings.HasPrefix(rest, "^") || strings.Contains(rest, "[:") {
+			return false
+		}
+	}
+	return true
+}
+
+// expandBraces expands one level of {a,b,...} groups, innermost-free: a
+// nested group, an unbalanced brace, or more than limit results reports
+// false. A {..} range or a group without a comma is left literal, as in
+// sh; bash range expansion ({1..3}) is reported false.
+func expandBraces(word string, limit int) ([]string, bool) {
+	results := []string{word}
+	for round := 0; round < 8; round++ {
+		changed := false
+		var next []string
+		for _, w := range results {
+			open := strings.IndexByte(w, '{')
+			if open < 0 {
+				next = append(next, w)
+				continue
+			}
+			end := strings.IndexByte(w[open:], '}')
+			if end < 0 {
+				return nil, false
+			}
+			end += open
+			body := w[open+1 : end]
+			if strings.ContainsRune(body, '{') {
+				return nil, false
+			}
+			if strings.Contains(body, "..") {
+				return nil, false
+			}
+			if !strings.Contains(body, ",") {
+				// Not a brace group; keep it literal and look past it.
+				rest, ok := expandBraces(w[end+1:], limit)
+				if !ok {
+					return nil, false
+				}
+				for _, r := range rest {
+					next = append(next, w[:end+1]+r)
+				}
+				continue
+			}
+			changed = true
+			for _, alt := range strings.Split(body, ",") {
+				next = append(next, w[:open]+alt+w[end+1:])
+			}
+			if len(next) > limit {
+				return nil, false
+			}
+		}
+		results = next
+		if !changed {
+			return results, true
+		}
+	}
+	return nil, false
 }
 
 // expandWord returns word with every expansion of a known variable replaced
