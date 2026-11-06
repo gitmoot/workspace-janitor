@@ -290,6 +290,9 @@ collectors:
   # and a spec that does not parse blocks every removal.
   stagehand_dirs:
     - /etc/stagehand/pipelines
+  # Stagehand state directory: $STAGEHAND_WORK in a spec is a run's work
+  # directory under <dir>/runs, protected as a whole.
+  stagehand_state_dir: /var/lib/stagehand
 
 # Destination checks of the safety engine. Nothing here disables a core
 # invariant: the protections themselves are not configurable.

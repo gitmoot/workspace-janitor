@@ -81,6 +81,9 @@ type ServiceSources struct {
 	GitmootPipelines string
 	// StagehandDirs hold stagehand pipeline specs (*.yaml, *.yml).
 	StagehandDirs []string
+	// StagehandStateDir is stagehand's state directory, which holds each
+	// run's work directory ($STAGEHAND_WORK).
+	StagehandStateDir string
 }
 
 // AgentRef is one directory a registered agent is using.

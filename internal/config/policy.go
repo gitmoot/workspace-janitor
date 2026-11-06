@@ -207,6 +207,9 @@ type Collectors struct {
 	// StagehandDirs hold stagehand pipeline specs (*.yaml, *.yml); every
 	// absolute path in a spec is a blocking service reference.
 	StagehandDirs []string `yaml:"stagehand_dirs" json:"stagehand_dirs"`
+	// StagehandStateDir is stagehand's state directory; $STAGEHAND_WORK in
+	// a spec is a run's work directory under it.
+	StagehandStateDir string `yaml:"stagehand_state_dir" json:"stagehand_state_dir"`
 }
 
 // CanonicalRoot declares where entries of a class are supposed to live.
@@ -495,10 +498,11 @@ func DefaultPolicy(p Paths) Policy {
 				"/etc/systemd/system",
 				"/usr/lib/systemd/system",
 			},
-			CronPaths:     []string{"/etc/crontab", "/etc/cron.d"},
-			PM2Dumps:      []string{},
-			ConfigFiles:   []string{},
-			StagehandDirs: []string{"/etc/stagehand/pipelines"},
+			CronPaths:         []string{"/etc/crontab", "/etc/cron.d"},
+			PM2Dumps:          []string{},
+			ConfigFiles:       []string{},
+			StagehandDirs:     []string{"/etc/stagehand/pipelines"},
+			StagehandStateDir: "/var/lib/stagehand",
 		},
 		Classification: Classification{
 			ProjectMarkers:   []string{".git", "go.mod", "package.json", "Cargo.toml", "pyproject.toml"},
@@ -672,6 +676,7 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	for i := range p.Collectors.CronPaths {
 		p.Collectors.CronPaths[i] = expand(fmt.Sprintf("collectors.cron_paths[%d]", i), p.Collectors.CronPaths[i])
 	}
+	p.Collectors.StagehandStateDir = expand("collectors.stagehand_state_dir", p.Collectors.StagehandStateDir)
 	for i := range p.Collectors.StagehandDirs {
 		p.Collectors.StagehandDirs[i] = expand(fmt.Sprintf("collectors.stagehand_dirs[%d]", i), p.Collectors.StagehandDirs[i])
 	}

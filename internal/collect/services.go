@@ -610,7 +610,7 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 			return refs
 		}
 		report.Visited++
-		found, unresolved, err := specPathReferences(spec, "gitmoot_pipeline_path", "used by enabled Gitmoot pipeline "+name)
+		found, unresolved, err := specPathReferences(spec, "gitmoot_pipeline_path", "used by enabled Gitmoot pipeline "+name, nil)
 		if err != nil {
 			noteUnreadable(report, fmt.Sprintf("could not parse Gitmoot pipeline %s: %v", name, err))
 			continue
@@ -626,6 +626,10 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 	return refs
 }
 
+// stagehandRunPlaceholder stands for a stagehand run id while expanding
+// $STAGEHAND_WORK. Like the integer it replaces, it holds no "/" or "..".
+const stagehandRunPlaceholder = "STAGEHAND-RUN-ID"
+
 // gatherStagehand reports every absolute path in each stagehand pipeline
 // spec (*.yaml, *.yml) in the configured directories: commands, working
 // directories, env and prompt files, and any other value. Disabled specs
@@ -634,6 +638,16 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 // refuses removals.
 func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
 	var refs []Reference
+	// Stagehand sets $STAGEHAND_WORK to <state>/runs/<run id>/work, where the
+	// run id is an integer stagehand assigns. A placeholder stands for it;
+	// references through it are folded into <state>/runs, unless the spec
+	// itself climbs out of that directory with a literal "..".
+	var runtime map[string]string
+	var runsDir string
+	if state := opts.ServiceSources.StagehandStateDir; filepath.IsAbs(state) {
+		runsDir = filepath.Join(state, "runs")
+		runtime = map[string]string{"STAGEHAND_WORK": runsDir + "/" + stagehandRunPlaceholder + "/work"}
+	}
 	for _, dir := range opts.ServiceSources.StagehandDirs {
 		if ctx.Err() != nil {
 			return refs
@@ -658,12 +672,28 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 				continue
 			}
 			report.Visited++
-			found, err := specPathReferences(content, "stagehand_path", "used by stagehand pipeline "+file)
+			found, unresolved, err := specPathReferences(content, "stagehand_path", "used by stagehand pipeline "+file, runtime)
 			if err != nil {
 				noteUnreadable(report, fmt.Sprintf("could not parse %s: %v", file, err))
 				continue
 			}
-			refs = append(refs, found...)
+			if len(unresolved) > 0 {
+				noteUnreadable(report, fmt.Sprintf("stagehand pipeline %s uses paths that cannot be resolved: %s", file, strings.Join(unresolved, " ")))
+			}
+			for _, ref := range found {
+				if !strings.Contains(ref.Path, stagehandRunPlaceholder) {
+					refs = append(refs, ref)
+					continue
+				}
+				// filepath.Clean has already applied any literal "..": a path
+				// that left <state>/runs is reported, not folded.
+				if !core.PathWithin(ref.Path, runsDir) {
+					noteUnreadable(report, fmt.Sprintf("stagehand pipeline %s builds a path outside its run directory: %s", file, ref.Path))
+					continue
+				}
+				ref.Path = runsDir
+				refs = append(refs, ref)
+			}
 		}
 	}
 	return refs
@@ -680,14 +710,15 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 //   - Variables are expanded from what the spec states: NAME=value words
 //     anywhere in it, string entries of YAML maps (env: blocks), and
 //     ${NAME:-default} fallbacks. HOME is the janitor's own HOME: pipelines
-//     on this host run as the same user.
+//     on this host run as the same user. runtime adds variables the runner
+//     itself sets.
 //   - Each expanded word counts, as does the value after every = and each
 //     :-separated part of it.
 //   - A word still holding an unresolved expansion ($x, $(...), `...`) and a
 //     / is a path whose location is unknown: the value may hold anything,
 //     "..", included. It is returned as unresolved, and the caller must
 //     treat the whole source as unknown.
-func specPathReferences(spec, signal, detail string) ([]Reference, []string, error) {
+func specPathReferences(spec, signal, detail string, runtime map[string]string) ([]Reference, []string, error) {
 	var docs []any
 	decoder := yaml.NewDecoder(strings.NewReader(spec))
 	var err error
@@ -721,6 +752,9 @@ func specPathReferences(spec, signal, detail string) ([]Reference, []string, err
 	}
 	if home := os.Getenv("HOME"); filepath.IsAbs(home) {
 		setVar("HOME", home)
+	}
+	for name, value := range runtime {
+		setVar(name, value)
 	}
 	walkConfigMaps(docs, func(key, value string) { setVar(key, value) })
 	walkConfigStrings(docs, func(value string) {
