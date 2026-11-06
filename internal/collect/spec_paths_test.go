@@ -1,10 +1,13 @@
 package collect
 
 import (
+	"context"
+	"github.com/gitmoot/workspace-janitor/internal/core"
 	"os"
 	"os/user"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // Review of #166: every valid pipeline path form must protect its folder.
@@ -197,5 +200,44 @@ func TestSpecPathReferencesUsesRunnerVariables(t *testing.T) {
 	refs, _, _ = specPathReferences("cmd: cat \"$STAGEHAND_WORK/../../../etc/x\"\n", "s", "d", runtime)
 	if len(refs) == 0 || refs[0].Path != "/state/etc/x" {
 		t.Fatalf("escape from the run directory not visible after Clean: %+v", refs)
+	}
+}
+
+// Review of #167: references folded into <state>/runs must protect every
+// run below it, and a stagehand state directory with a space in its path is
+// still a path. A one-line command in a cmd field is not one long path.
+func TestStagehandRunReferencesProtectRunsAndSurviveSpaces(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "stagehand state")
+	specs := filepath.Join(root, "specs")
+	if err := os.MkdirAll(specs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	spec := "stages:\n  - cmd: /usr/bin/tool --out \"$STAGEHAND_WORK/rows.json\" --run \"$STAGEHAND_RUN_ID\"\n"
+	if err := os.WriteFile(filepath.Join(specs, "p.yaml"), []byte(spec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts := &Options{ServiceSources: ServiceSources{StagehandDirs: []string{specs}, StagehandStateDir: state}}
+	report := &core.CollectorReport{Status: core.CollectorRan}
+	refs := gatherStagehand(context.Background(), opts, report)
+	if report.Status != core.CollectorRan || report.Unknowns != 0 {
+		t.Fatalf("spec should resolve completely: %+v", report)
+	}
+	runs := filepath.Join(state, "runs")
+	var folded *Reference
+	for i := range refs {
+		if refs[i].Path == runs {
+			folded = &refs[i]
+		}
+	}
+	if folded == nil {
+		t.Fatalf("run work path with a space in the state dir was dropped: %+v", refs)
+	}
+	entries := []core.Entry{{Path: runs}, {Path: filepath.Join(runs, "42")}, {Path: filepath.Join(runs, "42", "work")}}
+	attachReferences(entries, []Reference{*folded}, time.Now())
+	for _, entry := range entries {
+		if !entry.Protected() {
+			t.Errorf("%s not protected by the folded run reference", entry.Path)
+		}
 	}
 }

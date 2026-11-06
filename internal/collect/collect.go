@@ -361,11 +361,15 @@ func attachGitmootObservations(entries []core.Entry, refs []Reference, report *c
 
 // Reference is a path that something outside the filesystem points at.
 type Reference struct {
-	Path             string
-	Source           core.EvidenceSource
-	Protection       core.ProtectionKind
-	Signal           string
-	Detail           string
+	Path       string
+	Source     core.EvidenceSource
+	Protection core.ProtectionKind
+	Signal     string
+	Detail     string
+	// Subtree also protects every entry inside Path. It is used only where
+	// the unknown part of a path is bounded by construction (a stagehand
+	// run id is an integer, so a run's work stays inside <state>/runs).
+	Subtree          bool
 	ExportArchive    *core.ExportArchiveBinding    `json:"export_archive,omitempty"`
 	WorkspaceArchive *core.WorkspaceArchiveBinding `json:"workspace_archive,omitempty"`
 }
@@ -381,7 +385,7 @@ func attachReferences(entries []core.Entry, refs []Reference, now time.Time) int
 		}
 		hit := false
 		for i := range entries {
-			if !pathWithin(ref.Path, entries[i].Path) {
+			if !pathWithin(ref.Path, entries[i].Path) && !(ref.Subtree && pathWithin(entries[i].Path, ref.Path)) {
 				continue
 			}
 			hit = true

@@ -689,18 +689,13 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 					refs = append(refs, ref)
 					continue
 				}
-				// A whole command line that mentions the run id is not a path;
-				// its words were each considered on their own.
-				if strings.ContainsAny(ref.Path, " \t\n") {
-					continue
-				}
 				// filepath.Clean has already applied any literal "..": a path
 				// that left <state>/runs is reported, not folded.
 				if !core.PathWithin(ref.Path, runsDir) {
 					noteUnreadable(report, fmt.Sprintf("stagehand pipeline %s builds a path outside its run directory: %s", file, ref.Path))
 					continue
 				}
-				ref.Path = runsDir
+				ref.Path, ref.Subtree = runsDir, true
 				refs = append(refs, ref)
 			}
 		}
@@ -818,9 +813,11 @@ func specPathReferences(spec, signal, detail string, runtime map[string]string) 
 			}
 		}
 	}
-	walkConfigStrings(docs, func(value string) {
-		// A value that is itself one path may contain spaces.
-		if whole := strings.TrimSpace(value); strings.HasPrefix(whole, "/") && !strings.Contains(whole, "\n") {
+	// A path field's whole value is one path and may contain spaces
+	// (cwd: /a b). A command field is shell text: only its words count, or a
+	// whole command line would be read as one long path.
+	walkConfigKeyedStrings(docs, "", func(key, value string) {
+		if whole := strings.TrimSpace(value); !commandKeys[strings.ToLower(key)] && strings.HasPrefix(whole, "/") && !strings.Contains(whole, "\n") {
 			consider(whole)
 		}
 		forEachWord(value, 0, consider)
@@ -1020,6 +1017,37 @@ func expandWord(word string, vars map[string][]string) []string {
 		}
 	}
 	return results
+}
+
+// commandKeys name spec fields whose values are shell commands.
+var commandKeys = map[string]bool{
+	"cmd": true, "command": true, "commands": true, "run": true, "script": true,
+	"shell": true, "sh": true, "bash": true, "exec": true, "entrypoint": true, "args": true,
+}
+
+// walkConfigKeyedStrings calls visit with every string value (and map key)
+// in a decoded configuration document and the map key it sits under; list
+// items inherit their list's key.
+func walkConfigKeyedStrings(node any, key string, visit func(key, value string)) {
+	switch value := node.(type) {
+	case string:
+		visit(key, value)
+	case map[string]any:
+		for name, child := range value {
+			visit("", name)
+			walkConfigKeyedStrings(child, name, visit)
+		}
+	case map[any]any:
+		for name, child := range value {
+			text, _ := name.(string)
+			walkConfigKeyedStrings(name, "", visit)
+			walkConfigKeyedStrings(child, text, visit)
+		}
+	case []any:
+		for _, child := range value {
+			walkConfigKeyedStrings(child, key, visit)
+		}
+	}
 }
 
 // walkConfigMaps calls visit with every string-valued entry of every map in
