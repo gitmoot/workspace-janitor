@@ -639,10 +639,9 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 //   - Each expanded word counts, as does the value after every = and each
 //     :-separated part of it.
 //   - A word still holding an unresolved expansion ($x, $(...), `...`) and a
-//     / is a path whose exact location is unknown. If it starts with an
-//     absolute literal directory, that directory and everything under it is
-//     protected (Subtree). Otherwise the word is returned as unresolved, and
-//     the caller must treat the whole source as unknown.
+//     / is a path whose location is unknown: the value may hold anything,
+//     "..", included. It is returned as unresolved, and the caller must
+//     treat the whole source as unknown.
 func specPathReferences(spec, signal, detail string) ([]Reference, []string, error) {
 	var docs []any
 	decoder := yaml.NewDecoder(strings.NewReader(spec))
@@ -688,41 +687,34 @@ func specPathReferences(spec, signal, detail string) ([]Reference, []string, err
 	})
 	var refs []Reference
 	var unresolved []string
-	add := func(candidate string, subtree bool) {
+	add := func(candidate string) {
 		if !filepath.IsAbs(candidate) {
 			return
 		}
 		if p := filepath.Clean(candidate); p != "/" {
-			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail, Subtree: subtree})
+			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail})
 		}
 	}
 	consider := func(word string) {
 		for _, expanded := range expandWord(word, vars) {
-			if loc := unresolvedExpansion.FindStringIndex(expanded); loc != nil {
-				if !strings.Contains(expanded, "/") {
-					continue
-				}
-				prefix := expanded[:loc[0]]
-				if _, after, ok := strings.Cut(prefix, "="); ok && !strings.HasPrefix(prefix, "/") {
-					prefix = after
-				}
-				if dir := prefix[:strings.LastIndex(prefix, "/")+1]; filepath.IsAbs(dir) && filepath.Clean(dir) != "/" {
-					add(dir, true)
-				} else {
+			// An expansion still present may hold any value, including "..",
+			// so no part of the word bounds where it points: unresolved.
+			if unresolvedExpansion.MatchString(expanded) {
+				if strings.Contains(expanded, "/") {
 					unresolved = append(unresolved, word)
 				}
 				continue
 			}
-			add(expanded, false)
+			add(expanded)
 			rest := expanded
 			for {
 				_, after, ok := strings.Cut(rest, "=")
 				if !ok {
 					break
 				}
-				add(after, false)
+				add(after)
 				for _, part := range strings.Split(after, ":") {
-					add(part, false)
+					add(part)
 				}
 				rest = after
 			}
