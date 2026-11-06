@@ -165,7 +165,7 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 			SystemdDirs: policy.Collectors.SystemdDirs,
 			CronPaths:   policy.Collectors.CronPaths,
 			PM2Dumps:    policy.Collectors.PM2Dumps,
-			ConfigFiles: policy.Collectors.ConfigFiles,
+			ConfigFiles: policy.Collectors.ConfigFiles, GitmootPipelines: policy.Gitmoot.Database,
 		},
 		AgentSources: e.agentSources,
 		Prior:        prior,

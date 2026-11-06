@@ -2,12 +2,16 @@ package collect
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -38,7 +42,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		return nil, report
 	}
 	sources := opts.ServiceSources
-	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 && len(sources.ConfigFiles) == 0 {
+	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 && len(sources.ConfigFiles) == 0 && sources.GitmootPipelines == "" {
 		report.Status = core.CollectorSkipped
 		report.Detail = "no service definition locations are configured"
 		return nil, report
@@ -50,6 +54,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		gatherCron,
 		gatherPM2,
 		gatherConfigFiles,
+		gatherGitmootPipelines,
 	} {
 		if err := ctx.Err(); err != nil {
 			report.Status = core.CollectorPartial
@@ -550,6 +555,330 @@ func gatherConfigFiles(ctx context.Context, opts *Options, report *core.Collecto
 		})
 	}
 	return refs
+}
+
+// gatherGitmootPipelines reports every absolute path in the spec of an
+// enabled Gitmoot pipeline (its commands, working directories and any other
+// value). A scheduled pipeline runs from those paths whether or not anything
+// else references them (live 2026-11-06: keephair-geo ran
+// /root/keephair-pipelines/current/geo-collect.sh hourly and failed after
+// that folder was archived as idle scratch). A missing database is skipped;
+// one that cannot be read, or a spec that does not parse, leaves this source
+// unknown, which refuses removals.
+func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
+	path := opts.ServiceSources.GitmootPipelines
+	if path == "" {
+		return nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		noteUnreadable(report, fmt.Sprintf("could not stat %s: %v", path, err))
+		return nil
+	}
+	uri := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&_pragma=query_only(1)"}).String()
+	db, err := sql.Open("sqlite", uri)
+	if err != nil {
+		noteUnreadable(report, fmt.Sprintf("could not open %s: %v", path, err))
+		return nil
+	}
+	defer db.Close()
+	// A Gitmoot schema without a pipelines table has no pipelines. Any
+	// other read failure still leaves this source unknown.
+	var tables int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'pipelines'`).Scan(&tables); err != nil {
+		noteUnreadable(report, fmt.Sprintf("could not read Gitmoot schema: %v", err))
+		return nil
+	}
+	if tables == 0 {
+		return nil
+	}
+	rows, err := db.QueryContext(ctx, `SELECT name, spec_yaml FROM pipelines WHERE enabled != 0`)
+	if err != nil {
+		noteUnreadable(report, fmt.Sprintf("could not read Gitmoot pipelines: %v", err))
+		return nil
+	}
+	defer rows.Close()
+	var refs []Reference
+	for rows.Next() {
+		var name, spec string
+		if err := rows.Scan(&name, &spec); err != nil {
+			noteUnreadable(report, fmt.Sprintf("could not read a Gitmoot pipeline: %v", err))
+			return refs
+		}
+		report.Visited++
+		found, unresolved, err := specPathReferences(spec, "gitmoot_pipeline_path", "used by enabled Gitmoot pipeline "+name)
+		if err != nil {
+			noteUnreadable(report, fmt.Sprintf("could not parse Gitmoot pipeline %s: %v", name, err))
+			continue
+		}
+		if len(unresolved) > 0 {
+			noteUnreadable(report, fmt.Sprintf("Gitmoot pipeline %s uses paths that cannot be resolved: %s", name, strings.Join(unresolved, " ")))
+		}
+		refs = append(refs, found...)
+	}
+	if err := rows.Err(); err != nil {
+		noteUnreadable(report, fmt.Sprintf("could not read Gitmoot pipelines: %v", err))
+	}
+	return refs
+}
+
+// specPathReferences parses a pipeline spec (YAML, every document) and
+// returns a blocking service reference for each path it names.
+//
+//   - A string value that is itself an absolute path counts whole, spaces
+//     included.
+//   - Otherwise the value is split into shell words (quotes and backslashes
+//     honoured; whitespace and ; & | < > ( ) separate words). A quoted word
+//     that is itself a command (sh -c '...') is split again.
+//   - Variables are expanded from what the spec states: NAME=value words
+//     anywhere in it, string entries of YAML maps (env: blocks), and
+//     ${NAME:-default} fallbacks. HOME is the janitor's own HOME: pipelines
+//     on this host run as the same user.
+//   - Each expanded word counts, as does the value after every = and each
+//     :-separated part of it.
+//   - A word still holding an unresolved expansion ($x, $(...), `...`) and a
+//     / is a path whose location is unknown: the value may hold anything,
+//     "..", included. It is returned as unresolved, and the caller must
+//     treat the whole source as unknown.
+func specPathReferences(spec, signal, detail string) ([]Reference, []string, error) {
+	var docs []any
+	decoder := yaml.NewDecoder(strings.NewReader(spec))
+	var err error
+	for {
+		var one any
+		if err = decoder.Decode(&one); err != nil {
+			break
+		}
+		docs = append(docs, one)
+	}
+	if !errors.Is(err, io.EOF) {
+		return nil, nil, err
+	}
+	vars := map[string][]string{}
+	// A variable with more values than this is not expanded at all: words
+	// using it are then unresolved and protected conservatively, never
+	// expanded from a silently truncated list.
+	const maxValues = 8
+	setVar := func(name, value string) {
+		if !shellName.MatchString(name) || slices.Contains(vars[name], value) {
+			return
+		}
+		if values, seen := vars[name]; seen && values == nil {
+			return // already too many
+		}
+		if len(vars[name]) >= maxValues {
+			vars[name] = nil
+			return
+		}
+		vars[name] = append(vars[name], value)
+	}
+	if home := os.Getenv("HOME"); filepath.IsAbs(home) {
+		setVar("HOME", home)
+	}
+	walkConfigMaps(docs, func(key, value string) { setVar(key, value) })
+	walkConfigStrings(docs, func(value string) {
+		forEachWord(value, 0, func(word string) {
+			if name, val, ok := strings.Cut(word, "="); ok {
+				setVar(name, val)
+			}
+		})
+	})
+	var refs []Reference
+	var unresolved []string
+	add := func(candidate string) {
+		if !filepath.IsAbs(candidate) {
+			return
+		}
+		if p := filepath.Clean(candidate); p != "/" {
+			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail})
+		}
+	}
+	consider := func(word string) {
+		for _, expanded := range expandWord(word, vars) {
+			// An expansion still present may hold any value, including "..",
+			// so no part of the word bounds where it points: unresolved.
+			if unresolvedExpansion.MatchString(expanded) {
+				if strings.Contains(expanded, "/") {
+					unresolved = append(unresolved, word)
+				}
+				continue
+			}
+			add(expanded)
+			rest := expanded
+			for {
+				_, after, ok := strings.Cut(rest, "=")
+				if !ok {
+					break
+				}
+				add(after)
+				for _, part := range strings.Split(after, ":") {
+					add(part)
+				}
+				rest = after
+			}
+		}
+	}
+	walkConfigStrings(docs, func(value string) {
+		// A value that is itself one path may contain spaces.
+		if whole := strings.TrimSpace(value); strings.HasPrefix(whole, "/") && !strings.Contains(whole, "\n") {
+			consider(whole)
+		}
+		forEachWord(value, 0, consider)
+	})
+	return refs, unresolved, nil
+}
+
+var (
+	shellName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// shellParam matches ${NAME}, ${NAME:-default}, ${NAME-default},
+	// ${NAME:=default} and $NAME.
+	shellParam = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-=]([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)`)
+	// unresolvedExpansion is anything a shell would still expand.
+	unresolvedExpansion = regexp.MustCompile("\\$|`")
+)
+
+// forEachWord calls visit with every shell word of text, splitting quoted
+// words that are themselves commands again, a few levels deep.
+func forEachWord(text string, depth int, visit func(string)) {
+	for _, word := range shellWords(text) {
+		visit(word)
+		if depth < 3 && strings.ContainsAny(word, " \t\n;&|<>()") {
+			forEachWord(word, depth+1, visit)
+		}
+	}
+}
+
+// expandWord returns word with every expansion of a known variable replaced
+// by each of its values. A ${NAME:-default} fallback is always one of the
+// candidates, set or not. An unknown expansion, a variable recorded with too
+// many values (nil in vars), or a word whose expansions would exceed 16 is
+// returned unexpanded, for the caller to treat as unresolved: candidates are
+// never silently dropped.
+func expandWord(word string, vars map[string][]string) []string {
+	const maxResults = 16
+	results := []string{word}
+	for round := 0; round < 4; round++ {
+		changed := false
+		var next []string
+		for _, current := range results {
+			loc := shellParam.FindStringSubmatchIndex(current)
+			if loc == nil {
+				next = append(next, current)
+				continue
+			}
+			name := ""
+			if loc[2] >= 0 {
+				name = current[loc[2]:loc[3]]
+			} else {
+				name = current[loc[6]:loc[7]]
+			}
+			known, recorded := vars[name]
+			if recorded && known == nil {
+				return []string{word}
+			}
+			// A written fallback is always a candidate as well: POSIX uses it
+			// when NAME is unset and, for :- and :=, when NAME is empty, and
+			// the spec cannot tell us which applies at run time.
+			values := slices.Clone(known)
+			if loc[4] >= 0 {
+				if fallback := current[loc[4]:loc[5]]; !slices.Contains(values, fallback) {
+					values = append(values, fallback)
+				}
+			}
+			if len(values) == 0 {
+				next = append(next, current)
+				continue
+			}
+			if len(next)+len(values) > maxResults {
+				return []string{word}
+			}
+			changed = true
+			for _, value := range values {
+				next = append(next, current[:loc[0]]+value+current[loc[1]:])
+			}
+		}
+		results = next
+		if !changed {
+			break
+		}
+	}
+	return results
+}
+
+// walkConfigMaps calls visit with every string-valued entry of every map in
+// a decoded configuration document.
+func walkConfigMaps(node any, visit func(key, value string)) {
+	switch value := node.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if text, ok := child.(string); ok {
+				visit(key, text)
+			}
+			walkConfigMaps(child, visit)
+		}
+	case map[any]any:
+		for key, child := range value {
+			if name, ok := key.(string); ok {
+				if text, ok := child.(string); ok {
+					visit(name, text)
+				}
+			}
+			walkConfigMaps(child, visit)
+		}
+	case []any:
+		for _, child := range value {
+			walkConfigMaps(child, visit)
+		}
+	}
+}
+
+// shellWords splits s into words the way a POSIX shell would before
+// expansion: single quotes are literal, double quotes allow backslash
+// escapes, a backslash outside quotes escapes the next character, and
+// whitespace and the operators ; & | < > ( ) end a word. An unterminated
+// quote ends at the end of s.
+func shellWords(s string) []string {
+	var words []string
+	var word strings.Builder
+	inWord := false
+	flush := func() {
+		if inWord {
+			words = append(words, word.String())
+			word.Reset()
+			inWord = false
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\\' && i+1 < len(s):
+			i++
+			word.WriteByte(s[i])
+			inWord = true
+		case c == '\'':
+			inWord = true
+			for i++; i < len(s) && s[i] != '\''; i++ {
+				word.WriteByte(s[i])
+			}
+		case c == '"':
+			inWord = true
+			for i++; i < len(s) && s[i] != '"'; i++ {
+				if s[i] == '\\' && i+1 < len(s) && strings.IndexByte("\"\\$`", s[i+1]) >= 0 {
+					i++
+				}
+				word.WriteByte(s[i])
+			}
+		case strings.IndexByte(" \t\n\r;&|<>()", c) >= 0:
+			flush()
+		default:
+			word.WriteByte(c)
+			inWord = true
+		}
+	}
+	flush()
+	return words
 }
 
 // walkConfigStrings calls visit with every string value (and map key) in a
