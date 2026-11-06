@@ -79,6 +79,8 @@ type ServiceSources struct {
 	// GitmootPipelines is the Gitmoot database whose enabled pipelines'
 	// specs name paths those pipelines run from. Empty skips it.
 	GitmootPipelines string
+	// StagehandDirs hold stagehand pipeline specs (*.yaml, *.yml).
+	StagehandDirs []string
 }
 
 // AgentRef is one directory a registered agent is using.
