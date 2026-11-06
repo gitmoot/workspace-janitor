@@ -43,7 +43,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		return nil, report
 	}
 	sources := opts.ServiceSources
-	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 && len(sources.ConfigFiles) == 0 && sources.GitmootPipelines == "" {
+	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 && len(sources.ConfigFiles) == 0 && sources.GitmootPipelines == "" && len(sources.StagehandDirs) == 0 {
 		report.Status = core.CollectorSkipped
 		report.Detail = "no service definition locations are configured"
 		return nil, report
@@ -56,6 +56,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		gatherPM2,
 		gatherConfigFiles,
 		gatherGitmootPipelines,
+		gatherStagehand,
 	} {
 		if err := ctx.Err(); err != nil {
 			report.Status = core.CollectorPartial
@@ -621,6 +622,49 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 	}
 	if err := rows.Err(); err != nil {
 		noteUnreadable(report, fmt.Sprintf("could not read Gitmoot pipelines: %v", err))
+	}
+	return refs
+}
+
+// gatherStagehand reports every absolute path in each stagehand pipeline
+// spec (*.yaml, *.yml) in the configured directories: commands, working
+// directories, env and prompt files, and any other value. Disabled specs
+// count too. A missing directory is skipped; one that cannot be listed, or
+// a spec that cannot be read or parsed, leaves this source unknown, which
+// refuses removals.
+func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorReport) []Reference {
+	var refs []Reference
+	for _, dir := range opts.ServiceSources.StagehandDirs {
+		if ctx.Err() != nil {
+			return refs
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			noteUnreadable(report, fmt.Sprintf("could not list %s: %v", dir, err))
+			continue
+		}
+		for _, entry := range entries {
+			ext := strings.ToLower(filepath.Ext(entry.Name()))
+			if entry.IsDir() || (ext != ".yaml" && ext != ".yml") {
+				continue
+			}
+			file := filepath.Join(dir, entry.Name())
+			content, err := readFileBounded(file, maxPM2DumpBytes)
+			if err != nil {
+				noteUnreadable(report, fmt.Sprintf("could not read %s: %v", file, err))
+				continue
+			}
+			report.Visited++
+			found, err := specPathReferences(content, "stagehand_path", "used by stagehand pipeline "+file)
+			if err != nil {
+				noteUnreadable(report, fmt.Sprintf("could not parse %s: %v", file, err))
+				continue
+			}
+			refs = append(refs, found...)
+		}
 	}
 	return refs
 }
