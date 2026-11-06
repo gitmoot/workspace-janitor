@@ -606,38 +606,128 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 			return refs
 		}
 		report.Visited++
-		var docs []any
-		decoder := yaml.NewDecoder(strings.NewReader(spec))
-		for {
-			var one any
-			if err = decoder.Decode(&one); err != nil {
-				break
-			}
-			docs = append(docs, one)
-		}
-		if !errors.Is(err, io.EOF) {
+		found, err := specPathReferences(spec, "gitmoot_pipeline_path", "used by enabled Gitmoot pipeline "+name)
+		if err != nil {
 			noteUnreadable(report, fmt.Sprintf("could not parse Gitmoot pipeline %s: %v", name, err))
 			continue
 		}
-		walkConfigStrings(docs, func(value string) {
-			for _, field := range strings.Fields(value) {
-				field = strings.Trim(field, `"'();`)
-				if !filepath.IsAbs(field) {
-					continue
-				}
-				if p := filepath.Clean(field); p != "/" {
-					refs = append(refs, Reference{
-						Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference,
-						Signal: "gitmoot_pipeline_path", Detail: "used by enabled Gitmoot pipeline " + name,
-					})
-				}
-			}
-		})
+		refs = append(refs, found...)
 	}
 	if err := rows.Err(); err != nil {
 		noteUnreadable(report, fmt.Sprintf("could not read Gitmoot pipelines: %v", err))
 	}
 	return refs
+}
+
+// specPathReferences parses a pipeline spec (YAML, every document) and
+// returns a blocking service reference for each absolute path it names. A
+// string value that is itself an absolute path counts whole, spaces
+// included. Otherwise the value is split into shell words (quotes and
+// backslashes honoured; ; & | < > ( ) separate words), and each word counts,
+// as does the value after any = (A=/x, --chdir=/x) and each :-separated
+// part of that value. Paths built only from variables the spec does not
+// assign are not resolved. A quoted word that is itself a command
+// (sh -c '...') is split again.
+func specPathReferences(spec, signal, detail string) ([]Reference, error) {
+	var docs []any
+	decoder := yaml.NewDecoder(strings.NewReader(spec))
+	var err error
+	for {
+		var one any
+		if err = decoder.Decode(&one); err != nil {
+			break
+		}
+		docs = append(docs, one)
+	}
+	if !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	var refs []Reference
+	add := func(candidate string) {
+		if !filepath.IsAbs(candidate) {
+			return
+		}
+		if p := filepath.Clean(candidate); p != "/" {
+			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail})
+		}
+	}
+	walkConfigStrings(docs, func(value string) {
+		if whole := strings.TrimSpace(value); !strings.ContainsAny(whole, "\n") {
+			add(whole)
+		}
+		var visitWords func(text string, depth int)
+		visitWords = func(text string, depth int) {
+			for _, word := range shellWords(text) {
+				add(word)
+				rest := word
+				for {
+					_, after, ok := strings.Cut(rest, "=")
+					if !ok {
+						break
+					}
+					add(after)
+					for _, part := range strings.Split(after, ":") {
+						add(part)
+					}
+					rest = after
+				}
+				// A quoted word holding a whole command (sh -c '...') is
+				// split again, a few levels deep.
+				if depth < 3 && strings.ContainsAny(word, " \t\n;&|<>()") {
+					visitWords(word, depth+1)
+				}
+			}
+		}
+		visitWords(value, 0)
+	})
+	return refs, nil
+}
+
+// shellWords splits s into words the way a POSIX shell would before
+// expansion: single quotes are literal, double quotes allow backslash
+// escapes, a backslash outside quotes escapes the next character, and
+// whitespace and the operators ; & | < > ( ) end a word. An unterminated
+// quote ends at the end of s.
+func shellWords(s string) []string {
+	var words []string
+	var word strings.Builder
+	inWord := false
+	flush := func() {
+		if inWord {
+			words = append(words, word.String())
+			word.Reset()
+			inWord = false
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\\' && i+1 < len(s):
+			i++
+			word.WriteByte(s[i])
+			inWord = true
+		case c == '\'':
+			inWord = true
+			for i++; i < len(s) && s[i] != '\''; i++ {
+				word.WriteByte(s[i])
+			}
+		case c == '"':
+			inWord = true
+			for i++; i < len(s) && s[i] != '"'; i++ {
+				if s[i] == '\\' && i+1 < len(s) && strings.IndexByte("\"\\$`", s[i+1]) >= 0 {
+					i++
+				}
+				word.WriteByte(s[i])
+			}
+		case strings.IndexByte(" \t\n\r;&|<>()", c) >= 0:
+			flush()
+		default:
+			word.WriteByte(c)
+			inWord = true
+		}
+	}
+	flush()
+	return words
 }
 
 // walkConfigStrings calls visit with every string value (and map key) in a
