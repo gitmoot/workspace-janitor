@@ -393,7 +393,9 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 			report.set(candidate, scratchKept, "changed after it was observed; kept local")
 			continue
 		}
-		if idle := scratchNow().Sub(time.Unix(0, candidate.entry.NewestNS)); idle < scratch.Idle.Duration() {
+		// Judge idleness by the freshly loaded policy: withdrawing or raising
+		// regenerable_idle (or idle) mid-run still stops the deletion.
+		if idle := scratchNow().Sub(time.Unix(0, candidate.entry.NewestNS)); idle < current.IdleFor(config.MatchesAny(candidate.entry.Name, current.Regenerable)) {
 			report.set(candidate, scratchKept, "no longer idle at deletion time")
 			continue
 		}
@@ -468,8 +470,8 @@ func scratchCheck(ctx context.Context, dir *workspacearchive.ScratchDir, policy 
 		return entry, entry.Refusal
 	case entry.Sensitive != "":
 		return entry, fmt.Sprintf("sensitive name %s keeps the entry local", entry.Sensitive)
-	case idle < scratch.Idle.Duration():
-		return entry, fmt.Sprintf("changed %s ago; scratch entries must be unchanged for %s", idle.Truncate(time.Second), scratch.Idle)
+	case idle < scratch.IdleFor(config.MatchesAny(name, scratch.Regenerable)):
+		return entry, fmt.Sprintf("changed %s ago; scratch entries must be unchanged for %s", idle.Truncate(time.Second), scratch.IdleFor(config.MatchesAny(name, scratch.Regenerable)))
 	}
 	return entry, ""
 }

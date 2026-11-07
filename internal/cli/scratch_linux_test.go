@@ -696,3 +696,76 @@ func TestScratchRestoreTakesTheLockOnlyWhenWriting(t *testing.T) {
 		t.Fatalf("restore after the lock is released: exit=%d %s %s", code, out, stderr)
 	}
 }
+
+// Jarvis 415456: build scratch such as /tmp/go-build* is worthless once its
+// build exits; with regenerable_idle a regenerable entry is deleted after
+// that shorter idle while everything else still waits for idle.
+func TestScratchRegenerableIdleIsShorterOnlyForRegenerableEntries(t *testing.T) {
+	x := newScratchFixture(t)
+	x.options = "    regenerable_idle: 2h\n"
+	x.write(t)
+	regen := x.entry(t, "go-build123", map[string]string{"b/c.a": "object\n"})
+	plain := x.entry(t, "plain", map[string]string{"report.txt": "payload\n"})
+	// 3h after creation: past regenerable_idle (2h), short of idle (24h).
+	x.shift(t, 3*time.Hour)
+	preview := x.mustCleanup(t, false)
+	if got := scratchStatus(t, preview, "go-build123"); got.Status != scratchWouldDelete {
+		t.Fatalf("regenerable entry past regenerable_idle: %+v", got)
+	}
+	if got := scratchStatus(t, preview, "plain"); got.Status != scratchKept {
+		t.Fatalf("non-regenerable entry used the shorter idle: %+v", got)
+	}
+	x.mustCleanup(t, true)
+	if exists(t, regen) || !exists(t, plain) {
+		t.Fatalf("after the run: regenerable kept=%v plain kept=%v", exists(t, regen), exists(t, plain))
+	}
+	// 1h after creation the regenerable entry is still too fresh.
+	young := x.entry(t, "go-build456", map[string]string{"b/c.a": "object\n"})
+	x.shift(t, time.Hour)
+	if got := scratchStatus(t, x.mustCleanup(t, false), "go-build456"); got.Status != scratchKept {
+		t.Fatalf("regenerable entry younger than regenerable_idle: %+v", got)
+	}
+	if !exists(t, young) {
+		t.Fatal("young regenerable entry removed by a preview")
+	}
+}
+
+// regenerable_idle below one hour is rejected, so a build that pauses
+// between steps is not swept mid-run.
+func TestScratchRegenerableIdleHasAFloor(t *testing.T) {
+	x := newScratchFixture(t)
+	x.options = "    regenerable_idle: 10m\n"
+	x.write(t)
+	out, stderr, code := x.run(t, "--format", "json", "policy", "check")
+	if code == ExitOK || !strings.Contains(out+stderr, "regenerable_idle: must be at least 1h") {
+		t.Fatalf("10m regenerable_idle not rejected by the floor: %d %s %s", code, out, stderr)
+	}
+}
+
+// Review of #174: a regenerable_idle that is withdrawn or raised after an
+// entry was selected must stop its deletion; the threshold is judged by
+// the policy loaded immediately before deletion.
+func TestScratchRegenerableIdleIsRecheckedBeforeDeletion(t *testing.T) {
+	for name, later := range map[string]string{"withdrawn": "", "raised": "    regenerable_idle: 6h\n"} {
+		t.Run(name, func(t *testing.T) {
+			x := newScratchFixture(t)
+			x.options = "    regenerable_idle: 2h\n"
+			x.write(t)
+			regen := x.entry(t, "go-build123", map[string]string{"b/c.a": "object\n"})
+			x.shift(t, 3*time.Hour)
+			saved := scratchBeforeDeletion
+			scratchBeforeDeletion = func() {
+				x.options = later
+				x.write(t)
+			}
+			defer func() { scratchBeforeDeletion = saved }()
+			report := x.mustCleanup(t, true)
+			if !exists(t, regen) {
+				t.Fatalf("deleted under a regenerable_idle %s mid-run", name)
+			}
+			if got := scratchStatus(t, report, "go-build123"); got.Status != scratchKept {
+				t.Fatalf("want kept, got %+v", got)
+			}
+		})
+	}
+}

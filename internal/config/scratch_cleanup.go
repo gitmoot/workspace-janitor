@@ -31,6 +31,11 @@ type ScratchCleanup struct {
 	Path string `yaml:"path" json:"path"`
 	// Idle is measured from the newest mtime or ctime anywhere in the entry.
 	Idle IdleDuration `yaml:"idle" json:"idle"`
+	// RegenerableIdle, when set, is the idle time required of entries that
+	// match Regenerable, which are deleted without an archive. It may be
+	// shorter than Idle (build scratch such as go-build* is worthless once
+	// its build exits). An entry still in use is kept either way.
+	RegenerableIdle IdleDuration `yaml:"regenerable_idle" json:"regenerable_idle,omitempty"`
 	// Every is the shortest interval between two runs started by the cycle.
 	Every IdleDuration `yaml:"every" json:"every"`
 	// Skip and Regenerable are filepath.Match globs on the entry name.
@@ -43,6 +48,19 @@ type ScratchCleanup struct {
 	// MaxEntries bounds the depth-1 listing; a larger directory refuses the
 	// whole run rather than cleaning a partial listing.
 	MaxEntries int `yaml:"max_entries" json:"max_entries"`
+}
+
+// minRegenerableIdle is the shortest regenerable_idle accepted: long enough
+// that a build which pauses between steps is not swept mid-run.
+const minRegenerableIdle = time.Hour
+
+// IdleFor is the idle time an entry must reach before cleanup:
+// RegenerableIdle for a regenerable entry when set, Idle otherwise.
+func (s ScratchCleanup) IdleFor(regenerable bool) time.Duration {
+	if regenerable && s.RegenerableIdle.Duration() != 0 {
+		return s.RegenerableIdle.Duration()
+	}
+	return s.Idle.Duration()
 }
 
 // ScratchCleanupFor returns the configured scratch cleanup of path.
@@ -139,6 +157,9 @@ func (p *Policy) validateScratchCleanup(errs *core.FieldErrors) {
 		}
 		if scratch.Idle.Duration() < minScratchInterval {
 			errs.Add(field+".idle", "must be at least %s, got %s", IdleDuration(minScratchInterval), scratch.Idle)
+		}
+		if r := scratch.RegenerableIdle.Duration(); r != 0 && r < minRegenerableIdle {
+			errs.Add(field+".regenerable_idle", "must be at least %s, got %s", IdleDuration(minRegenerableIdle), scratch.RegenerableIdle)
 		}
 		if scratch.Every.Duration() < minScratchInterval {
 			errs.Add(field+".every", "must be at least %s, got %s", IdleDuration(minScratchInterval), scratch.Every)
