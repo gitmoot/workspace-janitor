@@ -218,6 +218,8 @@ workspace_archive_categories: []
 #     "node-compile-cache", "v8-compile-cache*", "gopls-*", "tsx-[0-9]*",
 #     "npm*", ".npm*", "yarn*", "pnpm*", "esbuild*", "vite*", "jiti",
 #     "deno*", "uv-*", "cargo*"]
+#   regenerable_idle: 2h          # optional shorter idle for regenerable entries;
+#                                 # minimum 1h; entries in use are kept either way
 #   archive:
 #     directory: /mnt/backup/janitor-scratch   # protected, outside every root
 #     expect_mount_source: backup.example:/export
