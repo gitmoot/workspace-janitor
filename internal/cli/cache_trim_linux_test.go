@@ -76,6 +76,14 @@ func (x *trimFixture) processEnv(t *testing.T, pid string, env []string, argv ..
 	if err := os.WriteFile(filepath.Join(x.proc, pid, "environ"), []byte(strings.Join(env, "\x00")+"\x00"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The executable is a fixture GOROOT's bin/go, as /proc/<pid>/exe.
+	goroot := filepath.Join(x.home, "goroot")
+	if err := os.MkdirAll(filepath.Join(goroot, "bin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(goroot, "bin", "go"), filepath.Join(x.proc, pid, "exe")); err != nil && !os.IsExist(err) {
+		t.Fatal(err)
+	}
 }
 
 // trimResult decodes the public cycle report, not internal types, so the
@@ -585,6 +593,53 @@ func TestGoTrimStillWaitsForGoProcessesUsingThisCache(t *testing.T) {
 			x.processEnv(t, "100", e, "/usr/bin/go", "test", "./...")
 			if trims := x.cycle(t); trims[0].Status != "skipped_in_use" {
 				t.Fatalf("a Go process using this cache did not block the trim: %+v", trims[0])
+			}
+		})
+	}
+}
+
+// Issue #177: Go also takes GOCACHE from its env file (go env -w, GOENV) and
+// from $GOROOT/go.env, which do not appear in /proc/<pid>/environ. A build
+// whose cache comes from either still blocks the trim; an env file that
+// cannot be read blocks it too.
+func TestGoTrimHonoursGoEnvFiles(t *testing.T) {
+	for _, name := range []string{"user env file", "GOENV path", "GOROOT go.env", "unreadable env file"} {
+		t.Run(name, func(t *testing.T) {
+			x := newTrimFixture(t)
+			x.fill(t, 1<<20)
+			home := filepath.Join(x.home, "user")
+			env := []string{"HOME=" + home}
+			write := func(path, body string, mode os.FileMode) {
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			setting := "GOCACHE=" + x.cache + "\n"
+			switch name {
+			case "user env file":
+				write(filepath.Join(home, ".config", "go", "env"), setting, 0o600)
+			case "GOENV path":
+				file := filepath.Join(x.home, "custom-goenv")
+				write(file, setting, 0o600)
+				env = append(env, "GOENV="+file)
+			case "GOROOT go.env":
+				write(filepath.Join(x.home, "goroot", "go.env"), setting, 0o600)
+			case "unreadable env file":
+				if os.Geteuid() == 0 {
+					// root reads mode-000 files; use a directory instead.
+					if err := os.MkdirAll(filepath.Join(home, ".config", "go", "env"), 0o700); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					write(filepath.Join(home, ".config", "go", "env"), setting, 0)
+				}
+			}
+			x.processEnv(t, "100", env, "/usr/bin/go", "build", "./...")
+			if trims := x.cycle(t); trims[0].Status != "skipped_in_use" {
+				t.Fatalf("a Go process taking this cache from %s did not block the trim: %+v", name, trims[0])
 			}
 		})
 	}

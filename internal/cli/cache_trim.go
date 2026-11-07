@@ -244,7 +244,7 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 				// A Go process with its own GOCACHE elsewhere does not use
 				// this cache; only one that resolves here (or cannot be
 				// resolved) blocks the trim.
-				uses, err := goProcessUsesCache(filepath.Join(procRoot, pid, "environ"), trim.Path)
+				uses, err := goProcessUsesCache(filepath.Join(procRoot, pid), trim.Path)
 				if processGone(err) {
 					continue
 				}
@@ -273,12 +273,16 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 	return users
 }
 
-// goProcessUsesCache reports whether the Go process whose environ file is
-// given builds into cache: its GOCACHE, or by default $XDG_CACHE_HOME/go-build
-// or $HOME/.cache/go-build, resolves to cache. GOCACHE=off uses no cache. A
-// process with no way to determine its cache counts as a user.
-func goProcessUsesCache(environ, cache string) (bool, error) {
-	raw, err := os.ReadFile(environ)
+// goProcessUsesCache reports whether the Go process at procDir
+// (/proc/<pid>) builds into cache. It follows Go's own precedence for
+// GOCACHE: the process environment, then the go env file (GOENV, or
+// $XDG_CONFIG_HOME/go/env or $HOME/.config/go/env, unless GOENV=off), then
+// $GOROOT/go.env, then the default $XDG_CACHE_HOME/go-build or
+// $HOME/.cache/go-build. GOCACHE=off uses no cache. It fails closed: a value
+// that cannot be established, or an existing file that cannot be read,
+// counts the process as a user.
+func goProcessUsesCache(procDir, cache string) (bool, error) {
+	raw, err := os.ReadFile(filepath.Join(procDir, "environ"))
 	if err != nil {
 		return false, err
 	}
@@ -288,11 +292,50 @@ func goProcessUsesCache(environ, cache string) (bool, error) {
 			env[name] = value
 		}
 	}
-	dir := env["GOCACHE"]
+	dir, set := env["GOCACHE"], env["GOCACHE"] != ""
+	if !set {
+		file := env["GOENV"]
+		switch {
+		case file == "off":
+			file = ""
+		case file != "":
+		case filepath.IsAbs(env["XDG_CONFIG_HOME"]):
+			file = filepath.Join(env["XDG_CONFIG_HOME"], "go", "env")
+		case filepath.IsAbs(env["HOME"]):
+			file = filepath.Join(env["HOME"], ".config", "go", "env")
+		default:
+			return true, nil
+		}
+		if file != "" {
+			value, found, err := goEnvFileValue(file, "GOCACHE")
+			if err != nil {
+				return true, nil
+			}
+			dir, set = value, found
+		}
+	}
+	if !set {
+		root := env["GOROOT"]
+		if root == "" {
+			exe, err := os.Readlink(filepath.Join(procDir, "exe"))
+			if err != nil {
+				return true, nil
+			}
+			root = goRootOf(exe)
+		}
+		if !filepath.IsAbs(root) {
+			return true, nil
+		}
+		value, found, err := goEnvFileValue(filepath.Join(root, "go.env"), "GOCACHE")
+		if err != nil {
+			return true, nil
+		}
+		dir, set = value, found
+	}
 	switch {
 	case dir == "off":
 		return false, nil
-	case dir != "":
+	case set:
 	case filepath.IsAbs(env["XDG_CACHE_HOME"]):
 		dir = filepath.Join(env["XDG_CACHE_HOME"], "go-build")
 	case filepath.IsAbs(env["HOME"]):
@@ -304,6 +347,43 @@ func goProcessUsesCache(environ, cache string) (bool, error) {
 		return true, nil
 	}
 	return samePath(dir, cache), nil
+}
+
+// goEnvFileValue reads one KEY=VALUE setting from a Go environment file. A
+// missing file holds no settings; any other read error is returned.
+func goEnvFileValue(path, key string) (string, bool, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	value, found := "", false
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok && strings.TrimSpace(k) == key {
+			value, found = strings.TrimSpace(v), true
+		}
+	}
+	return value, found, nil
+}
+
+// goRootOf derives GOROOT from a Go toolchain executable: <root>/bin/go, or
+// <root>/pkg/tool/<os_arch>/<tool>. Anything else returns "".
+func goRootOf(exe string) string {
+	exe = strings.TrimSuffix(exe, " (deleted)")
+	dir := filepath.Dir(exe)
+	switch {
+	case filepath.Base(dir) == "bin":
+		return filepath.Dir(dir)
+	case filepath.Base(filepath.Dir(filepath.Dir(dir))) == "pkg" && filepath.Base(filepath.Dir(dir)) == "tool":
+		return filepath.Dir(filepath.Dir(filepath.Dir(dir)))
+	}
+	return ""
 }
 
 // samePath compares two paths after resolving symlinks where possible.
