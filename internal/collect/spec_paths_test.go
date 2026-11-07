@@ -241,3 +241,15 @@ func TestStagehandRunReferencesProtectRunsAndSurviveSpaces(t *testing.T) {
 		}
 	}
 }
+
+// Review of #170: policy loading already rejects a relative
+// stagehand_state_dir (ExpandPath); the collector must not treat one it is
+// handed anyway as "no database".
+func TestStagehandDatabaseRejectsRelativeStateDir(t *testing.T) {
+	opts := &Options{ServiceSources: ServiceSources{StagehandStateDir: "stagehand state"}}
+	report := &core.CollectorReport{Status: core.CollectorRan}
+	gatherStagehandDatabase(context.Background(), opts, report, nil, "")
+	if report.Status == core.CollectorRan || report.Unknowns == 0 {
+		t.Fatalf("relative state directory skipped silently: %+v", report)
+	}
+}

@@ -843,20 +843,3 @@ func TestStagehandDatabasePipelineKeepsItsFoldersLocal(t *testing.T) {
 		}
 	}
 }
-
-// Review of #170: a relative stagehand_state_dir must be rejected, not
-// silently skip the database.
-func TestRelativeStagehandStateDirIsRejected(t *testing.T) {
-	x := newFleetStateFixture(t)
-	x.policy(t)
-	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
-	raw, err := os.ReadFile(policyFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  stagehand_state_dir: stagehand state\n", 1))
-	out, stderr, code := x.run(t, "--format", "json", "policy", "check")
-	if code == ExitOK && !strings.Contains(out+stderr, "stagehand_state_dir") {
-		t.Fatalf("relative stagehand_state_dir accepted: %d %s %s", code, out, stderr)
-	}
-}
