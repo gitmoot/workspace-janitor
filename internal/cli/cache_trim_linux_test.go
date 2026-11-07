@@ -601,10 +601,10 @@ func TestGoTrimStillWaitsForGoProcessesUsingThisCache(t *testing.T) {
 // Issue #177: Go also takes GOCACHE from its env file (go env -w, GOENV) and
 // from $GOROOT/go.env, which do not appear in /proc/<pid>/environ. A build
 // whose cache comes from either still blocks the trim; an env file that
-// cannot be read blocks it too.
+// cannot be read, or a relative GOENV, blocks it too.
 func TestGoTrimHonoursGoEnvFiles(t *testing.T) {
 	for _, name := range []string{"user env file", "GOENV path", "GOROOT go.env", "unreadable env file",
-		"relative GOENV", "GOROOT from env file", "value with trailing space"} {
+		"relative GOENV", "GOROOT from env file", "env-file GOROOT over process GOROOT", "value with trailing space"} {
 		t.Run(name, func(t *testing.T) {
 			x := newTrimFixture(t)
 			x.fill(t, 1<<20)
@@ -629,9 +629,10 @@ func TestGoTrimHonoursGoEnvFiles(t *testing.T) {
 			case "GOROOT go.env":
 				write(filepath.Join(x.home, "goroot", "go.env"), setting, 0o600)
 			case "relative GOENV":
-				// Relative to the process's working directory, not janitor's.
+				// Go resolved it in the directory it started in; after go -C
+				// the current directory's goenv may name another cache (#183).
 				work := filepath.Join(x.home, "proc-cwd")
-				write(filepath.Join(work, "goenv"), setting, 0o600)
+				write(filepath.Join(work, "goenv"), "GOCACHE="+filepath.Join(x.home, "other-cache")+"\n", 0o600)
 				if err := os.MkdirAll(filepath.Join(x.proc, "100"), 0o700); err != nil {
 					t.Fatal(err)
 				}
@@ -643,6 +644,14 @@ func TestGoTrimHonoursGoEnvFiles(t *testing.T) {
 				alt := filepath.Join(x.home, "alt-goroot")
 				write(filepath.Join(alt, "go.env"), setting, 0o600)
 				write(filepath.Join(home, ".config", "go", "env"), "GOROOT="+alt+"\n", 0o600)
+			case "env-file GOROOT over process GOROOT":
+				// Go reads go.env from the env file's GOROOT even when the
+				// process sets GOROOT too.
+				alt, own := filepath.Join(x.home, "alt-goroot"), filepath.Join(x.home, "own-goroot")
+				write(filepath.Join(alt, "go.env"), setting, 0o600)
+				write(filepath.Join(own, "go.env"), "GOCACHE="+filepath.Join(x.home, "other-cache")+"\n", 0o600)
+				write(filepath.Join(home, ".config", "go", "env"), "GOROOT="+alt+"\n", 0o600)
+				env = append(env, "GOROOT="+own)
 			case "value with trailing space":
 				// Go keeps the space; a symlink without it reaches the same cache.
 				spaced := x.cache + "-spaced "

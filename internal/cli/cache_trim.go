@@ -279,8 +279,8 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 // $XDG_CONFIG_HOME/go/env or $HOME/.config/go/env, unless GOENV=off), then
 // $GOROOT/go.env, then the default $XDG_CACHE_HOME/go-build or
 // $HOME/.cache/go-build. GOCACHE=off uses no cache. It fails closed: a value
-// that cannot be established, or an existing file that cannot be read,
-// counts the process as a user.
+// that cannot be established, a relative GOENV, or an existing file that
+// cannot be read counts the process as a user.
 func goProcessUsesCache(procDir, cache string) (bool, error) {
 	raw, err := os.ReadFile(filepath.Join(procDir, "environ"))
 	if err != nil {
@@ -297,18 +297,16 @@ func goProcessUsesCache(procDir, cache string) (bool, error) {
 	if set {
 		return goCacheDirIs(dir, cache), nil
 	}
-	// The go env file: GOENV (a relative path is relative to the process's
-	// own working directory), else the user config location.
+	// The go env file: GOENV, else the user config location. Go resolves a
+	// relative GOENV against the directory it started in, before -C and
+	// before tool subprocesses change directory, so /proc/<pid>/cwd does not
+	// establish it.
 	file := env["GOENV"]
 	switch {
 	case file == "off":
 		file = ""
 	case file != "" && !filepath.IsAbs(file):
-		cwd, err := os.Readlink(filepath.Join(procDir, "cwd"))
-		if err != nil || !filepath.IsAbs(cwd) {
-			return true, nil
-		}
-		file = filepath.Join(cwd, file)
+		return true, nil
 	case file != "":
 	case filepath.IsAbs(env["XDG_CONFIG_HOME"]):
 		file = filepath.Join(env["XDG_CONFIG_HOME"], "go", "env")
@@ -327,10 +325,11 @@ func goProcessUsesCache(procDir, cache string) (bool, error) {
 	}
 	dir, set = fileSettings["GOCACHE"]
 	if !set {
-		// GOROOT, which selects $GOROOT/go.env, has the same precedence.
-		root := env["GOROOT"]
+		// Go picks the go.env root from the env file's GOROOT first, then the
+		// process GOROOT, then the root of the running executable.
+		root := fileSettings["GOROOT"]
 		if root == "" {
-			root = fileSettings["GOROOT"]
+			root = env["GOROOT"]
 		}
 		if root == "" {
 			exe, err := os.Readlink(filepath.Join(procDir, "exe"))
