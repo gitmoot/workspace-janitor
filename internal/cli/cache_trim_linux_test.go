@@ -603,7 +603,8 @@ func TestGoTrimStillWaitsForGoProcessesUsingThisCache(t *testing.T) {
 // whose cache comes from either still blocks the trim; an env file that
 // cannot be read blocks it too.
 func TestGoTrimHonoursGoEnvFiles(t *testing.T) {
-	for _, name := range []string{"user env file", "GOENV path", "GOROOT go.env", "unreadable env file"} {
+	for _, name := range []string{"user env file", "GOENV path", "GOROOT go.env", "unreadable env file",
+		"relative GOENV", "GOROOT from env file", "value with trailing space"} {
 		t.Run(name, func(t *testing.T) {
 			x := newTrimFixture(t)
 			x.fill(t, 1<<20)
@@ -627,6 +628,31 @@ func TestGoTrimHonoursGoEnvFiles(t *testing.T) {
 				env = append(env, "GOENV="+file)
 			case "GOROOT go.env":
 				write(filepath.Join(x.home, "goroot", "go.env"), setting, 0o600)
+			case "relative GOENV":
+				// Relative to the process's working directory, not janitor's.
+				work := filepath.Join(x.home, "proc-cwd")
+				write(filepath.Join(work, "goenv"), setting, 0o600)
+				if err := os.MkdirAll(filepath.Join(x.proc, "100"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(work, filepath.Join(x.proc, "100", "cwd")); err != nil {
+					t.Fatal(err)
+				}
+				env = append(env, "GOENV=goenv")
+			case "GOROOT from env file":
+				alt := filepath.Join(x.home, "alt-goroot")
+				write(filepath.Join(alt, "go.env"), setting, 0o600)
+				write(filepath.Join(home, ".config", "go", "env"), "GOROOT="+alt+"\n", 0o600)
+			case "value with trailing space":
+				// Go keeps the space; a symlink without it reaches the same cache.
+				spaced := x.cache + "-spaced "
+				if err := os.Rename(x.cache, spaced); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(spaced, x.cache); err != nil {
+					t.Fatal(err)
+				}
+				write(filepath.Join(home, ".config", "go", "env"), "GOCACHE="+spaced+"\n", 0o600)
 			case "unreadable env file":
 				if os.Geteuid() == 0 {
 					// root reads mode-000 files; use a directory instead.

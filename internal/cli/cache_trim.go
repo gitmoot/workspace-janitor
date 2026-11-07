@@ -292,30 +292,46 @@ func goProcessUsesCache(procDir, cache string) (bool, error) {
 			env[name] = value
 		}
 	}
+	// A non-empty GOCACHE in the process environment wins outright.
 	dir, set := env["GOCACHE"], env["GOCACHE"] != ""
-	if !set {
-		file := env["GOENV"]
-		switch {
-		case file == "off":
-			file = ""
-		case file != "":
-		case filepath.IsAbs(env["XDG_CONFIG_HOME"]):
-			file = filepath.Join(env["XDG_CONFIG_HOME"], "go", "env")
-		case filepath.IsAbs(env["HOME"]):
-			file = filepath.Join(env["HOME"], ".config", "go", "env")
-		default:
+	if set {
+		return goCacheDirIs(dir, cache), nil
+	}
+	// The go env file: GOENV (a relative path is relative to the process's
+	// own working directory), else the user config location.
+	file := env["GOENV"]
+	switch {
+	case file == "off":
+		file = ""
+	case file != "" && !filepath.IsAbs(file):
+		cwd, err := os.Readlink(filepath.Join(procDir, "cwd"))
+		if err != nil || !filepath.IsAbs(cwd) {
 			return true, nil
 		}
-		if file != "" {
-			value, found, err := goEnvFileValue(file, "GOCACHE")
-			if err != nil {
-				return true, nil
-			}
-			dir, set = value, found
-		}
+		file = filepath.Join(cwd, file)
+	case file != "":
+	case filepath.IsAbs(env["XDG_CONFIG_HOME"]):
+		file = filepath.Join(env["XDG_CONFIG_HOME"], "go", "env")
+	case filepath.IsAbs(env["HOME"]):
+		file = filepath.Join(env["HOME"], ".config", "go", "env")
+	default:
+		return true, nil
 	}
+	var fileSettings map[string]string
+	if file != "" {
+		settings, err := goEnvFile(file)
+		if err != nil {
+			return true, nil
+		}
+		fileSettings = settings
+	}
+	dir, set = fileSettings["GOCACHE"]
 	if !set {
+		// GOROOT, which selects $GOROOT/go.env, has the same precedence.
 		root := env["GOROOT"]
+		if root == "" {
+			root = fileSettings["GOROOT"]
+		}
 		if root == "" {
 			exe, err := os.Readlink(filepath.Join(procDir, "exe"))
 			if err != nil {
@@ -326,15 +342,13 @@ func goProcessUsesCache(procDir, cache string) (bool, error) {
 		if !filepath.IsAbs(root) {
 			return true, nil
 		}
-		value, found, err := goEnvFileValue(filepath.Join(root, "go.env"), "GOCACHE")
+		settings, err := goEnvFile(filepath.Join(root, "go.env"))
 		if err != nil {
 			return true, nil
 		}
-		dir, set = value, found
+		dir, set = settings["GOCACHE"]
 	}
 	switch {
-	case dir == "off":
-		return false, nil
 	case set:
 	case filepath.IsAbs(env["XDG_CACHE_HOME"]):
 		dir = filepath.Join(env["XDG_CACHE_HOME"], "go-build")
@@ -343,33 +357,43 @@ func goProcessUsesCache(procDir, cache string) (bool, error) {
 	default:
 		return true, nil
 	}
-	if !filepath.IsAbs(dir) {
-		return true, nil
-	}
-	return samePath(dir, cache), nil
+	return goCacheDirIs(dir, cache), nil
 }
 
-// goEnvFileValue reads one KEY=VALUE setting from a Go environment file. A
-// missing file holds no settings; any other read error is returned.
-func goEnvFileValue(path, key string) (string, bool, error) {
+// goCacheDirIs reports whether a resolved GOCACHE value is cache: "off" is
+// no cache, and a relative value (which Go rejects) fails closed.
+func goCacheDirIs(dir, cache string) bool {
+	switch {
+	case dir == "off":
+		return false
+	case !filepath.IsAbs(dir):
+		return true
+	}
+	return samePath(dir, cache)
+}
+
+// goEnvFile reads a Go environment file the way the go command does: one
+// KEY=VALUE per line, # comments, values kept byte for byte, the last
+// setting of a key winning. A missing file holds no settings; any other
+// read error is returned.
+func goEnvFile(path string) (map[string]string, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return "", false, nil
+		return map[string]string{}, nil
 	}
 	if err != nil {
-		return "", false, err
+		return nil, err
 	}
-	value, found := "", false
+	settings := map[string]string{}
 	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if k, v, ok := strings.Cut(line, "="); ok && strings.TrimSpace(k) == key {
-			value, found = strings.TrimSpace(v), true
+		if key, value, ok := strings.Cut(line, "="); ok {
+			settings[key] = value
 		}
 	}
-	return value, found, nil
+	return settings, nil
 }
 
 // goRootOf derives GOROOT from a Go toolchain executable: <root>/bin/go, or
