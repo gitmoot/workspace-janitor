@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -767,5 +768,73 @@ func TestScratchRegenerableIdleIsRecheckedBeforeDeletion(t *testing.T) {
 				t.Fatalf("want kept, got %+v", got)
 			}
 		})
+	}
+}
+
+// Jarvis 415567: between full sweeps, regenerable_every runs a pass that
+// only deletes regenerable entries. It archives nothing, keeps every other
+// entry however idle, and does not count as a full sweep.
+func TestScratchRegenerablePassDeletesOnlyRegenerableEntries(t *testing.T) {
+	x := newScratchFixture(t)
+	x.options = "    regenerable_idle: 2h\n    regenerable_every: 1h\n"
+	x.write(t)
+	regen := x.entry(t, "go-build123", map[string]string{"b/c.a": "object\n"})
+	plain := x.entry(t, "plain", map[string]string{"report.txt": "payload\n"})
+	// Older than every idle, so a full sweep would archive plain.
+	x.shift(t, 100*time.Hour)
+	sink := &watchSink{reports: make(chan watchReport, 8)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard, lookup: config.MapLookup(x.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- scratchRegenerableLoop(ctx, e, paths, policy) }()
+	var report watchReport
+	select {
+	case report = <-sink.reports:
+	case err := <-done:
+		t.Fatalf("loop exited: %v", err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("no regenerable pass report")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if report.Reason != "scratch_regenerable" || len(report.ScratchCleanup) != 1 {
+		t.Fatalf("unexpected report: %+v", report)
+	}
+	run := report.ScratchCleanup[0]
+	if run.Archive != nil {
+		t.Fatalf("regenerable pass made an archive: %+v", run.Archive)
+	}
+	if exists(t, regen) || !exists(t, plain) {
+		t.Fatalf("after the pass: regenerable kept=%v plain kept=%v", exists(t, regen), exists(t, plain))
+	}
+	scratch, _ := policy.ScratchCleanupFor(x.scratch)
+	if due, _, err := scratchDue(context.Background(), paths, scratch, scratchNow()); err != nil || !due {
+		t.Fatalf("a regenerable pass reset the full sweep's cadence: due=%v err=%v", due, err)
+	}
+}
+
+// regenerable_every needs regenerable_idle, and has the same 1h floor.
+func TestScratchRegenerableEveryValidation(t *testing.T) {
+	for options, want := range map[string]string{
+		"    regenerable_every: 1h\n":                            "regenerable_every: requires regenerable_idle",
+		"    regenerable_idle: 2h\n    regenerable_every: 10m\n": "regenerable_every: must be at least 1h",
+	} {
+		x := newScratchFixture(t)
+		x.options = options
+		x.write(t)
+		out, stderr, code := x.run(t, "--format", "json", "policy", "check")
+		if code == ExitOK || !strings.Contains(out+stderr, want) {
+			t.Errorf("%q: want %q, got exit=%d %s %s", options, want, code, out, stderr)
+		}
 	}
 }

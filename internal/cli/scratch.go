@@ -188,7 +188,11 @@ func (r *scratchRunReport) count() {
 // that is not regenerable into one verified archive. Only after that archive
 // is published and read back does it delete anything, each entry after a
 // fresh in-use and unchanged check, recording a receipt per entry.
-func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Policy, scratch config.ScratchCleanup, dryRun bool) (scratchRunReport, error) {
+//
+// A regenerableOnly run selects only regenerable entries, archives nothing
+// and is recorded as its own kind, so it never resets the full sweep's
+// cadence.
+func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Policy, scratch config.ScratchCleanup, dryRun, regenerableOnly bool) (scratchRunReport, error) {
 	now := scratchNow()
 	report := scratchRunReport{Path: scratch.Path, DryRun: dryRun, Status: "preview", Items: []scratchItem{},
 		Attribution: "Sizes are the local bytes of regular files. Archived bytes on the archive mount are never counted as local headroom."}
@@ -275,6 +279,11 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	for _, next := range found {
 		item := scratchItem{Entry: next.name, Path: filepath.Join(scratch.Path, next.name), SizeBytes: next.size,
 			IdleFor: now.Sub(time.Unix(0, next.newestNS)).Truncate(time.Second).String()}
+		if regenerableOnly && !next.regenerable {
+			item.Status, item.Reason = scratchKept, "not regenerable; left for the full sweep"
+			report.list(item)
+			continue
+		}
 		if scratch.MaxBytesPerRun > 0 && total+next.size > scratch.MaxBytesPerRun {
 			item.Status, item.Reason = scratchDeferred, fmt.Sprintf("max_bytes_per_run %d reached; retried next run", scratch.MaxBytesPerRun)
 			report.list(item)
@@ -328,6 +337,9 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 		return report, fmt.Errorf("scratch cleanup of %s: %w", scratch.Path, err)
 	}
 	run := store.ScratchRun{RunID: report.RunID, Path: scratch.Path, StartedAt: now, ArchivedEntries: []string{}}
+	if regenerableOnly {
+		run.Kind = store.ScratchRunRegenerable
+	}
 	if len(archive) != 0 {
 		entries := make([]workspacearchive.ScratchEntry, len(archive))
 		for i, candidate := range archive {
@@ -502,12 +514,72 @@ func scratchPreflight(paths config.Paths, scratch config.ScratchCleanup, entries
 
 // scratchDue reports whether scratch has not run for its interval.
 func scratchDue(ctx context.Context, paths config.Paths, scratch config.ScratchCleanup, now time.Time) (bool, time.Time, error) {
-	last, err := store.ReadLastScratchRun(ctx, paths.DatabaseFile, scratch.Path)
+	last, err := store.ReadLastScratchRun(ctx, paths.DatabaseFile, scratch.Path, "")
 	if err != nil {
 		return false, time.Time{}, err
 	}
 	next := last.Add(scratch.Every.Duration())
 	return last.IsZero() || !next.After(now), next, nil
+}
+
+// scratchRegenerableTick is how often the watcher checks whether a
+// regenerable-only pass is due; the due time itself comes from the store,
+// so a watcher restart neither skips nor repeats a pass.
+var scratchRegenerableTick = 5 * time.Minute
+
+func scratchRegenerableConfigured(policy config.Policy) bool {
+	for _, scratch := range policy.ScratchCleanup {
+		if scratch.RegenerableEvery.Duration() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// scratchRegenerableLoop runs, from the watcher, each scratch directory's
+// regenerable-only pass whenever its regenerable_every is due. A pass that
+// finds the apply lock held (a cycle or apply is running) is reported busy
+// and retried at the next tick; any other pass failure is reported and does
+// not stop the watcher. Only a report that cannot be written does.
+func scratchRegenerableLoop(ctx context.Context, e *env, paths config.Paths, policy config.Policy) error {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+		}
+		var reports []scratchRunReport
+		for _, scratch := range policy.ScratchCleanup {
+			every := scratch.RegenerableEvery.Duration()
+			if every <= 0 {
+				continue
+			}
+			last, err := store.ReadLastScratchRun(ctx, paths.DatabaseFile, scratch.Path, store.ScratchRunRegenerable)
+			if err != nil && !errors.Is(err, store.ErrNotInitialized) {
+				reports = append(reports, scratchRunReport{Path: scratch.Path, Status: "failed", Error: err.Error(), Items: []scratchItem{}})
+				continue
+			}
+			if !last.IsZero() && scratchNow().Before(last.Add(every)) {
+				continue
+			}
+			report, err := scratchCleanup(ctx, paths, policy, scratch, false, true)
+			if ctx.Err() != nil {
+				return nil
+			}
+			if err != nil && strings.Contains(err.Error(), "another janitor apply or restore is active") {
+				report = scratchRunReport{Path: scratch.Path, Status: "busy", Error: "apply lock held; retried next tick", Items: []scratchItem{}}
+			}
+			reports = append(reports, report)
+		}
+		if len(reports) > 0 {
+			if err := writeWatchReport(e, watchReport{Reason: "scratch_regenerable", ScratchCleanup: reports}); err != nil {
+				return fmt.Errorf("scratch report: %w", err)
+			}
+		}
+		timer.Reset(scratchRegenerableTick)
+	}
 }
 
 // cycleScratchCleanup is the daily cycle's scratch step: every configured
@@ -526,7 +598,7 @@ func cycleScratchCleanup(ctx context.Context, paths config.Paths, policy config.
 			reports = append(reports, scratchRunReport{Path: scratch.Path, Status: "not_due", NextDue: &next, Items: []scratchItem{}})
 			continue
 		}
-		report, err := scratchCleanup(ctx, paths, policy, scratch, false)
+		report, err := scratchCleanup(ctx, paths, policy, scratch, false, false)
 		reports = append(reports, report)
 		if err != nil {
 			failures = append(failures, err)
@@ -610,7 +682,7 @@ func runScratch(ctx context.Context, e *env, opts scratchOptions) error {
 			continue
 		}
 		matched = true
-		run, err := scratchCleanup(ctx, paths, policy, scratch, opts.dryRun)
+		run, err := scratchCleanup(ctx, paths, policy, scratch, opts.dryRun, false)
 		report.Runs = append(report.Runs, run)
 		if err != nil {
 			failures = append(failures, err)

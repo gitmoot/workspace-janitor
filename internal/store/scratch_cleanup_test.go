@@ -53,7 +53,7 @@ func TestScratchReceiptsAreAppendOnly(t *testing.T) {
 	var last time.Time
 	if err := db.Read(ctx, func(tx *Tx) error {
 		var err error
-		last, err = tx.LastScratchRun(ctx, "/tmp")
+		last, err = tx.LastScratchRun(ctx, "/tmp", "")
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -61,7 +61,7 @@ func TestScratchReceiptsAreAppendOnly(t *testing.T) {
 	if !last.Equal(start.Add(48 * time.Hour)) {
 		t.Fatalf("last scratch run = %s, want the newer run", last)
 	}
-	if read, err := ReadLastScratchRun(ctx, db.path, "/tmp"); err != nil || !read.Equal(last) {
+	if read, err := ReadLastScratchRun(ctx, db.path, "/tmp", ""); err != nil || !read.Equal(last) {
 		t.Fatalf("read-only last run = %s, %v", read, err)
 	}
 }
