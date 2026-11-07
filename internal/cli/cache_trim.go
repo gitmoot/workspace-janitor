@@ -240,6 +240,20 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 		switch trim.Kind {
 		case config.CacheTrimGoBuild:
 			busy = goToolchainBusy(argv)
+			if busy {
+				// A Go process with its own GOCACHE elsewhere does not use
+				// this cache; only one that resolves here (or cannot be
+				// resolved) blocks the trim.
+				uses, err := goProcessUsesCache(filepath.Join(procRoot, pid, "environ"), trim.Path)
+				if processGone(err) {
+					continue
+				}
+				if err != nil {
+					users = append(users, fmt.Sprintf("%s (cannot inspect environment: %v)", pid, err))
+					continue
+				}
+				busy = uses
+			}
 			if !busy {
 				holds, err := holdsHandleUnder(filepath.Join(procRoot, pid, "fd"), trim.Path)
 				if err != nil {
@@ -257,6 +271,50 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 	}
 	sort.Strings(users)
 	return users
+}
+
+// goProcessUsesCache reports whether the Go process whose environ file is
+// given builds into cache: its GOCACHE, or by default $XDG_CACHE_HOME/go-build
+// or $HOME/.cache/go-build, resolves to cache. GOCACHE=off uses no cache. A
+// process with no way to determine its cache counts as a user.
+func goProcessUsesCache(environ, cache string) (bool, error) {
+	raw, err := os.ReadFile(environ)
+	if err != nil {
+		return false, err
+	}
+	env := map[string]string{}
+	for _, kv := range strings.Split(string(raw), "\x00") {
+		if name, value, ok := strings.Cut(kv, "="); ok {
+			env[name] = value
+		}
+	}
+	dir := env["GOCACHE"]
+	switch {
+	case dir == "off":
+		return false, nil
+	case dir != "":
+	case filepath.IsAbs(env["XDG_CACHE_HOME"]):
+		dir = filepath.Join(env["XDG_CACHE_HOME"], "go-build")
+	case filepath.IsAbs(env["HOME"]):
+		dir = filepath.Join(env["HOME"], ".cache", "go-build")
+	default:
+		return true, nil
+	}
+	if !filepath.IsAbs(dir) {
+		return true, nil
+	}
+	return samePath(dir, cache), nil
+}
+
+// samePath compares two paths after resolving symlinks where possible.
+func samePath(a, b string) bool {
+	resolve := func(p string) string {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return r
+		}
+		return filepath.Clean(p)
+	}
+	return resolve(a) == resolve(b)
 }
 
 // processGone reports an error that means the process exited while it was

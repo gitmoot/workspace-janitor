@@ -59,12 +59,21 @@ func (x *trimFixture) fill(t *testing.T, bytes int) {
 	}
 }
 
+// process adds a fixture process whose Go cache is the fixture cache.
 func (x *trimFixture) process(t *testing.T, pid string, argv ...string) {
+	t.Helper()
+	x.processEnv(t, pid, []string{"GOCACHE=" + x.cache}, argv...)
+}
+
+func (x *trimFixture) processEnv(t *testing.T, pid string, env []string, argv ...string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Join(x.proc, pid), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(x.proc, pid, "cmdline"), []byte(strings.Join(argv, "\x00")+"\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(x.proc, pid, "environ"), []byte(strings.Join(env, "\x00")+"\x00"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -533,5 +542,50 @@ func TestWatchSamplesAndTrimsTogether(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("clean shutdown returned %v", err)
+	}
+}
+
+// Jarvis 415803: the go-build trim skipped for hours because some Go build
+// was always running, though most used their own GOCACHE. Only a Go process
+// whose effective cache is this cache (or cannot be determined) blocks it.
+func TestGoTrimIgnoresGoProcessesWithAnotherCache(t *testing.T) {
+	x := newTrimFixture(t)
+	x.fill(t, 1<<20)
+	x.processEnv(t, "100", []string{"GOCACHE=" + filepath.Join(x.home, "other-cache")}, "/usr/bin/go", "test", "./...")
+	x.processEnv(t, "101", []string{"GOCACHE=off"}, "/usr/bin/go", "build", "./...")
+	x.processEnv(t, "102", []string{"HOME=" + filepath.Join(x.home, "elsewhere")}, "/usr/bin/go", "build", "./...")
+	trims := x.cycle(t)
+	if trims[0].Status != "trimmed" {
+		t.Fatalf("Go processes using other caches blocked the trim: %+v", trims[0])
+	}
+}
+
+func TestGoTrimStillWaitsForGoProcessesUsingThisCache(t *testing.T) {
+	for name, env := range map[string][]string{
+		"explicit":                   nil, // filled below
+		"default via HOME":           {"HOME=HOMEDIR"},
+		"default via XDG_CACHE_HOME": {"XDG_CACHE_HOME=CACHEDIR"},
+		"undeterminable":             {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			x := newTrimFixture(t)
+			// The fixture cache is <home>/go-build; make the defaults
+			// resolve to it.
+			x.cache = filepath.Join(x.home, ".cache", "go-build")
+			x.fill(t, 1<<20)
+			var e []string
+			for _, kv := range env {
+				kv = strings.Replace(kv, "HOMEDIR", x.home, 1)
+				kv = strings.Replace(kv, "CACHEDIR", filepath.Join(x.home, ".cache"), 1)
+				e = append(e, kv)
+			}
+			if name == "explicit" {
+				e = []string{"GOCACHE=" + x.cache}
+			}
+			x.processEnv(t, "100", e, "/usr/bin/go", "test", "./...")
+			if trims := x.cycle(t); trims[0].Status != "skipped_in_use" {
+				t.Fatalf("a Go process using this cache did not block the trim: %+v", trims[0])
+			}
+		})
 	}
 }
