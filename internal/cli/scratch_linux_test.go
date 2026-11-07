@@ -737,7 +737,7 @@ func TestScratchRegenerableIdleHasAFloor(t *testing.T) {
 	x.options = "    regenerable_idle: 10m\n"
 	x.write(t)
 	out, stderr, code := x.run(t, "--format", "json", "policy", "check")
-	if code == ExitOK && !strings.Contains(out+stderr, "regenerable_idle") {
-		t.Fatalf("10m regenerable_idle accepted: %d %s %s", code, out, stderr)
+	if code == ExitOK || !strings.Contains(out+stderr, "regenerable_idle: must be at least 1h") {
+		t.Fatalf("10m regenerable_idle not rejected by the floor: %d %s %s", code, out, stderr)
 	}
 }
