@@ -676,7 +676,7 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 				continue
 			}
 			report.Visited++
-			refs = append(refs, stagehandSpecRefs(content, "used by stagehand pipeline "+file, runtime, runsDir, file, report)...)
+			refs = append(refs, stagehandSpecRefs(content, "used by stagehand pipeline "+file, runtime, runsDir, dir, file, report)...)
 		}
 	}
 	refs = append(refs, gatherStagehandDatabase(ctx, opts, report, runtime, runsDir)...)
@@ -690,7 +690,11 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 // skipped; one that cannot be read leaves this source unknown.
 func gatherStagehandDatabase(ctx context.Context, opts *Options, report *core.CollectorReport, runtime map[string]string, runsDir string) []Reference {
 	state := opts.ServiceSources.StagehandStateDir
+	if state == "" {
+		return nil
+	}
 	if !filepath.IsAbs(state) {
+		noteUnreadable(report, fmt.Sprintf("stagehand state directory %q is not absolute", state))
 		return nil
 	}
 	path := filepath.Join(state, "stagehand.db")
@@ -728,7 +732,7 @@ func gatherStagehandDatabase(ctx context.Context, opts *Options, report *core.Co
 		} else if source != "" {
 			noteUnreadable(report, fmt.Sprintf("stagehand pipeline %s has a relative source_dir %q", name, source))
 		}
-		refs = append(refs, stagehandSpecRefs(spec, detail, runtime, runsDir, "stagehand pipeline "+name, report)...)
+		refs = append(refs, stagehandSpecRefs(spec, detail, runtime, runsDir, source, "stagehand pipeline "+name, report)...)
 	}
 	if err := rows.Err(); err != nil {
 		noteUnreadable(report, fmt.Sprintf("could not read stagehand pipelines: %v", err))
@@ -736,11 +740,37 @@ func gatherStagehandDatabase(ctx context.Context, opts *Options, report *core.Co
 	return refs
 }
 
+// stagehandFileKeys are stagehand spec fields that name a file and that
+// stagehand resolves against the pipeline's source directory when relative.
+var stagehandFileKeys = map[string]bool{"prompt_file": true, "env_file": true, "input_file": true, "schema_file": true}
+
 // stagehandSpecRefs extracts the references of one stagehand spec and folds
-// run-directory paths into <state>/runs (see gatherStagehand). label names
-// the spec in unreadable notes.
-func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, label string, report *core.CollectorReport) []Reference {
+// run-directory paths into <state>/runs (see gatherStagehand). A relative
+// file field (prompt_file, env_file, ...) is resolved against source, the
+// directory stagehand resolves it against; without an absolute source it is
+// unresolved. label names the spec in unreadable notes.
+func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, source, label string, report *core.CollectorReport) []Reference {
 	var refs []Reference
+	var docs []any
+	decoder := yaml.NewDecoder(strings.NewReader(spec))
+	for {
+		var one any
+		if err := decoder.Decode(&one); err != nil {
+			break
+		}
+		docs = append(docs, one)
+	}
+	walkConfigKeyedStrings(docs, "", func(key, value string) {
+		value = strings.TrimSpace(value)
+		if !stagehandFileKeys[strings.ToLower(key)] || value == "" || filepath.IsAbs(value) || strings.HasPrefix(value, "~") || strings.ContainsAny(value, "$`") {
+			return
+		}
+		if !filepath.IsAbs(source) {
+			noteUnreadable(report, fmt.Sprintf("%s: relative %s %q has no absolute source directory", label, key, value))
+			return
+		}
+		refs = append(refs, Reference{Path: filepath.Join(source, value), Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: "stagehand_path", Detail: detail + " (" + key + ")"})
+	})
 	found, unresolved, err := specPathReferences(spec, "stagehand_path", detail, runtime)
 	if err != nil {
 		noteUnreadable(report, fmt.Sprintf("could not parse %s: %v", label, err))

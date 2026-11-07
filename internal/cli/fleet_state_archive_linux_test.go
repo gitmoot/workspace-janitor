@@ -809,7 +809,10 @@ func TestStagehandDatabasePipelineKeepsItsFoldersLocal(t *testing.T) {
 	if _, err := db.Exec(`CREATE TABLE pipelines(name TEXT, spec_yaml BLOB, spec_hash TEXT, source_dir TEXT, enabled INTEGER)`); err != nil {
 		t.Fatal(err)
 	}
-	spec := []byte(fmt.Sprintf("name: doorbell\nstages:\n  - cmd: %s/f --db %s/f\n", source, used))
+	prompts := filepath.Join(x.state, "doorbell-prompts")
+	x.folder(t, prompts, 20*24*time.Hour, map[string]string{"p.md": "x"})
+	// stagehand resolves a relative prompt_file against source_dir.
+	spec := []byte(fmt.Sprintf("name: doorbell\nstages:\n  - cmd: %s/f --db %s/f\n  - prompt_file: ../doorbell-prompts/p.md\n", source, used))
 	if _, err := db.Exec(`INSERT INTO pipelines VALUES(?, ?, '', ?, 0)`, "doorbell", spec, source); err != nil {
 		t.Fatal(err)
 	}
@@ -824,7 +827,7 @@ func TestStagehandDatabasePipelineKeepsItsFoldersLocal(t *testing.T) {
 	}
 	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  stagehand_dirs: []\n  stagehand_state_dir: "+state+"\n", 1))
 	report := x.categories(t, true)
-	for _, path := range []string{source, used} {
+	for _, path := range []string{source, used, prompts} {
 		if item := x.item(t, report, path); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
 			t.Fatalf("%s is used by a database-registered stagehand pipeline but was not kept: %+v", path, item)
 		}
@@ -838,5 +841,22 @@ func TestStagehandDatabasePipelineKeepsItsFoldersLocal(t *testing.T) {
 		if collector.Name == "services" && collector.Status == core.CollectorRan {
 			t.Fatalf("an unreadable stagehand database left services complete: %+v", collector)
 		}
+	}
+}
+
+// Review of #170: a relative stagehand_state_dir must be rejected, not
+// silently skip the database.
+func TestRelativeStagehandStateDirIsRejected(t *testing.T) {
+	x := newFleetStateFixture(t)
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	raw, err := os.ReadFile(policyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  stagehand_state_dir: stagehand state\n", 1))
+	out, stderr, code := x.run(t, "--format", "json", "policy", "check")
+	if code == ExitOK && !strings.Contains(out+stderr, "stagehand_state_dir") {
+		t.Fatalf("relative stagehand_state_dir accepted: %d %s %s", code, out, stderr)
 	}
 }
