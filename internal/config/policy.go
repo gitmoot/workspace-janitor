@@ -1054,6 +1054,9 @@ func (p *Policy) Validate() core.FieldErrors {
 			}
 		}
 	}
+	if dir := p.Collectors.StagehandStateDir; dir != "" && !core.IsCanonicalPath(dir) {
+		errs.Add("collectors.stagehand_state_dir", "must be an absolute path, got %q", dir)
+	}
 	return errs
 }
 

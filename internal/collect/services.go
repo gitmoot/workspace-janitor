@@ -760,9 +760,14 @@ func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, 
 		}
 		docs = append(docs, one)
 	}
+	// Stagehand reads these fields literally: no shell or variable
+	// expansion, so $, ` and a leading ~ are ordinary characters here.
 	walkConfigKeyedStrings(docs, "", func(key, value string) {
-		value = strings.TrimSpace(value)
-		if !stagehandFileKeys[strings.ToLower(key)] || value == "" || filepath.IsAbs(value) || strings.HasPrefix(value, "~") || strings.ContainsAny(value, "$`") {
+		if !stagehandFileKeys[strings.ToLower(key)] || value == "" {
+			return
+		}
+		if filepath.IsAbs(value) {
+			refs = append(refs, Reference{Path: filepath.Clean(value), Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: "stagehand_path", Detail: detail + " (" + key + ")"})
 			return
 		}
 		if !filepath.IsAbs(source) {

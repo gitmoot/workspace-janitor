@@ -242,14 +242,32 @@ func TestStagehandRunReferencesProtectRunsAndSurviveSpaces(t *testing.T) {
 	}
 }
 
-// Review of #170: policy loading already rejects a relative
-// stagehand_state_dir (ExpandPath); the collector must not treat one it is
-// handed anyway as "no database".
+// Review of #170: the collector must not treat a relative state directory
+// as "no database" (policy validation also rejects one).
 func TestStagehandDatabaseRejectsRelativeStateDir(t *testing.T) {
 	opts := &Options{ServiceSources: ServiceSources{StagehandStateDir: "stagehand state"}}
 	report := &core.CollectorReport{Status: core.CollectorRan}
 	gatherStagehandDatabase(context.Background(), opts, report, nil, "")
 	if report.Status == core.CollectorRan || report.Unknowns == 0 {
 		t.Fatalf("relative state directory skipped silently: %+v", report)
+	}
+}
+
+// Review of #170 round 2: stagehand reads prompt_file and the other file
+// fields literally, so $, ` and a leading ~ are part of the file name.
+func TestStagehandFileFieldsAreLiteral(t *testing.T) {
+	report := &core.CollectorReport{Status: core.CollectorRan}
+	spec := "stages:\n  - prompt_file: ../data/f$HOME\n  - env_file: ~x/e`y\n  - prompt_file: /abs/p$X.md\n"
+	refs := stagehandSpecRefs(spec, "d", nil, "/runs", "/work/source", "spec", report)
+	want := map[string]bool{"/work/data/f$HOME": false, "/work/source/~x/e`y": false, "/abs/p$X.md": false}
+	for _, ref := range refs {
+		if _, ok := want[ref.Path]; ok {
+			want[ref.Path] = true
+		}
+	}
+	for path, seen := range want {
+		if !seen {
+			t.Errorf("literal file field %q not protected: %+v", path, refs)
+		}
 	}
 }
