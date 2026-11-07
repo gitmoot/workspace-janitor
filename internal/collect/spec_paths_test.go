@@ -28,7 +28,7 @@ stages:
   - cmd: cat "$PIPE_HOME/conf"
     description: "Prose that isn't a path: don't match it"
 `
-	refs, unresolved, err := specPathReferences(spec, "s", "d", nil)
+	refs, unresolved, err := specPathReferences(spec, "s", "d", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestSpecPathReferencesReportsUnresolvablePaths(t *testing.T) {
 		`cmd: ls /work/runs/$(date +%F)/out`,
 		`cmd: bash "/work/$UNSET/../../pipelines/run.sh"`,
 	} {
-		_, unresolved, err := specPathReferences(spec+"\n", "s", "d", nil)
+		_, unresolved, err := specPathReferences(spec+"\n", "s", "d", nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -80,7 +80,7 @@ func TestSpecPathReferencesNeverTruncatesExpansions(t *testing.T) {
 		"values":  `cmd: X=1; X=2; X=3; X=4; X=5; X=6; X=7; X=8; X=9; bash "/work/x$X/run.sh"`,
 		"escapes": `cmd: A=a0; A=a1; A=a2; A=a3; B=b0; B=b1; B=b2; B=b3; bash "/work/${A:-fa}-${B:-fb}/../../pipelines/run.sh"`,
 	} {
-		_, unresolved, err := specPathReferences(spec+"\n", "s", "d", nil)
+		_, unresolved, err := specPathReferences(spec+"\n", "s", "d", nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -107,7 +107,7 @@ func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
 		"bash " + dir + "/work/{pipelines,elsewhere}/run.sh",
 		"bash ~/work/pipelines/run.sh",
 	} {
-		refs, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d", nil)
+		refs, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d", nil, nil)
 		if err != nil || len(unresolved) != 0 {
 			t.Fatalf("%s: err=%v unresolved=%q", cmd, err, unresolved)
 		}
@@ -120,13 +120,13 @@ func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
 		}
 	}
 	// Text that is not a path, however brace-rich, is not a candidate.
-	if _, unresolved, err := specPathReferences(`cmd: echo '[{id:1,q:What {id:2}' --flag={x`+"\n", "s", "d", nil); err != nil || len(unresolved) != 0 {
+	if _, unresolved, err := specPathReferences(`cmd: echo '[{id:1,q:What {id:2}' --flag={x`+"\n", "s", "d", nil, nil); err != nil || len(unresolved) != 0 {
 		t.Errorf("non-path text reported unresolved: err=%v %q", err, unresolved)
 	}
 	// Quoting is gone before expansion, so the literal word must stay a
 	// candidate: a quoted '/work/{a,b}' names that directory itself.
 	literal := filepath.Join(dir, "work", "{a,b}")
-	refs, _, _ := specPathReferences("cmd: bash '"+literal+"/run.sh'\n", "s", "d", nil)
+	refs, _, _ := specPathReferences("cmd: bash '"+literal+"/run.sh'\n", "s", "d", nil, nil)
 	keptLiteral := false
 	for _, ref := range refs {
 		keptLiteral = keptLiteral || ref.Path == filepath.Join(literal, "run.sh")
@@ -152,7 +152,7 @@ func TestSpecPathReferencesExpandsPathnames(t *testing.T) {
 		"bash ~no-such-user-janitor/pipelines/run.sh",
 		"bash ~+/pipelines/run.sh",
 	} {
-		_, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d", nil)
+		_, unresolved, err := specPathReferences("cmd: "+cmd+"\n", "s", "d", nil, nil)
 		if err != nil || len(unresolved) == 0 {
 			t.Errorf("%s: not reported unresolved (err=%v)", cmd, err)
 		}
@@ -165,7 +165,7 @@ func TestSpecPathReferencesExpandsNamedUserHome(t *testing.T) {
 	if err != nil || !filepath.IsAbs(account.HomeDir) {
 		t.Skip("no current user home")
 	}
-	refs, unresolved, err := specPathReferences("cmd: bash ~"+account.Username+"/pipelines/run.sh\n", "s", "d", nil)
+	refs, unresolved, err := specPathReferences("cmd: bash ~"+account.Username+"/pipelines/run.sh\n", "s", "d", nil, nil)
 	if err != nil || len(unresolved) != 0 {
 		t.Fatalf("err=%v unresolved=%q", err, unresolved)
 	}
@@ -186,18 +186,18 @@ func TestSpecPathReferencesUsesRunnerVariables(t *testing.T) {
 		"STAGEHAND_WORK":   "/state/runs/" + stagehandRunPlaceholder + "/work",
 		"STAGEHAND_RUN_ID": stagehandRunPlaceholder,
 	}
-	refs, unresolved, err := specPathReferences("cmd: tool --out \"$STAGEHAND_WORK/rows.json\"\n", "s", "d", runtime)
+	refs, unresolved, err := specPathReferences("cmd: tool --out \"$STAGEHAND_WORK/rows.json\"\n", "s", "d", runtime, nil)
 	if err != nil || len(unresolved) != 0 {
 		t.Fatalf("err=%v unresolved=%q", err, unresolved)
 	}
 	if len(refs) == 0 || refs[0].Path != "/state/runs/"+stagehandRunPlaceholder+"/work/rows.json" {
 		t.Fatalf("run work path not expanded: %+v", refs)
 	}
-	refs, unresolved, _ = specPathReferences("cmd: tool --run \"$STAGEHAND_RUN_ID\" --log \"/state/runs/$STAGEHAND_RUN_ID/log\"\n", "s", "d", runtime)
+	refs, unresolved, _ = specPathReferences("cmd: tool --run \"$STAGEHAND_RUN_ID\" --log \"/state/runs/$STAGEHAND_RUN_ID/log\"\n", "s", "d", runtime, nil)
 	if len(unresolved) != 0 {
 		t.Fatalf("run id reported unresolved: %q", unresolved)
 	}
-	refs, _, _ = specPathReferences("cmd: cat \"$STAGEHAND_WORK/../../../etc/x\"\n", "s", "d", runtime)
+	refs, _, _ = specPathReferences("cmd: cat \"$STAGEHAND_WORK/../../../etc/x\"\n", "s", "d", runtime, nil)
 	if len(refs) == 0 || refs[0].Path != "/state/etc/x" {
 		t.Fatalf("escape from the run directory not visible after Clean: %+v", refs)
 	}
@@ -269,5 +269,30 @@ func TestStagehandFileFieldsAreLiteral(t *testing.T) {
 		if !seen {
 			t.Errorf("literal file field %q not protected: %+v", path, refs)
 		}
+	}
+}
+
+// Post-merge review of #170: stagehand file fields are resolved literally
+// by stagehandSpecRefs and must not also be read as shell text, or a valid
+// literal name like f$UNSET falsely marks the whole source partial.
+func TestStagehandLiteralFileFieldsDoNotMarkPartial(t *testing.T) {
+	report := &core.CollectorReport{Status: core.CollectorRan}
+	spec := "stages:\n  - prompt_file: ../data/f$UNSET\n  - env_file: ../data/f`literal`\n"
+	refs := stagehandSpecRefs(spec, "d", nil, "/runs", "/work/source", "spec", report)
+	if report.Status != core.CollectorRan || report.Unknowns != 0 {
+		t.Fatalf("literal file fields marked the source partial: %+v", report)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("want both literal targets protected: %+v", refs)
+	}
+}
+
+// Post-merge review of #170: a stagehand database is a service source on its
+// own; it must not be skipped when no other service location is configured.
+func TestStagehandStateDirAloneActivatesServices(t *testing.T) {
+	refs, report := gatherServiceReferences(context.Background(), &Options{Services: true,
+		ServiceSources: ServiceSources{StagehandStateDir: t.TempDir()}})
+	if report.Status == core.CollectorSkipped {
+		t.Fatalf("services skipped with a stagehand state directory configured: %+v %v", report, refs)
 	}
 }

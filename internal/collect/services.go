@@ -43,7 +43,7 @@ func gatherServiceReferences(ctx context.Context, opts *Options) ([]Reference, c
 		return nil, report
 	}
 	sources := opts.ServiceSources
-	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 && len(sources.ConfigFiles) == 0 && sources.GitmootPipelines == "" && len(sources.StagehandDirs) == 0 {
+	if len(sources.SystemdDirs) == 0 && len(sources.CronPaths) == 0 && len(sources.PM2Dumps) == 0 && len(sources.ConfigFiles) == 0 && sources.GitmootPipelines == "" && len(sources.StagehandDirs) == 0 && sources.StagehandStateDir == "" {
 		report.Status = core.CollectorSkipped
 		report.Detail = "no service definition locations are configured"
 		return nil, report
@@ -610,7 +610,7 @@ func gatherGitmootPipelines(ctx context.Context, opts *Options, report *core.Col
 			return refs
 		}
 		report.Visited++
-		found, unresolved, err := specPathReferences(spec, "gitmoot_pipeline_path", "used by enabled Gitmoot pipeline "+name, nil)
+		found, unresolved, err := specPathReferences(spec, "gitmoot_pipeline_path", "used by enabled Gitmoot pipeline "+name, nil, nil)
 		if err != nil {
 			noteUnreadable(report, fmt.Sprintf("could not parse Gitmoot pipeline %s: %v", name, err))
 			continue
@@ -776,7 +776,7 @@ func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, 
 		}
 		refs = append(refs, Reference{Path: filepath.Join(source, value), Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: "stagehand_path", Detail: detail + " (" + key + ")"})
 	})
-	found, unresolved, err := specPathReferences(spec, "stagehand_path", detail, runtime)
+	found, unresolved, err := specPathReferences(spec, "stagehand_path", detail, runtime, stagehandFileKeys)
 	if err != nil {
 		noteUnreadable(report, fmt.Sprintf("could not parse %s: %v", label, err))
 		return refs
@@ -820,7 +820,10 @@ func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, 
 //     / is a path whose location is unknown: the value may hold anything,
 //     "..", included. It is returned as unresolved, and the caller must
 //     treat the whole source as unknown.
-func specPathReferences(spec, signal, detail string, runtime map[string]string) ([]Reference, []string, error) {
+//
+// literal names fields the caller resolves itself, literally; they are not
+// read as shell text here.
+func specPathReferences(spec, signal, detail string, runtime map[string]string, literal map[string]bool) ([]Reference, []string, error) {
 	var docs []any
 	decoder := yaml.NewDecoder(strings.NewReader(spec))
 	var err error
@@ -915,6 +918,9 @@ func specPathReferences(spec, signal, detail string, runtime map[string]string) 
 	// (cwd: /a b). A command field is shell text: only its words count, or a
 	// whole command line would be read as one long path.
 	walkConfigKeyedStrings(docs, "", func(key, value string) {
+		if literal[strings.ToLower(key)] {
+			return
+		}
 		if whole := strings.TrimSpace(value); !commandKeys[strings.ToLower(key)] && strings.HasPrefix(whole, "/") && !strings.Contains(whole, "\n") {
 			consider(whole)
 		}
