@@ -786,3 +786,76 @@ prevention:
 		t.Fatalf("quarantined run was deleted (err=%v, found=%v)", err, quarantined)
 	}
 }
+
+// gitmoot 411727: stagehand pipelines can be added from any directory, and
+// then live only in stagehand's database (spec_yaml, source_dir). Both must
+// protect their folders; an unreadable database blocks removals.
+func TestStagehandDatabasePipelineKeepsItsFoldersLocal(t *testing.T) {
+	x := newFleetStateFixture(t)
+	source := filepath.Join(x.state, "doorbell-app")
+	used := filepath.Join(x.state, "doorbell-data")
+	for _, path := range []string{source, used} {
+		x.folder(t, path, 20*24*time.Hour, map[string]string{"f": "x"})
+	}
+	state := filepath.Join(x.home, "stagehand-state")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(state, "stagehand.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE pipelines(name TEXT, spec_yaml BLOB, spec_hash TEXT, source_dir TEXT, enabled INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	prompts := filepath.Join(x.state, "doorbell-prompts")
+	x.folder(t, prompts, 20*24*time.Hour, map[string]string{"p.md": "x"})
+	// stagehand resolves a relative prompt_file against source_dir.
+	spec := []byte(fmt.Sprintf("name: doorbell\nstages:\n  - cmd: %s/f --db %s/f\n  - prompt_file: ../doorbell-prompts/p.md\n", source, used))
+	if _, err := db.Exec(`INSERT INTO pipelines VALUES(?, ?, '', ?, 0)`, "doorbell", spec, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	raw, err := os.ReadFile(policyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  stagehand_dirs: []\n  stagehand_state_dir: "+state+"\n", 1))
+	report := x.categories(t, true)
+	for _, path := range []string{source, used, prompts} {
+		if item := x.item(t, report, path); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
+			t.Fatalf("%s is used by a database-registered stagehand pipeline but was not kept: %+v", path, item)
+		}
+	}
+	if err := os.WriteFile(dbPath, []byte("not a database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var scan core.Scan
+	field(t, x.data(t, "scan"), "scan", &scan)
+	for _, collector := range scan.Collectors {
+		if collector.Name == "services" && collector.Status == core.CollectorRan {
+			t.Fatalf("an unreadable stagehand database left services complete: %+v", collector)
+		}
+	}
+}
+
+// Review of #170: policy validation rejects a relative stagehand_state_dir.
+func TestRelativeStagehandStateDirIsRejected(t *testing.T) {
+	x := newFleetStateFixture(t)
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	raw, err := os.ReadFile(policyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  stagehand_state_dir: stagehand state\n", 1))
+	_, stderr, code := x.run(t, "scan")
+	if code == ExitOK || !strings.Contains(stderr, "stagehand_state_dir") {
+		t.Fatalf("relative stagehand_state_dir accepted: exit=%d %s", code, stderr)
+	}
+}

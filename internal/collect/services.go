@@ -676,29 +676,127 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 				continue
 			}
 			report.Visited++
-			found, unresolved, err := specPathReferences(content, "stagehand_path", "used by stagehand pipeline "+file, runtime)
-			if err != nil {
-				noteUnreadable(report, fmt.Sprintf("could not parse %s: %v", file, err))
-				continue
-			}
-			if len(unresolved) > 0 {
-				noteUnreadable(report, fmt.Sprintf("stagehand pipeline %s uses paths that cannot be resolved: %s", file, strings.Join(unresolved, " ")))
-			}
-			for _, ref := range found {
-				if !strings.Contains(ref.Path, stagehandRunPlaceholder) {
-					refs = append(refs, ref)
-					continue
-				}
-				// filepath.Clean has already applied any literal "..": a path
-				// that left <state>/runs is reported, not folded.
-				if !core.PathWithin(ref.Path, runsDir) {
-					noteUnreadable(report, fmt.Sprintf("stagehand pipeline %s builds a path outside its run directory: %s", file, ref.Path))
-					continue
-				}
-				ref.Path, ref.Subtree = runsDir, true
-				refs = append(refs, ref)
-			}
+			refs = append(refs, stagehandSpecRefs(content, "used by stagehand pipeline "+file, runtime, runsDir, dir, file, report)...)
 		}
+	}
+	refs = append(refs, gatherStagehandDatabase(ctx, opts, report, runtime, runsDir)...)
+	return refs
+}
+
+// gatherStagehandDatabase reads every pipeline registered in stagehand's
+// database, enabled or not: its stored spec, and its source_dir (the
+// directory it was added from). Pipelines can be added from anywhere, so the
+// spec directory alone does not list them all. A missing database is
+// skipped; one that cannot be read leaves this source unknown.
+func gatherStagehandDatabase(ctx context.Context, opts *Options, report *core.CollectorReport, runtime map[string]string, runsDir string) []Reference {
+	state := opts.ServiceSources.StagehandStateDir
+	if state == "" {
+		return nil
+	}
+	if !filepath.IsAbs(state) {
+		noteUnreadable(report, fmt.Sprintf("stagehand state directory %q is not absolute", state))
+		return nil
+	}
+	path := filepath.Join(state, "stagehand.db")
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		noteUnreadable(report, fmt.Sprintf("could not stat %s: %v", path, err))
+		return nil
+	}
+	uri := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&_pragma=query_only(1)"}).String()
+	db, err := sql.Open("sqlite", uri)
+	if err != nil {
+		noteUnreadable(report, fmt.Sprintf("could not open %s: %v", path, err))
+		return nil
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, `SELECT name, CAST(spec_yaml AS TEXT), COALESCE(source_dir, '') FROM pipelines`)
+	if err != nil {
+		noteUnreadable(report, fmt.Sprintf("could not read stagehand pipelines: %v", err))
+		return nil
+	}
+	defer rows.Close()
+	var refs []Reference
+	for rows.Next() {
+		var name, spec, source string
+		if err := rows.Scan(&name, &spec, &source); err != nil {
+			noteUnreadable(report, fmt.Sprintf("could not read a stagehand pipeline: %v", err))
+			return refs
+		}
+		report.Visited++
+		detail := "used by stagehand pipeline " + name
+		if filepath.IsAbs(source) {
+			refs = append(refs, Reference{Path: filepath.Clean(source), Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: "stagehand_path", Detail: detail + " (source_dir)"})
+		} else if source != "" {
+			noteUnreadable(report, fmt.Sprintf("stagehand pipeline %s has a relative source_dir %q", name, source))
+		}
+		refs = append(refs, stagehandSpecRefs(spec, detail, runtime, runsDir, source, "stagehand pipeline "+name, report)...)
+	}
+	if err := rows.Err(); err != nil {
+		noteUnreadable(report, fmt.Sprintf("could not read stagehand pipelines: %v", err))
+	}
+	return refs
+}
+
+// stagehandFileKeys are stagehand spec fields that name a file and that
+// stagehand resolves against the pipeline's source directory when relative.
+var stagehandFileKeys = map[string]bool{"prompt_file": true, "env_file": true, "input_file": true, "schema_file": true}
+
+// stagehandSpecRefs extracts the references of one stagehand spec and folds
+// run-directory paths into <state>/runs (see gatherStagehand). A relative
+// file field (prompt_file, env_file, ...) is resolved against source, the
+// directory stagehand resolves it against; without an absolute source it is
+// unresolved. label names the spec in unreadable notes.
+func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, source, label string, report *core.CollectorReport) []Reference {
+	var refs []Reference
+	var docs []any
+	decoder := yaml.NewDecoder(strings.NewReader(spec))
+	for {
+		var one any
+		if err := decoder.Decode(&one); err != nil {
+			break
+		}
+		docs = append(docs, one)
+	}
+	// Stagehand reads these fields literally: no shell or variable
+	// expansion, so $, ` and a leading ~ are ordinary characters here.
+	walkConfigKeyedStrings(docs, "", func(key, value string) {
+		if !stagehandFileKeys[strings.ToLower(key)] || value == "" {
+			return
+		}
+		if filepath.IsAbs(value) {
+			refs = append(refs, Reference{Path: filepath.Clean(value), Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: "stagehand_path", Detail: detail + " (" + key + ")"})
+			return
+		}
+		if !filepath.IsAbs(source) {
+			noteUnreadable(report, fmt.Sprintf("%s: relative %s %q has no absolute source directory", label, key, value))
+			return
+		}
+		refs = append(refs, Reference{Path: filepath.Join(source, value), Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: "stagehand_path", Detail: detail + " (" + key + ")"})
+	})
+	found, unresolved, err := specPathReferences(spec, "stagehand_path", detail, runtime)
+	if err != nil {
+		noteUnreadable(report, fmt.Sprintf("could not parse %s: %v", label, err))
+		return refs
+	}
+	if len(unresolved) > 0 {
+		noteUnreadable(report, fmt.Sprintf("%s uses paths that cannot be resolved: %s", label, strings.Join(unresolved, " ")))
+	}
+	for _, ref := range found {
+		if !strings.Contains(ref.Path, stagehandRunPlaceholder) {
+			refs = append(refs, ref)
+			continue
+		}
+		// filepath.Clean has already applied any literal "..": a path
+		// that left <state>/runs is reported, not folded.
+		if !core.PathWithin(ref.Path, runsDir) {
+			noteUnreadable(report, fmt.Sprintf("%s builds a path outside its run directory: %s", label, ref.Path))
+			continue
+		}
+		ref.Path, ref.Subtree = runsDir, true
+		refs = append(refs, ref)
 	}
 	return refs
 }
