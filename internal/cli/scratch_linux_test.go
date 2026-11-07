@@ -741,3 +741,31 @@ func TestScratchRegenerableIdleHasAFloor(t *testing.T) {
 		t.Fatalf("10m regenerable_idle not rejected by the floor: %d %s %s", code, out, stderr)
 	}
 }
+
+// Review of #174: a regenerable_idle that is withdrawn or raised after an
+// entry was selected must stop its deletion; the threshold is judged by
+// the policy loaded immediately before deletion.
+func TestScratchRegenerableIdleIsRecheckedBeforeDeletion(t *testing.T) {
+	for name, later := range map[string]string{"withdrawn": "", "raised": "    regenerable_idle: 6h\n"} {
+		t.Run(name, func(t *testing.T) {
+			x := newScratchFixture(t)
+			x.options = "    regenerable_idle: 2h\n"
+			x.write(t)
+			regen := x.entry(t, "go-build123", map[string]string{"b/c.a": "object\n"})
+			x.shift(t, 3*time.Hour)
+			saved := scratchBeforeDeletion
+			scratchBeforeDeletion = func() {
+				x.options = later
+				x.write(t)
+			}
+			defer func() { scratchBeforeDeletion = saved }()
+			report := x.mustCleanup(t, true)
+			if !exists(t, regen) {
+				t.Fatalf("deleted under a regenerable_idle %s mid-run", name)
+			}
+			if got := scratchStatus(t, report, "go-build123"); got.Status != scratchKept {
+				t.Fatalf("want kept, got %+v", got)
+			}
+		})
+	}
+}

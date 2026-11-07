@@ -393,7 +393,9 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 			report.set(candidate, scratchKept, "changed after it was observed; kept local")
 			continue
 		}
-		if idle := scratchNow().Sub(time.Unix(0, candidate.entry.NewestNS)); idle < scratch.IdleFor(candidate.regenerable) {
+		// Judge idleness by the freshly loaded policy: withdrawing or raising
+		// regenerable_idle (or idle) mid-run still stops the deletion.
+		if idle := scratchNow().Sub(time.Unix(0, candidate.entry.NewestNS)); idle < current.IdleFor(config.MatchesAny(candidate.entry.Name, current.Regenerable)) {
 			report.set(candidate, scratchKept, "no longer idle at deletion time")
 			continue
 		}
