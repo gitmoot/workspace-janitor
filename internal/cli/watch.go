@@ -45,6 +45,7 @@ type watchReport struct {
 	DiskAlerts      []diskAlert            `json:"disk_alerts,omitempty"`
 	Capacity        *core.CapacitySnapshot `json:"capacity,omitempty"`
 	CacheTrims      []cacheTrimReport      `json:"cache_trims,omitempty"`
+	ScratchCleanup  []scratchRunReport     `json:"scratch_cleanup,omitempty"`
 	Error           string                 `json:"error,omitempty"`
 }
 
@@ -164,6 +165,25 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 			<-trimming
 			if trimErr != nil && (err == nil || errors.Is(err, context.Canceled)) {
 				err = trimErr
+			}
+		}()
+	}
+	if scratchRegenerableConfigured(policy) {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		sweeping := make(chan struct{})
+		var sweepErr error
+		go func(ctx context.Context) {
+			defer close(sweeping)
+			if sweepErr = scratchRegenerableLoop(ctx, e, paths, policy); sweepErr != nil {
+				cancel()
+			}
+		}(ctx)
+		defer func() {
+			cancel()
+			<-sweeping
+			if sweepErr != nil && (err == nil || errors.Is(err, context.Canceled)) {
+				err = sweepErr
 			}
 		}()
 	}

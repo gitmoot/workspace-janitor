@@ -49,7 +49,13 @@ type ScratchRun struct {
 	ArchiveManifestSHA256 string    `json:"archive_manifest_sha256,omitempty"`
 	ArchivedEntries       []string  `json:"archived_entries"`
 	RecordedAt            time.Time `json:"recorded_at"`
+	// Kind is empty for a full sweep and ScratchRunRegenerable for a pass
+	// that only deletes regenerable entries. Each kind has its own cadence.
+	Kind string `json:"kind,omitempty"`
 }
+
+// ScratchRunRegenerable marks a run that only deleted regenerable entries.
+const ScratchRunRegenerable = "regenerable"
 
 // ScratchDeletion is the immutable receipt of one deleted scratch entry.
 type ScratchDeletion struct {
@@ -69,6 +75,12 @@ func (r ScratchRun) validate() error {
 	}
 	if (r.ArchiveManifest == "") != (r.ArchiveManifestSHA256 == "") || (r.ArchiveManifest == "") != (len(r.ArchivedEntries) == 0) {
 		return errors.New("store: a scratch run archive needs its manifest, checksum and entries together")
+	}
+	if r.Kind != "" && r.Kind != ScratchRunRegenerable {
+		return fmt.Errorf("store: unknown scratch run kind %q", r.Kind)
+	}
+	if r.Kind == ScratchRunRegenerable && r.ArchiveManifest != "" {
+		return errors.New("store: a regenerable scratch run archives nothing")
 	}
 	if r.ArchiveManifestSHA256 != "" && (len(r.ArchiveManifestSHA256) != 64 || strings.Trim(r.ArchiveManifestSHA256, "0123456789abcdef") != "") {
 		return errors.New("store: scratch run manifest_sha256 must be a lowercase SHA-256")
@@ -135,11 +147,12 @@ func (t *Tx) RecordScratchDeletion(ctx context.Context, d ScratchDeletion) error
 	return nil
 }
 
-// LastScratchRun returns the start of the newest recorded run of path, or
-// the zero time.
-func (t *Tx) LastScratchRun(ctx context.Context, path string) (time.Time, error) {
+// LastScratchRun returns the start of the newest recorded run of path and
+// kind ("" for full sweeps), or the zero time.
+func (t *Tx) LastScratchRun(ctx context.Context, path, kind string) (time.Time, error) {
 	var started sql.NullString
-	if err := t.tx.QueryRowContext(ctx, `SELECT MAX(started_at) FROM scratch_runs WHERE path = ?`, path).Scan(&started); err != nil {
+	if err := t.tx.QueryRowContext(ctx, `SELECT MAX(started_at) FROM scratch_runs
+		WHERE path = ? AND COALESCE(json_extract(document, '$.kind'), '') = ?`, path, kind).Scan(&started); err != nil {
 		return time.Time{}, fmt.Errorf("store: last scratch run: %w", err)
 	}
 	if !started.Valid {
@@ -221,11 +234,11 @@ func readScratch(ctx context.Context, dbPath string, fn func(*Tx) error) (bool, 
 
 // ReadLastScratchRun reads the newest run start of path read-only; see
 // readScratch.
-func ReadLastScratchRun(ctx context.Context, dbPath, path string) (time.Time, error) {
+func ReadLastScratchRun(ctx context.Context, dbPath, path, kind string) (time.Time, error) {
 	var last time.Time
 	_, err := readScratch(ctx, dbPath, func(tx *Tx) error {
 		var err error
-		last, err = tx.LastScratchRun(ctx, path)
+		last, err = tx.LastScratchRun(ctx, path, kind)
 		return err
 	})
 	return last, err

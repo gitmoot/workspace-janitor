@@ -220,6 +220,10 @@ workspace_archive_categories: []
 #     "deno*", "uv-*", "cargo*"]
 #   regenerable_idle: 2h          # optional shorter idle for regenerable entries;
 #                                 # minimum 1h; entries in use are kept either way
+#   regenerable_every: 1h         # optional: the watcher also runs a pass this
+#                                 # often that only deletes regenerable entries idle
+#                                 # for regenerable_idle (minimum 1h; needs
+#                                 # regenerable_idle); the full sweep keeps `every`
 #   archive:
 #     directory: /mnt/backup/janitor-scratch   # protected, outside every root
 #     expect_mount_source: backup.example:/export

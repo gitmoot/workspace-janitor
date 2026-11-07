@@ -36,6 +36,10 @@ type ScratchCleanup struct {
 	// shorter than Idle (build scratch such as go-build* is worthless once
 	// its build exits). An entry still in use is kept either way.
 	RegenerableIdle IdleDuration `yaml:"regenerable_idle" json:"regenerable_idle,omitempty"`
+	// RegenerableEvery, when set, also runs a pass between full sweeps that
+	// only deletes regenerable entries idle for RegenerableIdle. It may be
+	// as short as one hour; the full sweep keeps its own Every.
+	RegenerableEvery IdleDuration `yaml:"regenerable_every" json:"regenerable_every,omitempty"`
 	// Every is the shortest interval between two runs started by the cycle.
 	Every IdleDuration `yaml:"every" json:"every"`
 	// Skip and Regenerable are filepath.Match globs on the entry name.
@@ -157,6 +161,16 @@ func (p *Policy) validateScratchCleanup(errs *core.FieldErrors) {
 		}
 		if scratch.Idle.Duration() < minScratchInterval {
 			errs.Add(field+".idle", "must be at least %s, got %s", IdleDuration(minScratchInterval), scratch.Idle)
+		}
+		if e := scratch.RegenerableEvery.Duration(); e != 0 {
+			switch {
+			case e < minRegenerableIdle:
+				errs.Add(field+".regenerable_every", "must be at least %s, got %s", IdleDuration(minRegenerableIdle), scratch.RegenerableEvery)
+			case scratch.RegenerableIdle.Duration() == 0:
+				errs.Add(field+".regenerable_every", "requires regenerable_idle")
+			case len(scratch.Regenerable) == 0:
+				errs.Add(field+".regenerable_every", "requires regenerable patterns")
+			}
 		}
 		if r := scratch.RegenerableIdle.Duration(); r != 0 && r < minRegenerableIdle {
 			errs.Add(field+".regenerable_idle", "must be at least %s, got %s", IdleDuration(minRegenerableIdle), scratch.RegenerableIdle)
