@@ -20,7 +20,9 @@ build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY) ./cmd/janitor
 
 # The release artifact has no wall-clock metadata, VCS build stamp, or Go
-# build ID. Its version and commit are derived solely from the source commit.
+# build ID. Its version and commit are derived solely from the source commit:
+# ci-<commit12>, or RELEASE_TAG (vMAJOR.MINOR.PATCH) when that tag names
+# exactly the commit being built.
 # GNU binutils (readelf) and sha256sum are required on Linux.
 release-linux-amd64:
 	@set -eu; \
@@ -30,6 +32,16 @@ release-linux-amd64:
 	mkdir -p dist; \
 	commit=$$(git rev-parse --verify HEAD); \
 	version=ci-$$(printf '%s' "$$commit" | cut -c1-12); \
+	if [ -n "$${RELEASE_TAG:-}" ]; then \
+		if ! printf '%s' "$$RELEASE_TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+'; then \
+			echo "RELEASE_TAG must be vMAJOR.MINOR.PATCH, got $$RELEASE_TAG" >&2; exit 1; \
+		fi; \
+		tagged=$$(git rev-parse -q --verify "refs/tags/$$RELEASE_TAG^{commit}" || true); \
+		if [ "$$tagged" != "$$commit" ]; then \
+			echo "tag $$RELEASE_TAG does not name the commit being built ($$commit)" >&2; exit 1; \
+		fi; \
+		version=$$RELEASE_TAG; \
+	fi; \
 	flags="-s -w -buildid= -X $(PKG)/internal/buildinfo.version=$$version -X $(PKG)/internal/buildinfo.commit=$$commit"; \
 	export CGO_ENABLED=0 GOOS=linux GOARCH=amd64; \
 	go build -mod=readonly -trimpath -buildvcs=false -ldflags "$$flags" -o dist/janitor-linux-amd64 ./cmd/janitor; \

@@ -1,0 +1,61 @@
+name: release
+
+# Owner approval 2026-11-08: a pushed vMAJOR.MINOR.PATCH tag publishes a GitHub
+# release of the reproducible static linux/amd64 binary and its SHA256SUMS.
+# Only commits already on main are released; an existing release is never
+# replaced.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: publish ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: tag is vMAJOR.MINOR.PATCH on a commit already on main
+        run: |
+          printf '%s' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+'
+          commit="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
+          test "$commit" = "$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$commit" origin/main
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: build and verify reproducible static linux/amd64 artifact
+        run: make release-linux-amd64 RELEASE_TAG="$TAG"
+
+      - name: binary reports the tag
+        run: |
+          ./dist/janitor-linux-amd64 version | tee /dev/stderr | grep -Eq "^janitor ${TAG//./\\.} "
+
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" dist/janitor-linux-amd64 dist/SHA256SUMS \
+            --verify-tag --title "$TAG" \
+            --notes "Static linux/amd64 build of $(git rev-parse HEAD). Verify with: sha256sum -c SHA256SUMS"
