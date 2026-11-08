@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -95,25 +96,170 @@ const (
 	// KeepNewest newest versions present (owner, 2026-11-04: Mac admin work
 	// folders beyond the 3 newest versions).
 	CategoryVersionedWork WorkspaceArchiveCategoryKind = "versioned_work"
+	// CategoryOMPSessions selects idle OMP agent sessions in an
+	// ".../.omp/agent/sessions" root (owner, 2026-11-08). A unit is
+	// "<project>/<stem>": the session directory and its sibling
+	// "<stem>.jsonl", archived, quarantined, restored and expired together
+	// (a lone "<stem>.jsonl" is a unit by itself).
+	CategoryOMPSessions WorkspaceArchiveCategoryKind = "omp_sessions"
+	// CategoryGitmootJobLogs selects idle regular files directly inside a
+	// ".../.gitmoot/logs/jobs" root (owner, 2026-11-08).
+	CategoryGitmootJobLogs WorkspaceArchiveCategoryKind = "gitmoot_job_logs"
 )
+
+// stateRootShapes are the only raw runtime-state directory shapes a
+// category may use as a root, each for its own kind.
+var stateRootShapes = map[WorkspaceArchiveCategoryKind][]string{
+	CategoryOMPSessions:    {".omp", "agent", "sessions"},
+	CategoryGitmootJobLogs: {".gitmoot", "logs", "jobs"},
+}
+
+// StateStore reports whether the kind archives a raw runtime-state store
+// that is otherwise never archived by category (OMP sessions, Gitmoot job
+// logs). Only such a kind may name, and is restricted to, its exact root
+// shape.
+func (k WorkspaceArchiveCategoryKind) StateStore() bool {
+	_, ok := stateRootShapes[k]
+	return ok
+}
+
+// StateRootShape reports whether root is exactly the directory shape the
+// state-store kind k is approved for, such as "/root/.omp/agent/sessions",
+// with no other raw-state or credential component above it. Every other
+// kind, and every other shape, is false.
+func (k WorkspaceArchiveCategoryKind) StateRootShape(root string) bool {
+	shape, ok := stateRootShapes[k]
+	if !ok || !core.IsCanonicalPath(root) {
+		return false
+	}
+	parts := strings.Split(root, "/")
+	if len(parts) < len(shape)+2 || !slices.Equal(parts[len(parts)-len(shape):], shape) {
+		return false
+	}
+	return !rawStateOrCredentialPath(strings.Join(parts[:len(parts)-len(shape)], "/"))
+}
+
+// UnitDepth is how far below a category root its units lie: 2 for OMP
+// sessions ("<project>/<stem>"), 1 for every other kind.
+func (k WorkspaceArchiveCategoryKind) UnitDepth() int {
+	if k == CategoryOMPSessions {
+		return 2
+	}
+	return 1
+}
+
+// ompSessionLog is the transcript suffix of an OMP session.
+const ompSessionLog = ".jsonl"
+
+// UnitCompanion is the sibling archived and moved with the unit at path: an
+// OMP session directory's "<stem>.jsonl" (present or not). Everything else
+// has none.
+func (k WorkspaceArchiveCategoryKind) UnitCompanion(path string) string {
+	if k != CategoryOMPSessions || strings.HasSuffix(path, ompSessionLog) {
+		return ""
+	}
+	return path + ompSessionLog
+}
+
+// UnitMentions are the strings whose presence in a process's command line
+// or environment keeps the OMP session at path local: its path (which the
+// transcript path extends) and its session id, the text after the last '_'
+// of "<timestamp>_<id>". Other kinds rely on descriptors alone.
+func (k WorkspaceArchiveCategoryKind) UnitMentions(path string) []string {
+	if k != CategoryOMPSessions {
+		return nil
+	}
+	stem := strings.TrimSuffix(path, ompSessionLog)
+	mentions := []string{stem}
+	base := filepath.Base(stem)
+	if i := strings.LastIndexByte(base, '_'); i >= 0 && len(base)-i-1 >= 8 {
+		mentions = append(mentions, base[i+1:])
+	} else if len(base) >= 8 {
+		mentions = append(mentions, base)
+	}
+	return mentions
+}
+
+// ItemRoot is the root that holds path as one of the category's units: the
+// grandparent for OMP sessions, the parent otherwise. ok is false when that
+// directory is not one of the category's roots.
+func (c WorkspaceArchiveCategory) ItemRoot(path string) (string, bool) {
+	root := filepath.Dir(path)
+	if c.Kind.UnitDepth() == 2 {
+		root = filepath.Dir(root)
+	}
+	return root, slices.Contains(c.Roots, root)
+}
+
+// stateStoreUnit reports whether path lies at unit depth in a root of a
+// configured state-store category (an OMP session or a Gitmoot job log), and
+// that category's kind. The entry type is checked by the category run.
+func (p *Policy) stateStoreUnit(path string) (WorkspaceArchiveCategoryKind, bool) {
+	for _, category := range p.WorkspaceArchiveCategories {
+		if !category.Kind.StateStore() {
+			continue
+		}
+		if _, ok := category.ItemRoot(path); ok {
+			return category.Kind, true
+		}
+	}
+	return "", false
+}
+
+// GitmootJobLogRoots are the roots of configured gitmoot_job_logs
+// categories: the only places inside Gitmoot's protected home whose direct
+// regular files may be archived, quarantined and expired, each only through
+// its verified category archive.
+func (p *Policy) GitmootJobLogRoots() []string {
+	var roots []string
+	for _, category := range p.WorkspaceArchiveCategories {
+		if category.Kind == CategoryGitmootJobLogs {
+			roots = append(roots, category.Roots...)
+		}
+	}
+	return roots
+}
+
+// GitmootJobLog reports whether path lies directly inside a configured
+// gitmoot_job_logs root (the caller checks that it is a regular file).
+func (p *Policy) GitmootJobLog(path string) bool {
+	return slices.Contains(p.GitmootJobLogRoots(), filepath.Dir(path))
+}
+
+// ArchivedGitmootJobLog reports whether path is a Gitmoot job log that an
+// active category archive receipt binds: a pinned rule synthesized by
+// Janitor for exactly this path. Only such a log may leave Gitmoot's home.
+func (p *Policy) ArchivedGitmootJobLog(path string) bool {
+	if !p.GitmootJobLog(path) {
+		return false
+	}
+	for _, rule := range p.WorkspaceArchives {
+		if rule.Path == path && strings.HasPrefix(rule.Owner, CategoryOwnerPrefix) && rule.LocalExpiryEnabled {
+			return true
+		}
+	}
+	return false
+}
 
 // DefaultIdle is the idle period used when a category sets none.
 func (k WorkspaceArchiveCategoryKind) DefaultIdle() time.Duration {
 	if k == CategoryVersionedWork {
 		return day
 	}
-	if k == CategoryMergedWorktrees {
+	if k == CategoryMergedWorktrees || k.StateStore() {
 		return 14 * 24 * time.Hour
 	}
 	return 30 * 24 * time.Hour
 }
 
 // MinIdle is the shortest idle period the owner approved for the kind
-// (owner, 2026-10-29: merged worktrees 7d, other kinds 14d).
+// (owner, 2026-10-29: merged worktrees 7d, other kinds 14d; 2026-11-08: OMP
+// sessions and Gitmoot job logs 1d, the guard of the owner's manual session
+// archives).
 func (k WorkspaceArchiveCategoryKind) MinIdle() time.Duration {
 	// Versioned work is selected by version, not age; one quiet day still
 	// keeps a folder that is being written right now.
-	if k == CategoryVersionedWork {
+	if k == CategoryVersionedWork || k.StateStore() {
 		return day
 	}
 	if k == CategoryMergedWorktrees {
@@ -125,7 +271,8 @@ func (k WorkspaceArchiveCategoryKind) MinIdle() time.Duration {
 // Valid reports whether k is a known category kind.
 func (k WorkspaceArchiveCategoryKind) Valid() bool {
 	switch k {
-	case CategoryMergedWorktrees, CategoryPushedClones, CategoryRootScratch, CategoryVersionedWork:
+	case CategoryMergedWorktrees, CategoryPushedClones, CategoryRootScratch, CategoryVersionedWork,
+		CategoryOMPSessions, CategoryGitmootJobLogs:
 		return true
 	}
 	return false
@@ -212,16 +359,20 @@ func (p *Policy) WorkspaceArchiveCategory(name string) (WorkspaceArchiveCategory
 // report-only roots, configured roots and other cleanup or archive scopes it
 // overlaps, and raw runtime/credential stores. Live evidence (processes,
 // Git, Gitmoot, services) is checked separately by the collectors and the
-// safety engine.
+// safety engine. The only raw-state paths a category may archive are the
+// units of an omp_sessions or gitmoot_job_logs root; a Gitmoot job log is
+// also exempt from Gitmoot's own home protection, and from nothing else.
 func (p *Policy) CategoryArchiveRefusals(path string) []string {
 	var out []string
 	if !core.IsCanonicalPath(path) || path == "/" {
 		return []string{fmt.Sprintf("%q is not a canonical directory path", path)}
 	}
+	stateKind, stateUnit := p.stateStoreUnit(path)
+	gitmootLog := stateUnit && stateKind == CategoryGitmootJobLogs
 	if strings.HasPrefix(filepath.Base(path), ".") {
 		out = append(out, "dot-named entries are tool or configuration state, never category items")
 	}
-	if rawStateOrCredentialPath(path) {
+	if !stateUnit && rawStateOrCredentialPath(path) {
 		out = append(out, "raw runtime/session stores and credential containers are never archived by category")
 	}
 	for _, keep := range p.WorkspaceArchiveKeep {
@@ -230,6 +381,9 @@ func (p *Policy) CategoryArchiveRefusals(path string) []string {
 		}
 	}
 	for _, protected := range p.Protect.Paths {
+		if gitmootLog && protected == p.Gitmoot.Home {
+			continue
+		}
 		if core.PathsOverlap(path, protected) {
 			out = append(out, fmt.Sprintf("overlaps protect.paths entry %q", protected))
 		}
@@ -260,7 +414,10 @@ func (p *Policy) CategoryArchiveRefusals(path string) []string {
 		{"the quarantine directory", p.Retention.QuarantineDir},
 		{"Gitmoot's managed state", p.Gitmoot.Home},
 	} {
-		if scope.path != "" && core.PathsOverlap(path, scope.path) {
+		if scope.path == "" || gitmootLog && scope.path == p.Gitmoot.Home {
+			continue
+		}
+		if core.PathsOverlap(path, scope.path) {
 			out = append(out, "overlaps "+scope.what)
 		}
 	}
@@ -344,7 +501,7 @@ func (p *Policy) validateWorkspaceArchiveCategories(errs *core.FieldErrors) {
 			names[category.Name] = i
 		}
 		if !category.Kind.Valid() {
-			errs.Add(field+".kind", "must be merged_worktrees, pushed_clones, root_scratch or versioned_work, got %q", category.Kind)
+			errs.Add(field+".kind", "must be merged_worktrees, pushed_clones, root_scratch, versioned_work, omp_sessions or gitmoot_job_logs, got %q", category.Kind)
 		} else if category.Idle.Duration() < category.Kind.MinIdle() {
 			errs.Add(field+".idle", "must be at least %s for %s, got %s", IdleDuration(category.Kind.MinIdle()), category.Kind, category.Idle)
 		}
@@ -363,7 +520,7 @@ func (p *Policy) validateWorkspaceArchiveCategories(errs *core.FieldErrors) {
 		}
 		for j, root := range category.Roots {
 			rootField := fmt.Sprintf("%s.roots[%d]", field, j)
-			p.validateCategoryRoot(errs, rootField, root)
+			p.validateCategoryRoot(errs, rootField, root, category.Kind)
 			key := string(category.Kind) + "\x00" + root
 			if first, dup := kindRoots[key]; dup {
 				errs.Add(rootField, "duplicates workspace_archive_categories[%d]: one %s category per root", first, category.Kind)
@@ -398,11 +555,18 @@ func (p *Policy) validateWorkspaceArchiveCategories(errs *core.FieldErrors) {
 }
 
 // validateCategoryRoot requires an exact, mutable inventory root that is not
-// itself protected or kept.
-func (p *Policy) validateCategoryRoot(errs *core.FieldErrors, field, root string) {
+// itself protected or kept. A raw runtime-state root is refused, except the
+// exact store shape of an omp_sessions or gitmoot_job_logs kind; only a
+// Gitmoot job-log root may lie inside Gitmoot's own home protection.
+func (p *Policy) validateCategoryRoot(errs *core.FieldErrors, field, root string, kind WorkspaceArchiveCategoryKind) {
 	if !core.IsCanonicalPath(root) || root == "/" {
 		errs.Add(field, "must be a canonical absolute directory path other than /, got %q", root)
 		return
+	}
+	stateRoot := kind.StateRootShape(root)
+	if kind.StateStore() && !stateRoot {
+		shape := strings.Join(stateRootShapes[kind], "/")
+		errs.Add(field, "%s roots must be exactly a .../%s directory, got %q", kind, shape, root)
 	}
 	configured := false
 	for _, candidate := range p.Roots {
@@ -413,11 +577,17 @@ func (p *Policy) validateCategoryRoot(errs *core.FieldErrors, field, root string
 		if candidate.ReportOnly {
 			errs.Add(field, "is a report_only root")
 		}
+		if max(candidate.MaxDepth, 1) < kind.UnitDepth() {
+			errs.Add(field, "%s units lie %d levels below the root; its inventory root needs max_depth of at least %d", kind, kind.UnitDepth(), kind.UnitDepth())
+		}
 	}
 	if !configured {
 		errs.Add(field, "must be a configured inventory root, got %q", root)
 	}
 	for _, protected := range p.Protect.Paths {
+		if stateRoot && kind == CategoryGitmootJobLogs && protected == p.Gitmoot.Home {
+			continue
+		}
 		if core.PathWithin(root, protected) {
 			errs.Add(field, "lies inside protect.paths entry %q", protected)
 		}
@@ -427,7 +597,7 @@ func (p *Policy) validateCategoryRoot(errs *core.FieldErrors, field, root string
 			errs.Add(field, "lies inside workspace_archive_keep path %q", keep.Path)
 		}
 	}
-	if rawStateOrCredentialPath(root) {
+	if !stateRoot && rawStateOrCredentialPath(root) {
 		errs.Add(field, "raw runtime/session stores and credential containers cannot be category roots")
 	}
 }

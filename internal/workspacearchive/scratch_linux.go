@@ -130,7 +130,7 @@ func (s *ScratchDir) Unchanged(entry ScratchEntry) error {
 // dir can then be shown unused.
 func ScratchReferences(ctx context.Context, procRoot, dir string) (map[string]string, error) {
 	used := map[string]string{}
-	unknown, err := processReferences(ctx, procRoot, func(pid, label, target string) bool {
+	unknown, err := processReferences(ctx, procRoot, nil, func(pid, label, target string) bool {
 		if !core.PathWithin(target, dir) || target == dir {
 			return false
 		}
@@ -238,7 +238,7 @@ func (s *ScratchDir) CreateScratch(ctx context.Context, dest config.WorkspaceArc
 	if err = tarFile.Sync(); err != nil {
 		return m, nil, err
 	}
-	readback, err := verifyTar(ctx, tarFile, members, tarBytes)
+	readback, err := verifyTar(ctx, tarFile, tarLayout{members: members}, tarBytes)
 	if err != nil {
 		return m, nil, err
 	}
@@ -420,7 +420,7 @@ func CheckScratch(ctx context.Context, dest config.WorkspaceArchiveCategoryDesti
 	}
 	defer root.Close()
 	defer tarFile.Close()
-	readback, err := verifyTar(ctx, tarFile, m.Members, m.TarBytes)
+	readback, err := verifyTar(ctx, tarFile, tarLayout{members: m.Members}, m.TarBytes)
 	if err != nil {
 		return m, err
 	}
@@ -485,7 +485,7 @@ func RestoreScratch(ctx context.Context, dest config.WorkspaceArchiveCategoryDes
 		return m, err
 	}
 	defer stage.Close()
-	readback, err := readTar(ctx, tarFile, m.Members, m.TarBytes, func(member Member, content io.Reader) error {
+	readback, err := readTar(ctx, tarFile, tarLayout{members: m.Members}, m.TarBytes, func(member Member, _ bool, content io.Reader) error {
 		if member.Path != entry && !strings.HasPrefix(member.Path, entry+"/") {
 			_, err := io.Copy(io.Discard, content)
 			return err

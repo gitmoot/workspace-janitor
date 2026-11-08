@@ -40,10 +40,13 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 				if core.PathWithin(rule.Path, original) {
 					addProtection(&entries[i], core.Protection{Kind: core.ProtectDurableEvidence, Source: core.SourcePolicy, Blocking: true, Reason: "contains a released workspace; only its exact verified archive binding may expire it"})
 				}
+				if rule.Companion != "" && original == rule.Companion {
+					addProtection(&entries[i], core.Protection{Kind: core.ProtectDurableEvidence, Source: core.SourcePolicy, Blocking: true, Reason: fmt.Sprintf("companion of released unit %s; it moves only with it", rule.Path)})
+				}
 				continue
 			}
-			protected := protectedExportPath(original, policy)
 			category := strings.HasPrefix(rule.Owner, config.CategoryOwnerPrefix)
+			protected := protectedArchivePath(original, entries[i].Kind, category, policy)
 			for _, protection := range entries[i].Protections {
 				if category && protection.Kind == core.ProtectArchiveOnlyRoot {
 					continue // lifted below only if the archive exactly binds
@@ -95,8 +98,8 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 				ref.Detail = "archive binding deferred: this scan's binding budget is spent; a later scan binds it"
 			case item.protected:
 				ref.Detail = "existing protection prevents binding or expiring this released workspace"
-			case item.kind != core.EntryKindDirectory:
-				ref.Detail = "only an ordinary released directory may expire; symlinks and other types remain protected"
+			case item.kind != core.EntryKindDirectory && item.kind != core.EntryKindFile:
+				ref.Detail = "only an ordinary released directory or regular file may expire; symlinks and other types remain protected"
 			case !rule.LocalExpiryEnabled:
 				ref.Detail = "local expiry is disabled; the released workspace remains retained"
 			default:
@@ -155,6 +158,21 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 		report.Recorded++
 	}
 	return report
+}
+
+// protectedArchivePath is protectedExportPath for a workspace archive rule's
+// own path. A category's Gitmoot job log (a regular file directly in a
+// gitmoot_job_logs root) is exempt from Gitmoot's home entry alone; every
+// other protected path and name pattern still holds it.
+func protectedArchivePath(path string, kind core.EntryKind, category bool, policy *config.Policy) bool {
+	if !category || kind != core.EntryKindFile || !policy.GitmootJobLog(path) {
+		return protectedExportPath(path, policy)
+	}
+	trimmed := *policy
+	trimmed.Protect.Paths = slices.DeleteFunc(slices.Clone(policy.Protect.Paths), func(protected string) bool {
+		return protected == policy.Gitmoot.Home
+	})
+	return protectedExportPath(path, &trimmed)
 }
 
 // bindingBudget is when workspace archive binding stops starting new work:

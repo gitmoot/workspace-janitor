@@ -586,9 +586,9 @@ Binding is full before the quarantine move and before expiry.
 | Field | Contract |
 | --- | --- |
 | `name` | Unique; 1-48 letters, digits, `_` or `-`. Item archives are named `<name>-<base>-<hash12>` (hash of path and run). |
-| `kind` | `merged_worktrees` (linked Git worktree), `pushed_clones` (standalone non-bare checkout) or `root_scratch` (no `.git` at the item root). One category per kind and root. |
-| `roots` | Exact configured inventory roots. A root may not be `report_only`, inside `protect.paths`, or inside a `workspace_archive_keep` path. Only depth-1 entries are candidates. |
-| `idle` | Minimum age of the newest modification anywhere in the tree, measured by a bounded deep walk of that item alone (see below). Use `Nd` or Go syntax. Defaults: `14d` for `merged_worktrees`, `30d` otherwise. Shortest accepted: `7d` for `merged_worktrees`, `14d` otherwise. |
+| `kind` | `merged_worktrees` (linked Git worktree), `pushed_clones` (standalone non-bare checkout), `root_scratch` (no `.git` at the item root), `versioned_work` (see above), `omp_sessions` or `gitmoot_job_logs` (see [below](#omp-sessions-and-gitmoot-job-logs)). One category per kind and root. |
+| `roots` | Exact configured inventory roots. A root may not be `report_only`, inside `protect.paths`, or inside a `workspace_archive_keep` path. Only depth-1 entries are candidates (for `omp_sessions`, depth-2 sessions). |
+| `idle` | Minimum age of the newest modification anywhere in the tree, measured by a bounded deep walk of that item alone (see below). Use `Nd` or Go syntax. Defaults: `1d` for `versioned_work`, `14d` for `merged_worktrees`, `omp_sessions` and `gitmoot_job_logs`, `30d` otherwise. Shortest accepted: `1d` for `versioned_work`, `omp_sessions` and `gitmoot_job_logs`, `7d` for `merged_worktrees`, `14d` otherwise. |
 | `archive.directory`, `expect_mount_source`, `expect_fstype` | Same approval rules as `workspace_archives` destinations. The directory must also be outside every inventory root. |
 | `local_retention` | `none`, `30d` (default) or `90d`, measured from archive creation. `none` proposes quarantine as soon as the verified archive binds the local tree. The quarantine retention (`retention.default`) still applies before deletion, and deletion still re-binds the quarantined copy. |
 | `max_items_per_cycle` | Default 20, at most 200. Extra candidates are `deferred`, oldest first. |
@@ -652,6 +652,50 @@ categories are configured, so `local_retention: none` items can be
 auto-quarantined in that cycle. Item failures are reported in
 `category_archives` and fail the cycle only after quarantine and expiry have
 run. See [recovery](recovery.md#category-archive-items).
+
+#### OMP sessions and Gitmoot job logs
+
+Raw runtime stores (`.omp`, `.gitmoot`, `.claude`, `.codex`, credential
+directories) are never category roots, with two owner-approved exceptions, each
+for its own kind and its exact store only:
+
+- `omp_sessions`: the root must be exactly a `.../.omp/agent/sessions`
+  directory (not `.omp/agent`, `.omp/run/daemons` or anything else), with no
+  other raw-state or credential component above it, and its inventory root
+  needs `max_depth: 2`. A unit is one session, `<project>/<session>`: the
+  session directory **and** its sibling transcript `<session>.jsonl`. Both are
+  archived in one tar, bound together, quarantined together (the transcript
+  follows the directory to `<receipt>/item.jsonl`), restored together and
+  expired together; the transcript entry alone is never quarantined. A
+  transcript whose session directory is gone is a unit by itself; it loses
+  expiry authority once a directory with its stem exists again. Idle is the
+  newest mtime across the directory tree and the transcript.
+- `gitmoot_job_logs`: the root must be exactly a `.../.gitmoot/logs/jobs`
+  directory. A unit is each regular file directly inside it. Inside Gitmoot's
+  home, such a log is exempt from the Gitmoot-home protection only; every
+  other protection applies, and the plan keeps it unless an active category
+  archive binds it. A Gitmoot ledger reference to the exact log path still
+  keeps it.
+
+Every other kind still refuses these roots. Besides every refusal above, a
+state-store unit is kept while any of these hold:
+
+- any process holds a descriptor, cwd, root, executable or mapped file in the
+  unit (for sessions, the directory tree or the transcript)
+- for `omp_sessions`: any process's command line or environment mentions the
+  session's path or its session id (the text after the last `_` of the
+  session name). A herdr pane or session that runs an agent on that session
+  carries one of these.
+- a `workspace_archive_keep` or `protect.paths` entry covers the unit or its
+  transcript
+- anything in it was written within `idle`
+
+Live-use checks fail closed: a process whose descriptors, maps, command line
+or environment cannot be read keeps every unit; an unreadable `/proc` refuses
+the run. The checks run at selection, before and after the copy, and again at
+the quarantine move and at expiry, for both the original and quarantined
+paths. The category run observes the sessions root one project directory at a
+time; a listing above `limits.max_dir_entries` refuses the run.
 
 ### Stale-workspace report
 

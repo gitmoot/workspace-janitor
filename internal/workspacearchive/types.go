@@ -1,6 +1,6 @@
 // Package workspacearchive stores copy-only, verified tar archives of released
-// directories. It never deletes the source or an archive; local removal stays
-// with the existing quarantine and expiry engine.
+// directories and files. It never deletes the source or an archive; local
+// removal stays with the existing quarantine and expiry engine.
 package workspacearchive
 
 import (
@@ -24,7 +24,8 @@ const (
 )
 
 // Member is one archived tree entry. Path is relative to the archived
-// directory; the directory itself is ".".
+// directory; the archived directory or file itself is ".". A companion's Path
+// is its base name.
 type Member struct {
 	Path       string `json:"path"`
 	Type       string `json:"type"`
@@ -48,7 +49,10 @@ type Bundle struct {
 	AdminLocked   bool   `json:"admin_locked"`
 }
 
-// Manifest is the durable receipt of one verified archive.
+// Manifest is the durable receipt of one verified archive. ContentBytes
+// includes the companion; Companion is the archived companion sibling
+// (rule.Companion), nil when the rule has none or it was absent, which
+// binding then requires.
 type Manifest struct {
 	Version          int                         `json:"version"`
 	Name             string                      `json:"name"`
@@ -65,6 +69,7 @@ type Manifest struct {
 	ReadbackSHA256   string                      `json:"readback_sha256"`
 	ContentBytes     int64                       `json:"content_bytes"`
 	Members          []Member                    `json:"members"`
+	Companion        *Member                     `json:"companion,omitempty"`
 	Bundle           *Bundle                     `json:"bundle,omitempty"`
 	CreatedAt        time.Time                   `json:"created_at"`
 	VerifiedAt       time.Time                   `json:"verified_at"`
@@ -95,7 +100,8 @@ type Scope struct {
 	Dependents *DependentIndex
 }
 
-// Inspection is the refusal-free result of the pre-archive checks.
+// Inspection is the refusal-free result of the pre-archive checks. Members
+// and ContentBytes include an archived companion.
 type Inspection struct {
 	Source         core.FilesystemID `json:"source"`
 	Members        int               `json:"members"`
@@ -112,10 +118,10 @@ func ManifestName(rule config.WorkspaceArchiveRule) string {
 	return rule.Name + ".manifest.json"
 }
 
-// RuleHash binds name, path, owner, release and destination. The pinned
-// receipt, dependent scan scope, live mount expectations and local expiry
-// settings are excluded: they are checked afresh and changing them does not
-// change the archive.
+// RuleHash binds name, path, companion, owner, release and destination. The
+// pinned receipt, dependent scan scope, live mount expectations, live
+// mentions and local expiry settings are excluded: they are checked afresh
+// and changing them does not change the archive.
 func RuleHash(rule config.WorkspaceArchiveRule) string {
 	data, _ := json.Marshal(archiveRule(rule))
 	sum := sha256.Sum256(data)
@@ -127,6 +133,7 @@ func archiveRule(rule config.WorkspaceArchiveRule) config.WorkspaceArchiveRule {
 	rule.Archive.ExpectMountSource, rule.Archive.ExpectFSType = "", ""
 	rule.DependentRoots = []string{}
 	rule.LocalRetention, rule.LocalExpiryEnabled = "", false
+	rule.Mentions = nil
 	return rule
 }
 

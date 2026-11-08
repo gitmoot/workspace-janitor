@@ -107,6 +107,9 @@ func (e *Engine) Eligible(ctx context.Context, item core.CleanupItem) error {
 	if err := e.originalReferences(ctx, item.Source); err != nil {
 		return err
 	}
+	if err := e.eligibleCompanion(ctx, item); err != nil {
+		return err
+	}
 	handle, err := safety.Open(item.Destination)
 	if err != nil {
 		return err
@@ -173,6 +176,10 @@ func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.Cleanu
 	// restore stopped before its journal write; Reconcile records it restored.
 	switch e.settleAbsent(item) {
 	case absentDeleted:
+		// Expiry may have stopped between the primary and its companion.
+		if err := removeLeftoverCompanion(item); err != nil {
+			return item, fmt.Errorf("remove leftover companion: %w", err)
+		}
 		item.State, item.UpdatedAt = core.CleanupDeleted, e.now()
 		item.Reason = "expiry had already deleted the quarantined object but not journaled it; recorded as deleted"
 		if err := e.update(ctx, item, core.CleanupQuarantined); err != nil {
@@ -191,11 +198,67 @@ func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.Cleanu
 	if err := deleteAnchored(item.Destination, item.Entry.FilesystemID); err != nil {
 		return item, err
 	}
+	// The companion goes after its primary. Stopping in between leaves an
+	// absent primary with this receipt's marker, which settleAbsent records
+	// as deleted after removing the leftover companion.
+	if suffix, id := companionOf(item); suffix != "" && !id.Zero() {
+		if err := deleteAnchored(item.Destination+suffix, id); err != nil {
+			return item, fmt.Errorf("delete companion: %w", err)
+		}
+	}
 	item.State, item.UpdatedAt = core.CleanupDeleted, e.now()
 	if err := e.update(ctx, item, core.CleanupQuarantined); err != nil {
 		return item, err
 	}
 	return item, nil
+}
+
+// eligibleCompanion applies the expiry guards to a bound companion as well:
+// new references to its original name keep it, and the quarantined copy
+// must still be the bound regular file (or still absent if it was recorded
+// absent).
+func (e *Engine) eligibleCompanion(ctx context.Context, item core.CleanupItem) error {
+	suffix, id := companionOf(item)
+	if suffix == "" {
+		return nil
+	}
+	if err := e.originalReferences(ctx, item.Source+suffix); err != nil {
+		return fmt.Errorf("companion: %w", err)
+	}
+	path := item.Destination + suffix
+	info, err := os.Lstat(path)
+	if id.Zero() {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("companion was recorded absent but %s exists or cannot be inspected: %v", path, err)
+	}
+	if err != nil || !info.Mode().IsRegular() || !identityMatches(info, id) {
+		return fmt.Errorf("quarantined companion %s is not the bound regular file: %v", path, err)
+	}
+	return nil
+}
+
+// removeLeftoverCompanion finishes an expiry that deleted the primary but
+// stopped before its companion. It removes only the bound companion
+// identity, never anything else at that name.
+func removeLeftoverCompanion(item core.CleanupItem) error {
+	suffix, id := companionOf(item)
+	if suffix == "" || id.Zero() {
+		return nil
+	}
+	path := item.Destination + suffix
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !identityMatches(info, id) {
+		return nil
+	}
+	return deleteAnchored(path, id)
 }
 
 // absentOutcome is what an expired receipt's missing object turned out to be.

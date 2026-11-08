@@ -49,7 +49,12 @@ func collectGitmoot(ctx context.Context, opts *Options, entries []core.Entry, no
 		}
 	}
 	for i := range entries {
-		managed[i] = core.PathWithin(entries[i].Path, opts.GitmootHome)
+		// A job log of an approved gitmoot_job_logs root is a plain file
+		// Gitmoot no longer manages; the category's own live, idle and
+		// archive checks decide it. A ledger reference to its exact path
+		// still marks it below.
+		jobLog := opts.WorktreePolicy != nil && entries[i].Kind == core.EntryKindFile && opts.WorktreePolicy.GitmootJobLog(entries[i].Path)
+		managed[i] = core.PathWithin(entries[i].Path, opts.GitmootHome) && !jobLog
 	}
 	mark := func(entry *core.Entry, signal, detail string, unknown bool) {
 		if unknown {

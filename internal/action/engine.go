@@ -155,15 +155,7 @@ func (e *Engine) Quarantine(ctx context.Context, item core.CleanupItem) (core.Cl
 	if !verdict.Allows(item.Action.Kind) {
 		return item, fmt.Errorf("revalidation refused %s: %s", item.Source, verdict.Summary())
 	}
-	if err := absent(item.Destination); err != nil {
-		return item, err
-	}
-	if item.Entry.Git != nil && item.Entry.Git.WorktreeOf != "" {
-		err = MoveLinkedWorktree(ctx, item.Entry.Git.WorktreeOf, item.Source, item.Destination)
-	} else {
-		err = renameNoReplace(item.Source, item.Destination, handle.Identity())
-	}
-	if err != nil {
+	if err := e.moveUnit(ctx, item, handle.Identity()); err != nil {
 		return item, err
 	}
 	// Once renamed, never roll back on an error: recovery can identify this
@@ -177,9 +169,50 @@ func (e *Engine) Quarantine(ctx context.Context, item core.CleanupItem) (core.Cl
 	return e.finishMove(ctx, item)
 }
 
+// moveUnit renames the prepared object, and a bound companion before it, into
+// the receipt directory. The companion follows the primary: if the primary
+// did not move, the companion is moved back so the unit is never split.
+func (e *Engine) moveUnit(ctx context.Context, item core.CleanupItem, primary core.FilesystemID) error {
+	if err := absent(item.Destination); err != nil {
+		return err
+	}
+	suffix, companionID := companionOf(item)
+	companionMoved := false
+	if suffix != "" {
+		if err := absent(item.Destination + suffix); err != nil {
+			return fmt.Errorf("companion destination: %w", err)
+		}
+		if companionID.Zero() {
+			if err := absent(item.Source + suffix); err != nil {
+				return fmt.Errorf("companion was recorded absent: %w", err)
+			}
+		} else {
+			if err := renameNoReplace(item.Source+suffix, item.Destination+suffix, companionID); err != nil {
+				return fmt.Errorf("move companion: %w", err)
+			}
+			companionMoved = true
+		}
+	}
+	var err error
+	if item.Entry.Git != nil && item.Entry.Git.WorktreeOf != "" {
+		err = MoveLinkedWorktree(ctx, item.Entry.Git.WorktreeOf, item.Source, item.Destination)
+	} else {
+		err = renameNoReplace(item.Source, item.Destination, primary)
+	}
+	if err != nil && companionMoved && unmoved(item) {
+		if back := renameNoReplace(item.Destination+suffix, item.Source+suffix, companionID); back != nil {
+			return fmt.Errorf("%w; companion could not be moved back and is left in quarantine: %v", err, back)
+		}
+	}
+	return err
+}
+
 func (e *Engine) finishMove(ctx context.Context, item core.CleanupItem) (core.CleanupItem, error) {
 	if err := absent(item.Source); err != nil {
 		return item, fmt.Errorf("source reappeared after move: %w", err)
+	}
+	if err := companionMoved(item); err != nil {
+		return item, err
 	}
 	fresh, err := e.recollectReceipt(ctx, item.Destination, item.Source)
 	if err != nil {
@@ -254,9 +287,17 @@ func (e *Engine) Reconcile(ctx context.Context, item core.CleanupItem) (core.Cle
 	destinationPresent := dstErr == nil && identityMatches(dst, item.Entry.FilesystemID)
 	if item.State == core.CleanupPrepared {
 		if sourcePresent && errors.Is(dstErr, os.ErrNotExist) {
+			// A move that stopped between its companion and its primary is
+			// undone: the companion follows the primary back.
+			if err := followCompanion(item, item.Source); err != nil {
+				return e.investigate(ctx, item, companionReason(err))
+			}
 			return item, nil
 		}
 		if errors.Is(srcErr, os.ErrNotExist) && destinationPresent {
+			if err := followCompanion(item, item.Destination); err != nil {
+				return e.investigate(ctx, item, companionReason(err))
+			}
 			recovered, err := e.finishMove(ctx, item)
 			if err != nil {
 				return e.investigate(ctx, item, "post-move observation failed: "+err.Error())
@@ -265,13 +306,13 @@ func (e *Engine) Reconcile(ctx context.Context, item core.CleanupItem) (core.Cle
 		}
 		return e.investigate(ctx, item, "prepared move has conflicting or changed source and destination")
 	}
-	if errors.Is(srcErr, os.ErrNotExist) && destinationPresent {
-		return item, nil
-	}
 	// A different new object at the original path is an ordinary restore
 	// collision. Keep the quarantined receipt recoverable rather than
 	// promoting a harmless occupied source to an irreversible status.
-	if destinationPresent && srcErr == nil {
+	if destinationPresent && (srcErr == nil || errors.Is(srcErr, os.ErrNotExist)) {
+		if err := followCompanion(item, item.Destination); err != nil {
+			return e.investigate(ctx, item, companionReason(err))
+		}
 		return item, nil
 	}
 	if sourcePresent && errors.Is(dstErr, os.ErrNotExist) {
@@ -279,6 +320,11 @@ func (e *Engine) Reconcile(ctx context.Context, item core.CleanupItem) (core.Cle
 			if err := VerifyLinkedWorktree(ctx, item.Entry.Git.WorktreeOf, item.Source); err != nil {
 				return e.investigate(ctx, item, "restored Git registration is invalid")
 			}
+		}
+		// A restore that stopped between its primary and its companion is
+		// completed: the companion follows the primary home.
+		if err := followCompanion(item, item.Source); err != nil {
+			return e.investigate(ctx, item, companionReason(err))
 		}
 		item.State, item.UpdatedAt = core.CleanupRestored, e.now()
 		if err := e.update(ctx, item, core.CleanupQuarantined); err != nil {
@@ -334,6 +380,9 @@ func (e *Engine) Restore(ctx context.Context, item core.CleanupItem) (core.Clean
 					return item, err
 				}
 			}
+			if err := followCompanion(item, item.Source); err != nil {
+				return item, err
+			}
 			item.State, item.UpdatedAt = core.CleanupRestored, e.now()
 			if err := e.update(ctx, item, before); err != nil {
 				return item, err
@@ -344,6 +393,23 @@ func (e *Engine) Restore(ctx context.Context, item core.CleanupItem) (core.Clean
 	if err := absent(item.Source); err != nil {
 		return item, fmt.Errorf("occupied original source: %w", err)
 	}
+	// The companion comes home after its primary, so its name must be free
+	// before the primary moves: a unit is never restored half. Only the
+	// companion itself may already be there (an investigated split).
+	suffix, companionID := companionOf(item)
+	companionHome := false
+	if suffix != "" && !companionID.Zero() {
+		home, err := os.Lstat(item.Source + suffix)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+		case err == nil && identityMatches(home, companionID):
+			companionHome = true
+		case err == nil:
+			return item, fmt.Errorf("occupied companion source: %s is occupied", item.Source+suffix)
+		default:
+			return item, fmt.Errorf("occupied companion source: %w", err)
+		}
+	}
 	if err := sameFilesystem(item.Destination, filepath.Dir(item.Source)); err != nil {
 		return item, err
 	}
@@ -353,6 +419,19 @@ func (e *Engine) Restore(ctx context.Context, item core.CleanupItem) (core.Clean
 			return item, errors.New("investigated object disappeared or changed identity")
 		}
 		return e.investigate(ctx, item, "quarantined object disappeared or changed identity")
+	}
+	if suffix != "" {
+		companion, err := os.Lstat(item.Destination + suffix)
+		inPlace := errors.Is(err, os.ErrNotExist)
+		if !companionID.Zero() && !companionHome {
+			inPlace = err == nil && identityMatches(companion, companionID)
+		}
+		if !inPlace {
+			if before == core.CleanupInvestigate {
+				return item, errors.New("investigated companion disappeared or changed identity")
+			}
+			return e.investigate(ctx, item, "quarantined companion disappeared or changed identity")
+		}
 	}
 	if item.Entry.Git != nil && item.Entry.Git.WorktreeOf != "" {
 		if err := VerifyLinkedWorktree(ctx, item.Entry.Git.WorktreeOf, item.Destination); err != nil {
@@ -367,6 +446,11 @@ func (e *Engine) Restore(ctx context.Context, item core.CleanupItem) (core.Clean
 	}
 	if err := syncDir(filepath.Dir(item.Source)); err != nil {
 		return item, err
+	}
+	// Stopping here leaves the primary home and its companion in quarantine;
+	// Reconcile completes that restore by the same follow rule.
+	if err := followCompanion(item, item.Source); err != nil {
+		return item, fmt.Errorf("restored %s but not its companion: %w", item.Source, err)
 	}
 	item.State, item.UpdatedAt = core.CleanupRestored, e.now()
 	if err := e.update(ctx, item, before); err != nil {
@@ -408,4 +492,99 @@ func absent(path string) error {
 func within(path, root string) bool {
 	rel, err := filepath.Rel(root, path)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+// companionOf returns the suffix and identity of the companion bound with
+// the item's primary (an OMP session's "<stem>.jsonl"), or "" when the
+// primary moves alone. A zero identity means the companion was recorded
+// absent and must stay absent: there is nothing to move.
+func companionOf(item core.CleanupItem) (string, core.FilesystemID) {
+	if b := item.Entry.WorkspaceArchive; b != nil && b.CompanionSuffix != "" {
+		return b.CompanionSuffix, b.CompanionID
+	}
+	return "", core.FilesystemID{}
+}
+
+// unmoved reports whether the primary is still exactly at its source and
+// its destination name is free.
+func unmoved(item core.CleanupItem) bool {
+	src, err := os.Lstat(item.Source)
+	return err == nil && identityMatches(src, item.Entry.FilesystemID) && absent(item.Destination) == nil
+}
+
+// followCompanion makes a bound companion follow its primary, which is now
+// at primary (item.Source or item.Destination): the companion belongs at
+// primary plus its suffix. If a move or restore stopped between the two, it
+// is moved there from the other location with an identity-checked
+// no-replace rename. Already in place is success. It never guesses: the
+// companion at both names, missing or replaced, or its place occupied by
+// something else is an error. A companion recorded absent must not appear
+// in quarantine.
+func followCompanion(item core.CleanupItem, primary string) error {
+	suffix, id := companionOf(item)
+	if suffix == "" {
+		return nil
+	}
+	if id.Zero() {
+		if err := absent(item.Destination + suffix); err != nil {
+			return fmt.Errorf("companion was recorded absent: %w", err)
+		}
+		return nil
+	}
+	other := item.Destination
+	if primary == item.Destination {
+		other = item.Source
+	}
+	target, from := primary+suffix, other+suffix
+	t, targetErr := os.Lstat(target)
+	o, fromErr := os.Lstat(from)
+	atTarget := targetErr == nil && identityMatches(t, id)
+	atOther := fromErr == nil && identityMatches(o, id)
+	switch {
+	case atTarget && atOther:
+		return fmt.Errorf("companion is linked at both %s and %s", target, from)
+	case atTarget:
+		return nil
+	case atOther && errors.Is(targetErr, os.ErrNotExist):
+		if err := renameNoReplace(from, target, id); err != nil {
+			return fmt.Errorf("move companion to %s: %w", target, err)
+		}
+		return nil
+	case atOther:
+		if targetErr == nil {
+			targetErr = fmt.Errorf("%s is occupied", target)
+		}
+		return fmt.Errorf("companion cannot follow its primary: %w", targetErr)
+	default:
+		return fmt.Errorf("companion %s disappeared or changed identity", target)
+	}
+}
+
+// companionReason is the investigation reason for a unit whose companion
+// could not be brought to its primary.
+func companionReason(err error) string {
+	return "companion did not follow its primary: " + err.Error()
+}
+
+// companionMoved is finishMove's companion check: it left its source and is
+// in quarantine with its bound identity, or stays absent if recorded absent.
+func companionMoved(item core.CleanupItem) error {
+	suffix, id := companionOf(item)
+	if suffix == "" {
+		return nil
+	}
+	if id.Zero() {
+		if err := absent(item.Destination + suffix); err != nil {
+			return fmt.Errorf("companion was recorded absent: %w", err)
+		}
+		return nil
+	}
+	if err := absent(item.Source + suffix); err != nil {
+		return fmt.Errorf("companion source reappeared after move: %w", err)
+	}
+	info, err := os.Lstat(item.Destination + suffix)
+	if err != nil || !identityMatches(info, id) {
+		return fmt.Errorf("moved companion is missing or changed identity; investigate receipt: %v", err)
+	}
+	return nil
 }

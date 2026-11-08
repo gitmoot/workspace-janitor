@@ -95,8 +95,12 @@ func proposals(entry core.Entry, class Classification, policy config.Policy, ver
 		})
 	}
 
+	// A Gitmoot job log bound by its own category archive is the one entry
+	// inside Gitmoot's home that home protection does not keep; any other
+	// protected path, and every safety protection, still does.
+	jobLog := entry.Kind == core.EntryKindFile && policy.ArchivedGitmootJobLog(entry.Path)
 	for _, protected := range policy.Protect.Paths {
-		if !core.PathsOverlap(entry.Path, protected) {
+		if !core.PathsOverlap(entry.Path, protected) || jobLog && protected == policy.Gitmoot.Home {
 			continue
 		}
 		out = append(out, Proposal{
@@ -105,7 +109,7 @@ func proposals(entry core.Entry, class Classification, policy config.Policy, ver
 			Reason:      fmt.Sprintf("%s overlaps the protected path %s", entry.Path, protected),
 		})
 	}
-	if policy.Gitmoot.Home != "" && core.PathsOverlap(entry.Path, policy.Gitmoot.Home) {
+	if policy.Gitmoot.Home != "" && core.PathsOverlap(entry.Path, policy.Gitmoot.Home) && !jobLog {
 		out = append(out, Proposal{
 			Rule: "policy.gitmoot_home", Tier: TierProtected, Kind: core.ActionKeep,
 			Specificity: len(policy.Gitmoot.Home),

@@ -82,7 +82,7 @@ func (r StaleReport) ArchivesReleases() bool {
 // ReleaseCategory is the archive category a released item of kind is
 // archived and bound under. It exists only while releases are archived.
 func (r StaleReport) ReleaseCategory(kind WorkspaceArchiveCategoryKind) (WorkspaceArchiveCategory, bool) {
-	if !r.ArchivesReleases() || !kind.Valid() {
+	if !r.ArchivesReleases() || !kind.Valid() || kind.StateStore() {
 		return WorkspaceArchiveCategory{}, false
 	}
 	return WorkspaceArchiveCategory{
@@ -210,7 +210,7 @@ func (p *Policy) validateStaleReport(errs *core.FieldErrors) {
 		if r.ReleaseAction == StaleReleaseArchive {
 			// Released items are archived from these roots: hold them to
 			// the category root rules.
-			p.validateCategoryRoot(errs, field, root)
+			p.validateCategoryRoot(errs, field, root, "")
 			continue
 		}
 		configured := false
