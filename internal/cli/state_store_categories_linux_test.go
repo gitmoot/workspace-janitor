@@ -364,3 +364,30 @@ func TestGitmootJobLogsArchiveOnlyIdleUnusedFiles(t *testing.T) {
 	}
 	absentPaths(t, expired, receipt.Destination)
 }
+
+// A job log that Gitmoot's ledger names is still Gitmoot's: the job-log
+// exemption from Gitmoot's home never covers a ledger reference, so it is
+// neither archived nor planned for removal.
+func TestGitmootJobLogNamedByTheLedgerStaysLocal(t *testing.T) {
+	x := newStateStoreFixture(t)
+	path := filepath.Join(x.jobs, "coordinator.log")
+	if err := os.WriteFile(path, []byte("job output\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backdate(t, path, categoryIdleAge)
+	db, err := sql.Open("sqlite", filepath.Join(x.gitmoot, "gitmoot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO jobs VALUES ('job-1', 'running', ?, '2026-01-01 00:00:00', 'coordinator')`, `{"worktree_path":"`+path+`"}`); err != nil {
+		t.Fatal(err)
+	}
+	item := categoryItem(t, x.categories(t, false), path)
+	if item.Status != categoryRefused || !strings.Contains(strings.Join(item.Reasons, ";"), "Gitmoot references") {
+		t.Fatalf("ledger-referenced job log not kept: %+v", item)
+	}
+	if entries, err := os.ReadDir(x.archive); err != nil || len(entries) != 0 {
+		t.Fatalf("a ledger-referenced job log was copied off-host: %v %v", entries, err)
+	}
+}

@@ -616,3 +616,23 @@ func TestUnreadableProcessEnvironmentFailsClosed(t *testing.T) {
 		t.Fatalf("Inspect with an exited process: %v", err)
 	}
 }
+
+// A procfs that cannot be listed proves nothing about live use: archiving
+// and binding both refuse rather than reading it as "no process".
+func TestUnlistableProcfsFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	f := sessionFixture(t, true)
+	f.rule.Mentions = []string{sessionID}
+	_, binding, err := Create(ctx, f.rule, f.scope, allow)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	f.rule = pin(f.rule, binding)
+	f.scope.ProcRoot = filepath.Join(f.home, "no-procfs")
+	if _, err := Inspect(ctx, f.rule, f.scope); err == nil || !strings.Contains(err.Error(), "live process check") {
+		t.Fatalf("Inspect = %v, want an unlistable procfs to refuse", err)
+	}
+	if _, err := Bind(ctx, f.rule, f.scope, f.source, true); err == nil || !strings.Contains(err.Error(), "live process check") {
+		t.Fatalf("Bind = %v, want an unlistable procfs to refuse", err)
+	}
+}
