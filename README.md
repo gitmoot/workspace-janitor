@@ -14,7 +14,8 @@ Operator guides: [threat model](docs/threat-model.md),
 [recovery and restore](docs/recovery.md),
 [contributing and security reporting](docs/contributing-security.md), and
 [Linux release-readiness checklist](docs/release-readiness.md). The checklist
-prepares an artifact; release and deployment require separate owner approval.
+prepares an artifact; a pushed `vX.Y.Z` tag publishes a GitHub release of it (see
+the checklist's GitHub releases section). Deployment requires separate owner approval.
 
 ## Status
 

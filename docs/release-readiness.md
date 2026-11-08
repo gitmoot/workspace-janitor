@@ -1,6 +1,6 @@
 # Linux release-readiness checklist
 
-This is a **preparation checklist**, not a release announcement or authorization. CI is intended to prepare `dist/janitor-linux-amd64` and `dist/SHA256SUMS` as an artifact; there is no GitHub release publication, deployment, live service, real provider call or credential use in this workflow. See [threat model](threat-model.md), [privacy](privacy.md), [recovery](recovery.md), and [contribution/security reporting](contributing-security.md).
+This is a **preparation checklist**, not a release announcement or authorization. CI prepares `dist/janitor-linux-amd64` and `dist/SHA256SUMS` as an artifact for every main commit and pull request; that workflow publishes nothing, deploys nothing, makes no real provider call and uses no credentials. Publication is the separate tag-triggered workflow described under [GitHub releases](#github-releases). See [threat model](threat-model.md), [privacy](privacy.md), [recovery](recovery.md), and [contribution/security reporting](contributing-security.md).
 
 ## Evidence to record for the exact candidate commit
 
@@ -11,7 +11,19 @@ This is a **preparation checklist**, not a release announcement or authorization
 - [ ] Review outbound `--jev-dry-run` projection with synthetic entries; ensure default policy makes no Jev request. Check recovery/restore, stale plan, concurrent writer, expiry and provider-prune safeguards against current code. Record limitations rather than converting an untested property into a claim.
 - [ ] Obtain an independent review of the **exact head commit** and resolve its findings; archive its approval and the final CI/artifact/checksum evidence with the candidate PR.
 
-**Owner approval hold:** preparing or uploading a CI artifact is not authorization to publish a release, deploy a binary/service/timer, invoke a live provider, enable Jev against a live endpoint, or use real credentials. Each remains held for explicit owner approval after the candidate evidence and exact-head review. Do not infer approval from a green CI job, an artifact download, or this checklist.
+**Owner approval hold:** preparing or uploading a CI artifact is not authorization to deploy a binary/service/timer, invoke a live provider, enable Jev against a live endpoint, or use real credentials. Each remains held for explicit owner approval after the candidate evidence and exact-head review. Do not infer approval from a green CI job, an artifact download, or this checklist.
+
+## GitHub releases
+
+The owner approved tag-triggered releases on 2026-11-08. Pushing a `vMAJOR.MINOR.PATCH` tag runs `.github/workflows/release.yml`, which:
+
+- refuses unless the tag names a commit already on `main`;
+- runs `go vet` and `go test`;
+- builds with `make release-linux-amd64 RELEASE_TAG=<tag>`, which stamps the tag as the version only when that tag names exactly the commit being built;
+- checks that `janitor version` prints the tag;
+- publishes `janitor-linux-amd64` and `SHA256SUMS` as the GitHub release for that tag, and never replaces an existing release.
+
+A release installs nothing anywhere. Installers pin the tag and the SHA-256 from `SHA256SUMS`, and verify with `sha256sum -c SHA256SUMS` before installing.
 
 ## Local scan measurement (candidate `8de643aaf33e`)
 
