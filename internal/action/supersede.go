@@ -98,11 +98,14 @@ func (e *Engine) withoutArchiveRulesAt(source string) *Engine {
 // would apply, against the copy's own names only: a process, gitdir,
 // alternates file or symlink reaching into the copy keeps it, or any that
 // cannot be examined. The rule's original names and its mentions (which are
-// derived from the original names) describe the original, which stays.
+// derived from the original names) describe the original, which stays. The
+// scope is the one binding uses (workspacearchive.BindingScope), so a
+// category rule searches through the shared dependent index under its own
+// bound, as its binding and ordinary expiry do.
 func (e *Engine) copyArchiveReferences(ctx context.Context, item core.CleanupItem) error {
+	var categoryDependents *workspacearchive.DependentIndex
 	for _, rule := range e.archiveRulesAt(item.Source) {
-		scope := workspacearchive.PolicyScope(*e.Collect.WorktreePolicy, rule)
-		scope.ProcRoot = e.Collect.ProcRoot
+		scope := workspacearchive.BindingScope(ctx, *e.Collect.WorktreePolicy, rule, e.Collect.ProcRoot, &categoryDependents)
 		if err := workspacearchive.LocalReferences(ctx, rule, scope, item.Destination); err != nil {
 			return fmt.Errorf("quarantined copy: %w", err)
 		}

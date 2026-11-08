@@ -151,3 +151,38 @@ func originalState(t *testing.T, root string) string {
 	}
 	return out.String()
 }
+
+// A category item's archive binds through the dependent index shared by the
+// whole category, bounded by limits.dependent_index_max_entries, not the
+// per-tree deep_size_max_entries. With inventory roots larger than the
+// per-tree bound but within the index bound, archiving, binding and
+// ordinary expiry fit; superseding the quarantined copy by an identical
+// original must search the same index, not fall back to a per-tree walk that
+// exceeds the smaller bound.
+func TestCategoryCopySupersededWithinDependentIndexBudget(t *testing.T) {
+	x := newCategoryFixture(t)
+	x.limits = "  deep_size_max_entries: 30\n"
+	x.write(t)
+	backdate(t, x.source, categoryIdleAge)
+	for i := range 8 {
+		backdate(t, x.scratch(t, fmt.Sprintf("scratch-%d", i), map[string]string{"a": "a\n", "b": "b\n", "c/d": "d\n"}), categoryIdleAge)
+	}
+	if item := categoryItem(t, x.categories(t, false), x.source); item.Status != categoryArchived {
+		t.Fatalf("category archive not created: %+v", item)
+	}
+	receipt := x.quarantine(t)
+	recreateIdentical(t, receipt.Destination, x.source)
+	before := originalState(t, x.source)
+
+	out, stderr, code := x.run(t, "apply", "--expire", "--cleanup", receipt.CleanupID, "--dry-run=false", "--confirm")
+
+	if code != ExitOK || !strings.Contains(out, "(superseded_by_original)") {
+		t.Fatalf("expiry: exit=%d %s %s", code, out, stderr)
+	}
+	if _, err := os.Lstat(receipt.Destination); !os.IsNotExist(err) {
+		t.Fatalf("superseded copy remains: %v", err)
+	}
+	if got := originalState(t, x.source); got != before {
+		t.Fatalf("expiry touched the original:\n%s\nwas\n%s", got, before)
+	}
+}

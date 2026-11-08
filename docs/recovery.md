@@ -42,9 +42,11 @@ applies (open descriptors, processes, Git state, protected names, mounts and
 its identity, apart from a workspace archive binding that the restore
 withdrew). A workspace archive rule still configured for the original path
 does not bind the copy; instead its live-process and external-dependent
-checks run against the copy's own names, so a process using only the
-original does not hold the copy, while one using the copy, or one that
-cannot be inspected, does. Just before removal both trees must still show, for every entry,
+checks run against the copy's own names (a category rule through its shared
+dependent index, bounded by `limits.dependent_index_max_entries`, as when it
+binds), so a process using only the original does not hold the copy, while
+one using the copy, or one that cannot be inspected, does. Just before
+removal both trees must still show, for every entry,
 the inode, change time and size the comparison saw. A unit with a bound
 companion is never superseded. Any other original (changed bytes, a symlink or
 file where a directory was, an unreadable entry, a tree changed meanwhile)
