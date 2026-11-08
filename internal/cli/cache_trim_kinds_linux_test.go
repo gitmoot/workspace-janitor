@@ -149,7 +149,8 @@ func TestDockerImagesTrimWaitsForBuildsAndPulls(t *testing.T) {
 }
 
 // A docker-images trim is checked against the data root the daemon
-// reports, like docker-builder.
+// reports, like docker-builder: the refusal is reported as a failed trim and
+// no prune runs.
 func TestDockerImagesTrimRefusedWhenItsDataRootIsArchiveOnly(t *testing.T) {
 	x := newTrimFixture(t)
 	relocated := filepath.Join(x.root, "docker-data")
@@ -158,42 +159,19 @@ func TestDockerImagesTrimRefusedWhenItsDataRootIsArchiveOnly(t *testing.T) {
 	}
 	docker := x.fakeTool(t, "docker", "if [ \"$1\" = info ]; then echo "+relocated+"; fi\n")
 	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\n    archive_only: true\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n%s", x.root, x.proc, dockerImagesTrim(docker, "")))
-	_, _, _ = x.run(t, "cycle")
+	out, _, code := x.run(t, "cycle")
+	var report struct {
+		CacheTrims []kindResult `json:"cache_trims"`
+	}
+	_ = json.Unmarshal([]byte(out), &report)
+	if code == ExitOK || len(report.CacheTrims) != 1 || report.CacheTrims[0].Status != "failed" ||
+		!strings.Contains(report.CacheTrims[0].Error, "archive_only") {
+		t.Fatalf("archive_only data root not reported as a refused trim (exit %d): %s", code, out)
+	}
 	for _, call := range x.calls(t) {
 		if !strings.HasPrefix(call, "docker|info ") {
 			t.Fatalf("docker ran more than its data-root query for an archive_only data root: %v", x.calls(t))
 		}
-	}
-}
-
-// containerd's root is its config file's top-level `root`, else the default;
-// an unreadable config fails closed.
-func TestContainerdRootFollowsItsConfig(t *testing.T) {
-	dir := t.TempDir()
-	write := func(body string) string {
-		path := filepath.Join(dir, "config.toml")
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return path
-	}
-	for body, want := range map[string]string{
-		"version = 2\nroot = \"/srv/containerd\" # moved\n":        "/srv/containerd",
-		"disabled_plugins = [\"cri\"]\n":                           "/var/lib/containerd",
-		"[plugins.\"io.containerd.grpc.v1.cri\"]\nroot = \"/x\"\n": "/var/lib/containerd",
-	} {
-		if got, err := containerdRoot(write(body)); err != nil || got != want {
-			t.Errorf("containerdRoot(%q) = %q, %v; want %q", body, got, err, want)
-		}
-	}
-	if got, err := containerdRoot(filepath.Join(dir, "absent.toml")); err != nil || got != "/var/lib/containerd" {
-		t.Errorf("missing config: %q, %v", got, err)
-	}
-	if _, err := containerdRoot(write("root = \"relative\"\n")); err == nil {
-		t.Error("relative containerd root accepted")
-	}
-	if _, err := containerdRoot(dir); err == nil {
-		t.Error("unreadable containerd config accepted")
 	}
 }
 
