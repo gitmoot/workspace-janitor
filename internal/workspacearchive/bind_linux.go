@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -154,8 +155,15 @@ func Bind(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope, lo
 // file must equal it in type, size, mode, owner, modification time and
 // SHA-256. The companion screens and the live process, mention and external
 // dependent checks are repeated for path and the rule's companion name.
-// VerifyCompanion never modifies anything.
-func VerifyCompanion(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope, path string) error {
+// VerifyCompanion never modifies anything. It returns the verified
+// manifest's creation time, from which local retention is measured.
+func VerifyCompanion(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope, path string) (time.Time, error) {
+	var created time.Time
+	err := verifyCompanion(ctx, rule, scope, path, &created)
+	return created, err
+}
+
+func verifyCompanion(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope, path string, created *time.Time) error {
 	if !core.IsCanonicalPath(path) || path == "/" {
 		return errors.New("local companion path must be a canonical absolute path")
 	}
@@ -209,6 +217,7 @@ func VerifyCompanion(ctx context.Context, rule config.WorkspaceArchiveRule, scop
 	if err := c.unchanged(parent); err != nil {
 		return fmt.Errorf("local companion changed while being verified; local changes would be lost: %w", err)
 	}
+	*created = m.CreatedAt
 	return nil
 }
 

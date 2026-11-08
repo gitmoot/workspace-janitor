@@ -255,11 +255,14 @@ func (e *Engine) receiptPolicy() safety.Policy {
 // expiry left behind its deleted primary to the expiry guards again before
 // removeLeftoverCompanion deletes it. Its identity alone is not enough: an
 // append keeps it. It must still equal the archived companion in every fact
-// and in content (workspacearchive.VerifyCompanion), no new reference may
-// name its original path, and a fresh, complete observation must be the
-// bound regular file allowed by every guard, at its receipt and at its
-// original name, apart from its unit protections (unitCompanion). Nothing
-// for removeLeftoverCompanion to delete is nil.
+// and in content (workspacearchive.VerifyCompanion), the bound rule's current
+// local expiry setting and retention must allow it exactly as binding would
+// (collect.LocalExpiryRefusal, measured from the verified manifest's
+// creation), no new reference may name its original path, and a fresh,
+// complete observation must be the bound regular file allowed by every
+// guard, at its receipt and at its original name, apart from its unit
+// protections (unitCompanion). Nothing for removeLeftoverCompanion to delete
+// is nil.
 func (e *Engine) eligibleLeftoverCompanion(ctx context.Context, item core.CleanupItem) error {
 	suffix, id := companionOf(item)
 	if suffix == "" || id.Zero() {
@@ -285,8 +288,14 @@ func (e *Engine) eligibleLeftoverCompanion(ctx context.Context, item core.Cleanu
 	}
 	scope := workspacearchive.PolicyScope(*e.Collect.WorktreePolicy, rule)
 	scope.ProcRoot = e.Collect.ProcRoot
-	if err := workspacearchive.VerifyCompanion(ctx, rule, scope, path); err != nil {
+	created, err := workspacearchive.VerifyCompanion(ctx, rule, scope, path)
+	if err != nil {
 		return err
+	}
+	// The archive hash excludes these settings: a retention raised or local
+	// expiry disabled after the interruption keeps the companion.
+	if refusal := collect.LocalExpiryRefusal(rule, created, e.now()); refusal != "" {
+		return errors.New(refusal)
 	}
 	fresh, err := e.recollectReceipt(ctx, path, source)
 	if err != nil {

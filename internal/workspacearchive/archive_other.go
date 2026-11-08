@@ -5,6 +5,7 @@ package workspacearchive
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -27,6 +28,6 @@ func Restore(context.Context, config.WorkspaceArchiveRule, string) (Manifest, er
 func Bind(context.Context, config.WorkspaceArchiveRule, Scope, string, bool) (*core.WorkspaceArchiveBinding, error) {
 	return nil, errUnsupported
 }
-func VerifyCompanion(context.Context, config.WorkspaceArchiveRule, Scope, string) error {
-	return errUnsupported
+func VerifyCompanion(context.Context, config.WorkspaceArchiveRule, Scope, string) (time.Time, error) {
+	return time.Time{}, errUnsupported
 }

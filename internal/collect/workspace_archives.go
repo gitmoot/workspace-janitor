@@ -101,7 +101,7 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 			case item.kind != core.EntryKindDirectory && item.kind != core.EntryKindFile:
 				ref.Detail = "only an ordinary released directory or regular file may expire; symlinks and other types remain protected"
 			case !rule.LocalExpiryEnabled:
-				ref.Detail = "local expiry is disabled; the released workspace remains retained"
+				ref.Detail = LocalExpiryRefusal(rule, time.Time{}, now)
 			default:
 				scope := workspacearchive.PolicyScope(*policy, rule)
 				scope.ProcRoot = opts.ProcRoot
@@ -118,8 +118,8 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 				switch {
 				case err != nil:
 					ref.Detail = fmt.Sprintf("verified workspace archive does not bind the local tree: %v", err)
-				case !rule.LocalRetention.Expired(binding.CreatedAt, now):
-					ref.Detail = "the local retention window measured from archive creation has not elapsed"
+				case LocalExpiryRefusal(rule, binding.CreatedAt, now) != "":
+					ref.Detail = LocalExpiryRefusal(rule, binding.CreatedAt, now)
 				default:
 					ref.Protection = ""
 					ref.WorkspaceArchive = binding
@@ -197,4 +197,19 @@ var BeforeWorkspaceArchiveBind func()
 // companion carries: it moves, restores and expires only with primary.
 func CompanionMarker(primary string) string {
 	return fmt.Sprintf("companion of released unit %s; it moves only with it", primary)
+}
+
+// LocalExpiryRefusal is why rule does not yet let its verified archive,
+// created at createdAt, stand in for the local copy at now: local expiry is
+// disabled, or the local retention measured from creation has not elapsed.
+// "" allows it. Binding and an interrupted expiry's leftover companion both
+// apply it, so the current policy decides even for an unchanged archive.
+func LocalExpiryRefusal(rule config.WorkspaceArchiveRule, createdAt, now time.Time) string {
+	switch {
+	case !rule.LocalExpiryEnabled:
+		return "local expiry is disabled; the released workspace remains retained"
+	case !rule.LocalRetention.Expired(createdAt, now):
+		return "the local retention window measured from archive creation has not elapsed"
+	}
+	return ""
 }

@@ -387,3 +387,27 @@ func interruptedCompanionExpiry(t *testing.T) (*Engine, core.CleanupItem) {
 	}
 	return e, item
 }
+
+// The archive hash leaves out local expiry settings, so an unchanged archive
+// still binds after the owner raises the retention or disables local expiry.
+// An interrupted expiry retried after that change must follow the current
+// policy, as the primary's binding would, and keep the leftover companion.
+func TestInterruptedExpiryFollowsTheCurrentLocalExpiryPolicy(t *testing.T) {
+	for name, change := range map[string]func(*config.WorkspaceArchiveRule){
+		"retention raised to 90d": func(rule *config.WorkspaceArchiveRule) { rule.LocalRetention = core.Retention90Days },
+		"local expiry disabled":   func(rule *config.WorkspaceArchiveRule) { rule.LocalExpiryEnabled = false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			e, item := interruptedCompanionExpiry(t)
+			change(&e.Collect.WorktreePolicy.WorkspaceArchives[0])
+			companion := item.Destination + ".jsonl"
+			item, err := e.Delete(context.Background(), item)
+			if err == nil || item.State != core.CleanupInvestigate || !strings.Contains(item.Reason, "leftover companion") {
+				t.Fatalf("retried expiry under a stricter local expiry policy: %+v %q %v, want the companion kept", item.State, item.Reason, err)
+			}
+			if id := idOf(t, companion); id != item.Entry.WorkspaceArchive.CompanionID {
+				t.Fatalf("leftover companion has identity %s", id)
+			}
+		})
+	}
+}
