@@ -669,7 +669,10 @@ for its own kind and its exact store only:
   expired together; the transcript entry alone is never quarantined. A
   transcript whose session directory is gone is a unit by itself; it loses
   expiry authority once a directory with its stem exists again. Idle is the
-  newest mtime across the directory tree and the transcript.
+  newest mtime across the directory tree and the transcript. An archived
+  session counts as unchanged only while its transcript is still present (or
+  still absent) with the size and mtime its archive recorded; a removed,
+  added or replaced transcript makes it a new unit, archived again once idle.
 - `gitmoot_job_logs`: the root must be exactly a `.../.gitmoot/logs/jobs`
   directory. A unit is each regular file directly inside it. Inside Gitmoot's
   home, such a log is exempt from the Gitmoot-home protection only; every

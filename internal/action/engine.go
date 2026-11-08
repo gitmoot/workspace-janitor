@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -170,8 +171,9 @@ func (e *Engine) Quarantine(ctx context.Context, item core.CleanupItem) (core.Cl
 }
 
 // moveUnit renames the prepared object, and a bound companion before it, into
-// the receipt directory. The companion follows the primary: if the primary
-// did not move, the companion is moved back so the unit is never split.
+// the receipt directory. The companion is revalidated immediately before its
+// rename and follows the primary: if the primary did not move, the companion
+// is moved back so the unit is never split.
 func (e *Engine) moveUnit(ctx context.Context, item core.CleanupItem, primary core.FilesystemID) error {
 	if err := absent(item.Destination); err != nil {
 		return err
@@ -187,6 +189,9 @@ func (e *Engine) moveUnit(ctx context.Context, item core.CleanupItem, primary co
 				return fmt.Errorf("companion was recorded absent: %w", err)
 			}
 		} else {
+			if err := e.revalidateCompanion(ctx, item, item.Source+suffix, companionID); err != nil {
+				return err
+			}
 			if err := renameNoReplace(item.Source+suffix, item.Destination+suffix, companionID); err != nil {
 				return fmt.Errorf("move companion: %w", err)
 			}
@@ -205,6 +210,28 @@ func (e *Engine) moveUnit(ctx context.Context, item core.CleanupItem, primary co
 		}
 	}
 	return err
+}
+
+// revalidateCompanion gives a bound companion the primary's mutation-time
+// check. Collection attaches cron, systemd, PM2, service, process and Git
+// references to the entry they name, so those on the companion are on its
+// own entry, never on the primary's verdict. A fresh, complete observation
+// must still be the bound regular file, and every guard must allow the move
+// apart from the protections it carries as part of the unit (unitCompanion).
+func (e *Engine) revalidateCompanion(ctx context.Context, item core.CleanupItem, path string, id core.FilesystemID) error {
+	fresh, err := e.recollect(ctx, path)
+	if err != nil {
+		return fmt.Errorf("companion revalidation refused %s: %w", path, err)
+	}
+	if fresh.Kind != core.EntryKindFile || fresh.FilesystemID != id {
+		return fmt.Errorf("companion revalidation refused %s: it is no longer the bound regular file", path)
+	}
+	target := safety.ResolveTarget(filepath.Dir(item.Destination))
+	verdict := safety.Evaluate(safety.Input{Entry: unitCompanion(fresh, item.Source), Policy: e.Policy, Target: &target, Now: e.now()})
+	if !verdict.Allows(item.Action.Kind) {
+		return fmt.Errorf("companion revalidation refused %s: %s", path, verdict.Summary())
+	}
+	return nil
 }
 
 func (e *Engine) finishMove(ctx context.Context, item core.CleanupItem) (core.CleanupItem, error) {
@@ -503,6 +530,23 @@ func companionOf(item core.CleanupItem) (string, core.FilesystemID) {
 		return b.CompanionSuffix, b.CompanionID
 	}
 	return "", core.FilesystemID{}
+}
+
+// unitCompanion drops the two collected protections a bound companion of
+// the unit at source carries as part of that unit rather than as evidence
+// about itself: the marker that it moves only with its primary
+// (collect.CompanionMarker), and an archive_only root, which
+// only the primary's exact verified category binding, covering the
+// companion, lifts. Its sibling primary lies in every archive_only root it
+// does, and the primary's own verdict is what authorizes the unit. Every
+// other protection still refuses.
+func unitCompanion(fresh core.Entry, source string) core.Entry {
+	marker := collect.CompanionMarker(source)
+	fresh.Protections = slices.DeleteFunc(slices.Clone(fresh.Protections), func(p core.Protection) bool {
+		return p.Kind == core.ProtectArchiveOnlyRoot ||
+			p.Kind == core.ProtectDurableEvidence && p.Source == core.SourcePolicy && p.Reason == marker
+	})
+	return fresh
 }
 
 // unmoved reports whether the primary is still exactly at its source and

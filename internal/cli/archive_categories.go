@@ -628,7 +628,20 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 				continue
 			}
 		}
-		if record, ok := recorded[entry.Path]; ok && record.Unchanged(entry.LatestModifiedAt) {
+		record, ok := recorded[entry.Path]
+		if ok && category.Kind.UnitCompanion(entry.Path) != "" && record.Unchanged(entry.LatestModifiedAt) {
+			// Removing or replacing a transcript changes its project
+			// directory, not the session: compare it with the archive's
+			// record before trusting the session's timestamps.
+			changed, err := companionChanged(ctx, policy, record, companion)
+			if err != nil {
+				item.Reasons = []string{"its archived transcript record could not be compared: " + err.Error()}
+				report.Items = append(report.Items, item)
+				continue
+			}
+			ok = !changed
+		}
+		if ok && record.Unchanged(entry.LatestModifiedAt) {
 			item.Status, item.Name = categoryAlreadyArchived, record.Name
 			follow := "its local retention and quarantine follow that archive"
 			if _, inactive := activeCategoryRule(policy, record); inactive != "" {
@@ -910,17 +923,41 @@ func runCategoryItemRestore(ctx context.Context, e *env, opts archiveOptions, fo
 		if record.Path != opts.categoryItem {
 			continue
 		}
-		// Mount expectations come from the category while it still names the
-		// same directory; they are never part of the archive's rule hash. The
-		// recorded kind decides the unit's companion, which is.
-		category, _ := policy.ArchiveCategory(record.Category, record.Kind)
-		if category.Archive.Directory != record.ArchiveDirectory {
-			category = config.WorkspaceArchiveCategory{Archive: config.WorkspaceArchiveCategoryDestination{Directory: record.ArchiveDirectory}}
-		}
-		category.Kind = config.WorkspaceArchiveCategoryKind(record.Kind)
-		rule := categoryRule(category, record.Name, record.Path, record.Owner, record.Release)
-		rule.Archive.Manifest, rule.Archive.ManifestSHA256 = record.Manifest, record.ManifestSHA256
+		rule := recordedRule(policy, record)
 		return runWorkspaceArchiveRule(ctx, e, opts, format, paths, policy, &rule)
 	}
 	return fmt.Errorf("no category archive receipt for %s", opts.categoryItem)
+}
+
+// recordedRule rebuilds the pinned rule a category receipt was archived
+// under. Mount expectations come from the category while it still names the
+// same directory; they are never part of the archive's rule hash. The
+// recorded kind decides the unit's companion, which is.
+func recordedRule(policy config.Policy, record store.CategoryArchive) config.WorkspaceArchiveRule {
+	category, _ := policy.ArchiveCategory(record.Category, record.Kind)
+	if category.Archive.Directory != record.ArchiveDirectory {
+		category = config.WorkspaceArchiveCategory{Archive: config.WorkspaceArchiveCategoryDestination{Directory: record.ArchiveDirectory}}
+	}
+	category.Kind = config.WorkspaceArchiveCategoryKind(record.Kind)
+	rule := categoryRule(category, record.Name, record.Path, record.Owner, record.Release)
+	rule.Archive.Manifest, rule.Archive.ManifestSHA256 = record.Manifest, record.ManifestSHA256
+	return rule
+}
+
+// companionChanged reports whether the unit's companion (observed now, nil
+// when absent) differs from the one its archive recorded: it appeared,
+// disappeared, or has another type, size or modification time.
+func companionChanged(ctx context.Context, policy config.Policy, record store.CategoryArchive, companion *core.Entry) (bool, error) {
+	m, _, err := workspacearchive.Check(ctx, recordedRule(policy, record), false)
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case m.Companion == nil || companion == nil:
+		return (m.Companion == nil) != (companion == nil), nil
+	case companion.Kind != core.EntryKindFile || m.Companion.Type != workspacearchive.TypeFile:
+		return true, nil
+	default:
+		return companion.SizeBytes != m.Companion.Size || companion.ModifiedAt.UnixNano() != m.Companion.ModifiedNS, nil
+	}
 }

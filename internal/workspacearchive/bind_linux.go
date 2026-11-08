@@ -147,6 +147,71 @@ func Bind(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope, lo
 	return binding, nil
 }
 
+// VerifyCompanion is Bind's companion half for a companion left at path
+// without its primary, as when an expiry stopped between deleting the two.
+// Its identity proves nothing about its bytes: an append keeps it. The
+// pinned archive must verify in full and record a companion, and the local
+// file must equal it in type, size, mode, owner, modification time and
+// SHA-256. The companion screens and the live process, mention and external
+// dependent checks are repeated for path and the rule's companion name.
+// VerifyCompanion never modifies anything.
+func VerifyCompanion(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope, path string) error {
+	if !core.IsCanonicalPath(path) || path == "/" {
+		return errors.New("local companion path must be a canonical absolute path")
+	}
+	if err := validCompanion(rule); err != nil {
+		return err
+	}
+	if rule.Companion == "" {
+		return errors.New("the workspace archive rule binds no companion")
+	}
+	for _, name := range []string{path, rule.Companion} {
+		if core.PathsOverlap(name, rule.Archive.Directory) {
+			return errors.New("archive directory must be outside the archived workspace")
+		}
+	}
+	if len(scope.SearchRoots) == 0 {
+		return errors.New("external dependent scan requires at least one search root")
+	}
+	m, root, tarFile, err := load(ctx, rule)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	defer tarFile.Close()
+	if err := verifyArchive(ctx, m, root, tarFile); err != nil {
+		return err
+	}
+	if m.Companion == nil {
+		return fmt.Errorf("the archive records the companion absent, so %s was never archived; local changes would be lost", path)
+	}
+	parent, err := openDirectory(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("local companion: %w", err)
+	}
+	defer parent.Close()
+	parentSt, err := fstate(parent)
+	if err != nil {
+		return err
+	}
+	c, err := observeCompanion(ctx, parent, path, scope.SensitiveNames, parentSt, true)
+	if err != nil {
+		return err
+	}
+	defer c.close()
+	if err := sameCompanion(c, m.Companion, true); err != nil {
+		return err
+	}
+	if err := scope.live(ctx, []string{path, rule.Companion}, rule.Mentions); err != nil {
+		return err
+	}
+	// The live checks take time; the companion must still be the one compared.
+	if err := c.unchanged(parent); err != nil {
+		return fmt.Errorf("local companion changed while being verified; local changes would be lost: %w", err)
+	}
+	return nil
+}
+
 // sameCompanion compares the local companion with the archive's record: a
 // recorded absence must persist, and a recorded file must be present and
 // equal in every fact sameMembers compares. Its name is the unit's, which

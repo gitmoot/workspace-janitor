@@ -41,7 +41,7 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 					addProtection(&entries[i], core.Protection{Kind: core.ProtectDurableEvidence, Source: core.SourcePolicy, Blocking: true, Reason: "contains a released workspace; only its exact verified archive binding may expire it"})
 				}
 				if rule.Companion != "" && original == rule.Companion {
-					addProtection(&entries[i], core.Protection{Kind: core.ProtectDurableEvidence, Source: core.SourcePolicy, Blocking: true, Reason: fmt.Sprintf("companion of released unit %s; it moves only with it", rule.Path)})
+					addProtection(&entries[i], core.Protection{Kind: core.ProtectDurableEvidence, Source: core.SourcePolicy, Blocking: true, Reason: CompanionMarker(rule.Path)})
 				}
 				continue
 			}
@@ -192,3 +192,9 @@ func bindingBudget(ctx context.Context) time.Time {
 // BeforeWorkspaceArchiveBind is a test seam called before each archive
 // bind, so a test can make binding slow. Nil outside tests.
 var BeforeWorkspaceArchiveBind func()
+
+// CompanionMarker is the reason of the blocking protection a bound unit's
+// companion carries: it moves, restores and expires only with primary.
+func CompanionMarker(primary string) string {
+	return fmt.Sprintf("companion of released unit %s; it moves only with it", primary)
+}

@@ -27,3 +27,6 @@ func Restore(context.Context, config.WorkspaceArchiveRule, string) (Manifest, er
 func Bind(context.Context, config.WorkspaceArchiveRule, Scope, string, bool) (*core.WorkspaceArchiveBinding, error) {
 	return nil, errUnsupported
 }
+func VerifyCompanion(context.Context, config.WorkspaceArchiveRule, Scope, string) error {
+	return errUnsupported
+}

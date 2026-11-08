@@ -105,9 +105,10 @@ func TestCompanionQuarantinesAndRestoresWithItsPrimary(t *testing.T) {
 	requireUnitAt(t, item, item.Source)
 }
 
-// The whole unit goes through Quarantine's mutation-time revalidation, whose
-// fresh archive binding pins the companion, and through expiry.
-func TestArchivedCompanionUnitQuarantinesAndExpiresTogether(t *testing.T) {
+// archivedCompanionFixture prepares an OMP-session-like unit whose pinned
+// archive, recording its companion, binds it for immediate local expiry.
+func archivedCompanionFixture(t *testing.T) (*Engine, core.CleanupItem, *time.Time) {
+	t.Helper()
 	e, root, clock := fixtureEngine(t)
 	ctx := context.Background()
 	source := filepath.Join(root, "session")
@@ -136,7 +137,15 @@ func TestArchivedCompanionUnitQuarantinesAndExpiresTogether(t *testing.T) {
 	if b := item.Entry.WorkspaceArchive; b == nil || b.CompanionSuffix != ".jsonl" || b.CompanionID != idOf(t, source+".jsonl") {
 		t.Fatalf("unit binding = %+v", b)
 	}
-	item, err = e.Quarantine(ctx, item)
+	return e, item, clock
+}
+
+// The whole unit goes through Quarantine's mutation-time revalidation, whose
+// fresh archive binding pins the companion, and through expiry.
+func TestArchivedCompanionUnitQuarantinesAndExpiresTogether(t *testing.T) {
+	e, item, clock := archivedCompanionFixture(t)
+	ctx := context.Background()
+	item, err := e.Quarantine(ctx, item)
 	if err != nil || item.State != core.CleanupQuarantined {
 		t.Fatalf("quarantine: %+v %v", item.State, err)
 	}
@@ -151,6 +160,23 @@ func TestArchivedCompanionUnitQuarantinesAndExpiresTogether(t *testing.T) {
 			t.Fatalf("%s survived expiry: %v", path, err)
 		}
 	}
+}
+
+// Collection puts a scheduler reference to the companion on the companion's
+// own entry, not on the primary's. Quarantine must revalidate the companion
+// too and refuse the whole unit.
+func TestQuarantineRefusesAUnitWhoseCompanionIsReferenced(t *testing.T) {
+	e, item, _ := archivedCompanionFixture(t)
+	crontab := filepath.Join(t.TempDir(), "crontab")
+	if err := os.WriteFile(crontab, []byte("*/5 * * * * /usr/bin/logger -f "+item.Source+".jsonl\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	e.Collect.ServiceSources.CronPaths = []string{crontab}
+	_, err := e.Quarantine(context.Background(), item)
+	if err == nil || !strings.Contains(err.Error(), "companion revalidation refused") || !strings.Contains(err.Error(), string(core.ProtectServiceReference)) {
+		t.Fatalf("quarantine of a unit with a referenced companion: %v", err)
+	}
+	requireUnitAt(t, item, item.Source)
 }
 
 // A companion moves first. If its primary then cannot move, the companion
@@ -306,17 +332,10 @@ func TestExpiryRefusesAChangedCompanion(t *testing.T) {
 }
 
 // Expiry deletes the primary, then the companion. A crash in between is
-// settled as deleted, removing the bound companion and nothing else.
+// settled as deleted, removing the bound companion and nothing else once it
+// still equals its archived copy.
 func TestExpiryFinishesTheCompanionOfAnInterruptedDeletion(t *testing.T) {
-	e, item, clock := companionFixture(t)
-	item = quarantineUnit(t, e, item)
-	*clock = clock.Add(31 * 24 * time.Hour)
-	if err := writeDeletionMarker(item); err != nil {
-		t.Fatal(err)
-	}
-	if err := deleteAnchored(item.Destination, item.Entry.FilesystemID); err != nil {
-		t.Fatal(err)
-	}
+	e, item := interruptedCompanionExpiry(t)
 	item, err := e.Delete(context.Background(), item)
 	if err != nil || item.State != core.CleanupDeleted {
 		t.Fatalf("interrupted expiry: %+v %v, want deleted", item.State, err)
@@ -324,4 +343,47 @@ func TestExpiryFinishesTheCompanionOfAnInterruptedDeletion(t *testing.T) {
 	if _, err := os.Lstat(item.Destination + ".jsonl"); !os.IsNotExist(err) {
 		t.Fatalf("leftover companion survived: %v", err)
 	}
+}
+
+// An append keeps the leftover companion's identity but adds bytes its
+// archive lacks: the retried expiry must keep it and investigate.
+func TestInterruptedExpiryKeepsAnAppendedLeftoverCompanion(t *testing.T) {
+	e, item := interruptedCompanionExpiry(t)
+	companion := item.Destination + ".jsonl"
+	f, err := os.OpenFile(companion, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("{\"type\":\"message\"}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	item, err = e.Delete(context.Background(), item)
+	if err == nil || item.State != core.CleanupInvestigate || !strings.Contains(item.Reason, "leftover companion") {
+		t.Fatalf("interrupted expiry of an appended companion: %+v %q %v, want investigate", item.State, item.Reason, err)
+	}
+	if id := idOf(t, companion); id != item.Entry.WorkspaceArchive.CompanionID {
+		t.Fatalf("leftover companion has identity %s", id)
+	}
+}
+
+// interruptedCompanionExpiry quarantines an archived unit and stops its
+// expiry between the primary and its companion.
+func interruptedCompanionExpiry(t *testing.T) (*Engine, core.CleanupItem) {
+	t.Helper()
+	e, item, clock := archivedCompanionFixture(t)
+	item, err := e.Quarantine(context.Background(), item)
+	if err != nil || item.State != core.CleanupQuarantined {
+		t.Fatalf("quarantine: %+v %v", item.State, err)
+	}
+	*clock = clock.Add(31 * 24 * time.Hour)
+	if err := writeDeletionMarker(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteAnchored(item.Destination, item.Entry.FilesystemID); err != nil {
+		t.Fatal(err)
+	}
+	return e, item
 }
