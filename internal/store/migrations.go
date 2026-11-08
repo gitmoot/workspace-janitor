@@ -374,6 +374,58 @@ var migrations = []migration{
 			 BEGIN SELECT RAISE(ABORT, 'scratch deletion receipts are immutable'); END`,
 		},
 	},
+	{
+		// SQLite cannot alter a CHECK constraint, so the journal table is
+		// rebuilt with the same columns, rows, indexes and triggers. The
+		// events' foreign key names cleanup_items: dropping it orphans every
+		// event, which deferred foreign keys count rather than refuse, and
+		// copying each row back into the new cleanup_items gives those events
+		// their parent again before commit checks. The rows are copied back
+		// before the triggers exist, so the rebuild records no events.
+		version: supersededCleanupVersion,
+		name:    "cleanup_superseded_state",
+		statements: []string{
+			`PRAGMA defer_foreign_keys = ON`,
+			`CREATE TABLE cleanup_items_previous AS SELECT * FROM cleanup_items`,
+			`DROP TABLE cleanup_items`,
+			`CREATE TABLE cleanup_items (
+				cleanup_id       TEXT NOT NULL,
+				plan_id          TEXT NOT NULL,
+				action_id        TEXT NOT NULL,
+				source           TEXT NOT NULL,
+				destination      TEXT NOT NULL,
+				state            TEXT NOT NULL CHECK (state IN ('prepared', 'quarantined', 'restored', 'deleted', 'investigate', 'superseded_by_original')),
+				entry_json       TEXT NOT NULL,
+				action_json      TEXT NOT NULL,
+				quarantined_json TEXT,
+				created_at       TEXT NOT NULL,
+				updated_at       TEXT NOT NULL,
+				moved_at         TEXT,
+				expires_at       TEXT,
+				reason           TEXT NOT NULL DEFAULT '',
+				PRIMARY KEY (cleanup_id, action_id)
+			)`,
+			`INSERT INTO cleanup_items SELECT cleanup_id, plan_id, action_id, source, destination, state,
+				entry_json, action_json, quarantined_json, created_at, updated_at, moved_at, expires_at, reason
+			 FROM cleanup_items_previous`,
+			`DROP TABLE cleanup_items_previous`,
+			`CREATE UNIQUE INDEX cleanup_items_active_source_idx ON cleanup_items(source)
+			 WHERE state IN ('prepared', 'quarantined', 'investigate')`,
+			`CREATE INDEX cleanup_items_cleanup_idx ON cleanup_items(cleanup_id, created_at, action_id)`,
+			`CREATE INDEX cleanup_items_pending_idx ON cleanup_items(state, updated_at)`,
+			`CREATE TRIGGER cleanup_items_insert_event AFTER INSERT ON cleanup_items
+			 BEGIN
+			   INSERT INTO cleanup_events (cleanup_id, action_id, from_state, to_state, occurred_at, reason)
+			   VALUES (NEW.cleanup_id, NEW.action_id, NULL, NEW.state, NEW.updated_at, NEW.reason);
+			 END`,
+			`CREATE TRIGGER cleanup_items_transition_event AFTER UPDATE OF state ON cleanup_items
+			 WHEN OLD.state != NEW.state
+			 BEGIN
+			   INSERT INTO cleanup_events (cleanup_id, action_id, from_state, to_state, occurred_at, reason)
+			   VALUES (NEW.cleanup_id, NEW.action_id, OLD.state, NEW.state, NEW.updated_at, NEW.reason);
+			 END`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.

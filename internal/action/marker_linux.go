@@ -15,11 +15,17 @@ import (
 const deletionMarkerName = "deleting"
 
 // markerContent binds a marker to one receipt: its action, the receipt
-// directory's own identity, and the object's identity.
-func markerContent(item core.CleanupItem, dir unix.Stat_t) []byte {
+// directory's own identity, and the object's identity. A removal that an
+// identical original supersedes also names that outcome; a deletion keeps
+// the format earlier releases wrote, so their markers still settle.
+func markerContent(item core.CleanupItem, dir unix.Stat_t, outcome core.CleanupState) []byte {
 	obj := item.Entry.FilesystemID
-	return []byte(fmt.Sprintf("%s dir=%d:%d object=%d:%d\n",
-		item.ActionID, uint64(dir.Dev), dir.Ino, obj.Device, obj.Inode))
+	content := fmt.Sprintf("%s dir=%d:%d object=%d:%d",
+		item.ActionID, uint64(dir.Dev), dir.Ino, obj.Device, obj.Inode)
+	if outcome == core.CleanupSuperseded {
+		content += " " + string(outcome)
+	}
+	return []byte(content + "\n")
 }
 
 // openReceiptDir opens the receipt directory without following a symlink and
@@ -39,10 +45,17 @@ func openReceiptDir(item core.CleanupItem) (int, unix.Stat_t, error) {
 	return fd, st, nil
 }
 
-// writeDeletionMarker records, inside the receipt directory that actually
-// holds the object, that expiry is about to delete it. It refuses unless that
-// directory, opened once, contains the recorded object.
+// writeDeletionMarker records that expiry is about to delete the object.
 func writeDeletionMarker(item core.CleanupItem) error {
+	return writeRemovalMarker(item, core.CleanupDeleted)
+}
+
+// writeRemovalMarker records, inside the receipt directory that actually
+// holds the object, that expiry is about to remove it with outcome
+// (CleanupDeleted or CleanupSuperseded); the latest attempt's marker
+// replaces an earlier one. It refuses unless that directory, opened once,
+// contains the recorded object.
+func writeRemovalMarker(item core.CleanupItem, outcome core.CleanupState) error {
 	dir, dirStat, err := openReceiptDir(item)
 	if err != nil {
 		return err
@@ -60,7 +73,7 @@ func writeDeletionMarker(item core.CleanupItem) error {
 	if err != nil {
 		return err
 	}
-	content := markerContent(item, dirStat)
+	content := markerContent(item, dirStat, outcome)
 	if _, err := unix.Write(fd, content); err != nil {
 		unix.Close(fd)
 		return err
@@ -75,27 +88,35 @@ func writeDeletionMarker(item core.CleanupItem) error {
 	return unix.Fsync(dir)
 }
 
-// hasDeletionMarker reports whether expiry itself started deleting this exact
-// object from the receipt directory now at its path. A directory moved away
-// and replaced, even with the manifest and marker copied, has another
-// identity and so does not match.
-func hasDeletionMarker(item core.CleanupItem) bool {
+// deletionMarker reports the outcome with which expiry itself started
+// removing this exact object from the receipt directory now at its path, or
+// "" when there is no such marker. A directory moved away and replaced, even
+// with the manifest and marker copied, has another identity and so does not
+// match.
+func deletionMarker(item core.CleanupItem) core.CleanupState {
 	dir, dirStat, err := openReceiptDir(item)
 	if err != nil {
-		return false
+		return ""
 	}
 	defer unix.Close(dir)
-	want := markerContent(item, dirStat)
 	fd, err := unix.Openat(dir, deletionMarkerName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return false
+		return ""
 	}
 	defer unix.Close(fd)
 	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || st.Size != int64(len(want)) {
-		return false
+	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || st.Size > 4096 {
+		return ""
 	}
-	got := make([]byte, len(want)+1)
+	got := make([]byte, st.Size+1)
 	n, err := unix.Read(fd, got)
-	return err == nil && string(got[:n]) == string(want)
+	if err != nil {
+		return ""
+	}
+	for _, outcome := range []core.CleanupState{core.CleanupDeleted, core.CleanupSuperseded} {
+		if string(got[:n]) == string(markerContent(item, dirStat, outcome)) {
+			return outcome
+		}
+	}
+	return ""
 }

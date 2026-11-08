@@ -97,6 +97,11 @@ func (e *Engine) originalReferences(ctx context.Context, source string) error {
 // Eligible performs a second complete observation and guard evaluation. It
 // never deletes. An expired timestamp alone is not an authorization.
 func (e *Engine) Eligible(ctx context.Context, item core.CleanupItem) error {
+	return e.eligible(ctx, item, true)
+}
+
+// expiryReady holds the receipt facts every expiry outcome needs.
+func (e *Engine) expiryReady(item core.CleanupItem) error {
 	if item.State != core.CleanupQuarantined {
 		return fmt.Errorf("%s is not quarantined", item.ActionID)
 	}
@@ -106,8 +111,28 @@ func (e *Engine) Eligible(ctx context.Context, item core.CleanupItem) error {
 	if item.Quarantined == nil {
 		return errors.New("missing post-move safety snapshot")
 	}
-	if err := e.originalReferences(ctx, item.Source); err != nil {
+	return nil
+}
+
+// eligible is Eligible; without original it skips the two checks of the
+// original pathname (new references there, and the policy verdict on that
+// name), keeping every guard on the quarantined copy itself.
+//
+// Without original it also leaves the workspace archive binding out of the
+// copy's identity. That binding recorded that a verified archive stood in
+// for the copy; an identical original stands in for it now, and putting the
+// original back (an archive restore, a KEEP record) is what withdraws the
+// archive's authority, so the fresh copy no longer binds. The saved snapshot
+// must still be one this build can verify, and every other fact of the copy
+// must be unchanged.
+func (e *Engine) eligible(ctx context.Context, item core.CleanupItem, original bool) error {
+	if err := e.expiryReady(item); err != nil {
 		return err
+	}
+	if original {
+		if err := e.originalReferences(ctx, item.Source); err != nil {
+			return err
+		}
 	}
 	if err := e.eligibleCompanion(ctx, item); err != nil {
 		return err
@@ -120,10 +145,19 @@ func (e *Engine) Eligible(ctx context.Context, item core.CleanupItem) error {
 	policy := e.receiptPolicy()
 	planned := *item.Quarantined
 	planned.Root = item.Entry.Root // symlink containment is judged against its original discovery root
+	if !original {
+		if _, known := collect.SnapshotFingerprint(planned); !known {
+			return errors.New("saved fingerprint of the quarantined copy has an unknown format")
+		}
+		planned.WorkspaceArchive, planned.Fingerprint = nil, ""
+	}
 	var observed core.Entry
 	probe := func(ctx context.Context, path string) (core.Entry, error) {
 		fresh, err := e.recollectReceipt(ctx, path, item.Source)
 		fresh.Root = item.Entry.Root
+		if !original {
+			fresh.WorkspaceArchive = nil
+		}
 		observed = fresh
 		return fresh, err
 	}
@@ -138,11 +172,13 @@ func (e *Engine) Eligible(ctx context.Context, item core.CleanupItem) error {
 	// Re-evaluate the *original* pathname as well. Names and protected-path
 	// rules can change after quarantine; evaluating only the receipt's generic
 	// name \"item\" would silently lose those protections.
-	mirror := observed
-	mirror.Path, mirror.Root, mirror.CanonicalPath = item.Source, item.Entry.Root, item.Entry.CanonicalPath
-	original := safety.Evaluate(safety.Input{Entry: mirror, Policy: e.Policy, Now: e.now()})
-	if !original.Allows(core.ActionDeleteCandidate) {
-		return fmt.Errorf("original source safety refused: %s", original.Summary())
+	if original {
+		mirror := observed
+		mirror.Path, mirror.Root, mirror.CanonicalPath = item.Source, item.Entry.Root, item.Entry.CanonicalPath
+		verdict := safety.Evaluate(safety.Input{Entry: mirror, Policy: e.Policy, Now: e.now()})
+		if !verdict.Allows(core.ActionDeleteCandidate) {
+			return fmt.Errorf("original source safety refused: %s", verdict.Summary())
+		}
 	}
 	// Inspect the full tree for mount boundaries before deleting any child.
 	// This streams directory names without the estimator's entry cap or
@@ -181,11 +217,22 @@ func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.Cleanu
 			return item, err
 		}
 		return item, nil
+	case absentSuperseded:
+		item.State, item.UpdatedAt = core.CleanupSuperseded, e.now()
+		item.Reason = "expiry had already removed the quarantined copy an identical original superseded but not journaled it; recorded as superseded"
+		if err := e.update(ctx, item, core.CleanupQuarantined); err != nil {
+			return item, err
+		}
+		return item, nil
 	case absentRestored:
 		return e.Reconcile(ctx, item)
 	}
-	if err := e.Eligible(ctx, item); err != nil {
+	proof, err := e.expiryEligible(ctx, item)
+	if err != nil {
 		return e.investigate(ctx, item, err.Error())
+	}
+	if proof != nil {
+		return e.supersede(ctx, item, proof)
 	}
 	if err := writeDeletionMarker(item); err != nil {
 		return item, fmt.Errorf("record deletion intent: %w", err)
@@ -362,6 +409,9 @@ const (
 	absentUnproven absentOutcome = iota
 	// absentDeleted: the object is gone and nowhere else to be found.
 	absentDeleted
+	// absentSuperseded: expiry removed the copy because an identical
+	// original was back at its source.
+	absentSuperseded
 	// absentRestored: the object is back at its source with its identity.
 	absentRestored
 )
@@ -369,10 +419,11 @@ const (
 // settleAbsent decides, without guessing, whether a receipt's object is gone.
 // Absence alone proves nothing: the receipt directory may have been moved or
 // replaced with the object still inside. An object back at its source with its
-// recorded identity was restored. Otherwise it counts as deleted only when
-// this receipt's deletion marker shows that expiry itself started deleting it
-// and the source is provably not the object (absent, or another identity).
-// Any other error leaves the outcome unproven.
+// recorded identity was restored. Otherwise it counts as deleted (or
+// superseded) only when this receipt's marker shows that expiry itself
+// started removing it with that outcome and the source is provably not the
+// object (absent, or another identity). Any other error leaves the outcome
+// unproven.
 func (e *Engine) settleAbsent(item core.CleanupItem) absentOutcome {
 	if _, err := os.Lstat(item.Destination); !errors.Is(err, os.ErrNotExist) {
 		return absentUnproven
@@ -383,8 +434,12 @@ func (e *Engine) settleAbsent(item core.CleanupItem) absentOutcome {
 		return absentRestored
 	case err != nil && !errors.Is(err, os.ErrNotExist):
 		return absentUnproven
-	case hasDeletionMarker(item):
+	}
+	switch deletionMarker(item) {
+	case core.CleanupDeleted:
 		return absentDeleted
+	case core.CleanupSuperseded:
+		return absentSuperseded
 	default:
 		return absentUnproven
 	}
@@ -397,10 +452,11 @@ func (e *Engine) ExpiryPreview(ctx context.Context, item core.CleanupItem) error
 	switch e.settleAbsent(item) {
 	case absentDeleted:
 		return e.eligibleLeftoverCompanion(ctx, item)
-	case absentRestored:
+	case absentSuperseded, absentRestored:
 		return nil
 	}
-	return e.Eligible(ctx, item)
+	_, err := e.expiryEligible(ctx, item)
+	return err
 }
 
 func filesystemID(info os.FileInfo) core.FilesystemID {

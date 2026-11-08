@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -276,5 +277,103 @@ func TestCleanupTransitionsFailClosed(t *testing.T) {
 	}
 	if len(all) != 1 || all[0].State != core.CleanupInvestigate {
 		t.Errorf("failed transitions changed stored state: %#v", all)
+	}
+}
+
+// The superseded state needs a rebuilt cleanup_items table, because SQLite
+// cannot alter a CHECK constraint. Upgrading a journal that already holds
+// receipts and their immutable events must keep every row, record no event
+// of its own, keep the event triggers and the one-active-receipt-per-source
+// index, and then admit quarantined -> superseded_by_original.
+func TestSupersededMigrationKeepsJournalAndAdmitsState(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "janitor.db")
+	raw, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.SetMaxOpenConns(1)
+	db := &Store{db: raw, path: path}
+	defer db.Close()
+	for _, m := range migrations {
+		if m.version >= supersededCleanupVersion {
+			break
+		}
+		if err := db.applyMigration(ctx, m); err != nil {
+			t.Fatalf("migration %d: %v", m.version, err)
+		}
+	}
+	at := time.Date(2026, 9, 23, 11, 0, 0, 0, time.UTC)
+	item := cleanupFixture("run-1", "action-1", "/repos/one", at)
+	moved := quarantineFixture(item, at.Add(time.Minute))
+	if err := db.Write(ctx, func(tx *Tx) error {
+		if err := tx.InsertCleanup(ctx, item); err != nil {
+			return err
+		}
+		return tx.UpdateCleanup(ctx, moved, core.CleanupPrepared)
+	}); err != nil {
+		t.Fatalf("record receipt before upgrade: %v", err)
+	}
+	events := func() []string {
+		t.Helper()
+		var out []string
+		if err := db.Read(ctx, func(tx *Tx) error {
+			rows, err := tx.tx.QueryContext(ctx, `SELECT COALESCE(from_state, '') || '>' || to_state FROM cleanup_events ORDER BY id`)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var event string
+				if err := rows.Scan(&event); err != nil {
+					return err
+				}
+				out = append(out, event)
+			}
+			return rows.Err()
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	before := events()
+	last := migrations[len(migrations)-1]
+	if err := db.applyMigration(ctx, last); err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	if got := events(); !reflect.DeepEqual(got, before) {
+		t.Fatalf("upgrade rewrote event history: %v, was %v", got, before)
+	}
+	var stored []core.CleanupItem
+	if err := db.Read(ctx, func(tx *Tx) error {
+		var err error
+		stored, err = tx.CleanupItems(ctx, "")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := moved
+	want.Normalize()
+	if len(stored) != 1 || !reflect.DeepEqual(stored[0], want) {
+		t.Fatalf("upgrade changed the receipt: %#v", stored)
+	}
+	if err := db.Write(ctx, func(tx *Tx) error {
+		return tx.InsertCleanup(ctx, cleanupFixture("run-2", "action-2", item.Source, at))
+	}); err == nil {
+		t.Fatal("upgrade lost the one-active-receipt-per-source index")
+	}
+	superseded := moved
+	superseded.State, superseded.UpdatedAt, superseded.Reason = core.CleanupSuperseded, at.Add(2*time.Minute), "identical original"
+	if err := db.Write(ctx, func(tx *Tx) error { return tx.UpdateCleanup(ctx, superseded, core.CleanupQuarantined) }); err != nil {
+		t.Fatalf("superseded transition after upgrade: %v", err)
+	}
+	if got := events(); !reflect.DeepEqual(got, append(before, "quarantined>superseded_by_original")) {
+		t.Fatalf("superseded transition was not journaled: %v", got)
+	}
+	var violations int
+	if err := db.Read(ctx, func(tx *Tx) error {
+		return tx.tx.QueryRowContext(ctx, `SELECT count(*) FROM pragma_foreign_key_check`).Scan(&violations)
+	}); err != nil || violations != 0 {
+		t.Fatalf("foreign key check after upgrade: %d %v", violations, err)
 	}
 }

@@ -8,6 +8,9 @@ import (
 
 // CleanupState is the durable phase of one cleanup action. Investigate marks
 // an outcome that cannot be proven safe without inspecting the filesystem.
+// Superseded marks an expired quarantined copy that expiry removed because
+// an identical object is back at its original path: the original remains,
+// so nothing was lost and the receipt is not recorded as deleted.
 type CleanupState string
 
 const (
@@ -16,12 +19,13 @@ const (
 	CleanupRestored    CleanupState = "restored"
 	CleanupDeleted     CleanupState = "deleted"
 	CleanupInvestigate CleanupState = "investigate"
+	CleanupSuperseded  CleanupState = "superseded_by_original"
 )
 
 // Valid reports whether the state is part of the persisted cleanup contract.
 func (s CleanupState) Valid() bool {
 	switch s {
-	case CleanupPrepared, CleanupQuarantined, CleanupRestored, CleanupDeleted, CleanupInvestigate:
+	case CleanupPrepared, CleanupQuarantined, CleanupRestored, CleanupDeleted, CleanupInvestigate, CleanupSuperseded:
 		return true
 	default:
 		return false
@@ -30,13 +34,13 @@ func (s CleanupState) Valid() bool {
 
 // CanTransitionTo permits only transitions that do not bypass recovery or
 // deletion review. Investigate must first be reconciled to quarantined before
-// deletion can be considered again.
+// deletion (or supersession) can be considered again.
 func (s CleanupState) CanTransitionTo(next CleanupState) bool {
 	switch s {
 	case CleanupPrepared:
 		return next == CleanupQuarantined || next == CleanupRestored || next == CleanupInvestigate
 	case CleanupQuarantined:
-		return next == CleanupRestored || next == CleanupDeleted || next == CleanupInvestigate
+		return next == CleanupRestored || next == CleanupDeleted || next == CleanupSuperseded || next == CleanupInvestigate
 	case CleanupInvestigate:
 		return next == CleanupPrepared || next == CleanupQuarantined || next == CleanupRestored
 	default:

@@ -159,9 +159,11 @@ func (t *Tx) CategoryArchives(ctx context.Context) ([]CategoryArchive, error) {
 	// keeps it, so it is the evidence that the item actually left. A move
 	// interrupted before its journal update is indistinguishable from one
 	// that never happened; its undo is not counted (the archive is verified,
-	// so a later quarantine loses nothing).
+	// so a later quarantine loses nothing). A copy expiry removed because an
+	// identical original was put back at its path (superseded_by_original)
+	// is a restore made outside Janitor, and counts as one.
 	restored, err := t.tx.QueryContext(ctx, `SELECT source, updated_at FROM cleanup_items
-		WHERE state = 'restored' AND moved_at IS NOT NULL`)
+		WHERE state IN ('restored', 'superseded_by_original') AND moved_at IS NOT NULL`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list restored cleanup items: %w", err)
 	}
