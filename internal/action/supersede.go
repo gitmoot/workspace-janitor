@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 
+	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 	"github.com/gitmoot/workspace-janitor/internal/workspacearchive"
 )
@@ -34,7 +36,10 @@ func (e *Engine) expiryEligible(ctx context.Context, item core.CleanupItem) (*id
 	if err := e.eligible(ctx, item, false); err != nil {
 		return proof, err
 	}
-	return proof, e.copyInUse(ctx, item)
+	if err := e.copyInUse(ctx, item); err != nil {
+		return proof, err
+	}
+	return proof, e.copyArchiveReferences(ctx, item)
 }
 
 // copyInUse refuses a quarantined copy that any process uses through its
@@ -52,13 +57,71 @@ func (e *Engine) copyInUse(ctx context.Context, item core.CleanupItem) error {
 	return nil
 }
 
+// archiveRulesAt lists the workspace archive rules configured for exactly
+// source.
+func (e *Engine) archiveRulesAt(source string) []config.WorkspaceArchiveRule {
+	if e.Collect.WorktreePolicy == nil {
+		return nil
+	}
+	var out []config.WorkspaceArchiveRule
+	for _, rule := range e.Collect.WorktreePolicy.WorkspaceArchives {
+		if rule.Path == source {
+			out = append(out, rule)
+		}
+	}
+	return out
+}
+
+// withoutArchiveRulesAt is e observing without the workspace archive rules
+// for exactly source. Binding the quarantined copy to such a rule asks
+// whether the archive may stand in for it, and checks live use of the
+// original names as well as the copy's; with an identical original standing
+// in, that question is moot, and a process using only the original must not
+// hold the redundant copy. Every other rule still applies, including a
+// rule's protection of the trees that contain it, and copyArchiveReferences
+// repeats the dropped rules' checks against the copy's own names.
+func (e *Engine) withoutArchiveRulesAt(source string) *Engine {
+	if len(e.archiveRulesAt(source)) == 0 {
+		return e
+	}
+	policy := *e.Collect.WorktreePolicy
+	policy.WorkspaceArchives = slices.DeleteFunc(slices.Clone(policy.WorkspaceArchives), func(rule config.WorkspaceArchiveRule) bool {
+		return rule.Path == source
+	})
+	observer := *e
+	observer.Collect.WorktreePolicy = &policy
+	return &observer
+}
+
+// copyArchiveReferences holds the quarantined copy to the live-use and
+// external-dependent checks a binding to an archive rule for its source
+// would apply, against the copy's own names only: a process, gitdir,
+// alternates file or symlink reaching into the copy keeps it, or any that
+// cannot be examined. The rule's original names and its mentions (which are
+// derived from the original names) describe the original, which stays.
+func (e *Engine) copyArchiveReferences(ctx context.Context, item core.CleanupItem) error {
+	for _, rule := range e.archiveRulesAt(item.Source) {
+		scope := workspacearchive.PolicyScope(*e.Collect.WorktreePolicy, rule)
+		scope.ProcRoot = e.Collect.ProcRoot
+		if err := workspacearchive.LocalReferences(ctx, rule, scope, item.Destination); err != nil {
+			return fmt.Errorf("quarantined copy: %w", err)
+		}
+	}
+	return nil
+}
+
 // identicalOriginal compares the object at item.Source, if there is one, with
 // the quarantined copy, and returns proof only when they are identical. A
-// unit with a bound companion never qualifies: its two parts expire together
-// under every guard.
+// unit with a companion (bound, or named by a rule for its source) never
+// qualifies: its two parts expire together under every guard.
 func (e *Engine) identicalOriginal(ctx context.Context, item core.CleanupItem) *identicalTrees {
 	if suffix, _ := companionOf(item); suffix != "" {
 		return nil
+	}
+	for _, rule := range e.archiveRulesAt(item.Source) {
+		if rule.Companion != "" {
+			return nil
+		}
 	}
 	if _, err := os.Lstat(item.Source); err != nil {
 		return nil

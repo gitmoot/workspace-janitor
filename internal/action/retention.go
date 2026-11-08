@@ -119,12 +119,13 @@ func (e *Engine) expiryReady(item core.CleanupItem) error {
 // name), keeping every guard on the quarantined copy itself.
 //
 // Without original it also leaves the workspace archive binding out of the
-// copy's identity. That binding recorded that a verified archive stood in
-// for the copy; an identical original stands in for it now, and putting the
-// original back (an archive restore, a KEEP record) is what withdraws the
-// archive's authority, so the fresh copy no longer binds. The saved snapshot
-// must still be one this build can verify, and every other fact of the copy
-// must be unchanged.
+// copy's identity, and observes the copy without the archive rules for its
+// source (withoutArchiveRulesAt). That binding recorded that a verified
+// archive stood in for the copy; an identical original stands in for it
+// now, and putting the original back (an archive restore, a KEEP record) is
+// what withdraws the archive's authority, so the fresh copy no longer binds.
+// The saved snapshot must still be one this build can verify, and every
+// other fact of the copy must be unchanged.
 func (e *Engine) eligible(ctx context.Context, item core.CleanupItem, original bool) error {
 	if err := e.expiryReady(item); err != nil {
 		return err
@@ -151,9 +152,13 @@ func (e *Engine) eligible(ctx context.Context, item core.CleanupItem, original b
 		}
 		planned.WorkspaceArchive, planned.Fingerprint = nil, ""
 	}
+	observer := e
+	if !original {
+		observer = e.withoutArchiveRulesAt(item.Source)
+	}
 	var observed core.Entry
 	probe := func(ctx context.Context, path string) (core.Entry, error) {
-		fresh, err := e.recollectReceipt(ctx, path, item.Source)
+		fresh, err := observer.recollectReceipt(ctx, path, item.Source)
 		fresh.Root = item.Entry.Root
 		if !original {
 			fresh.WorkspaceArchive = nil
