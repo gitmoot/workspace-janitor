@@ -509,7 +509,7 @@ func TestJevProviderSettingsAreValidated(t *testing.T) {
 	}
 }
 
-// Standing cache trims are a deletion authority, so anything but the two
+// Standing cache trims are a deletion authority, so anything but the
 // supported kinds with an absolute binary and positive bound is refused.
 func TestCacheTrimsRejectUnsupportedOrUnbounded(t *testing.T) {
 	paths := fixturePaths(t)
@@ -523,7 +523,7 @@ func TestCacheTrimsRejectUnsupportedOrUnbounded(t *testing.T) {
       path: /var/lib/docker
       binary: /usr/bin/docker
       max_bytes: 1
-    - kind: docker-images
+    - kind: npm-cache
       binary: /usr/bin/docker
       max_bytes: 1
 `)
@@ -536,6 +536,98 @@ func TestCacheTrimsRejectUnsupportedOrUnbounded(t *testing.T) {
 		}
 	}
 	if _, err := parse(t, paths, "prevention:\n  cache_trims:\n    - kind: go-build\n      path: /root/.cache/go-build\n      binary: /usr/local/go/bin/go\n      max_bytes: 2147483648\n    - kind: docker-builder\n      binary: /usr/bin/docker\n      max_bytes: 2147483648\n"); err != nil {
+		t.Fatalf("valid cache trims rejected: %v", err)
+	}
+}
+
+// The image, module-cache and pnpm-store trims each require their own fields:
+// docker-images an age of at least a day in whole hours and no path; go-mod
+// and pnpm-store a canonical path not holding their binary; and none may
+// target an archive_only root (for docker-images, containerd's root too).
+func TestNewCacheTrimKindsRequireTheirFields(t *testing.T) {
+	paths := fixturePaths(t)
+	_, err := parse(t, paths, `roots:
+  - path: /var/lib/containerd
+    archive_only: true
+prevention:
+  cache_trims:
+    - kind: docker-images
+      path: /var/lib/docker
+      binary: /usr/bin/docker
+      min_age: 23h
+      max_bytes: -1
+    - kind: docker-images
+      binary: /usr/bin/docker
+      min_age: 36h30m
+    - kind: go-mod
+      path: /
+      binary: /go/bin/go
+      max_bytes: 0
+      min_age: 48h
+    - kind: pnpm-store
+      path: /srv/pnpm-store/v11
+      binary: /srv/pnpm-store/v11/pnpm
+      max_bytes: 1
+    - kind: pnpm-store
+      path: /root/.local/share/pnpm/store/v11
+      binary: /usr/bin/pnpm
+      max_bytes: 1
+    - kind: pnpm-store
+      path: /root/.local/share/pnpm/store/v11
+      binary: /usr/bin/pnpm
+      max_bytes: 2
+`)
+	if err == nil {
+		t.Fatal("invalid cache trims were accepted")
+	}
+	for _, field := range []string{"cache_trims[0].path", "cache_trims[0].min_age", "cache_trims[0].max_bytes",
+		"cache_trims[1].min_age", `cache_trims[1].path: overlaps archive_only root "/var/lib/containerd"`,
+		"cache_trims[2].path", "cache_trims[2].max_bytes", "cache_trims[2].min_age", "cache_trims[3].binary",
+		"cache_trims[5]: duplicates"} {
+		if !strings.Contains(err.Error(), field) {
+			t.Errorf("error %q does not identify %s", err, field)
+		}
+	}
+	for _, field := range []string{"cache_trims[4]"} {
+		if strings.Contains(err.Error(), field) {
+			t.Errorf("valid trim refused: %q mentions %s", err, field)
+		}
+	}
+	if _, err := parse(t, paths, `prevention:
+  cache_trims:
+    - kind: docker-images
+      binary: /usr/bin/docker
+      min_age: 168h
+    - kind: docker-images
+      binary: /usr/bin/docker
+      min_age: 24h
+      max_bytes: 10737418240
+    - kind: go-mod
+      path: /root/go/pkg/mod
+      binary: /root/.local/toolchains/go1.26.4/bin/go
+      max_bytes: 8589934592
+    - kind: pnpm-store
+      path: /root/.local/share/pnpm/store/v11
+      binary: /root/.nvm/versions/node/v22.23.2/bin/pnpm
+      max_bytes: 2147483648
+`); err == nil || !strings.Contains(err.Error(), "cache_trims[1]: duplicates") {
+		t.Fatalf("two docker-images trims not refused as duplicates: %v", err)
+	}
+	if _, err := parse(t, paths, `prevention:
+  cache_trims:
+    - kind: docker-images
+      binary: /usr/bin/docker
+      min_age: 24h
+      max_bytes: 10737418240
+    - kind: go-mod
+      path: /root/go/pkg/mod
+      binary: /root/.local/toolchains/go1.26.4/bin/go
+      max_bytes: 8589934592
+    - kind: pnpm-store
+      path: /root/.local/share/pnpm/store/v11
+      binary: /root/.nvm/versions/node/v22.23.2/bin/pnpm
+      max_bytes: 2147483648
+`); err != nil {
 		t.Fatalf("valid cache trims rejected: %v", err)
 	}
 }

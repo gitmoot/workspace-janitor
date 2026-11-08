@@ -312,14 +312,19 @@ func InArchiveOnlyRoot(policy *Policy, path string) bool {
 }
 
 // DockerDataRoot is Docker's default data root. Validation checks a
-// docker-builder trim against it; before each run the trim asks the daemon
-// for its actual data root and checks that too.
+// docker-builder or docker-images trim against it; before each run the trim
+// asks the daemon for its actual data root and checks that too.
 const DockerDataRoot = "/var/lib/docker"
 
+// ContainerdDataRoot is containerd's default root. With the containerd image
+// store (snapshotter) Docker keeps image content and layers there, so a
+// docker-images trim is checked against it as well.
+const ContainerdDataRoot = "/var/lib/containerd"
+
 // TrimTarget is the directory a standing cache trim acts on, as far as
-// policy alone can tell (Docker's default data root for docker-builder).
+// policy alone can tell (Docker's default data root for the Docker kinds).
 func (t CacheTrim) TrimTarget() string {
-	if t.Kind == CacheTrimDockerBuilder {
+	if t.Kind == CacheTrimDockerBuilder || t.Kind == CacheTrimDockerImages {
 		return DockerDataRoot
 	}
 	return t.Path
@@ -376,18 +381,32 @@ func ResolvesIntoArchiveOnlyRoot(policy *Policy, path string) (bool, error) {
 const (
 	CacheTrimGoBuild       = "go-build"
 	CacheTrimDockerBuilder = "docker-builder"
+	CacheTrimDockerImages  = "docker-images"
+	CacheTrimGoMod         = "go-mod"
+	CacheTrimPnpmStore     = "pnpm-store"
 )
 
-// CacheTrim bounds one live shared build cache. go-build runs
-// `go clean -cache` for Path when its allocated size exceeds MaxBytes and no
-// Go build is running; docker-builder runs `docker builder prune
-// --keep-storage MaxBytes`, which removes only unused build cache and never
+// MinDockerImageAge is the youngest min_age a docker-images trim accepts.
+const MinDockerImageAge = 24 * time.Hour
+
+// CacheTrim bounds one live shared cache with its official command. go-build
+// runs `go clean -cache` for Path when its allocated size exceeds MaxBytes and
+// no Go build is running; docker-builder runs `docker builder prune
+// --max-used-space MaxBytes`, which removes only unused build cache and never
 // images, containers or volumes, and only when no image build is running.
+// docker-images runs `docker image prune --all --force --filter until=MinAge`,
+// which removes only images no container uses, when Docker reports more than
+// MaxBytes (if set) of reclaimable images and no image build or pull runs.
+// go-mod runs `go clean -modcache` for Path, and pnpm-store runs `pnpm store
+// prune` for Path, when its allocated size exceeds MaxBytes and no process
+// using it runs.
 type CacheTrim struct {
 	Kind     string `yaml:"kind" json:"kind"`
 	Path     string `yaml:"path,omitempty" json:"path,omitempty"`
 	Binary   string `yaml:"binary" json:"binary"`
 	MaxBytes int64  `yaml:"max_bytes" json:"max_bytes"`
+	// MinAge is docker-images only: images younger than this are kept.
+	MinAge Duration `yaml:"min_age,omitempty" json:"min_age,omitempty"`
 }
 
 // CapacityTarget names an inventory root whose filesystem needs headroom.
@@ -898,21 +917,36 @@ func (p *Policy) Validate() core.FieldErrors {
 	trimKinds := map[string]bool{}
 	for i, trim := range p.Prevention.CacheTrims {
 		field := fmt.Sprintf("prevention.cache_trims[%d]", i)
+		targets := []string{trim.TrimTarget()}
 		switch trim.Kind {
 		case CacheTrimGoBuild:
 			if !core.IsCanonicalPath(trim.Path) || trim.Path == "/" {
 				errs.Add(field+".path", "go-build requires the absolute cache directory")
 			}
+		case CacheTrimGoMod, CacheTrimPnpmStore:
+			if !core.IsCanonicalPath(trim.Path) || trim.Path == "/" {
+				errs.Add(field+".path", "%s requires the absolute cache directory", trim.Kind)
+			} else if core.IsCanonicalPath(trim.Binary) && core.PathWithin(trim.Binary, trim.Path) {
+				// The trim would delete the binary running it.
+				errs.Add(field+".binary", "must not lie inside the cache it trims")
+			}
 		case CacheTrimDockerBuilder:
 			if trim.Path != "" {
 				errs.Add(field+".path", "docker-builder takes no path; Docker owns its build cache location")
 			}
+		case CacheTrimDockerImages:
+			if trim.Path != "" {
+				errs.Add(field+".path", "docker-images takes no path; Docker owns its image store")
+			}
+			targets = append(targets, ContainerdDataRoot)
 		default:
-			errs.Add(field+".kind", "must be go-build or docker-builder")
+			errs.Add(field+".kind", "must be go-build, docker-builder, docker-images, go-mod or pnpm-store")
 		}
-		for _, root := range p.Roots {
-			if root.ArchiveOnly && core.PathsOverlap(trim.TrimTarget(), root.Path) {
-				errs.Add(field+".path", "overlaps archive_only root %q; only an archive category may remove data there", root.Path)
+		for _, target := range targets {
+			for _, root := range p.Roots {
+				if root.ArchiveOnly && core.PathsOverlap(target, root.Path) {
+					errs.Add(field+".path", "overlaps archive_only root %q; only an archive category may remove data there", root.Path)
+				}
 			}
 		}
 		if trimKinds[trim.Kind+"\x00"+trim.Path] {
@@ -922,8 +956,22 @@ func (p *Policy) Validate() core.FieldErrors {
 		if !core.IsCanonicalPath(trim.Binary) {
 			errs.Add(field+".binary", "must be an absolute executable path")
 		}
+		if trim.Kind == CacheTrimDockerImages {
+			// max_bytes is optional: zero prunes on every run.
+			if trim.MaxBytes < 0 {
+				errs.Add(field+".max_bytes", "must not be negative")
+			}
+			age := trim.MinAge.Duration()
+			if age < MinDockerImageAge || age%time.Hour != 0 {
+				errs.Add(field+".min_age", "docker-images requires a whole number of hours, at least %s", MinDockerImageAge)
+			}
+			continue
+		}
 		if trim.MaxBytes <= 0 {
 			errs.Add(field+".max_bytes", "must be positive")
+		}
+		if trim.MinAge != 0 {
+			errs.Add(field+".min_age", "only docker-images takes min_age")
 		}
 	}
 	targetPaths := make(map[string]bool, len(p.Prevention.Targets))

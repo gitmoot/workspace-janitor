@@ -2,9 +2,11 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,7 +16,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/gitmoot/workspace-janitor/internal/config"
+	"github.com/gitmoot/workspace-janitor/internal/core"
 )
 
 // cacheTrimLoop re-runs the standing cache trims every cache_trim_interval
@@ -76,6 +80,8 @@ const (
 	cacheTrimBusy     = "skipped_trim_running"
 )
 
+// cacheTrimReport is one trim's outcome. For docker-images the sizes are the
+// reclaimable image bytes Docker reports, not a directory's allocated size.
 type cacheTrimReport struct {
 	Kind        string   `json:"kind"`
 	Path        string   `json:"path,omitempty"`
@@ -83,6 +89,7 @@ type cacheTrimReport struct {
 	Status      string   `json:"status"`
 	SizeBefore  *int64   `json:"size_before_bytes,omitempty"`
 	SizeAfter   *int64   `json:"size_after_bytes,omitempty"`
+	Reclaimed   *int64   `json:"reclaimed_bytes,omitempty"`
 	FreeBefore  *uint64  `json:"free_before_bytes,omitempty"`
 	FreeAfter   *uint64  `json:"free_after_bytes,omitempty"`
 	Command     []string `json:"command,omitempty"`
@@ -145,7 +152,7 @@ func trimCache(ctx context.Context, procRoot string, trim config.CacheTrim) cach
 	}
 	var args, env []string
 	switch trim.Kind {
-	case config.CacheTrimGoBuild:
+	case config.CacheTrimGoBuild, config.CacheTrimGoMod, config.CacheTrimPnpmStore:
 		info, err := os.Lstat(trim.Path)
 		if errors.Is(err, fs.ErrNotExist) {
 			report.Status = cacheTrimNotFound
@@ -166,13 +173,51 @@ func trimCache(ctx context.Context, procRoot string, trim config.CacheTrim) cach
 			report.Status = cacheUnderBound
 			return report
 		}
-		args = []string{"clean", "-cache"}
-		env = []string{"GOCACHE=" + trim.Path, "GOTOOLCHAIN=local", "GOENV=off", "GOFLAGS=", "GOPROXY=off",
-			"HOME=" + os.Getenv("HOME"), "PATH=/usr/bin:/bin"}
+		switch trim.Kind {
+		case config.CacheTrimGoBuild:
+			args = []string{"clean", "-cache"}
+			env = []string{"GOCACHE=" + trim.Path, "GOTOOLCHAIN=local", "GOENV=off", "GOFLAGS=", "GOPROXY=off",
+				"HOME=" + os.Getenv("HOME"), "PATH=/usr/bin:/bin"}
+		case config.CacheTrimGoMod:
+			if err := binaryOutside(trim); err != nil {
+				return fail(err)
+			}
+			// go clean -modcache makes Go's read-only module files writable
+			// before removing them.
+			args = []string{"clean", "-modcache"}
+			env = []string{"GOMODCACHE=" + trim.Path, "GOTOOLCHAIN=local", "GOENV=off", "GOFLAGS=", "GOPROXY=off",
+				"HOME=" + os.Getenv("HOME"), "PATH=/usr/bin:/bin"}
+		case config.CacheTrimPnpmStore:
+			if err := binaryOutside(trim); err != nil {
+				return fail(err)
+			}
+			env = pnpmEnv(trim.Binary)
+			if err := pnpmStoreIs(ctx, trim.Binary, env, trim.Path); err != nil {
+				return fail(err)
+			}
+			// pnpm removes only packages no project links to.
+			args = []string{"store", "prune", "--store-dir", trim.Path}
+		}
 	case config.CacheTrimDockerBuilder:
 		// Docker enforces the bound itself and removes only unused build
 		// cache: never images, containers or volumes.
 		args = []string{"builder", "prune", "--force", "--max-used-space", strconv.FormatInt(trim.MaxBytes, 10)}
+		env = dockerEnv()
+	case config.CacheTrimDockerImages:
+		reclaimable, err := dockerReclaimableImageBytes(ctx, trim.Binary)
+		if err != nil {
+			return fail(err)
+		}
+		report.SizeBefore = &reclaimable
+		if trim.MaxBytes > 0 && reclaimable <= trim.MaxBytes {
+			report.Status = cacheUnderBound
+			return report
+		}
+		// --all removes only images no container (running or stopped)
+		// uses, and the filter keeps every image younger than min_age.
+		// Containers, volumes, networks and build cache are never touched.
+		hours := int64(trim.MinAge.Duration() / time.Hour)
+		args = []string{"image", "prune", "--all", "--force", "--filter", "until=" + strconv.FormatInt(hours, 10) + "h"}
 		env = dockerEnv()
 	default:
 		return fail(fmt.Errorf("unsupported cache trim kind %q", trim.Kind))
@@ -192,10 +237,19 @@ func trimCache(ctx context.Context, procRoot string, trim config.CacheTrim) cach
 	out, err := cmd.CombinedOutput()
 	report.Output = boundedOutput(out)
 	report.FreeAfter = freeBytes(trimFilesystem(trim))
-	if trim.Kind == config.CacheTrimGoBuild {
+	switch trim.Kind {
+	case config.CacheTrimGoBuild, config.CacheTrimGoMod, config.CacheTrimPnpmStore:
 		if size, sizeErr := allocatedBytes(ctx, trim.Path); sizeErr == nil {
 			report.SizeAfter = &size
 		}
+	case config.CacheTrimDockerImages:
+		if size, sizeErr := dockerReclaimableImageBytes(ctx, trim.Binary); sizeErr == nil {
+			report.SizeAfter = &size
+		}
+	}
+	if report.SizeBefore != nil && report.SizeAfter != nil {
+		reclaimed := max(*report.SizeBefore-*report.SizeAfter, 0)
+		report.Reclaimed = &reclaimed
 	}
 	if err != nil {
 		return fail(err)
@@ -209,10 +263,12 @@ func trimFilesystem(trim config.CacheTrim) string {
 }
 
 // cacheUsers lists processes that may be using the cache right now: Go
-// toolchain commands for go-build (plus any handle open under the cache), or
-// image builds for Docker. It fails closed: a process that cannot be
-// inspected counts as a possible user. A false positive only postpones the
-// trim to the next cycle.
+// toolchain commands for go-build (plus any handle open under the cache); Go
+// commands and gopls for go-mod (plus any handle or executable under the
+// cache); pnpm for pnpm-store (plus any handle under the store); image builds
+// for docker-builder, and image builds or pulls for docker-images. It fails
+// closed: a process that cannot be inspected counts as a possible user. A
+// false positive only postpones the trim to the next cycle.
 func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
@@ -237,14 +293,19 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 		}
 		argv := strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
 		var busy bool
+		procDir := filepath.Join(procRoot, pid)
 		switch trim.Kind {
-		case config.CacheTrimGoBuild:
-			busy = goToolchainBusy(argv)
+		case config.CacheTrimGoBuild, config.CacheTrimGoMod:
+			candidate, uses := goToolchainBusy, goProcessUsesCache
+			if trim.Kind == config.CacheTrimGoMod {
+				candidate, uses = goModuleUser, goProcessUsesModCache
+			}
+			busy = candidate(argv)
 			if busy {
-				// A Go process with its own GOCACHE elsewhere does not use
-				// this cache; only one that resolves here (or cannot be
-				// resolved) blocks the trim.
-				uses, err := goProcessUsesCache(filepath.Join(procRoot, pid), trim.Path)
+				// A Go process whose cache is elsewhere does not use this
+				// one; only one that resolves here (or cannot be resolved)
+				// blocks the trim.
+				here, err := uses(procDir, trim.Path)
 				if processGone(err) {
 					continue
 				}
@@ -252,10 +313,29 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 					users = append(users, fmt.Sprintf("%s (cannot inspect environment: %v)", pid, err))
 					continue
 				}
-				busy = uses
+				busy = here
+			}
+			if !busy && trim.Kind == config.CacheTrimGoMod {
+				// A toolchain that Go downloaded runs from the module cache.
+				runs, err := executableUnder(procDir, trim.Path)
+				if err != nil {
+					users = append(users, fmt.Sprintf("%s (cannot inspect executable: %v)", pid, err))
+					continue
+				}
+				busy = runs
 			}
 			if !busy {
-				holds, err := holdsHandleUnder(filepath.Join(procRoot, pid, "fd"), trim.Path)
+				holds, err := holdsHandleUnder(filepath.Join(procDir, "fd"), trim.Path)
+				if err != nil {
+					users = append(users, fmt.Sprintf("%s (cannot inspect handles: %v)", pid, err))
+					continue
+				}
+				busy = holds
+			}
+		case config.CacheTrimPnpmStore:
+			busy = pnpmBusy(argv)
+			if !busy {
+				holds, err := holdsHandleUnder(filepath.Join(procDir, "fd"), trim.Path)
 				if err != nil {
 					users = append(users, fmt.Sprintf("%s (cannot inspect handles: %v)", pid, err))
 					continue
@@ -264,6 +344,8 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 			}
 		case config.CacheTrimDockerBuilder:
 			busy = dockerBuildBusy(argv)
+		case config.CacheTrimDockerImages:
+			busy = dockerImageBusy(argv)
 		}
 		if busy {
 			users = append(users, pid+" "+truncate(strings.Join(argv, " "), 160))
@@ -275,16 +357,78 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 
 // goProcessUsesCache reports whether the Go process at procDir
 // (/proc/<pid>) builds into cache. It follows Go's own precedence for
-// GOCACHE: the process environment, then the go env file (GOENV, or
-// $XDG_CONFIG_HOME/go/env or $HOME/.config/go/env, unless GOENV=off), then
-// $GOROOT/go.env, then the default $XDG_CACHE_HOME/go-build or
+// GOCACHE (see goProcEnv), then the default $XDG_CACHE_HOME/go-build or
 // $HOME/.cache/go-build. GOCACHE=off uses no cache. It fails closed: a value
 // that cannot be established, a relative GOENV, or an existing file that
 // cannot be read counts the process as a user.
 func goProcessUsesCache(procDir, cache string) (bool, error) {
-	raw, err := os.ReadFile(filepath.Join(procDir, "environ"))
+	g, err := readGoProcEnv(procDir)
 	if err != nil {
 		return false, err
+	}
+	dir, set, ok := g.lookup("GOCACHE")
+	switch {
+	case !ok:
+		return true, nil
+	case set:
+	case filepath.IsAbs(g.env["XDG_CACHE_HOME"]):
+		dir = filepath.Join(g.env["XDG_CACHE_HOME"], "go-build")
+	case filepath.IsAbs(g.env["HOME"]):
+		dir = filepath.Join(g.env["HOME"], ".cache", "go-build")
+	default:
+		return true, nil
+	}
+	return goCacheDirIs(dir, cache), nil
+}
+
+// goProcessUsesModCache reports whether the Go process at procDir
+// (/proc/<pid>) uses modcache as its module cache. Go takes GOMODCACHE, or
+// when it is empty the first GOPATH entry plus /pkg/mod, where GOPATH
+// defaults to $HOME/go; both follow Go's precedence (see goProcEnv). It fails
+// closed: a value that cannot be established, or a relative or empty result,
+// counts the process as a user.
+func goProcessUsesModCache(procDir, modcache string) (bool, error) {
+	g, err := readGoProcEnv(procDir)
+	if err != nil {
+		return false, err
+	}
+	dir, ok := g.envOr("GOMODCACHE", func() (string, bool) {
+		gopath, ok := g.envOr("GOPATH", func() (string, bool) {
+			home := g.env["HOME"]
+			return filepath.Join(home, "go"), home != ""
+		})
+		if !ok {
+			return "", false
+		}
+		list := filepath.SplitList(gopath)
+		if len(list) == 0 || list[0] == "" {
+			return "", false
+		}
+		return filepath.Join(list[0], "pkg", "mod"), true
+	})
+	if !ok || !filepath.IsAbs(dir) {
+		return true, nil
+	}
+	return samePath(dir, modcache), nil
+}
+
+// goProcEnv resolves go env settings of one Go process the way the go
+// command does: a non-empty value in the process environment wins; then the
+// go env file (GOENV, else $XDG_CONFIG_HOME/go/env or $HOME/.config/go/env;
+// none for GOENV=off); then $GOROOT/go.env, where GOROOT comes from the env
+// file, then the process environment, then the running executable. Values
+// are kept verbatim.
+type goProcEnv struct {
+	procDir string
+	env     map[string]string
+	file    map[string]string // the go env file; nil until read
+	rootEnv map[string]string // $GOROOT/go.env; nil until read
+}
+
+func readGoProcEnv(procDir string) (*goProcEnv, error) {
+	raw, err := os.ReadFile(filepath.Join(procDir, "environ"))
+	if err != nil {
+		return nil, err
 	}
 	env := map[string]string{}
 	for _, kv := range strings.Split(string(raw), "\x00") {
@@ -292,71 +436,82 @@ func goProcessUsesCache(procDir, cache string) (bool, error) {
 			env[name] = value
 		}
 	}
-	// A non-empty GOCACHE in the process environment wins outright.
-	dir, set := env["GOCACHE"], env["GOCACHE"] != ""
-	if set {
-		return goCacheDirIs(dir, cache), nil
+	return &goProcEnv{procDir: procDir, env: env}, nil
+}
+
+// lookup returns key's value and whether any source sets it. ok is false
+// when a source that may set it cannot be established: a relative GOENV
+// (Go resolved it against the directory it started in, before -C and before
+// tool subprocesses change directory, so /proc/<pid>/cwd does not establish
+// it), no absolute config home, an unreadable file, or an unknown GOROOT.
+func (g *goProcEnv) lookup(key string) (value string, set, ok bool) {
+	if v := g.env[key]; v != "" {
+		return v, true, true
 	}
-	// The go env file: GOENV, else the user config location. Go resolves a
-	// relative GOENV against the directory it started in, before -C and
-	// before tool subprocesses change directory, so /proc/<pid>/cwd does not
-	// establish it.
-	file := env["GOENV"]
-	switch {
-	case file == "off":
-		file = ""
-	case file != "" && !filepath.IsAbs(file):
-		return true, nil
-	case file != "":
-	case filepath.IsAbs(env["XDG_CONFIG_HOME"]):
-		file = filepath.Join(env["XDG_CONFIG_HOME"], "go", "env")
-	case filepath.IsAbs(env["HOME"]):
-		file = filepath.Join(env["HOME"], ".config", "go", "env")
-	default:
-		return true, nil
-	}
-	var fileSettings map[string]string
-	if file != "" {
-		settings, err := goEnvFile(file)
-		if err != nil {
-			return true, nil
+	if g.file == nil {
+		file := g.env["GOENV"]
+		switch {
+		case file == "off":
+			file = ""
+		case file != "" && !filepath.IsAbs(file):
+			return "", false, false
+		case file != "":
+		case filepath.IsAbs(g.env["XDG_CONFIG_HOME"]):
+			file = filepath.Join(g.env["XDG_CONFIG_HOME"], "go", "env")
+		case filepath.IsAbs(g.env["HOME"]):
+			file = filepath.Join(g.env["HOME"], ".config", "go", "env")
+		default:
+			return "", false, false
 		}
-		fileSettings = settings
-	}
-	dir, set = fileSettings["GOCACHE"]
-	if !set {
-		// Go picks the go.env root from the env file's GOROOT first, then the
-		// process GOROOT, then the root of the running executable.
-		root := fileSettings["GOROOT"]
-		if root == "" {
-			root = env["GOROOT"]
-		}
-		if root == "" {
-			exe, err := os.Readlink(filepath.Join(procDir, "exe"))
+		settings := map[string]string{}
+		if file != "" {
+			read, err := goEnvFile(file)
 			if err != nil {
-				return true, nil
+				return "", false, false
+			}
+			settings = read
+		}
+		g.file = settings
+	}
+	if v, set := g.file[key]; set {
+		return v, true, true
+	}
+	if g.rootEnv == nil {
+		root := g.file["GOROOT"]
+		if root == "" {
+			root = g.env["GOROOT"]
+		}
+		if root == "" {
+			exe, err := os.Readlink(filepath.Join(g.procDir, "exe"))
+			if err != nil {
+				return "", false, false
 			}
 			root = goRootOf(exe)
 		}
 		if !filepath.IsAbs(root) {
-			return true, nil
+			return "", false, false
 		}
 		settings, err := goEnvFile(filepath.Join(root, "go.env"))
 		if err != nil {
-			return true, nil
+			return "", false, false
 		}
-		dir, set = settings["GOCACHE"]
+		g.rootEnv = settings
 	}
+	value, set = g.rootEnv[key]
+	return value, set, true
+}
+
+// envOr is Go's EnvOr: key's value from lookup, or def() when it is empty.
+// ok is false when either cannot be established.
+func (g *goProcEnv) envOr(key string, def func() (string, bool)) (string, bool) {
+	value, _, ok := g.lookup(key)
 	switch {
-	case set:
-	case filepath.IsAbs(env["XDG_CACHE_HOME"]):
-		dir = filepath.Join(env["XDG_CACHE_HOME"], "go-build")
-	case filepath.IsAbs(env["HOME"]):
-		dir = filepath.Join(env["HOME"], ".cache", "go-build")
-	default:
-		return true, nil
+	case !ok:
+		return "", false
+	case value != "":
+		return value, true
 	}
-	return goCacheDirIs(dir, cache), nil
+	return def()
 }
 
 // goCacheDirIs reports whether a resolved GOCACHE value is cache: "off" is
@@ -457,6 +612,77 @@ func dockerBuildBusy(argv []string) bool {
 	return false
 }
 
+// dockerImageBusy reports an image build (as for docker-builder) or an image
+// pull (`docker pull`, `docker image pull`, `docker compose pull`,
+// `docker-compose pull`): a pulled image has no container yet, so a prune
+// running meanwhile could remove what the client is about to use.
+func dockerImageBusy(argv []string) bool {
+	if dockerBuildBusy(argv) {
+		return true
+	}
+	base := filepath.Base(argv[0])
+	if base != "docker" && base != "docker-compose" {
+		return false
+	}
+	for _, arg := range argv[1:] {
+		if arg == "pull" {
+			return true
+		}
+	}
+	return false
+}
+
+// goModuleUser reports a process that may read or fill a Go module cache: a
+// Go toolchain command, any go command, or gopls.
+func goModuleUser(argv []string) bool {
+	switch filepath.Base(argv[0]) {
+	case "go", "gopls":
+		return true
+	}
+	return goToolchainBusy(argv)
+}
+
+// pnpmBusy reports a running pnpm: the pnpm or pnpx executable itself, or a
+// script launcher (node, corepack, ...) running one, which is how an npm-,
+// nvm- or corepack-installed pnpm appears (`node /path/bin/pnpm install`).
+func pnpmBusy(argv []string) bool {
+	if pnpmName(argv[0]) {
+		return true
+	}
+	switch filepath.Base(argv[0]) {
+	case "node", "nodejs", "bun", "corepack", "npx", "npm":
+	default:
+		return false
+	}
+	for _, arg := range argv[1:] {
+		if pnpmName(arg) {
+			return true
+		}
+	}
+	return false
+}
+
+func pnpmName(arg string) bool {
+	base := filepath.Base(arg)
+	for _, ext := range []string{".cjs", ".mjs", ".js"} {
+		base = strings.TrimSuffix(base, ext)
+	}
+	return base == "pnpm" || base == "pnpx"
+}
+
+// executableUnder reports whether the process at procDir runs an executable
+// below root. An unreadable link is an error, not "no".
+func executableUnder(procDir, root string) (bool, error) {
+	exe, err := os.Readlink(filepath.Join(procDir, "exe"))
+	if processGone(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return core.PathWithin(strings.TrimSuffix(exe, " (deleted)"), root), nil
+}
+
 // holdsHandleUnder reports whether any descriptor in fdDir resolves below
 // root. An unreadable descriptor table or link is an error, not "no".
 func holdsHandleUnder(fdDir, root string) (bool, error) {
@@ -533,14 +759,22 @@ func truncate(s string, n int) string {
 
 // archiveOnlyTrimRefusal says why trim may not run because its physical
 // target is, or cannot be shown not to be, inside an archive_only root. A
-// docker-builder trim is checked against the data root the daemon reports,
-// not only the default one.
+// Docker trim is checked against the data root the daemon reports, not only
+// the default one; a docker-images trim also against containerd's root, where
+// the containerd image store keeps image content and snapshots.
 func archiveOnlyTrimRefusal(ctx context.Context, policy *config.Policy, trim config.CacheTrim) string {
 	targets := []string{trim.TrimTarget()}
-	if trim.Kind == config.CacheTrimDockerBuilder {
+	if trim.Kind == config.CacheTrimDockerBuilder || trim.Kind == config.CacheTrimDockerImages {
 		root, err := dockerDataRoot(ctx, trim.Binary)
 		if err != nil {
 			return fmt.Sprintf("docker data root unknown, so it cannot be shown to be outside every archive_only root: %v", err)
+		}
+		targets = append(targets, root)
+	}
+	if trim.Kind == config.CacheTrimDockerImages {
+		root, err := containerdRoot(containerdConfig)
+		if err != nil {
+			return fmt.Sprintf("containerd root unknown, so it cannot be shown to be outside every archive_only root: %v", err)
 		}
 		targets = append(targets, root)
 	}
@@ -554,6 +788,129 @@ func archiveOnlyTrimRefusal(ctx context.Context, policy *config.Policy, trim con
 		}
 	}
 	return ""
+}
+
+// containerdConfig is containerd's default configuration file.
+const containerdConfig = "/etc/containerd/config.toml"
+
+// containerdRoot is the root a containerd configuration file sets with its
+// top-level `root` key, else containerd's default when the file does not
+// exist. It fails closed: a file that cannot be read or parsed as TOML, or a
+// root that is not a non-empty absolute path string, is an error.
+func containerdRoot(file string) (string, error) {
+	data, err := os.ReadFile(file)
+	if errors.Is(err, fs.ErrNotExist) {
+		return config.ContainerdDataRoot, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var doc map[string]any
+	if _, err := toml.Decode(string(data), &doc); err != nil {
+		return "", fmt.Errorf("parse %s: %w", file, err)
+	}
+	value, set := doc["root"]
+	if !set {
+		return config.ContainerdDataRoot, nil
+	}
+	root, ok := value.(string)
+	if !ok || !filepath.IsAbs(root) {
+		return "", fmt.Errorf("%s sets root %v, not an absolute path", file, value)
+	}
+	return filepath.Clean(root), nil
+}
+
+// dockerReclaimableImageBytes is the image space Docker reports as
+// reclaimable (held by images no container uses), from `docker system df
+// --format json`. Docker prints it rounded to four significant digits.
+func dockerReclaimableImageBytes(ctx context.Context, binary string) (int64, error) {
+	runCtx, cancel := context.WithTimeout(ctx, cacheTrimTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, binary, "system", "df", "--format", "json")
+	cmd.Env = dockerEnv()
+	cmd.Dir = "/"
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("docker system df: %w", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		var row struct{ Type, Reclaimable string }
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			return 0, fmt.Errorf("docker system df: %w", err)
+		}
+		if row.Type != "Images" {
+			continue
+		}
+		// "19.45GB (80%)": the size, then the share of all image bytes.
+		size, _, _ := strings.Cut(row.Reclaimable, " ")
+		bytes, err := parseDockerSize(size)
+		if err != nil {
+			return 0, fmt.Errorf("docker system df reclaimable images %q: %w", row.Reclaimable, err)
+		}
+		return bytes, nil
+	}
+	return 0, errors.New("docker system df reported no Images row")
+}
+
+// parseDockerSize parses a size as Docker prints it (decimal units, for
+// example "0B", "970.8kB", "19.45GB").
+func parseDockerSize(s string) (int64, error) {
+	i := strings.IndexFunc(s, func(r rune) bool { return (r < '0' || r > '9') && r != '.' })
+	if i <= 0 {
+		return 0, errors.New("not a size")
+	}
+	value, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil {
+		return 0, err
+	}
+	unit := map[string]float64{"B": 1, "kB": 1e3, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "PB": 1e15}[s[i:]]
+	if unit == 0 || value*unit >= math.MaxInt64 {
+		return 0, errors.New("unknown unit or out of range")
+	}
+	return int64(value * unit), nil
+}
+
+// binaryOutside refuses a trim whose binary resolves into the cache it
+// trims: the command would delete the program running it.
+func binaryOutside(trim config.CacheTrim) error {
+	resolved, err := filepath.EvalSymlinks(trim.Binary)
+	if err != nil {
+		return fmt.Errorf("resolve binary: %w", err)
+	}
+	if core.PathWithin(resolved, trim.Path) {
+		return fmt.Errorf("binary %s resolves into %s", resolved, trim.Path)
+	}
+	return nil
+}
+
+// pnpmEnv is the environment pnpm runs with. pnpm installed by npm, nvm or
+// corepack is a `#!/usr/bin/env node` script that needs the node beside it,
+// so the binary's own directory (as configured, not resolved) leads PATH.
+func pnpmEnv(binary string) []string {
+	return []string{"HOME=" + os.Getenv("HOME"), "PATH=" + filepath.Dir(binary) + ":/usr/bin:/bin",
+		"COREPACK_ENABLE_DOWNLOAD_PROMPT=0"}
+}
+
+// pnpmStoreIs checks that pnpm, given --store-dir path, acts on path itself.
+// pnpm appends its store layout version (v10, v11, ...) to a directory that
+// does not already end in it, so a configured parent directory would be
+// measured but never pruned.
+func pnpmStoreIs(ctx context.Context, binary string, env []string, path string) error {
+	runCtx, cancel := context.WithTimeout(ctx, cacheTrimTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, binary, "store", "path", "--store-dir", path)
+	cmd.Env = env
+	cmd.Dir = "/"
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("pnpm store path: %w", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	got := strings.TrimSpace(lines[len(lines)-1])
+	if !filepath.IsAbs(got) || !samePath(got, path) {
+		return fmt.Errorf("pnpm uses store %q for --store-dir %s; configure that directory as the path", got, path)
+	}
+	return nil
 }
 
 // dockerDataRoot asks the Docker daemon for its data root.

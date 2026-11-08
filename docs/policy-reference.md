@@ -103,7 +103,7 @@ the root that do not match fall under any other category for that root.
 
 ## Standing cache trims
 
-`prevention.cache_trims` keeps live shared build caches within a bound. Each
+`prevention.cache_trims` keeps live shared caches within a bound. Each
 cycle runs every trim once, after its scan and before expiry, and the watcher
 re-runs them every `prevention.cache_trim_interval` (default `15m`, accepted
 `1m` through `2h`) so a busy cache cannot regrow to the disk floor between
@@ -116,10 +116,13 @@ deletion authority; configure it only with the owner's approval.
 
 | Field | Meaning |
 | --- | --- |
-| `kind` | `go-build` or `docker-builder`; nothing else is accepted. |
-| `path` | `go-build` only: the absolute shared `GOCACHE` directory. |
-| `binary` | Absolute path of the official `go` or `docker` executable. |
-| `max_bytes` | Positive bound. |
+| `kind` | `go-build`, `docker-builder`, `docker-images`, `go-mod` or `pnpm-store`; nothing else is accepted. |
+| `path` | `go-build`, `go-mod`, `pnpm-store` only: the absolute shared cache directory. The Docker kinds take no path. |
+| `binary` | Absolute path of the official `go`, `docker` or `pnpm` executable. For `go-mod` and `pnpm-store` it may not lie inside `path`. |
+| `max_bytes` | Positive bound. Optional for `docker-images` (see below). |
+| `min_age` | `docker-images` only, required: a whole number of hours, at least `24h`. |
+
+At most one trim per kind and path is accepted.
 
 - `go-build`: when the cache's allocated size exceeds `max_bytes`, runs
   `go clean -cache` with that exact `GOCACHE`, `GOTOOLCHAIN=local`,
@@ -127,16 +130,67 @@ deletion authority; configure it only with the owner's approval.
 - `docker-builder`: runs `docker builder prune --force --max-used-space
   <max_bytes>`. Docker removes only unused build cache, never images,
   containers or volumes.
+- `docker-images`: runs `docker image prune --all --force --filter
+  until=<min_age in hours>h`. Docker removes only images that no container,
+  running or stopped, uses and that are older than `min_age`; containers,
+  volumes, networks and build cache are never touched. With `max_bytes` the
+  prune runs only while the reclaimable image space that `docker system df
+  --format json` reports exceeds it (Docker prints that figure to four
+  significant digits); without it every run prunes. The report's sizes are
+  that reclaimable space before and after, and `reclaimed_bytes` their
+  difference.
+- `go-mod`: when the module cache's allocated size exceeds `max_bytes`, runs
+  `go clean -modcache` with that exact `GOMODCACHE`, `GOTOOLCHAIN=local`,
+  `GOENV=off`, `GOPROXY=off` and empty `GOFLAGS`. Go removes the whole
+  module cache, including its read-only files and any toolchains Go
+  downloaded into it; builds download what they need again.
+- `pnpm-store`: when the store's allocated size exceeds `max_bytes`, runs
+  `pnpm store prune --store-dir <path>`, which removes only packages no
+  project references (and pnpm's cached metadata). pnpm appends its store
+  layout version to a store directory that does not already end in it, so
+  `path` must be the versioned directory `pnpm store path` prints (for
+  example `~/.local/share/pnpm/store/v11`); before pruning, the trim checks
+  `pnpm store path --store-dir <path>` names `path` itself and fails
+  otherwise. pnpm runs with the binary's directory first on `PATH`, so an
+  nvm-, npm- or corepack-installed pnpm finds the `node` beside it.
+
+Trims with a `path` report `size_before_bytes`, `size_after_bytes` (the
+allocated size) and `reclaimed_bytes`.
 
 Immediately before running, the trim checks the process table
 (`collectors.proc_root`). A Go toolchain command (`go build/test/vet/run/
 install/generate/list/tool/get/mod`, `compile`, `link`, `asm`, `cgo`, `vet`,
-`cover`), or any open handle under the Go cache, postpones the Go trim. An
-image build (`docker build`, `docker buildx build`, `bake`, `buildctl build`)
-postpones the Docker prune. A postponed trim is reported as `skipped_in_use`
-and retried next cycle; it is not an error. A trim command that fails is
-reported and makes the cycle exit non-zero. Results appear as `cache_trims`
-in the cycle report.
+`cover`), or any open handle under the Go cache, postpones the Go trim. Any
+`go` command or `gopls` whose module cache resolves to `path`, any process
+running an executable under it (a toolchain Go downloaded) or holding a
+handle under it, postpones the `go-mod` trim. Both resolve the cache as Go
+does: the process environment, then the go env file (`GOENV`, else
+`$XDG_CONFIG_HOME/go/env` or `$HOME/.config/go/env`), then `$GOROOT/go.env`
+(`GOROOT` from the env file, the process, then its executable); `GOCACHE`
+defaults to `$XDG_CACHE_HOME/go-build` or `$HOME/.cache/go-build`, and
+`GOMODCACHE` to the first `GOPATH` entry plus `/pkg/mod`, with `GOPATH`
+resolved the same way and defaulting to `$HOME/go`. A process whose cache
+cannot be determined (a relative `GOENV`, no `HOME`, an unreadable file, an
+empty first `GOPATH` entry) counts as a user. Any running pnpm (the `pnpm`
+or `pnpx` executable, or `node`, `corepack`, `npm`, `npx` or `bun` running
+one) or a handle under the store postpones `pnpm-store`. An image build
+(`docker build`, `docker buildx build`, `bake`, `buildctl build`) postpones
+the Docker build cache prune; an image build or pull (`docker pull`,
+`docker image pull`, `docker compose pull`, `docker-compose pull`) postpones
+the image prune. A postponed trim is reported as `skipped_in_use` and
+retried next cycle; it is not an error. A process that cannot be inspected
+counts as a user. A trim command that fails is reported and makes the cycle
+exit non-zero. Results appear as `cache_trims` in the cycle report.
+
+No trim may target an archive_only root. Validation checks the path, or for
+the Docker kinds Docker's default data root `/var/lib/docker` (and for
+`docker-images` containerd's default root `/var/lib/containerd`, where the
+containerd image store keeps image content and snapshots). Before each run
+the trim also checks the data root `docker info` reports and, for
+`docker-images`, the top-level `root` of `/etc/containerd/config.toml`
+(decoded as TOML; the default when the file does not exist). Anything it
+cannot resolve refuses the trim, as does a config that cannot be read or
+parsed or whose `root` is not a non-empty absolute path string.
 
 Do not also configure a `caches` quarantine rule for a cache that has a
 trim: the quarantine is refused whenever a build writes the cache.
