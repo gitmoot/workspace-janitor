@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
@@ -792,9 +793,10 @@ func archiveOnlyTrimRefusal(ctx context.Context, policy *config.Policy, trim con
 // containerdConfig is containerd's default configuration file.
 const containerdConfig = "/etc/containerd/config.toml"
 
-// containerdRoot is the root a containerd configuration file sets with a
-// top-level `root = "..."`, else containerd's default. A file that exists
-// but cannot be read, or a root that is not an absolute path, is an error.
+// containerdRoot is the root a containerd configuration file sets with its
+// top-level `root` key, else containerd's default when the file does not
+// exist. It fails closed: a file that cannot be read or parsed as TOML, or a
+// root that is not a non-empty absolute path string, is an error.
 func containerdRoot(file string) (string, error) {
 	data, err := os.ReadFile(file)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -803,29 +805,19 @@ func containerdRoot(file string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "[") {
-			break // top-level keys precede the first table
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) != "root" {
-			continue
-		}
-		value = strings.TrimSpace(value)
-		if i := strings.Index(value, "#"); i >= 0 {
-			value = strings.TrimSpace(value[:i])
-		}
-		root, err := strconv.Unquote(value)
-		if err != nil {
-			root = strings.Trim(value, "'")
-		}
-		if !filepath.IsAbs(root) {
-			return "", fmt.Errorf("%s sets root %s", file, value)
-		}
-		return filepath.Clean(root), nil
+	var doc map[string]any
+	if _, err := toml.Decode(string(data), &doc); err != nil {
+		return "", fmt.Errorf("parse %s: %w", file, err)
 	}
-	return config.ContainerdDataRoot, nil
+	value, set := doc["root"]
+	if !set {
+		return config.ContainerdDataRoot, nil
+	}
+	root, ok := value.(string)
+	if !ok || !filepath.IsAbs(root) {
+		return "", fmt.Errorf("%s sets root %v, not an absolute path", file, value)
+	}
+	return filepath.Clean(root), nil
 }
 
 // dockerReclaimableImageBytes is the image space Docker reports as

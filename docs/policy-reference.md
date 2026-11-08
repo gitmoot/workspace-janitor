@@ -187,8 +187,10 @@ the Docker kinds Docker's default data root `/var/lib/docker` (and for
 `docker-images` containerd's default root `/var/lib/containerd`, where the
 containerd image store keeps image content and snapshots). Before each run
 the trim also checks the data root `docker info` reports and, for
-`docker-images`, the top-level `root` of `/etc/containerd/config.toml`;
-anything it cannot resolve refuses the trim.
+`docker-images`, the top-level `root` of `/etc/containerd/config.toml`
+(decoded as TOML; the default when the file does not exist). Anything it
+cannot resolve refuses the trim, as does a config that cannot be read or
+parsed or whose `root` is not a non-empty absolute path string.
 
 Do not also configure a `caches` quarantine rule for a cache that has a
 trim: the quarantine is refused whenever a build writes the cache.

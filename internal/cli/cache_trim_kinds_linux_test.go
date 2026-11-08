@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gitmoot/workspace-janitor/internal/config"
 )
 
 // kindResult decodes one entry of the public cycle report's cache_trims.
@@ -172,6 +174,53 @@ func TestDockerImagesTrimRefusedWhenItsDataRootIsArchiveOnly(t *testing.T) {
 		if !strings.HasPrefix(call, "docker|info ") {
 			t.Fatalf("docker ran more than its data-root query for an archive_only data root: %v", x.calls(t))
 		}
+	}
+}
+
+// Review #186 P1: the docker-images archive_only guard checks the root that
+// containerd's config.toml really sets. Any valid TOML spelling of the
+// top-level root (a quoted key, a literal string containing '#') must be
+// read exactly, and a config that cannot be parsed or sets no usable root
+// must refuse the trim, never fall back to the default. Each case runs the
+// guard's containerd step: resolve the root, then check it against the
+// archive_only roots.
+func TestDockerImagesGuardReadsContainerdRootAsTOML(t *testing.T) {
+	dir := t.TempDir()
+	protected := filepath.Join(dir, "srv", "protected#state")
+	policy := &config.Policy{Roots: []config.Root{{Path: protected, ArchiveOnly: true}}}
+	inside := filepath.Join(protected, "containerd")
+	for name, tc := range map[string]struct {
+		body    string
+		refused bool
+	}{
+		"quoted key":                {`"root" = "` + inside + `"` + "\n", true},
+		"literal string with #":     {"version = 2\nroot = '" + inside + "' # relocated\n", true},
+		"malformed TOML":            {"this is not toml\n", true},
+		"root not a string":         {"root = 5\n", true},
+		"empty root":                {"root = \"\"\n", true},
+		"relative root":             {"root = \"containerd\"\n", true},
+		"root outside":              {"root = \"" + filepath.Join(dir, "srv", "containerd") + "\"\n", false},
+		"no root":                   {"disabled_plugins = [\"cri\"]\n", false},
+		"root only inside a table":  {"[plugins.cri]\nroot = \"" + inside + "\"\n", false},
+		"missing file (no content)": {"", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "config.toml")
+			if tc.body != "" {
+				if err := os.WriteFile(file, []byte(tc.body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			root, err := containerdRoot(file)
+			refused := err != nil
+			if !refused {
+				in, resolveErr := config.ResolvesIntoArchiveOnlyRoot(policy, root)
+				refused = resolveErr != nil || in
+			}
+			if refused != tc.refused {
+				t.Fatalf("config %q: root %q, err %v; refused = %v, want %v", tc.body, root, err, refused, tc.refused)
+			}
+		})
 	}
 }
 
