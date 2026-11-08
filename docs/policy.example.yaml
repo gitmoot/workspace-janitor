@@ -80,6 +80,31 @@ prevention:
   # retention expires; with auto_expire they are then deleted. A cache rule
   # with retention: none is therefore removed in the same cycle.
   auto_quarantine: false
+  # Owner-approved standing trims of live shared caches, each with its
+  # official command and only while no process uses the cache. Empty by
+  # default; see docs/policy-reference.md#standing-cache-trims.
+  cache_trims: []
+  # cache_trims:
+  #   - kind: go-build
+  #     path: ~/.cache/go-build
+  #     binary: /usr/local/go/bin/go
+  #     max_bytes: 10737418240
+  #   - kind: docker-builder
+  #     binary: /usr/bin/docker
+  #     max_bytes: 10737418240
+  #   - kind: docker-images        # unused images older than min_age
+  #     binary: /usr/bin/docker
+  #     min_age: 168h
+  #     max_bytes: 10737418240     # optional: prune only above this reclaimable
+  #   - kind: go-mod
+  #     path: ~/go/pkg/mod
+  #     binary: /usr/local/go/bin/go  # never a toolchain inside the cache
+  #     max_bytes: 8589934592
+  #   - kind: pnpm-store
+  #     path: ~/.local/share/pnpm/store/v11  # as `pnpm store path` prints
+  #     binary: /usr/local/bin/pnpm
+  #     max_bytes: 2147483648
+  # cache_trim_interval: 15m
 
 # Where entries of a class are supposed to live. A primary project found
 # outside its canonical root is a relocation candidate, never a deletion
