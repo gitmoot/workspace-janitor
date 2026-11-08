@@ -15,6 +15,10 @@ import (
 // ErrCleanupStateMismatch reports a stale optimistic transition.
 var ErrCleanupStateMismatch = errors.New("store: cleanup state mismatch")
 
+// supersededCleanupVersion is the schema step that admits the
+// superseded_by_original cleanup state.
+const supersededCleanupVersion = 14
+
 const cleanupColumns = `cleanup_id, plan_id, action_id, source, destination, state,
 	entry_json, action_json, quarantined_json, created_at, updated_at, moved_at, expires_at, reason`
 

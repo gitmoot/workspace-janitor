@@ -696,7 +696,10 @@ its expiry authority while any of these hold:
   keeps its expiry authority. A move interrupted before Janitor recorded it
   cannot be told apart from one that never happened, so restoring it does not
   withdraw expiry either; the archive stays verified, so a later quarantine
-  loses nothing.
+  loses nothing. A quarantined copy that expiry removed as
+  `superseded_by_original`, because an identical original was put back at its
+  path ([recovery](recovery.md#expiry-and-irreversible-paths)), counts as the
+  owner's undo too.
 
 `janitor archive --categories` previews by default and writes nothing.
 `--dry-run=false --confirm` creates the archives under the apply lock and

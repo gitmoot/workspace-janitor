@@ -272,7 +272,7 @@ func (e *Engine) RetryPreview(ctx context.Context, item core.CleanupItem) error 
 	candidate := item
 	candidate.State = core.CleanupQuarantined
 	if e.settleAbsent(item) == absentUnproven {
-		if err := e.Eligible(ctx, candidate); err != nil {
+		if _, err := e.expiryEligible(ctx, candidate); err != nil {
 			return err
 		}
 	}
@@ -290,12 +290,14 @@ func (e *Engine) Reconcile(ctx context.Context, item core.CleanupItem) (core.Cle
 		// An investigation is not a permanent tombstone. Recheck every expiry
 		// guard before allowing an explicitly retried deletion; an unchanged
 		// reason (new reference, changed bytes, unknown collector) stays put.
+		// A copy an identical original now supersedes is held to the guards
+		// on the copy alone, as Delete holds it.
 		candidate := item
 		candidate.State = core.CleanupQuarantined
 		// With the object gone there is nothing for the guards to protect;
 		// Delete records the outcome, or a restore that stopped short.
 		if e.settleAbsent(item) == absentUnproven {
-			if err := e.Eligible(ctx, candidate); err != nil {
+			if _, err := e.expiryEligible(ctx, candidate); err != nil {
 				return item, err
 			}
 		}

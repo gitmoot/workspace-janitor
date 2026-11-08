@@ -103,14 +103,7 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 			case !rule.LocalExpiryEnabled:
 				ref.Detail = LocalExpiryRefusal(rule, time.Time{}, now)
 			default:
-				scope := workspacearchive.PolicyScope(*policy, rule)
-				scope.ProcRoot = opts.ProcRoot
-				if strings.HasPrefix(rule.Owner, config.CategoryOwnerPrefix) {
-					if categoryDependents == nil {
-						categoryDependents = workspacearchive.BuildDependentIndex(budgetCtx, scope.SearchRoots, policy.Limits.DependentIndexMaxEntries)
-					}
-					scope.Dependents = categoryDependents
-				}
+				scope := workspacearchive.BindingScope(budgetCtx, *policy, rule, opts.ProcRoot, &categoryDependents)
 				if BeforeWorkspaceArchiveBind != nil {
 					BeforeWorkspaceArchiveBind()
 				}

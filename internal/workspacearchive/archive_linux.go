@@ -187,6 +187,21 @@ func (s Scope) live(ctx context.Context, paths, mentions []string) error {
 	return nil
 }
 
+// LocalReferences runs the live process and external dependent checks Bind
+// applies to the local unit at localPath (a quarantined copy) against its
+// own names alone: not the rule's original names, and not its mentions,
+// which are derived from those names. A process or dependent reaching into
+// the local unit, or one that cannot be examined, refuses.
+func LocalReferences(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope, localPath string) error {
+	if !core.IsCanonicalPath(localPath) || localPath == "/" {
+		return errors.New("local workspace path must be a canonical absolute path")
+	}
+	if len(scope.SearchRoots) == 0 {
+		return errors.New("external dependent scan requires at least one search root")
+	}
+	return scope.live(ctx, unitPaths(rule, localPath), nil)
+}
+
 // validCompanion refuses a companion that is not a sibling of rule.Path whose
 // name extends rule.Path's: the unit moves and restores as one name pair.
 func validCompanion(rule config.WorkspaceArchiveRule) error {

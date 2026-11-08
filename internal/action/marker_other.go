@@ -13,4 +13,8 @@ func writeDeletionMarker(_ core.CleanupItem) error {
 	return errors.New("anchored quarantine deletion is not supported on this platform")
 }
 
-func hasDeletionMarker(_ core.CleanupItem) bool { return false }
+func writeRemovalMarker(_ core.CleanupItem, _ core.CleanupState) error {
+	return errors.New("anchored quarantine deletion is not supported on this platform")
+}
+
+func deletionMarker(_ core.CleanupItem) core.CleanupState { return "" }

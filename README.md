@@ -416,7 +416,11 @@ Expiry checks references at or under the original path, not its siblings: a
 home directory's parent always has live processes. A directory recreated at
 the original path, such as a cache a service regenerates, is a new object:
 expiry neither deletes it nor is blocked by it, unless something references a
-path inside it.
+path inside it. A recreated original identical to the quarantined copy (same
+tree, types, modes, owners, symlink targets and file bytes) makes the copy
+redundant: expiry removes only the copy, under every guard on the copy, and
+records `superseded_by_original` even while the original is referenced. See
+[recovery](docs/recovery.md#expiry-and-irreversible-paths).
 
 Automatic quarantine is also **off** by default. With
 `prevention.auto_quarantine: true` the cycle plans its own scan from rules

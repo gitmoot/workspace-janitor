@@ -735,11 +735,7 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 				}
 			}
 			rule := categoryRule(category, name, item.Path, owner, release)
-			scope := workspacearchive.PolicyScope(policy, rule)
-			if dependents == nil {
-				dependents = workspacearchive.BuildDependentIndex(ctx, scope.SearchRoots, policy.Limits.DependentIndexMaxEntries)
-			}
-			scope.Dependents = dependents
+			scope := workspacearchive.BindingScope(ctx, policy, rule, policy.Collectors.ProcRoot, &dependents)
 			inspection, err := workspacearchive.Inspect(ctx, rule, scope)
 			switch {
 			case err != nil:

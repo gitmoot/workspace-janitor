@@ -15,12 +15,16 @@ import (
 	"github.com/gitmoot/workspace-janitor/internal/store"
 )
 
-func TestScheduledExpiryRechecksOriginalReferences(t *testing.T) {
-	f := newFixture(t)
+// quarantinedCache quarantines root/cache (one 0600 payload file in a 0700
+// directory) under a policy with automatic expiry and no restore window, and
+// returns its receipt and the systemd unit directory the service collector
+// reads.
+func quarantinedCache(t *testing.T, f *fixture) (cache, units string, receipt core.CleanupItem) {
+	t.Helper()
 	root := filepath.Join(f.home, "workspace")
-	cache := filepath.Join(root, "cache")
+	cache = filepath.Join(root, "cache")
 	proc := filepath.Join(f.home, "empty-proc")
-	units := filepath.Join(f.home, "systemd")
+	units = filepath.Join(f.home, "systemd")
 	for _, path := range []string{cache, proc, units} {
 		if err := os.MkdirAll(path, 0700); err != nil {
 			t.Fatal(err)
@@ -67,7 +71,6 @@ func TestScheduledExpiryRechecksOriginalReferences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var receipt core.CleanupItem
 	if err := db.Read(ctx, func(tx *store.Tx) error {
 		items, err := tx.PendingCleanupItems(ctx)
 		if err == nil && len(items) != 1 {
@@ -81,6 +84,12 @@ func TestScheduledExpiryRechecksOriginalReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Close()
+	return cache, units, receipt
+}
+
+func TestScheduledExpiryRechecksOriginalReferences(t *testing.T) {
+	f := newFixture(t)
+	cache, units, receipt := quarantinedCache(t, f)
 	unit := filepath.Join(units, "active.service")
 	if err := os.WriteFile(unit, []byte("[Service]\nWorkingDirectory="+cache+"\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -101,7 +110,7 @@ func TestScheduledExpiryRechecksOriginalReferences(t *testing.T) {
 	if err := os.Remove(unit); err != nil {
 		t.Fatal(err)
 	}
-	out, stderr, code = f.run(t, "cycle")
+	out, stderr, code := f.run(t, "cycle")
 	if code != ExitOK {
 		t.Fatalf("expiry did not recover after reference removal: %s", stderr)
 	}
@@ -111,6 +120,53 @@ func TestScheduledExpiryRechecksOriginalReferences(t *testing.T) {
 	}
 	if _, err := os.Lstat(receipt.Destination); !os.IsNotExist(err) {
 		t.Fatalf("expired receipt remains: %v", err)
+	}
+}
+
+// sandboxd-*-omp (live 2026-11-08): a quarantined directory was put back at
+// its original path byte for byte, and a service then named it. Expiry
+// refused the redundant quarantined copy every night ("original source has
+// new protected references"), failing the cycle. An identical original
+// supersedes the copy: the cycle removes only the copy, leaves the original
+// alone and succeeds.
+func TestScheduledExpiryRemovesCopySupersededByIdenticalOriginal(t *testing.T) {
+	f := newFixture(t)
+	cache, units, receipt := quarantinedCache(t, f)
+	if err := os.Mkdir(cache, 0700); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(cache, "payload")
+	if err := os.WriteFile(payload, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(units, "active.service"), []byte("[Service]\nWorkingDirectory="+cache+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, code := f.run(t, "cycle")
+	var cycle cycleReport
+	if code != ExitOK || json.Unmarshal([]byte(out), &cycle) != nil || cycle.Expiry != "checked" {
+		t.Fatalf("cycle: exit=%d %s %s", code, stderr, out)
+	}
+	if !strings.Contains(cycle.ExpiryReport, "(superseded_by_original)") || strings.Contains(cycle.ExpiryReport, "refused") {
+		t.Fatalf("expiry report: %q", cycle.ExpiryReport)
+	}
+	if _, err := os.Lstat(receipt.Destination); !os.IsNotExist(err) {
+		t.Fatalf("superseded copy remains: %v", err)
+	}
+	after, err := os.Lstat(payload)
+	if err != nil || !os.SameFile(before, after) || !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("original was touched: %v", err)
+	}
+	if raw, err := os.ReadFile(payload); err != nil || string(raw) != "fixture" {
+		t.Fatalf("original content: %q %v", raw, err)
+	}
+	// The receipt is settled: the next cycle has nothing left to refuse.
+	if _, stderr, code := f.run(t, "cycle"); code != ExitOK {
+		t.Fatalf("second cycle: exit=%d %s", code, stderr)
 	}
 }
 

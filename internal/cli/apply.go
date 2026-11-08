@@ -203,7 +203,7 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	}
 	byAction := make(map[string]core.CleanupItem)
 	for _, item := range prior {
-		if item.PlanID != stored.ID || item.State == core.CleanupRestored || item.State == core.CleanupDeleted {
+		if item.PlanID != stored.ID || item.State == core.CleanupRestored || item.State == core.CleanupDeleted || item.State == core.CleanupSuperseded {
 			continue
 		}
 		if report.ID != "" && item.CleanupID != report.ID {
@@ -396,7 +396,7 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 			}
 		}
 		if item.State != core.CleanupQuarantined {
-			if monitor != nil && opts.cleanupID != "" && item.State == core.CleanupDeleted {
+			if monitor != nil && opts.cleanupID != "" && (item.State == core.CleanupDeleted || item.State == core.CleanupSuperseded) {
 				monitor.activity.Replayed++
 			}
 			continue
@@ -410,7 +410,7 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 		} else {
 			monitor.activity.Attempted++
 			item, err = engine.Delete(ctx, item)
-			if err == nil && item.State == core.CleanupDeleted {
+			if err == nil && (item.State == core.CleanupDeleted || item.State == core.CleanupSuperseded) {
 				monitor.activity.Completed++
 			}
 		}

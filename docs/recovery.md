@@ -26,6 +26,37 @@ retry flags or manual database edits to bypass an unresolved receipt.
 
 Retention reaching its date alone never deletes an object. With `retention.delete_enabled: true`, `janitor apply --expire` previews eligible receipts; `janitor apply --expire --confirm --dry-run=false` separately requests deletion after fresh receipt, original-path, Git and live-reference checks. A changed or newly referenced item enters `investigate` and remains recoverable; address the evidence and re-run a separately confirmed evaluation, or restore it. Automatic expiry also requires `prevention.auto_expire: true` and an operator-installed timer; it uses the guarded path but is irreversible when it succeeds. `prevention.auto_quarantine: true` additionally lets that timer approve and move rule-based quarantine actions without an operator; restore them with `janitor restore <cleanup-id>` before their retention expires. Keep these switches off unless explicitly authorized.
 
+If the original path holds an object again at expiry (an archive restore, a
+copy made outside Janitor), expiry compares it with the quarantined copy.
+They are identical when the trees have the same shape and entry names, and
+every entry has the same type, permission bits, owner and group, every
+symlink the same target, and every regular file the same size and bytes.
+Modification times, extended attributes and ACLs are not compared; symlinks
+are never followed, mounts never crossed, and a tree with more than
+`limits.deep_size_max_entries` entries is not compared. An identical original
+makes the copy redundant: expiry removes only the copy, never touching the
+original, and records the receipt `superseded_by_original` rather than
+`deleted`. References to and protections of the original path do not hold the
+copy, since nothing happens there, but every guard on the copy itself still
+applies (open descriptors, processes, Git state, protected names, mounts and
+its identity, apart from a workspace archive binding that the restore
+withdrew). A workspace archive rule still configured for the original path
+does not bind the copy; instead its live-process and external-dependent
+checks run against the copy's own names (a category rule through its shared
+dependent index, bounded by `limits.dependent_index_max_entries`, as when it
+binds), so a process using only the original does not hold the copy, while
+one using the copy, or one that cannot be inspected, does. Just before
+removal both trees must still show, for every entry,
+the inode, change time and size the comparison saw. A unit with a bound
+companion is never superseded. Any other original (changed bytes, a symlink or
+file where a directory was, an unreadable entry, a tree changed meanwhile)
+gets the usual original-path checks, so a referenced one is still refused. A
+copy removed before its receipt was updated is recorded from its removal
+marker on the next expiry. A `superseded_by_original` receipt, like
+`restored`, withdraws a category archive's local-expiry authority for that
+path. Superseded items do not fail `janitor cycle`; any other expiry refusal
+still does.
+
 An `identity_changed` refusal after upgrading can also mean that an older
 receipt used a different fingerprint format; it is not proof of replacement.
 Janitor recognizes the pre-Git-activity format only when the saved digest

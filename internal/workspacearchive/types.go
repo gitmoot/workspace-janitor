@@ -4,9 +4,11 @@
 package workspacearchive
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
@@ -147,6 +149,24 @@ func PolicyScope(policy config.Policy, rule config.WorkspaceArchiveRule) Scope {
 		for _, root := range policy.Roots {
 			scope.SearchRoots = append(scope.SearchRoots, root.Path)
 		}
+	}
+	return scope
+}
+
+// BindingScope is PolicyScope for binding rule's local unit. A category
+// archive rule (owner prefixed config.CategoryOwnerPrefix) checks dependents
+// through one index shared by every category rule of an observation, walked
+// once from its search roots under limits.dependent_index_max_entries rather
+// than per tree under deep_size_max_entries; *shared holds that index, built
+// on first use. Explicit rules keep their own walk.
+func BindingScope(ctx context.Context, policy config.Policy, rule config.WorkspaceArchiveRule, procRoot string, shared **DependentIndex) Scope {
+	scope := PolicyScope(policy, rule)
+	scope.ProcRoot = procRoot
+	if strings.HasPrefix(rule.Owner, config.CategoryOwnerPrefix) {
+		if *shared == nil {
+			*shared = BuildDependentIndex(ctx, scope.SearchRoots, policy.Limits.DependentIndexMaxEntries)
+		}
+		scope.Dependents = *shared
 	}
 	return scope
 }
