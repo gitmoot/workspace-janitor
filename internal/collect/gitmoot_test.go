@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
 
@@ -224,5 +225,73 @@ func TestGitmootTimeoutProtectsManagedEntry(t *testing.T) {
 	if report.Status != core.CollectorPartial || report.Unknowns == 0 ||
 		!strings.Contains(report.Detail, "command timeout") {
 		t.Fatalf("timed-out ledger reported certainty: %+v", report)
+	}
+}
+
+func gitmootJobLogPolicy(jobs string) *config.Policy {
+	return &config.Policy{WorkspaceArchiveCategories: []config.WorkspaceArchiveCategory{
+		{Name: "job-logs", Kind: config.CategoryGitmootJobLogs, Roots: []string{jobs}}}}
+}
+
+func TestGitmootUnreadableLedgerKeepsJobLogLocal(t *testing.T) {
+	base := t.TempDir()
+	home := mustMkdir(t, filepath.Join(base, ".gitmoot"))
+	jobs := mustMkdir(t, filepath.Join(home, "logs", "jobs"))
+	log := mustWrite(t, filepath.Join(jobs, "job.log"), "log\n")
+	dbPath := mustWrite(t, filepath.Join(home, "gitmoot.db"), "not a sqlite database")
+	opts := fixtureOptions(base)
+	opts.Roots[0].MaxDepth = 4
+	opts.GitmootHome, opts.GitmootDatabase = home, dbPath
+	opts.WorktreePolicy = gitmootJobLogPolicy(jobs)
+	result := run(t, opts)
+	entry := entryFor(t, result, log)
+	if signal := gitmootSignal(entry); signal != "unknown:gitmoot" || !entry.Protected() {
+		t.Fatalf("unreadable ledger did not protect job log: %q %+v", signal, entry.Protections)
+	}
+	if report := reportFor(t, result, CollectorGitmoot); report.Status != core.CollectorPartial {
+		t.Fatalf("unreadable ledger reported certainty: %+v", report)
+	}
+}
+
+func TestGitmootLedgerClaimOnQuarantinedJobLogOrigin(t *testing.T) {
+	base := t.TempDir()
+	home := mustMkdir(t, filepath.Join(base, ".gitmoot"))
+	jobs := mustMkdir(t, filepath.Join(home, "logs", "jobs"))
+	idle := mustWrite(t, filepath.Join(jobs, "idle.log"), "log\n")
+	original := filepath.Join(jobs, "running.log")
+	quarantined := mustWrite(t, filepath.Join(base, "quarantine", "running.log"), "log\n")
+	dbPath := filepath.Join(home, "gitmoot.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`CREATE TABLE jobs(id TEXT PRIMARY KEY, state TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE tasks(id TEXT PRIMARY KEY, state TEXT NOT NULL, worktree_path TEXT NOT NULL)`,
+		`CREATE TABLE cleanup_obligations(owner_job_id TEXT, expected_path TEXT, resource_kind TEXT, state TEXT, created_at TEXT, updated_at TEXT)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO jobs VALUES(?,?,?,?)`, "running", "running", `{"worktree_path":"`+original+`"}`, "2026-03-01 00:00:00"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opts := fixtureOptions(base)
+	opts.Roots[0].MaxDepth = 4
+	opts.GitmootHome, opts.GitmootDatabase = home, dbPath
+	opts.WorktreePolicy = gitmootJobLogPolicy(jobs)
+	opts.WorktreeOrigins = map[string]string{quarantined: original}
+	result := run(t, opts)
+	entry := entryFor(t, result, quarantined)
+	if signal := gitmootSignal(entry); signal != "unknown:gitmoot" || !entry.Protected() {
+		t.Fatalf("ledger claim on original path did not protect quarantined log: %q %+v", signal, entry.Protections)
+	}
+	// An unreferenced job log stays outside Gitmoot's managed lifecycle.
+	if entry := entryFor(t, result, idle); gitmootSignal(entry) != "" {
+		t.Fatalf("unreferenced job log marked: %+v", entry.Evidence)
 	}
 }

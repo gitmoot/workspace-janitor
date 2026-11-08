@@ -219,6 +219,22 @@ workspace_archive_keep: []
 #   local_retention: none
 #   archive:
 #     directory: /mnt/backup/janitor-categories
+# - name: omp-sessions
+#   kind: omp_sessions            # idle OMP sessions: <project>/<session> dir and
+#                                 # its <session>.jsonl, moved and restored together
+#   roots: [/root/.omp/agent/sessions]  # exactly .../.omp/agent/sessions; the
+#                                 # inventory root needs max_depth: 2
+#   idle: 14d                     # newest mtime of the dir and transcript; minimum 1d
+#   local_retention: none
+#   archive:
+#     directory: /mnt/backup/omp-sessions
+# - name: gitmoot-job-logs
+#   kind: gitmoot_job_logs        # regular files directly in the jobs log dir
+#   roots: [/root/.gitmoot/logs/jobs]   # exactly .../.gitmoot/logs/jobs
+#   idle: 14d                     # minimum 1d
+#   local_retention: none
+#   archive:
+#     directory: /mnt/backup/gitmoot-job-logs
 workspace_archive_categories: []
 # Opt-in scratch directory cleanup; empty by default. Only depth-1 entries of
 # each path are candidates. Entries matching skip are never touched; idle,

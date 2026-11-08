@@ -40,10 +40,13 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 				if core.PathWithin(rule.Path, original) {
 					addProtection(&entries[i], core.Protection{Kind: core.ProtectDurableEvidence, Source: core.SourcePolicy, Blocking: true, Reason: "contains a released workspace; only its exact verified archive binding may expire it"})
 				}
+				if rule.Companion != "" && original == rule.Companion {
+					addProtection(&entries[i], core.Protection{Kind: core.ProtectDurableEvidence, Source: core.SourcePolicy, Blocking: true, Reason: CompanionMarker(rule.Path)})
+				}
 				continue
 			}
-			protected := protectedExportPath(original, policy)
 			category := strings.HasPrefix(rule.Owner, config.CategoryOwnerPrefix)
+			protected := protectedArchivePath(original, entries[i].Kind, category, policy)
 			for _, protection := range entries[i].Protections {
 				if category && protection.Kind == core.ProtectArchiveOnlyRoot {
 					continue // lifted below only if the archive exactly binds
@@ -95,10 +98,10 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 				ref.Detail = "archive binding deferred: this scan's binding budget is spent; a later scan binds it"
 			case item.protected:
 				ref.Detail = "existing protection prevents binding or expiring this released workspace"
-			case item.kind != core.EntryKindDirectory:
-				ref.Detail = "only an ordinary released directory may expire; symlinks and other types remain protected"
+			case item.kind != core.EntryKindDirectory && item.kind != core.EntryKindFile:
+				ref.Detail = "only an ordinary released directory or regular file may expire; symlinks and other types remain protected"
 			case !rule.LocalExpiryEnabled:
-				ref.Detail = "local expiry is disabled; the released workspace remains retained"
+				ref.Detail = LocalExpiryRefusal(rule, time.Time{}, now)
 			default:
 				scope := workspacearchive.PolicyScope(*policy, rule)
 				scope.ProcRoot = opts.ProcRoot
@@ -115,8 +118,8 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 				switch {
 				case err != nil:
 					ref.Detail = fmt.Sprintf("verified workspace archive does not bind the local tree: %v", err)
-				case !rule.LocalRetention.Expired(binding.CreatedAt, now):
-					ref.Detail = "the local retention window measured from archive creation has not elapsed"
+				case LocalExpiryRefusal(rule, binding.CreatedAt, now) != "":
+					ref.Detail = LocalExpiryRefusal(rule, binding.CreatedAt, now)
 				default:
 					ref.Protection = ""
 					ref.WorkspaceArchive = binding
@@ -157,6 +160,21 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 	return report
 }
 
+// protectedArchivePath is protectedExportPath for a workspace archive rule's
+// own path. A category's Gitmoot job log (a regular file directly in a
+// gitmoot_job_logs root) is exempt from Gitmoot's home entry alone; every
+// other protected path and name pattern still holds it.
+func protectedArchivePath(path string, kind core.EntryKind, category bool, policy *config.Policy) bool {
+	if !category || kind != core.EntryKindFile || !policy.GitmootJobLog(path) {
+		return protectedExportPath(path, policy)
+	}
+	trimmed := *policy
+	trimmed.Protect.Paths = slices.DeleteFunc(slices.Clone(policy.Protect.Paths), func(protected string) bool {
+		return protected == policy.Gitmoot.Home
+	})
+	return protectedExportPath(path, &trimmed)
+}
+
 // bindingBudget is when workspace archive binding stops starting new work:
 // a fifth of the remaining collector time (at least 2 s, at most 15 s)
 // before its deadline, so the collector publishes in time. A bind or index
@@ -174,3 +192,24 @@ func bindingBudget(ctx context.Context) time.Time {
 // BeforeWorkspaceArchiveBind is a test seam called before each archive
 // bind, so a test can make binding slow. Nil outside tests.
 var BeforeWorkspaceArchiveBind func()
+
+// CompanionMarker is the reason of the blocking protection a bound unit's
+// companion carries: it moves, restores and expires only with primary.
+func CompanionMarker(primary string) string {
+	return fmt.Sprintf("companion of released unit %s; it moves only with it", primary)
+}
+
+// LocalExpiryRefusal is why rule does not yet let its verified archive,
+// created at createdAt, stand in for the local copy at now: local expiry is
+// disabled, or the local retention measured from creation has not elapsed.
+// "" allows it. Binding and an interrupted expiry's leftover companion both
+// apply it, so the current policy decides even for an unchanged archive.
+func LocalExpiryRefusal(rule config.WorkspaceArchiveRule, createdAt, now time.Time) string {
+	switch {
+	case !rule.LocalExpiryEnabled:
+		return "local expiry is disabled; the released workspace remains retained"
+	case !rule.LocalRetention.Expired(createdAt, now):
+		return "the local retention window measured from archive creation has not elapsed"
+	}
+	return ""
+}

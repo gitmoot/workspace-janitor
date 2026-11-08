@@ -4,6 +4,7 @@ package workspacearchive
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -128,15 +130,17 @@ func (w *walker) add(m Member, st state) error {
 }
 
 // scanTree records every member without following symlinks or crossing
-// mounts. hash also hashes regular files; screen applies the refusal screens,
-// which apply to sources and to local trees bound for expiry, not to restores.
+// mounts; a regular file root is its own only member. hash also hashes
+// regular files; screen applies the refusal screens, which apply to sources
+// and to local trees bound for expiry, not to restores.
 func scanTree(ctx context.Context, root *os.File, source string, patterns []string, limit int, hash, screen bool) (*walker, error) {
 	rootState, err := fstate(root)
 	if err != nil {
 		return nil, err
 	}
-	if rootState.kind() != unix.S_IFDIR {
-		return nil, errors.New("workspace archive source must be a directory")
+	kind := rootState.kind()
+	if kind != unix.S_IFDIR && kind != unix.S_IFREG {
+		return nil, errors.New("workspace archive source must be a directory or a regular file")
 	}
 	w := &walker{ctx: ctx, source: source, rootState: rootState, patterns: patterns, max: limit, hash: hash, screen: screen}
 	if screen {
@@ -146,6 +150,18 @@ func scanTree(ctx context.Context, root *os.File, source string, patterns []stri
 		if hasXattrs(unix.Flistxattr(int(root.Fd()), nil)) {
 			w.refuse(".: extended attributes are unsupported")
 		}
+	}
+	if kind == unix.S_IFREG {
+		m := regularMember(".", rootState)
+		if hash {
+			if m.SHA256, err = hashRegular(ctx, root, rootState.size, source); err != nil {
+				return nil, err
+			}
+		}
+		if err = w.add(m, rootState); err != nil {
+			return nil, err
+		}
+		return w, nil
 	}
 	if err = w.add(Member{Path: ".", Type: TypeDirectory, Mode: rootState.mode & 07777, UID: rootState.uid, GID: rootState.gid, ModifiedNS: rootState.mtimeNS}, rootState); err != nil {
 		return nil, err
@@ -283,20 +299,11 @@ func (w *walker) readRegular(dir *os.File, name, rel string, m *Member, st state
 		return fmt.Errorf("%s changed while being inspected", m.Path)
 	}
 	if w.hash {
-		hash := sha256.New()
-		n, err := io.Copy(hash, contextReader{w.ctx, io.LimitReader(f, st.size+1)})
-		if err != nil {
+		if m.SHA256, err = hashRegular(w.ctx, f, st.size, m.Path); err != nil {
 			return err
 		}
-		if n != st.size {
-			return fmt.Errorf("%s size changed while being verified", m.Path)
-		}
-		m.SHA256 = hex.EncodeToString(hash.Sum(nil))
 		if !w.screen || (name != ".git" && name != "alternates") {
 			return nil
-		}
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return err
 		}
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxPointerSize+1))
@@ -329,6 +336,88 @@ func (w *walker) readRegular(dir *os.File, name, rel string, m *Member, st state
 				w.refuse("%s: repository borrows objects from %s outside the archived tree", m.Path, target)
 			}
 		}
+	}
+	return nil
+}
+
+// hashRegular hashes the first size bytes of f, read from offset 0 without
+// moving its file offset, and requires exactly that many.
+func hashRegular(ctx context.Context, f *os.File, size int64, path string) (string, error) {
+	hash := sha256.New()
+	n, err := io.Copy(hash, contextReader{ctx, io.NewSectionReader(f, 0, size+1)})
+	if err != nil {
+		return "", err
+	}
+	if n != size {
+		return "", fmt.Errorf("%s size changed while being verified", path)
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// regularMember records the metadata of a regular file observed as st.
+func regularMember(path string, st state) Member {
+	return Member{Path: path, Type: TypeFile, Size: st.size, Mode: st.mode & 07777, UID: st.uid, GID: st.gid, ModifiedNS: st.mtimeNS}
+}
+
+// companion is one observation of a unit's companion sibling. file is nil
+// when it was absent, which must then stay so; member's Path is its base name.
+type companion struct {
+	path   string
+	file   *os.File
+	member Member
+	state  state
+}
+
+func (c *companion) close() {
+	if c != nil && c.file != nil {
+		c.file.Close()
+	}
+}
+
+// observeCompanion opens the companion at path through parent, its
+// directory, without following a symlink, and applies the source screens: a
+// secret-like name, extended attributes or another mount than the primary's
+// keep it local, and anything but a regular file is refused. An absent
+// companion is returned with a nil file. hash also hashes its content.
+func observeCompanion(ctx context.Context, parent *os.File, path string, patterns []string, primary state, hash bool) (*companion, error) {
+	c := &companion{path: path}
+	f, st, err := openEntry(parent, path, false)
+	if errors.Is(err, unix.ENOENT) {
+		return c, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("companion: %w", err)
+	}
+	c.file, c.state, c.member = f, st, regularMember(filepath.Base(path), st)
+	switch {
+	case st.id.Device != primary.id.Device || st.mountID != primary.mountID:
+		err = fmt.Errorf("%s cannot be archived faithfully: .: the companion is on another mount than its workspace", path)
+	case secretLike(filepath.Base(path), filepath.Dir(path), patterns):
+		err = fmt.Errorf("secret-like files keep %s local: .", path)
+	case hasXattrs(unix.Flistxattr(int(f.Fd()), nil)):
+		err = fmt.Errorf("%s cannot be archived faithfully: .: extended attributes are unsupported", path)
+	case hash:
+		c.member.SHA256, err = hashRegular(ctx, f, st.size, path)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// unchanged re-observes the companion's name in parent: a recorded file must
+// keep its identity, size, ownership, mode, mtime and ctime, and a recorded
+// absence must persist.
+func (c *companion) unchanged(parent *os.File) error {
+	st, err := statxAt(int(parent.Fd()), filepath.Base(c.path), 0)
+	switch {
+	case c.file == nil && errors.Is(err, unix.ENOENT):
+		return nil
+	case c.file == nil && err == nil:
+		return fmt.Errorf("companion appeared at %s after it was recorded absent", c.path)
+	case err != nil || st != c.state:
+		return fmt.Errorf("companion %s changed after it was recorded", c.path)
 	}
 	return nil
 }
@@ -540,12 +629,17 @@ func checkMount(rule config.WorkspaceArchiveRule, root state) (source, fstype st
 }
 
 // liveReferences fails closed: any process whose cwd, root, executable, open
-// descriptor or mapped file is inside source, or any process that cannot be
-// inspected, keeps the source local.
-func liveReferences(ctx context.Context, procRoot, source string) error {
+// descriptor or mapped file is inside one of paths, whose command line or
+// environment contains one of mentions, or that cannot be inspected keeps
+// paths[0], the unit, local.
+func liveReferences(ctx context.Context, procRoot string, paths, mentions []string) error {
+	if slices.Contains(mentions, "") {
+		return errors.New("live process check: an empty mention would match every process")
+	}
 	var hits []string
-	unknown, err := processReferences(ctx, procRoot, func(pid, label, target string) bool {
-		if !core.PathWithin(target, source) {
+	unknown, err := processReferences(ctx, procRoot, mentions, func(pid, label, target string) bool {
+		// An empty target is a mention in the command line or environment.
+		if target != "" && !slices.ContainsFunc(paths, func(path string) bool { return core.PathWithin(target, path) }) {
 			return false
 		}
 		if len(hits) < maxReported {
@@ -557,17 +651,19 @@ func liveReferences(ctx context.Context, procRoot, source string) error {
 		return err
 	}
 	if len(hits) > 0 || unknown > 0 {
-		return fmt.Errorf("live process references keep %s local: [%s]; %d process(es) could not be inspected", source, strings.Join(hits, ", "), unknown)
+		return fmt.Errorf("live process references keep %s local: [%s]; %d process(es) could not be inspected", paths[0], strings.Join(hits, ", "), unknown)
 	}
 	return nil
 }
 
 // processReferences calls match with every absolute path a process holds:
 // its cwd, root and executable, each open descriptor and each mapped file.
+// With mentions it also reads the process's cmdline and environ and calls
+// match with that label and an empty target when one contains a mention.
 // match returns true once it has seen enough of that process. The count of
 // processes that could not be fully inspected is returned; a process that
 // exited meanwhile holds nothing and is not counted.
-func processReferences(ctx context.Context, procRoot string, match func(pid, label, target string) bool) (int, error) {
+func processReferences(ctx context.Context, procRoot string, mentions []string, match func(pid, label, target string) bool) (int, error) {
 	if procRoot == "" {
 		return 0, errors.New("live process check requires a procfs root")
 	}
@@ -576,6 +672,7 @@ func processReferences(ctx context.Context, procRoot string, match func(pid, lab
 		return 0, fmt.Errorf("live process check: %w", err)
 	}
 	self := strconv.Itoa(os.Getpid())
+	scan := newMentionScan(mentions)
 	clean := func(target string) (string, bool) {
 		target = strings.TrimSuffix(target, " (deleted)")
 		if !filepath.IsAbs(target) {
@@ -634,6 +731,19 @@ func processReferences(ctx context.Context, procRoot string, match func(pid, lab
 				}
 			}
 		}
+		if !found && scan != nil {
+			for _, name := range []string{"cmdline", "environ"} {
+				hit, err := scan.found(filepath.Join(dir, name))
+				if err != nil {
+					unreadable = unreadable || !(errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH))
+					continue
+				}
+				if hit && match(pid, name, "") {
+					found = true
+					break
+				}
+			}
+		}
 		if !found && unreadable {
 			if _, err := os.Lstat(dir); err == nil {
 				unknown++
@@ -641,6 +751,55 @@ func processReferences(ctx context.Context, procRoot string, match func(pid, lab
 		}
 	}
 	return unknown, nil
+}
+
+// mentionScan searches procfs files for mentions with one reusable buffer.
+type mentionScan struct {
+	needles [][]byte
+	carry   int
+	buf     []byte
+}
+
+// newMentionScan returns nil when there is nothing to search for.
+func newMentionScan(mentions []string) *mentionScan {
+	if len(mentions) == 0 {
+		return nil
+	}
+	s := &mentionScan{needles: make([][]byte, len(mentions))}
+	for i, mention := range mentions {
+		s.needles[i] = []byte(mention)
+		s.carry = max(s.carry, len(mention)-1)
+	}
+	s.buf = make([]byte, 0, s.carry+64<<10)
+	return s
+}
+
+// found reports whether the file at path contains a mention. It streams the
+// whole file, carrying the tail of each read into the next so a mention that
+// spans two reads is still found.
+func (s *mentionScan) found(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	buf := s.buf[:0]
+	for {
+		n, err := f.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		for _, needle := range s.needles {
+			if bytes.Contains(buf, needle) {
+				return true, nil
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		buf = buf[:copy(buf, buf[len(buf)-min(len(buf), s.carry):])]
+	}
 }
 
 // mappedFiles lists the file paths of a /proc/<pid>/maps file.

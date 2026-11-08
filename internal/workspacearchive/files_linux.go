@@ -190,6 +190,38 @@ func createChild(parent *os.File, name string) (*os.File, error) {
 	return openChild(parent, name, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL)
 }
 
+// openEntry opens path, a child of the directory parent, without following a
+// symlink. Its type is checked first, so a device, FIFO or socket is never
+// opened: it must be a regular file, or a directory when dirs is set. The
+// opened descriptor must be the observed entry.
+func openEntry(parent *os.File, path string, dirs bool) (*os.File, state, error) {
+	name := filepath.Base(path)
+	st, err := statxAt(int(parent.Fd()), name, 0)
+	if err != nil {
+		return nil, st, fmt.Errorf("open %s: %w", path, err)
+	}
+	flags := unix.O_RDONLY
+	switch {
+	case st.kind() == unix.S_IFREG:
+	case st.kind() == unix.S_IFDIR && dirs:
+		flags |= unix.O_DIRECTORY
+	case dirs:
+		return nil, st, fmt.Errorf("%s must be a directory or a regular file", path)
+	default:
+		return nil, st, fmt.Errorf("%s must be a regular file", path)
+	}
+	f, err := openChild(parent, name, flags)
+	if err != nil {
+		return nil, st, err
+	}
+	opened, err := fstate(f)
+	if err != nil || opened.id != st.id || opened.kind() != st.kind() {
+		f.Close()
+		return nil, st, fmt.Errorf("%s changed while being opened", path)
+	}
+	return f, opened, nil
+}
+
 // openRegularChild opens one existing single-link regular file.
 func openRegularChild(parent *os.File, name string) (*os.File, state, error) {
 	f, err := openChild(parent, name, unix.O_RDONLY)

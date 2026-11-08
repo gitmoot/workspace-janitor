@@ -66,6 +66,11 @@ func fingerprint(entry core.Entry, gitActivity bool) string {
 	if entry.WorkspaceArchive != nil {
 		b := entry.WorkspaceArchive
 		write("workspace_archive=%s|%s|%d|%s|%d", b.Manifest, b.ManifestSHA256, b.MemberCount, b.TreeDigest, b.CreatedAt.UTC().UnixNano())
+		// Only a companion unit adds this line, so digests saved for bindings
+		// without a companion stay valid.
+		if b.CompanionSuffix != "" {
+			write("workspace_archive_companion=%s|%d|%d", b.CompanionSuffix, b.CompanionID.Device, b.CompanionID.Inode)
+		}
 	}
 	if entry.Git == nil {
 		write("git=none")

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -33,12 +34,16 @@ const (
 	categoryFailed          = "failed"
 )
 
-// categoryArchiveItem is one depth-1 entry of a category root and what the
-// category run decided about it.
+// categoryArchiveItem is one unit of a category root (a depth-1 entry, or an
+// OMP session with its transcript) and what the category run decided about
+// it.
 type categoryArchiveItem struct {
-	Category         string                    `json:"category,omitempty"`
-	Kind             string                    `json:"kind,omitempty"`
-	Path             string                    `json:"path"`
+	Category string `json:"category,omitempty"`
+	Kind     string `json:"kind,omitempty"`
+	Path     string `json:"path"`
+	// Companion is the sibling that belongs to the unit (an OMP session's
+	// "<stem>.jsonl"); size and idle cover both.
+	Companion        string                    `json:"companion,omitempty"`
 	Status           string                    `json:"status"`
 	SizeBytes        int64                     `json:"size_bytes"`
 	SizeKnown        bool                      `json:"size_known"`
@@ -109,14 +114,14 @@ func activeCategoryRule(policy config.Policy, record store.CategoryArchive) (con
 		return config.WorkspaceArchiveRule{}, "its category kind changed"
 	case category.Archive.Directory != record.ArchiveDirectory:
 		return config.WorkspaceArchiveRule{}, "its category archive directory changed"
-	case !slices.Contains(category.Roots, filepath.Dir(record.Path)):
-		return config.WorkspaceArchiveRule{}, "its path is no longer directly inside a category root"
+	case !inCategoryRoot(category, record.Path):
+		return config.WorkspaceArchiveRule{}, "its path is no longer a unit of a category root"
 	case record.RestoredByOwner:
 		return config.WorkspaceArchiveRule{}, "its quarantine was restored after archiving; it stays local until it changes, idles again and is archived anew"
 	case record.Withdrawn:
 		return config.WorkspaceArchiveRule{}, "it was restored from its archive; it stays local until it changes, idles again and is archived anew"
 	}
-	if refusals := policy.CategoryArchiveRefusals(record.Path); len(refusals) != 0 {
+	if refusals := unitArchiveRefusals(policy, category.Kind, record.Path); len(refusals) != 0 {
 		return config.WorkspaceArchiveRule{}, strings.Join(refusals, "; ")
 	}
 	// A version that became one of the newest after it was archived keeps
@@ -126,6 +131,14 @@ func activeCategoryRule(policy config.Policy, record store.CategoryArchive) (con
 			return config.WorkspaceArchiveRule{}, reason
 		}
 	}
+	// A transcript archived on its own moves only while no session directory
+	// shares its stem; once one exists the two are one unit again, archived
+	// together under that directory.
+	if stem, transcript := strings.CutSuffix(record.Path, ".jsonl"); category.Kind == config.CategoryOMPSessions && transcript {
+		if _, err := os.Lstat(stem); !errors.Is(err, fs.ErrNotExist) {
+			return config.WorkspaceArchiveRule{}, "its session directory " + filepath.Base(stem) + " exists (or cannot be checked); the transcript moves only with it"
+		}
+	}
 	rule := categoryRule(category, record.Name, record.Path, record.Owner, record.Release)
 	rule.LocalExpiryEnabled = true
 	rule.Archive.Manifest, rule.Archive.ManifestSHA256 = record.Manifest, record.ManifestSHA256
@@ -133,11 +146,13 @@ func activeCategoryRule(policy config.Policy, record store.CategoryArchive) (con
 }
 
 // categoryRule is the workspace archive rule a category item is archived
-// and bound under. Its rule hash covers name, path, owner, release and the
-// archive directory.
+// and bound under. Its rule hash covers name, path, companion, owner,
+// release and the archive directory. The companion and the live mentions
+// follow from the kind and the path alone.
 func categoryRule(category config.WorkspaceArchiveCategory, name, path, owner, release string) config.WorkspaceArchiveRule {
 	return config.WorkspaceArchiveRule{
 		Name: name, Path: path, Owner: owner, Release: release,
+		Companion: category.Kind.UnitCompanion(path), Mentions: category.Kind.UnitMentions(path),
 		DependentRoots: []string{}, LocalRetention: category.LocalRetention,
 		Archive: config.WorkspaceArchiveDestination{
 			Directory:         category.Archive.Directory,
@@ -145,6 +160,25 @@ func categoryRule(category config.WorkspaceArchiveCategory, name, path, owner, r
 			ExpectFSType:      category.Archive.ExpectFSType,
 		},
 	}
+}
+
+// inCategoryRoot reports whether path is a unit of one of category's roots:
+// directly inside it, or "<project>/<session>" for OMP sessions.
+func inCategoryRoot(category config.WorkspaceArchiveCategory, path string) bool {
+	_, ok := category.ItemRoot(path)
+	return ok
+}
+
+// unitArchiveRefusals is CategoryArchiveRefusals for the unit at path and
+// for its companion: a KEEP or protection of either keeps both.
+func unitArchiveRefusals(policy config.Policy, kind config.WorkspaceArchiveCategoryKind, path string) []string {
+	out := policy.CategoryArchiveRefusals(path)
+	if companion := kind.UnitCompanion(path); companion != "" {
+		for _, reason := range policy.CategoryArchiveRefusals(companion) {
+			out = append(out, fmt.Sprintf("companion %s: %s", filepath.Base(companion), reason))
+		}
+	}
+	return out
 }
 
 // categoryItemName derives a plain, unique archive name from the category,
@@ -179,6 +213,102 @@ func categoryKindOf(entry core.Entry) (config.WorkspaceArchiveCategoryKind, stri
 	default:
 		return config.CategoryPushedClones, ""
 	}
+}
+
+// stateStoreUnit decides whether an entry of an omp_sessions or
+// gitmoot_job_logs root is one of its units, or explains why not. isDir
+// reports whether a sibling path was observed as a directory: an OMP
+// transcript beside its session directory is part of that unit (skip), and
+// a transcript whose directory is gone is a unit by itself.
+func stateStoreUnit(kind config.WorkspaceArchiveCategoryKind, entry core.Entry, isDir func(string) bool) (reason string, skip bool) {
+	switch kind {
+	case config.CategoryGitmootJobLogs:
+		if entry.Kind != core.EntryKindFile {
+			return fmt.Sprintf("only regular files are %s units, not a %s", kind, entry.Kind), false
+		}
+	case config.CategoryOMPSessions:
+		stem, transcript := strings.CutSuffix(entry.Path, ".jsonl")
+		switch {
+		case transcript && isDir(stem):
+			return "", true
+		case entry.Kind == core.EntryKindDirectory && !transcript, entry.Kind == core.EntryKindFile && transcript:
+		default:
+			return fmt.Sprintf("only session directories and .jsonl transcripts are %s units, not this %s", kind, entry.Kind), false
+		}
+	}
+	return "", false
+}
+
+// unitEntry is the observation of a state-store unit: a regular file's own
+// size and mtime are exact, and an OMP session's transcript adds its bytes
+// and its mtime to its directory's. Every other fact stays the primary's.
+func unitEntry(entry core.Entry, companion *core.Entry) core.Entry {
+	if entry.Kind == core.EntryKindFile {
+		entry.SizeIsDeep, entry.SizeIsLowerBound, entry.LatestModifiedAt = true, false, entry.ModifiedAt
+	}
+	if companion != nil {
+		entry.SizeBytes += companion.SizeBytes
+		if !entry.LatestModifiedAt.IsZero() && companion.ModifiedAt.After(entry.LatestModifiedAt) {
+			entry.LatestModifiedAt = companion.ModifiedAt
+		}
+	}
+	return entry
+}
+
+// categorySpecs is the category run's observation: every category root
+// (and, when releases are archived, every report root) one level deep. An
+// omp_sessions root is replaced by its project directories, each one level
+// deep, so its units are entries and the projects themselves are not sized.
+// A projects listing that cannot be read, or exceeds limits.max_dir_entries,
+// fails the run rather than silently dropping sessions.
+func categorySpecs(policy config.Policy, releases bool) ([]collect.RootSpec, error) {
+	var roots []string
+	sessionRoots := map[string]bool{}
+	for _, category := range policy.WorkspaceArchiveCategories {
+		roots = append(roots, category.Roots...)
+		for _, root := range category.Roots {
+			sessionRoots[root] = sessionRoots[root] || category.Kind.UnitDepth() == 2
+		}
+	}
+	if releases {
+		roots = append(roots, policy.Report.Roots...)
+	}
+	var specs []collect.RootSpec
+	add := func(spec collect.RootSpec) {
+		if !slices.ContainsFunc(specs, func(have collect.RootSpec) bool { return have.Path == spec.Path }) {
+			specs = append(specs, spec)
+		}
+	}
+	for _, root := range roots {
+		for _, configured := range policy.Roots {
+			if configured.Path != root {
+				continue
+			}
+			spec := rootSpec(configured, scanOptions{})
+			spec.MaxDepth = 1
+			if !sessionRoots[root] {
+				add(spec)
+				continue
+			}
+			projects, err := os.ReadDir(root)
+			if err != nil {
+				return nil, fmt.Errorf("list OMP session projects: %w", err)
+			}
+			if len(projects) > policy.Limits.MaxDirEntries {
+				return nil, fmt.Errorf("%s holds %d entries, above limits.max_dir_entries %d; no session is selected from a partial listing", root, len(projects), policy.Limits.MaxDirEntries)
+			}
+			for _, project := range projects {
+				// Only real project directories hold sessions; a symlink is
+				// never followed into another tree.
+				if project.IsDir() && !strings.HasPrefix(project.Name(), ".") {
+					sessions := spec
+					sessions.Path = filepath.Join(root, project.Name())
+					add(sessions)
+				}
+			}
+		}
+	}
+	return specs, nil
 }
 
 // categoryGitRefusals is the per-kind Git gate: nothing dirty, stashed,
@@ -221,13 +351,14 @@ func categoryGitRefusals(git *core.GitState) []string {
 // category: policy facts, the full safety verdict (collected protections,
 // unknown evidence, Git state, protected paths, sensitive names, live
 // databases, durable evidence), the Git gate, and the size and idle bounds
-// from the bounded deep walk.
+// from the bounded deep walk. For a unit with a companion, entry and verdict
+// already cover both (see mergeCompanion).
 func categoryRefusals(policy config.Policy, category config.WorkspaceArchiveCategory, entry core.Entry, verdict core.Verdict, now time.Time) []string {
-	out := policy.CategoryArchiveRefusals(entry.Path)
+	out := unitArchiveRefusals(policy, category.Kind, entry.Path)
 	seen := map[string]bool{}
 	gitRefused := false
 	for _, protection := range verdict.Protections {
-		if protection.Kind == core.ProtectArchiveOnlyRoot && slices.Contains(category.Roots, filepath.Dir(entry.Path)) {
+		if protection.Kind == core.ProtectArchiveOnlyRoot && inCategoryRoot(category, entry.Path) {
 			// The owner approved this category for its archive_only root;
 			// every other protection still refuses.
 			continue
@@ -314,10 +445,10 @@ func categoryPreflight(paths config.Paths, category config.WorkspaceArchiveCateg
 	}
 	latest, ok := current.ArchiveCategory(category.Name, string(category.Kind))
 	if !ok || latest.Kind != category.Kind || latest.Archive != category.Archive || latest.LocalRetention != category.LocalRetention ||
-		!slices.Contains(latest.Roots, filepath.Dir(path)) {
+		!inCategoryRoot(latest, path) {
 		return fmt.Errorf("archive category %q was withdrawn or changed during archiving; original retained", category.Name)
 	}
-	if refusals := current.CategoryArchiveRefusals(path); len(refusals) != 0 {
+	if refusals := unitArchiveRefusals(current, category.Kind, path); len(refusals) != 0 {
 		return fmt.Errorf("policy now refuses %s: %s; original retained", path, strings.Join(refusals, "; "))
 	}
 	return nil
@@ -377,26 +508,11 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 	// releases to archive, every report root) with the policy file alone:
 	// existing category pins must not shape selection. Every candidate gets
 	// its own deep-size budget, so a few large siblings cannot leave the rest
-	// of a root unmeasured (and so unselectable).
-	var roots []string
-	for _, category := range policy.WorkspaceArchiveCategories {
-		roots = append(roots, category.Roots...)
-	}
-	if len(releases) != 0 {
-		roots = append(roots, policy.Report.Roots...)
-	}
-	var specs []collect.RootSpec
-	for _, root := range roots {
-		if slices.ContainsFunc(specs, func(spec collect.RootSpec) bool { return spec.Path == root }) {
-			continue
-		}
-		for _, configured := range policy.Roots {
-			if configured.Path == root {
-				spec := rootSpec(configured, scanOptions{})
-				spec.MaxDepth = 1
-				specs = append(specs, spec)
-			}
-		}
+	// of a root unmeasured (and so unselectable). An omp_sessions root is
+	// observed one project directory at a time, so only sessions are sized.
+	specs, err := categorySpecs(policy, len(releases) != 0)
+	if err != nil {
+		return report, err
 	}
 	engine := cleanupEngine(e, nil, paths, policy)
 	options := engine.Collect
@@ -407,6 +523,10 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 	}
 	safetyPolicy := enginePolicy(paths, policy)
 	releaseOwners := releaseOwnerAttribution(ctx, policy, releases)
+	byPath := make(map[string]int, len(observed.Entries))
+	for i, entry := range observed.Entries {
+		byPath[entry.Path] = i
+	}
 
 	type pending struct {
 		item     int
@@ -419,8 +539,9 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 		parent := filepath.Dir(entry.Path)
 		kind, reason := categoryKindOf(entry)
 		var (
-			category *config.WorkspaceArchiveCategory
-			release  *store.ReportReply
+			category  *config.WorkspaceArchiveCategory
+			release   *store.ReportReply
+			companion *core.Entry
 		)
 		if reply, ok := releases[entry.Path]; ok && slices.Contains(policy.Report.Roots, parent) {
 			// An owner's release takes the item out of any category: it is
@@ -432,12 +553,35 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 		} else {
 			var matching []config.WorkspaceArchiveCategory
 			for _, candidate := range policy.WorkspaceArchiveCategories {
-				if slices.Contains(candidate.Roots, parent) {
+				if inCategoryRoot(candidate, entry.Path) {
 					matching = append(matching, candidate)
 				}
 			}
 			if len(matching) == 0 {
 				continue
+			}
+			// A state-store root belongs to its one category, whose kind
+			// alone decides what its units are.
+			if owning := matching[0]; owning.Kind.StateStore() {
+				var skip bool
+				reason, skip = stateStoreUnit(owning.Kind, entry, func(path string) bool {
+					i, ok := byPath[path]
+					return ok && observed.Entries[i].Kind == core.EntryKindDirectory
+				})
+				if skip {
+					continue // an OMP transcript, reported with its session
+				}
+				if path := owning.Kind.UnitCompanion(entry.Path); reason == "" && path != "" {
+					if i, ok := byPath[path]; ok {
+						companion = &observed.Entries[i]
+						if companion.Kind != core.EntryKindFile {
+							reason = fmt.Sprintf("its transcript %s is a %s, not a regular file", filepath.Base(path), companion.Kind)
+						}
+					}
+				}
+				if reason == "" {
+					category, kind = &matching[0], owning.Kind
+				}
 			}
 			// A versioned_work pattern is more specific than root_scratch
 			// for the same plain directory, so it is matched first.
@@ -459,7 +603,13 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 				reason = fmt.Sprintf("a %s item matches no category configured for %s", kind, parent)
 			}
 		}
+		if category != nil && category.Kind.StateStore() {
+			entry = unitEntry(entry, companion)
+		}
 		item := categoryArchiveItem{Path: entry.Path, Status: categoryRefused, SizeBytes: entry.SizeBytes, SizeKnown: entry.SizeIsDeep && !entry.SizeIsLowerBound}
+		if companion != nil {
+			item.Companion = companion.Path
+		}
 		if !entry.LatestModifiedAt.IsZero() {
 			newest := entry.LatestModifiedAt.UTC()
 			item.NewestModifiedAt = &newest
@@ -478,7 +628,20 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 				continue
 			}
 		}
-		if record, ok := recorded[entry.Path]; ok && record.Unchanged(entry.LatestModifiedAt) {
+		record, ok := recorded[entry.Path]
+		if ok && category.Kind.UnitCompanion(entry.Path) != "" && record.Unchanged(entry.LatestModifiedAt) {
+			// Removing or replacing a transcript changes its project
+			// directory, not the session: compare it with the archive's
+			// record before trusting the session's timestamps.
+			changed, err := companionChanged(ctx, policy, record, companion)
+			if err != nil {
+				item.Reasons = []string{"its archived transcript record could not be compared: " + err.Error()}
+				report.Items = append(report.Items, item)
+				continue
+			}
+			ok = !changed
+		}
+		if ok && record.Unchanged(entry.LatestModifiedAt) {
 			item.Status, item.Name = categoryAlreadyArchived, record.Name
 			follow := "its local retention and quarantine follow that archive"
 			if _, inactive := activeCategoryRule(policy, record); inactive != "" {
@@ -511,6 +674,13 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 		}
 		entry.Class = plan.Classify(entry, policy).Class
 		verdict := safety.Evaluate(safety.Input{Entry: entry, Policy: safetyPolicy, Now: now})
+		if companion != nil {
+			// The transcript moves with its session: anything that protects
+			// it protects the unit.
+			own := *companion
+			own.Class = plan.Classify(own, policy).Class
+			verdict.Protections = append(verdict.Protections, safety.Evaluate(safety.Input{Entry: own, Policy: safetyPolicy, Now: now}).Protections...)
+		}
 		if item.Reasons = categoryRefusals(policy, *category, entry, verdict, now); len(item.Reasons) == 0 {
 			queues[category.Name] = append(queues[category.Name], pending{len(report.Items), entry.LatestModifiedAt, *category, release})
 		}
@@ -631,13 +801,19 @@ func createCategoryArchive(ctx context.Context, db *store.Store, paths config.Pa
 	monitor.activity.Attempted = 1
 	m, binding, err := workspacearchive.Create(ctx, rule, scope, preflight)
 	if err == nil {
+		// The unit's companion counts as a member: a transcript written
+		// after its session directory is what makes the unit newest.
+		members := m.Members
+		if m.Companion != nil {
+			members = append(slices.Clip(members), *m.Companion)
+		}
 		err = db.Write(ctx, func(tx *store.Tx) error {
 			return tx.RecordCategoryArchive(ctx, store.CategoryArchive{
 				Name: rule.Name, Category: category.Name, Kind: string(category.Kind), Path: rule.Path,
 				Owner: rule.Owner, Release: rule.Release, RunID: runID, ArchiveDirectory: rule.Archive.Directory,
 				Manifest: binding.Manifest, ManifestSHA256: binding.ManifestSHA256,
-				ContentBytes: m.ContentBytes, Members: len(m.Members), CreatedAt: m.CreatedAt, RecordedAt: time.Now().UTC(),
-				TreeModifiedAt: newestMember(m.Members),
+				ContentBytes: m.ContentBytes, Members: len(members), CreatedAt: m.CreatedAt, RecordedAt: time.Now().UTC(),
+				TreeModifiedAt: newestMember(members),
 			})
 		})
 		if err != nil {
@@ -747,15 +923,41 @@ func runCategoryItemRestore(ctx context.Context, e *env, opts archiveOptions, fo
 		if record.Path != opts.categoryItem {
 			continue
 		}
-		// Mount expectations come from the category while it still names the
-		// same directory; they are never part of the archive's rule hash.
-		category, _ := policy.ArchiveCategory(record.Category, record.Kind)
-		if category.Archive.Directory != record.ArchiveDirectory {
-			category = config.WorkspaceArchiveCategory{Archive: config.WorkspaceArchiveCategoryDestination{Directory: record.ArchiveDirectory}}
-		}
-		rule := categoryRule(category, record.Name, record.Path, record.Owner, record.Release)
-		rule.Archive.Manifest, rule.Archive.ManifestSHA256 = record.Manifest, record.ManifestSHA256
+		rule := recordedRule(policy, record)
 		return runWorkspaceArchiveRule(ctx, e, opts, format, paths, policy, &rule)
 	}
 	return fmt.Errorf("no category archive receipt for %s", opts.categoryItem)
+}
+
+// recordedRule rebuilds the pinned rule a category receipt was archived
+// under. Mount expectations come from the category while it still names the
+// same directory; they are never part of the archive's rule hash. The
+// recorded kind decides the unit's companion, which is.
+func recordedRule(policy config.Policy, record store.CategoryArchive) config.WorkspaceArchiveRule {
+	category, _ := policy.ArchiveCategory(record.Category, record.Kind)
+	if category.Archive.Directory != record.ArchiveDirectory {
+		category = config.WorkspaceArchiveCategory{Archive: config.WorkspaceArchiveCategoryDestination{Directory: record.ArchiveDirectory}}
+	}
+	category.Kind = config.WorkspaceArchiveCategoryKind(record.Kind)
+	rule := categoryRule(category, record.Name, record.Path, record.Owner, record.Release)
+	rule.Archive.Manifest, rule.Archive.ManifestSHA256 = record.Manifest, record.ManifestSHA256
+	return rule
+}
+
+// companionChanged reports whether the unit's companion (observed now, nil
+// when absent) differs from the one its archive recorded: it appeared,
+// disappeared, or has another type, size or modification time.
+func companionChanged(ctx context.Context, policy config.Policy, record store.CategoryArchive, companion *core.Entry) (bool, error) {
+	m, _, err := workspacearchive.Check(ctx, recordedRule(policy, record), false)
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case m.Companion == nil || companion == nil:
+		return (m.Companion == nil) != (companion == nil), nil
+	case companion.Kind != core.EntryKindFile || m.Companion.Type != workspacearchive.TypeFile:
+		return true, nil
+	default:
+		return companion.SizeBytes != m.Companion.Size || companion.ModifiedAt.UnixNano() != m.Companion.ModifiedNS, nil
+	}
 }

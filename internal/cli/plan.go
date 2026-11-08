@@ -480,6 +480,8 @@ func enginePolicy(paths config.Paths, policy config.Policy) safety.Policy {
 		QuarantineDir:            policy.Retention.QuarantineDir,
 		AllowCrossFilesystemCopy: policy.Safety.AllowCrossFilesystemQuarantine,
 		MinFreeBytes:             policy.Safety.MinFreeBytes,
+		GitmootHome:              policy.Gitmoot.Home,
+		GitmootJobLogRoots:       policy.GitmootJobLogRoots(),
 	}
 }
 

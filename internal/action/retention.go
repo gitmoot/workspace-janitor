@@ -9,8 +9,10 @@ import (
 	"strings"
 
 	"github.com/gitmoot/workspace-janitor/internal/collect"
+	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 	"github.com/gitmoot/workspace-janitor/internal/safety"
+	"github.com/gitmoot/workspace-janitor/internal/workspacearchive"
 )
 
 // recollect refuses incomplete reference observation, rather than interpreting
@@ -107,23 +109,15 @@ func (e *Engine) Eligible(ctx context.Context, item core.CleanupItem) error {
 	if err := e.originalReferences(ctx, item.Source); err != nil {
 		return err
 	}
+	if err := e.eligibleCompanion(ctx, item); err != nil {
+		return err
+	}
 	handle, err := safety.Open(item.Destination)
 	if err != nil {
 		return err
 	}
 	defer handle.Close()
-	policy := e.Policy
-	// This exact receipt is within our own state/quarantine directory. Those
-	// self-protections are not evidence about the object; all configured path,
-	// name, Git, live-reference, identity and unknown-evidence guards remain.
-	policy.StateDir, policy.QuarantineDir = "", ""
-	policy.ProtectedPaths = make([]string, 0, len(e.Policy.ProtectedPaths))
-	for _, protected := range e.Policy.ProtectedPaths {
-		if filepath.Clean(protected) != filepath.Clean(e.Policy.StateDir) &&
-			filepath.Clean(protected) != filepath.Clean(e.Policy.QuarantineDir) {
-			policy.ProtectedPaths = append(policy.ProtectedPaths, protected)
-		}
-	}
+	policy := e.receiptPolicy()
 	planned := *item.Quarantined
 	planned.Root = item.Entry.Root // symlink containment is judged against its original discovery root
 	var observed core.Entry
@@ -173,6 +167,14 @@ func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.Cleanu
 	// restore stopped before its journal write; Reconcile records it restored.
 	switch e.settleAbsent(item) {
 	case absentDeleted:
+		// Expiry may have stopped between the primary and its companion,
+		// which is held to the expiry guards again before it goes.
+		if err := e.eligibleLeftoverCompanion(ctx, item); err != nil {
+			return e.investigate(ctx, item, "leftover companion: "+err.Error())
+		}
+		if err := removeLeftoverCompanion(item); err != nil {
+			return item, fmt.Errorf("remove leftover companion: %w", err)
+		}
 		item.State, item.UpdatedAt = core.CleanupDeleted, e.now()
 		item.Reason = "expiry had already deleted the quarantined object but not journaled it; recorded as deleted"
 		if err := e.update(ctx, item, core.CleanupQuarantined); err != nil {
@@ -191,11 +193,164 @@ func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.Cleanu
 	if err := deleteAnchored(item.Destination, item.Entry.FilesystemID); err != nil {
 		return item, err
 	}
+	// The companion goes after its primary. Stopping in between leaves an
+	// absent primary with this receipt's marker, which settleAbsent records
+	// as deleted after removing the leftover companion.
+	if suffix, id := companionOf(item); suffix != "" && !id.Zero() {
+		if err := deleteAnchored(item.Destination+suffix, id); err != nil {
+			return item, fmt.Errorf("delete companion: %w", err)
+		}
+	}
 	item.State, item.UpdatedAt = core.CleanupDeleted, e.now()
 	if err := e.update(ctx, item, core.CleanupQuarantined); err != nil {
 		return item, err
 	}
 	return item, nil
+}
+
+// eligibleCompanion applies the expiry guards to a bound companion as well:
+// new references to its original name keep it, and the quarantined copy
+// must still be the bound regular file (or still absent if it was recorded
+// absent).
+func (e *Engine) eligibleCompanion(ctx context.Context, item core.CleanupItem) error {
+	suffix, id := companionOf(item)
+	if suffix == "" {
+		return nil
+	}
+	if err := e.originalReferences(ctx, item.Source+suffix); err != nil {
+		return fmt.Errorf("companion: %w", err)
+	}
+	path := item.Destination + suffix
+	info, err := os.Lstat(path)
+	if id.Zero() {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("companion was recorded absent but %s exists or cannot be inspected: %v", path, err)
+	}
+	if err != nil || !info.Mode().IsRegular() || !identityMatches(info, id) {
+		return fmt.Errorf("quarantined companion %s is not the bound regular file: %v", path, err)
+	}
+	return nil
+}
+
+// receiptPolicy is e.Policy for an object inside a receipt, which lies
+// within our own state/quarantine directory. Those self-protections are not
+// evidence about the object; all configured path, name, Git, live-reference,
+// identity and unknown-evidence guards remain.
+func (e *Engine) receiptPolicy() safety.Policy {
+	policy := e.Policy
+	policy.StateDir, policy.QuarantineDir = "", ""
+	policy.ProtectedPaths = make([]string, 0, len(e.Policy.ProtectedPaths))
+	for _, protected := range e.Policy.ProtectedPaths {
+		if filepath.Clean(protected) != filepath.Clean(e.Policy.StateDir) &&
+			filepath.Clean(protected) != filepath.Clean(e.Policy.QuarantineDir) {
+			policy.ProtectedPaths = append(policy.ProtectedPaths, protected)
+		}
+	}
+	return policy
+}
+
+// eligibleLeftoverCompanion holds a bound companion that an interrupted
+// expiry left behind its deleted primary to the expiry guards again before
+// removeLeftoverCompanion deletes it. Its identity alone is not enough: an
+// append keeps it. It must still equal the archived companion in every fact
+// and in content (workspacearchive.VerifyCompanion), the bound rule's current
+// local expiry setting and retention must allow it exactly as binding would
+// (collect.LocalExpiryRefusal, measured from the verified manifest's
+// creation), no new reference may name its original path, and a fresh,
+// complete observation must be the bound regular file allowed by every
+// guard, at its receipt and at its original name, apart from its unit
+// protections (unitCompanion). Nothing for removeLeftoverCompanion to delete
+// is nil.
+func (e *Engine) eligibleLeftoverCompanion(ctx context.Context, item core.CleanupItem) error {
+	suffix, id := companionOf(item)
+	if suffix == "" || id.Zero() {
+		return nil
+	}
+	path, source := item.Destination+suffix, item.Source+suffix
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !identityMatches(info, id) {
+		return nil
+	}
+	if err := e.originalReferences(ctx, source); err != nil {
+		return err
+	}
+	rule, err := e.boundRule(item)
+	if err != nil {
+		return err
+	}
+	scope := workspacearchive.PolicyScope(*e.Collect.WorktreePolicy, rule)
+	scope.ProcRoot = e.Collect.ProcRoot
+	created, err := workspacearchive.VerifyCompanion(ctx, rule, scope, path)
+	if err != nil {
+		return err
+	}
+	// The archive hash excludes these settings: a retention raised or local
+	// expiry disabled after the interruption keeps the companion.
+	if refusal := collect.LocalExpiryRefusal(rule, created, e.now()); refusal != "" {
+		return errors.New(refusal)
+	}
+	fresh, err := e.recollectReceipt(ctx, path, source)
+	if err != nil {
+		return err
+	}
+	if fresh.Kind != core.EntryKindFile || fresh.FilesystemID != id {
+		return fmt.Errorf("%s is no longer the bound regular file", path)
+	}
+	fresh = unitCompanion(fresh, item.Source)
+	fresh.Root = item.Entry.Root
+	verdict := safety.Evaluate(safety.Input{Entry: fresh, Policy: e.receiptPolicy(), Now: e.now()})
+	if !verdict.Allows(core.ActionDeleteCandidate) {
+		return fmt.Errorf("deletion safety refused: %s", verdict.Summary())
+	}
+	fresh.Path = source
+	if original := safety.Evaluate(safety.Input{Entry: fresh, Policy: e.Policy, Now: e.now()}); !original.Allows(core.ActionDeleteCandidate) {
+		return fmt.Errorf("original source safety refused: %s", original.Summary())
+	}
+	return nil
+}
+
+// boundRule is the configured workspace archive rule that bound item's unit:
+// its original path, companion suffix and the manifest pinned at binding.
+func (e *Engine) boundRule(item core.CleanupItem) (config.WorkspaceArchiveRule, error) {
+	if b := item.Entry.WorkspaceArchive; b != nil && e.Collect.WorktreePolicy != nil {
+		for _, rule := range e.Collect.WorktreePolicy.WorkspaceArchives {
+			if rule.Path == item.Source && rule.CompanionSuffix() == b.CompanionSuffix &&
+				rule.Archive.Manifest == b.Manifest && rule.Archive.ManifestSHA256 == b.ManifestSHA256 {
+				return rule, nil
+			}
+		}
+	}
+	return config.WorkspaceArchiveRule{}, errors.New("no configured workspace archive rule pins the archive that bound this unit")
+}
+
+// removeLeftoverCompanion finishes an expiry that deleted the primary but
+// stopped before its companion. It removes only the bound companion
+// identity, never anything else at that name.
+func removeLeftoverCompanion(item core.CleanupItem) error {
+	suffix, id := companionOf(item)
+	if suffix == "" || id.Zero() {
+		return nil
+	}
+	path := item.Destination + suffix
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !identityMatches(info, id) {
+		return nil
+	}
+	return deleteAnchored(path, id)
 }
 
 // absentOutcome is what an expired receipt's missing object turned out to be.
@@ -236,9 +391,13 @@ func (e *Engine) settleAbsent(item core.CleanupItem) absentOutcome {
 }
 
 // ExpiryPreview reports what a confirmed expiry would do with a receipt,
-// without changing anything: an absent object is settled, not refused.
+// without changing anything: an absent object is settled, not refused,
+// unless the companion it left behind would be.
 func (e *Engine) ExpiryPreview(ctx context.Context, item core.CleanupItem) error {
-	if e.settleAbsent(item) != absentUnproven {
+	switch e.settleAbsent(item) {
+	case absentDeleted:
+		return e.eligibleLeftoverCompanion(ctx, item)
+	case absentRestored:
 		return nil
 	}
 	return e.Eligible(ctx, item)

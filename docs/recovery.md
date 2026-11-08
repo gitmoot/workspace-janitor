@@ -156,6 +156,16 @@ policy.
   an immutable withdrawal of that archive's expiry authority, so the restored
   tree is never quarantined or expired again on that archive; it is archived
   anew only after it changes and is idle again.
+- An `omp_sessions` unit is the session directory plus its `<session>.jsonl`
+  transcript, and every step above handles both: `janitor restore` moves the
+  quarantined `item` and `item.jsonl` back to `<session>` and
+  `<session>.jsonl` (it refuses if either original name is occupied), and
+  `--restore-category-item <session dir> --restore-to <session dir>` restores
+  the directory and writes the transcript beside it as `<dest>.jsonl`. A
+  `gitmoot_job_logs` unit is a single file restored to its original name.
+  Both use the unit tar layout, whose member names are the original base
+  names, so a manual restore is
+  `tar -C <original parent> --numeric-owner -xpf <archive>/<name>.tar`.
 
 ## Scratch cleanup
 

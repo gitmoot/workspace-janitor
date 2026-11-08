@@ -32,6 +32,8 @@ func collectGitmoot(ctx context.Context, opts *Options, entries []core.Entry, no
 		return report
 	}
 	managed := make([]bool, len(entries))
+	jobLog := make([]bool, len(entries))
+	origins := make([]string, len(entries))
 	recoveryPaths := make(map[string]bool)
 	if opts.WorktreePolicy != nil {
 		for _, cache := range opts.WorktreePolicy.Caches {
@@ -49,7 +51,18 @@ func collectGitmoot(ctx context.Context, opts *Options, entries []core.Entry, no
 		}
 	}
 	for i := range entries {
-		managed[i] = core.PathWithin(entries[i].Path, opts.GitmootHome)
+		// A quarantined copy is judged by its receipt source: the ledger
+		// names the original path, never the quarantine pathname.
+		origins[i] = entries[i].Path
+		if source, ok := opts.WorktreeOrigins[entries[i].Path]; ok {
+			origins[i] = source
+		}
+		// A job log of an approved gitmoot_job_logs root is a plain file
+		// Gitmoot no longer manages; the category's own live, idle and
+		// archive checks decide it. A ledger reference to its exact path
+		// still marks it below, and an unreadable ledger keeps it local.
+		jobLog[i] = opts.WorktreePolicy != nil && entries[i].Kind == core.EntryKindFile && opts.WorktreePolicy.GitmootJobLog(origins[i])
+		managed[i] = core.PathWithin(origins[i], opts.GitmootHome) && !jobLog[i]
 	}
 	mark := func(entry *core.Entry, signal, detail string, unknown bool) {
 		if unknown {
@@ -69,7 +82,7 @@ func collectGitmoot(ctx context.Context, opts *Options, entries []core.Entry, no
 		report.Recorded = 0
 		report.Unknowns = 0
 		for i := range entries {
-			if managed[i] || recoveryPaths[entries[i].Path] {
+			if managed[i] || jobLog[i] || recoveryPaths[entries[i].Path] {
 				entries[i].Evidence = removeGitmootEvidence(entries[i].Evidence)
 				mark(&entries[i], "", report.Detail, true)
 			}
@@ -124,7 +137,7 @@ func collectGitmoot(ctx context.Context, opts *Options, entries []core.Entry, no
 			}
 		}
 	}
-	refs, err := loadGitmootRefs(observeCtx, tx, entries, opts.Limits.MaxEntries)
+	refs, err := loadGitmootRefs(observeCtx, tx, entries, origins, opts.Limits.MaxEntries)
 	if err != nil {
 		return fail(err)
 	}
@@ -134,6 +147,9 @@ func collectGitmoot(ctx context.Context, opts *Options, entries []core.Entry, no
 		// DB records may name other scanned locations. Only an exact path match
 		// receives protection there; never protect an arbitrary parent entry.
 		reference := refs[entry.Path]
+		if origins[i] != entry.Path {
+			reference = mergeGitmootRefs(reference, refs[origins[i]])
+		}
 		job, jobs := reference.job, reference.jobs
 		task, tasks := reference.task, reference.tasks
 		obligation, obligations := reference.obligation, reference.obligations
@@ -207,15 +223,36 @@ type gitmootRefs struct {
 	obligations int
 }
 
+// mergeGitmootRefs combines the references to a quarantined copy and to its
+// original path; any second owner surfaces as ambiguity.
+func mergeGitmootRefs(a, b gitmootRefs) gitmootRefs {
+	if b.jobs != 0 {
+		a.job = b.job
+	}
+	if b.tasks != 0 {
+		a.task = b.task
+	}
+	if b.obligations != 0 {
+		a.obligation = b.obligation
+	}
+	a.jobs += b.jobs
+	a.tasks += b.tasks
+	a.obligations += b.obligations
+	return a
+}
+
 // Load each ledger once. A path-by-path json_extract scan would read the
 // entire jobs table once per inventory entry on a real Gitmoot home.
-func loadGitmootRefs(ctx context.Context, tx *sql.Tx, entries []core.Entry, limit int) (map[string]gitmootRefs, error) {
+func loadGitmootRefs(ctx context.Context, tx *sql.Tx, entries []core.Entry, origins []string, limit int) (map[string]gitmootRefs, error) {
 	if limit <= 0 {
 		limit = 20000
 	}
 	wanted := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
 		wanted[entry.Path] = struct{}{}
+	}
+	for _, origin := range origins {
+		wanted[origin] = struct{}{}
 	}
 	refs := make(map[string]gitmootRefs)
 	jobs, err := tx.QueryContext(ctx, `SELECT id, state, updated_at, json_extract(payload, '$.worktree_path') FROM jobs

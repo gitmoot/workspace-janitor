@@ -14,6 +14,7 @@
 package safety
 
 import (
+	"path/filepath"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -31,6 +32,29 @@ type Policy struct {
 	QuarantineDir            string
 	AllowCrossFilesystemCopy bool
 	MinFreeBytes             int64
+	// GitmootHome is the ProtectedPaths entry that protects Gitmoot's home.
+	// GitmootJobLogRoots are the owner-approved gitmoot_job_logs category
+	// roots inside it: a regular file directly inside one is not covered by
+	// that one entry (every other protection, including other protected
+	// paths, still applies). Gitmoot's home is a policy default, not a core
+	// invariant; the category archive is the job log's only release path.
+	GitmootHome        string
+	GitmootJobLogRoots []string
+}
+
+// GitmootJobLog reports whether entry is a regular file directly inside an
+// approved gitmoot_job_logs root.
+func (p Policy) GitmootJobLog(entry core.Entry) bool {
+	if entry.Kind != core.EntryKindFile || p.GitmootHome == "" {
+		return false
+	}
+	parent := filepath.Dir(entry.Path)
+	for _, root := range p.GitmootJobLogRoots {
+		if root == parent && pathWithin(root, p.GitmootHome) {
+			return true
+		}
+	}
+	return false
 }
 
 // JobState is the lifecycle state of a job that may own a path.

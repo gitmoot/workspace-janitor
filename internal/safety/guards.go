@@ -127,7 +127,8 @@ func guardSymlinkContainment(in Input) []core.Protection {
 
 // guardProtectedPaths refuses any overlap with a protected location, in
 // either direction: the entry inside a protected path, or a protected path
-// inside the entry.
+// inside the entry. A Gitmoot job log of an approved gitmoot_job_logs root
+// is the one exception to Gitmoot's home entry.
 func guardProtectedPaths(in Input) []core.Protection {
 	var out []core.Protection
 	protected := append([]string{}, in.Policy.ProtectedPaths...)
@@ -136,8 +137,12 @@ func guardProtectedPaths(in Input) []core.Protection {
 			protected = append(protected, own)
 		}
 	}
+	jobLog := in.Policy.GitmootJobLog(in.Entry)
 	for _, candidate := range protected {
 		if candidate == "" || !overlaps(in.Entry.Path, candidate) {
+			continue
+		}
+		if jobLog && candidate == in.Policy.GitmootHome {
 			continue
 		}
 		reason := fmt.Sprintf("%s is a protected location", candidate)

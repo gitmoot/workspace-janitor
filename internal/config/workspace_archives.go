@@ -28,6 +28,28 @@ type WorkspaceArchiveRule struct {
 	LocalRetention     core.Retention              `yaml:"local_retention" json:"local_retention,omitempty"`
 	LocalExpiryEnabled bool                        `yaml:"local_expiry_enabled" json:"local_expiry_enabled,omitempty"`
 	Archive            WorkspaceArchiveDestination `yaml:"archive" json:"archive"`
+	// Companion is set only on rules Janitor synthesizes for an archive
+	// category, never read from the policy file: a sibling of Path whose name
+	// extends Path's base name (an OMP session's "<stem>.jsonl" beside its
+	// "<stem>" directory). It is archived, bound, quarantined, restored and
+	// expired together with Path as one unit; an absent companion is recorded
+	// as absent and must stay absent. It is part of RuleHash.
+	Companion string `yaml:"-" json:"companion,omitempty"`
+	// Mentions is set only on synthesized category rules: strings (the unit's
+	// path, an OMP session id) whose presence in any process's command line
+	// or environment keeps the unit local, like a live descriptor would. It
+	// is a live check, excluded from RuleHash.
+	Mentions []string `yaml:"-" json:"mentions,omitempty"`
+}
+
+// CompanionSuffix is what the companion's base name adds to Path's base name
+// (".jsonl"), or "" when the rule has no companion. A quarantined or restored
+// copy of Path at P keeps its companion at P plus this suffix.
+func (r WorkspaceArchiveRule) CompanionSuffix() string {
+	if r.Companion == "" {
+		return ""
+	}
+	return strings.TrimPrefix(filepath.Base(r.Companion), filepath.Base(r.Path))
 }
 
 // WorkspaceArchiveDestination is an existing, independently protected
