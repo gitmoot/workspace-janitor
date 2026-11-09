@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,8 +23,11 @@ import (
 type applyOptions struct {
 	planID, cleanupID, actionID                string
 	quarantine, expire, prune, dryRun, confirm bool
-	pruneLimitBytes                            uint64
-	pruneResult                                *pruneReport
+	// artifacts selects, with quarantine, the verified
+	// omp_session_artifacts batches instead of an approved plan.
+	artifacts       bool
+	pruneLimitBytes uint64
+	pruneResult     *pruneReport
 }
 
 type officialCommandHint struct {
@@ -86,6 +90,9 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	if !opts.expire && opts.cleanupID != "" {
 		return &usageError{msg: "--cleanup applies only to expiry"}
 	}
+	if opts.artifacts && (!opts.quarantine || opts.planID != "" || opts.actionID != "") {
+		return &usageError{msg: "--artifacts applies only to --quarantine and takes no --plan or --action"}
+	}
 	format, err := e.format()
 	if err != nil {
 		return err
@@ -113,6 +120,10 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	engine := cleanupEngine(e, db, paths, policy)
 	if opts.expire {
 		return runExpiry(ctx, e.stdout, format, engine, policy, opts)
+	}
+	if opts.artifacts {
+		report, err := quarantineArtifacts(ctx, engine, policy, opts.dryRun)
+		return errors.Join(err, writeArtifactQuarantine(e.stdout, format, report))
 	}
 
 	var stored core.Plan
@@ -288,8 +299,12 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 }
 
 func runRestore(ctx context.Context, e *env, args []string, confirm bool) error {
-	if len(args) != 1 || !strings.HasPrefix(args[0], "cleanup-") {
-		return &usageError{msg: "restore requires one cleanup id"}
+	if len(args) < 1 || !strings.HasPrefix(args[0], "cleanup-") {
+		return &usageError{msg: "restore requires one cleanup id, optionally followed by original paths of its items"}
+	}
+	only := make(map[string]bool, len(args)-1)
+	for _, path := range args[1:] {
+		only[path] = true
 	}
 	format, err := e.format()
 	if err != nil {
@@ -323,6 +338,12 @@ func runRestore(ctx context.Context, e *env, args []string, confirm bool) error 
 	if len(items) == 0 {
 		return fmt.Errorf("no receipt %s", args[0])
 	}
+	if len(only) != 0 {
+		items = slices.DeleteFunc(items, func(item core.CleanupItem) bool { return !only[item.Source] })
+		if len(items) != len(only) {
+			return fmt.Errorf("receipt %s holds %d of the %d named paths", args[0], len(items), len(only))
+		}
+	}
 	report := cleanupReport{ID: args[0], Mode: "restore", DryRun: !confirm, Items: []core.CleanupItem{}, Errors: []string{}}
 	for _, item := range items {
 		if confirm && (item.State == core.CleanupQuarantined || item.State == core.CleanupPrepared || item.State == core.CleanupInvestigate) {
@@ -353,6 +374,7 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 	if opts.cleanupID != "" && len(items) == 0 {
 		return fmt.Errorf("no receipt %s", opts.cleanupID)
 	}
+	engine.Artifacts = newArtifactExpiry(engine.DB, policy, items)
 	report := cleanupReport{ID: opts.cleanupID, Mode: "expiry", DryRun: opts.dryRun, Items: []core.CleanupItem{}, Errors: []string{}}
 	eligible := make([]core.Entry, 0)
 	var monitor *activityMonitor

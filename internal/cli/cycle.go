@@ -17,19 +17,22 @@ import (
 )
 
 type cycleReport struct {
-	ScanID           string                 `json:"scan_id"`
-	Deep             bool                   `json:"deep"`
-	Quarantine       string                 `json:"quarantine"`
-	QuarantineReport string                 `json:"quarantine_report,omitempty"`
-	Expiry           string                 `json:"expiry"`
-	DiskAlerts       []diskAlert            `json:"disk_alerts"`
-	ExpiryReport     string                 `json:"expiry_report,omitempty"`
-	Capacity         *core.CapacitySnapshot `json:"capacity,omitempty"`
-	Recovery         *recoveryReport        `json:"recovery,omitempty"`
-	CategoryArchives *categoryArchiveReport `json:"category_archives,omitempty"`
-	ScratchCleanup   []scratchRunReport     `json:"scratch_cleanup,omitempty"`
-	CacheTrims       []cacheTrimReport      `json:"cache_trims,omitempty"`
-	Inventory        *inventoryReport       `json:"inventory_report"`
+	ScanID           string `json:"scan_id"`
+	Deep             bool   `json:"deep"`
+	Quarantine       string `json:"quarantine"`
+	QuarantineReport string `json:"quarantine_report,omitempty"`
+	// ArtifactQuarantine is the omp_session_artifacts batch quarantine's
+	// report, when prevention.auto_quarantine runs it.
+	ArtifactQuarantine string                 `json:"artifact_quarantine,omitempty"`
+	Expiry             string                 `json:"expiry"`
+	DiskAlerts         []diskAlert            `json:"disk_alerts"`
+	ExpiryReport       string                 `json:"expiry_report,omitempty"`
+	Capacity           *core.CapacitySnapshot `json:"capacity,omitempty"`
+	Recovery           *recoveryReport        `json:"recovery,omitempty"`
+	CategoryArchives   *categoryArchiveReport `json:"category_archives,omitempty"`
+	ScratchCleanup     []scratchRunReport     `json:"scratch_cleanup,omitempty"`
+	CacheTrims         []cacheTrimReport      `json:"cache_trims,omitempty"`
+	Inventory          *inventoryReport       `json:"inventory_report"`
 }
 
 // runCycle is the one-shot daily timer target. A deep scan subsumes that day's
@@ -154,6 +157,18 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	}
 	// Expiry does not depend on the latest scan; the watcher may resume.
 	releaseScan()
+	// Session artifact batches are moved from their own verified receipts,
+	// not from the scan's plan.
+	if policy.Prevention.AutoQuarantine && artifactCategories(policy) {
+		var moved bytes.Buffer
+		applyEnv := *e
+		applyEnv.stdout = &moved
+		err := runApply(ctx, &applyEnv, nil, applyOptions{quarantine: true, artifacts: true, confirm: true, dryRun: false})
+		report.ArtifactQuarantine = strings.TrimSpace(moved.String())
+		if err != nil {
+			quarantineErr = errors.Join(quarantineErr, fmt.Errorf("scheduled session artifact quarantine: %w", err))
+		}
+	}
 	// Standing trims of live shared build caches. They need no scan: each
 	// checks for live users at the moment it runs. A failed trim does not
 	// stop expiry; it is reported and fails the cycle at the end.

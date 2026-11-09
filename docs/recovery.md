@@ -197,6 +197,20 @@ policy.
   Both use the unit tar layout, whose member names are the original base
   names, so a manual restore is
   `tar -C <original parent> --numeric-owner -xpf <archive>/<name>.tar`.
+- An `omp_session_artifacts` batch is one session folder's archived files.
+  Its quarantine journals every moved file as its own item under the batch's
+  cleanup id (shown as `quarantine receipt` in the category report and as
+  `cleanup_id` in the `apply --quarantine --artifacts` report), each in
+  `<quarantine>/<cleanup-id>/file-NNNNN/item`. `janitor restore --confirm
+  <cleanup-id>` moves the whole batch back; `janitor restore --confirm
+  <cleanup-id> <original path> ...` moves back only those files. A restored,
+  unchanged file is never batched again; it is archived anew only after it
+  changes and is idle again. After expiry, restore from the batch tar, whose
+  member names are paths relative to the sessions root:
+  `tar -C <sessions root> --numeric-owner -xpf <archive>/<name>.tar
+  <project>/<session>/<file>` (omit the member to restore the batch). The
+  tar keeps each file's mtime, so a file restored this way is not batched
+  again either.
 
 ## Scratch cleanup
 

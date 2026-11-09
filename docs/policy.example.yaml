@@ -235,6 +235,19 @@ workspace_archive_keep: []
 #   local_retention: none
 #   archive:
 #     directory: /mnt/backup/gitmoot-job-logs
+# - name: omp-session-artifacts
+#   kind: omp_session_artifacts   # idle regular files inside live OMP session
+#                                 # folders <project>/<session>/..., one batch
+#                                 # tar per session folder per cycle; never the
+#                                 # session's own <session>.jsonl
+#   roots: [/root/.omp/agent/sessions]  # exactly .../.omp/agent/sessions
+#   idle: 14d                     # each file's own mtime; minimum 1d
+#   local_retention: none
+#   max_items_per_cycle: 20       # batches (session folders) per cycle
+#   max_files_per_batch: 5000     # default 5000, at most 50000
+#   max_bytes_per_item: 10737418240   # bytes per batch
+#   archive:
+#     directory: /mnt/backup/omp-session-artifacts
 workspace_archive_categories: []
 # Opt-in scratch directory cleanup; empty by default. Only depth-1 entries of
 # each path are candidates. Entries matching skip are never touched; idle,

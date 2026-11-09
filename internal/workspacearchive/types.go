@@ -221,3 +221,61 @@ type ScratchManifest struct {
 
 // ScratchArchiveName names one run's archive files.
 func ScratchArchiveName(runID string) string { return "scratch-" + runID }
+
+// ArtifactManifestVersion is the only artifact batch manifest layout
+// accepted.
+const ArtifactManifestVersion = 1
+
+// ArtifactFile is one observed regular file inside a session folder of an
+// omp_session_artifacts root. Path is relative to the root
+// ("<project>/<session>/..."); the archive keeps it as the tar member name.
+type ArtifactFile struct {
+	Path       string            `json:"path"`
+	Identity   core.FilesystemID `json:"identity"`
+	Size       int64             `json:"size"`
+	ModifiedNS int64             `json:"mtime_ns"`
+
+	st artifactState
+}
+
+// VerifiedArtifact is the exact state of a file whose contents were just
+// verified against its archive; Same and SameCopy compare it in full.
+type VerifiedArtifact struct {
+	st artifactState
+}
+
+// ArtifactSkip is a session folder entry that is never an artifact unit
+// (symlinks, other file types, hard links, sensitive names, extended
+// attributes, mount crossings), with the reason.
+type ArtifactSkip struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+}
+
+// ArtifactMember is one archived file: its manifest member (Path relative to
+// the root, with its SHA-256) and the identity it was archived from.
+type ArtifactMember struct {
+	Member
+	Identity core.FilesystemID `json:"identity"`
+}
+
+// ArtifactManifest is the durable receipt of one verified artifact batch
+// archive: one session folder's files, each a regular file member named by
+// its path relative to Root.
+type ArtifactManifest struct {
+	Version          int               `json:"version"`
+	Name             string            `json:"name"`
+	Root             string            `json:"root"`
+	Session          string            `json:"session"`
+	ArchiveDirectory core.FilesystemID `json:"archive_directory"`
+	MountSource      string            `json:"mount_source"`
+	FSType           string            `json:"fstype"`
+	TarFile          string            `json:"tar_file"`
+	TarBytes         int64             `json:"tar_bytes"`
+	StreamSHA256     string            `json:"stream_sha256"`
+	ReadbackSHA256   string            `json:"readback_sha256"`
+	ContentBytes     int64             `json:"content_bytes"`
+	Members          []ArtifactMember  `json:"members"`
+	CreatedAt        time.Time         `json:"created_at"`
+	VerifiedAt       time.Time         `json:"verified_at"`
+}

@@ -75,6 +75,9 @@ func TestCycleMigratesPreviousSchemaBeforeCheckingDeepCadence(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, statement := range []string{
+		"DROP TABLE IF EXISTS artifact_batch_settlements",
+		"DROP TABLE IF EXISTS artifact_batch_files",
+		"DROP TABLE IF EXISTS artifact_batches",
 		"DROP TABLE IF EXISTS scratch_deletions",
 		"DROP TABLE IF EXISTS scratch_runs",
 		"DROP TABLE IF EXISTS report_replies",

@@ -24,6 +24,9 @@ type Engine struct {
 	Policy        safety.Policy
 	Collect       collect.Options
 	Now           func() time.Time
+	// Artifacts decides the expiry of quarantined omp_session_artifacts
+	// files (ArtifactBatch); nil refuses it.
+	Artifacts ArtifactGuard
 }
 
 func (e *Engine) now() time.Time {
