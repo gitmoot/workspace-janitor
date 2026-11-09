@@ -5,6 +5,7 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -80,13 +81,13 @@ retention:
 prevention:
   min_free_bytes: 0
   min_free_percent: 0
-limits:
+%slimits:
   command_timeout: 30s
-gitmoot:
+%sgitmoot:
   home: %s
   database: %s
 %sworkspace_archive_categories:
-%s%s`, x.sessions, x.jobs, x.archive, x.proc, x.services, x.gitmoot, filepath.Join(x.gitmoot, "gitmoot.db"), extra,
+%s%s`, x.sessions, x.jobs, x.archive, x.proc, x.services, x.prevention, x.limits, x.gitmoot, filepath.Join(x.gitmoot, "gitmoot.db"), extra,
 		category("sessions", "omp_sessions", x.sessions), category("job-logs", "gitmoot_job_logs", x.jobs)))
 }
 
@@ -389,5 +390,90 @@ func TestGitmootJobLogNamedByTheLedgerStaysLocal(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(x.archive); err != nil || len(entries) != 0 {
 		t.Fatalf("a ledger-referenced job log was copied off-host: %v %v", entries, err)
+	}
+}
+
+// pastRootBudget is a sessions store whose deep-size budget, shared by the
+// whole inventory root, is spent before the scan reaches the returned idle
+// session: an earlier project holds a busy session larger than the budget,
+// and the max_depth 2 root walks that project before walking its session
+// again. The returned session has already been archived with its transcript.
+func pastRootBudget(t *testing.T, prevention string) (*stateStoreFixture, string) {
+	t.Helper()
+	x := newStateStoreFixture(t)
+	x.prevention, x.limits = prevention, "  deep_size_max_entries: 16\n"
+	x.writeStores(t, "")
+	busy := filepath.Join(x.sessions, "-aaa", sessionB)
+	for i := range 40 {
+		name := filepath.Join(busy, fmt.Sprintf("%02d.bash.log", i))
+		if err := os.MkdirAll(busy, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, []byte("ls\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	session := x.session(t, "-proj", sessionA, categoryIdleAge)
+	return x, session
+}
+
+// A session the cycle's inventory scan reached only after its root's shared
+// deep-size budget was spent is still the same unchanged tree when
+// quarantine re-observes it on its own: the cycle archives it and moves it,
+// instead of refusing it as identity_changed.
+func TestCycleQuarantinesAnArchivedSessionPastTheRootDeepSizeBudget(t *testing.T) {
+	x, session := pastRootBudget(t, "  auto_quarantine: true\n")
+	out, stderr, code := x.runAgents(t, "cycle")
+	if code != ExitOK {
+		t.Fatalf("cycle: exit=%d stdout=%s stderr=%s", code, out, stderr)
+	}
+	var report struct {
+		Deep             bool                   `json:"deep"`
+		Quarantine       string                 `json:"quarantine"`
+		CategoryArchives *categoryArchiveReport `json:"category_archives"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("cycle output: %v\n%s", err, out)
+	}
+	if !report.Deep || report.Quarantine != "applied" || categoryItem(t, *report.CategoryArchives, session).Status != categoryArchived {
+		t.Fatalf("cycle report = %s", out)
+	}
+	absentPaths(t, session, session+".jsonl")
+}
+
+// The same session past the root's budget, planned from a deep scan, is
+// still refused when its contents change between planning and the move.
+func TestQuarantineRefusesASessionPastTheRootDeepSizeBudgetThatChanged(t *testing.T) {
+	x, session := pastRootBudget(t, "")
+	if item := categoryItem(t, x.categories(t, false), session); item.Status != categoryArchived {
+		t.Fatalf("session not archived: %+v", item)
+	}
+	x.data(t, "scan", "--deep-size")
+	var plan core.Plan
+	field(t, x.data(t, "plan", "--no-jev"), "plan", &plan)
+	var action core.Action
+	for _, planned := range plan.Actions {
+		if planned.Path == session {
+			action = planned
+		}
+	}
+	if action.Kind != core.ActionQuarantine {
+		t.Fatalf("archived session not proposed for quarantine: %+v", plan.Actions)
+	}
+	var entry core.Entry
+	field(t, x.data(t, "explain", session), "entry", &entry)
+	if !entry.SizeIsDeep || !entry.SizeIsLowerBound || entry.WorkspaceArchive == nil {
+		t.Fatalf("plan did not see a bound session past the root's budget: %+v", entry)
+	}
+	x.data(t, "plan", "--plan", plan.ID, "--approve", action.ID, "--no-jev")
+	if err := os.WriteFile(filepath.Join(session, "sub", "1.read.log"), []byte("rewritten after planning\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, code := x.run(t, "apply", "--quarantine", "--action", action.ID, "--dry-run=false", "--confirm")
+	if code == ExitOK || !strings.Contains(out+stderr, "identity_changed") {
+		t.Fatalf("a session changed after planning was not refused as changed: exit=%d %s %s", code, out, stderr)
+	}
+	if _, err := os.Lstat(filepath.Join(session, "sub", "1.read.log")); err != nil {
+		t.Fatalf("changed session moved: %v", err)
 	}
 }
