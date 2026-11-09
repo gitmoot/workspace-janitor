@@ -36,7 +36,8 @@ const (
 
 // categoryArchiveItem is one unit of a category root (a depth-1 entry, or an
 // OMP session with its transcript) and what the category run decided about
-// it.
+// it. For omp_session_artifacts it is one session folder's batch: Files and
+// SizeBytes count the files in it, and Reasons count the files left out.
 type categoryArchiveItem struct {
 	Category string `json:"category,omitempty"`
 	Kind     string `json:"kind,omitempty"`
@@ -47,11 +48,15 @@ type categoryArchiveItem struct {
 	Status           string                    `json:"status"`
 	SizeBytes        int64                     `json:"size_bytes"`
 	SizeKnown        bool                      `json:"size_known"`
+	Files            int                       `json:"files,omitempty"`
 	NewestModifiedAt *time.Time                `json:"newest_modified_at,omitempty"`
 	IdleFor          string                    `json:"idle_for,omitempty"`
 	Reasons          []string                  `json:"reasons,omitempty"`
 	Name             string                    `json:"name,omitempty"`
 	Binding          *workspacearchive.Binding `json:"binding,omitempty"`
+	// CleanupID is the receipt a batch's quarantine will journal its files
+	// under: `janitor restore <CleanupID>` restores them.
+	CleanupID string `json:"cleanup_id,omitempty"`
 }
 
 type categoryArchiveReport struct {
@@ -260,11 +265,16 @@ func unitEntry(entry core.Entry, companion *core.Entry) core.Entry {
 // omp_sessions root is replaced by its project directories, each one level
 // deep, so its units are entries and the projects themselves are not sized.
 // A projects listing that cannot be read, or exceeds limits.max_dir_entries,
-// fails the run rather than silently dropping sessions.
+// fails the run rather than silently dropping sessions. An
+// omp_session_artifacts root is walked by its own run
+// (archiveSessionArtifacts), so it adds no spec.
 func categorySpecs(policy config.Policy, releases bool) ([]collect.RootSpec, error) {
 	var roots []string
 	sessionRoots := map[string]bool{}
 	for _, category := range policy.WorkspaceArchiveCategories {
+		if category.Kind == config.CategoryOMPSessionArtifacts {
+			continue
+		}
 		roots = append(roots, category.Roots...)
 		for _, root := range category.Roots {
 			sessionRoots[root] = sessionRoots[root] || category.Kind.UnitDepth() == 2
@@ -515,11 +525,13 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 		return report, err
 	}
 	engine := cleanupEngine(e, nil, paths, policy)
-	options := engine.Collect
-	options.Roots, options.DeepSize, options.DeepSizePerEntry = specs, true, true
-	observed, err := collect.Run(ctx, options)
-	if err != nil {
-		return report, err
+	var observed collect.Result
+	if len(specs) != 0 {
+		options := engine.Collect
+		options.Roots, options.DeepSize, options.DeepSizePerEntry = specs, true, true
+		if observed, err = collect.Run(ctx, options); err != nil {
+			return report, err
+		}
 	}
 	safetyPolicy := enginePolicy(paths, policy)
 	releaseOwners := releaseOwnerAttribution(ctx, policy, releases)
@@ -761,6 +773,9 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			item.Status, item.Name, item.Binding = categoryArchived, name, binding
 		}
 	}
+	// Session artifact batches come last: a session folder omp_sessions
+	// archives whole in this run is left to it.
+	failures = append(failures, archiveSessionArtifacts(ctx, db, paths, policy, &report, now, dryRun)...)
 	for _, item := range report.Items {
 		switch item.Status {
 		case categoryRefused:
@@ -869,6 +884,9 @@ func writeCategoryArchiveReport(e *env, format output.Format, report categoryArc
 		if item.SizeKnown {
 			size = fmt.Sprintf("%d bytes", item.SizeBytes)
 		}
+		if item.Kind == string(config.CategoryOMPSessionArtifacts) {
+			size = fmt.Sprintf("%d file(s), %s", item.Files, size)
+		}
 		idle := item.IdleFor
 		if idle == "" {
 			idle = "unknown"
@@ -878,6 +896,11 @@ func writeCategoryArchiveReport(e *env, format output.Format, report categoryArc
 		}
 		if item.Name != "" {
 			if _, err := fmt.Fprintf(e.stdout, "  archive: %s\n", item.Name); err != nil {
+				return err
+			}
+		}
+		if item.CleanupID != "" {
+			if _, err := fmt.Fprintf(e.stdout, "  quarantine receipt: %s\n", item.CleanupID); err != nil {
 				return err
 			}
 		}

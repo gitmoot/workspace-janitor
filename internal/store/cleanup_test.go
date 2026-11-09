@@ -337,9 +337,13 @@ func TestSupersededMigrationKeepsJournalAndAdmitsState(t *testing.T) {
 		return out
 	}
 	before := events()
-	last := migrations[len(migrations)-1]
-	if err := db.applyMigration(ctx, last); err != nil {
-		t.Fatalf("upgrade: %v", err)
+	for _, m := range migrations {
+		if m.version < supersededCleanupVersion {
+			continue
+		}
+		if err := db.applyMigration(ctx, m); err != nil {
+			t.Fatalf("upgrade to %d: %v", m.version, err)
+		}
 	}
 	if got := events(); !reflect.DeepEqual(got, before) {
 		t.Fatalf("upgrade rewrote event history: %v, was %v", got, before)

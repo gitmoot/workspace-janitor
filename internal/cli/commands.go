@@ -153,7 +153,7 @@ func explainCommand() *command {
 func applyCommand() *command {
 	return &command{
 		name:    "apply",
-		usage:   "janitor apply (--quarantine | --expire | --prune --action ID) [flags]",
+		usage:   "janitor apply (--quarantine [--artifacts] | --expire | --prune --action ID) [flags]",
 		summary: "Preview or perform approved cleanup, expiry, or official dedicated-cache pruning",
 		long:    "Dry-run is the default. Quarantine is reversible; expiry needs policy opt-in. Official prune is irreversible and requires an approved action, an explicitly dedicated cache, a configured executable, confirmation, and a bounded runtime.",
 		register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
@@ -163,6 +163,7 @@ func applyCommand() *command {
 			fs.StringVar(&opts.planID, "plan", "", "stored plan id (default: latest)")
 			fs.StringVar(&opts.cleanupID, "cleanup", "", "expiry scan restricted to one receipt id")
 			fs.BoolVar(&opts.quarantine, "quarantine", false, "move approved actions into quarantine")
+			fs.BoolVar(&opts.artifacts, "artifacts", false, "with --quarantine: move the files of verified omp_session_artifacts batches instead of a plan's actions")
 			fs.BoolVar(&opts.expire, "expire", false, "scan quarantined receipts for expiry")
 			fs.BoolVar(&opts.dryRun, "dry-run", true, "show proposed moves or deletions without mutating")
 			fs.BoolVar(&opts.confirm, "confirm", false, "required for every filesystem mutation")
@@ -197,7 +198,7 @@ func serviceCommand() *command {
 func restoreCommand() *command {
 	return &command{
 		name:    "restore",
-		usage:   "janitor restore [--confirm] <cleanup-id>",
+		usage:   "janitor restore [--confirm] <cleanup-id> [original-path ...]",
 		summary: "Restore quarantined items without overwriting occupied paths",
 		register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
 			confirm := fs.Bool("confirm", false, "required to perform the restore")

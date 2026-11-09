@@ -426,6 +426,46 @@ var migrations = []migration{
 			 END`,
 		},
 	},
+	{
+		version: artifactBatchesVersion,
+		name:    "artifact_batches",
+		statements: []string{
+			`CREATE TABLE artifact_batches (
+				sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+				name TEXT NOT NULL UNIQUE,
+				cleanup_id TEXT NOT NULL UNIQUE,
+				session TEXT NOT NULL,
+				document TEXT NOT NULL CHECK (length(document) <= 65536)
+			)`,
+			`CREATE INDEX artifact_batches_session ON artifact_batches(session, sequence)`,
+			`CREATE TRIGGER artifact_batches_no_update BEFORE UPDATE ON artifact_batches
+			 BEGIN SELECT RAISE(ABORT, 'artifact batch receipts are immutable'); END`,
+			`CREATE TRIGGER artifact_batches_no_delete BEFORE DELETE ON artifact_batches
+			 BEGIN SELECT RAISE(ABORT, 'artifact batch receipts are immutable'); END`,
+			`CREATE TABLE artifact_batch_files (
+				batch TEXT NOT NULL REFERENCES artifact_batches(name),
+				action_id TEXT NOT NULL,
+				path TEXT NOT NULL,
+				size INTEGER NOT NULL,
+				mtime_ns INTEGER NOT NULL,
+				PRIMARY KEY (batch, action_id)
+			)`,
+			`CREATE INDEX artifact_batch_files_path ON artifact_batch_files(path)`,
+			`CREATE TRIGGER artifact_batch_files_no_update BEFORE UPDATE ON artifact_batch_files
+			 BEGIN SELECT RAISE(ABORT, 'artifact batch receipts are immutable'); END`,
+			`CREATE TRIGGER artifact_batch_files_no_delete BEFORE DELETE ON artifact_batch_files
+			 BEGIN SELECT RAISE(ABORT, 'artifact batch receipts are immutable'); END`,
+			`CREATE TABLE artifact_batch_settlements (
+				name TEXT NOT NULL PRIMARY KEY REFERENCES artifact_batches(name),
+				settled_at TEXT NOT NULL,
+				document TEXT NOT NULL CHECK (length(document) <= 65536)
+			)`,
+			`CREATE TRIGGER artifact_batch_settlements_no_update BEFORE UPDATE ON artifact_batch_settlements
+			 BEGIN SELECT RAISE(ABORT, 'artifact batch settlements are immutable'); END`,
+			`CREATE TRIGGER artifact_batch_settlements_no_delete BEFORE DELETE ON artifact_batch_settlements
+			 BEGIN SELECT RAISE(ABORT, 'artifact batch settlements are immutable'); END`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build expects.

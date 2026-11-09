@@ -640,13 +640,14 @@ Binding is full before the quarantine move and before expiry.
 | Field | Contract |
 | --- | --- |
 | `name` | Unique; 1-48 letters, digits, `_` or `-`. Item archives are named `<name>-<base>-<hash12>` (hash of path and run). |
-| `kind` | `merged_worktrees` (linked Git worktree), `pushed_clones` (standalone non-bare checkout), `root_scratch` (no `.git` at the item root), `versioned_work` (see above), `omp_sessions` or `gitmoot_job_logs` (see [below](#omp-sessions-and-gitmoot-job-logs)). One category per kind and root. |
-| `roots` | Exact configured inventory roots. A root may not be `report_only`, inside `protect.paths`, or inside a `workspace_archive_keep` path. Only depth-1 entries are candidates (for `omp_sessions`, depth-2 sessions). |
-| `idle` | Minimum age of the newest modification anywhere in the tree, measured by a bounded deep walk of that item alone (see below). Use `Nd` or Go syntax. Defaults: `1d` for `versioned_work`, `14d` for `merged_worktrees`, `omp_sessions` and `gitmoot_job_logs`, `30d` otherwise. Shortest accepted: `1d` for `versioned_work`, `omp_sessions` and `gitmoot_job_logs`, `7d` for `merged_worktrees`, `14d` otherwise. |
+| `kind` | `merged_worktrees` (linked Git worktree), `pushed_clones` (standalone non-bare checkout), `root_scratch` (no `.git` at the item root), `versioned_work` (see above), `omp_sessions`, `omp_session_artifacts` or `gitmoot_job_logs` (see [below](#omp-sessions-and-gitmoot-job-logs)). One category per kind and root. |
+| `roots` | Exact configured inventory roots. A root may not be `report_only`, inside `protect.paths`, or inside a `workspace_archive_keep` path. Only depth-1 entries are candidates (for `omp_sessions`, depth-2 sessions; for `omp_session_artifacts`, files inside depth-2 session folders). |
+| `idle` | Minimum age of the newest modification anywhere in the tree, measured by a bounded deep walk of that item alone (see below); for `omp_session_artifacts`, each file's own mtime. Use `Nd` or Go syntax. Defaults: `1d` for `versioned_work`, `14d` for `merged_worktrees`, `omp_sessions`, `omp_session_artifacts` and `gitmoot_job_logs`, `30d` otherwise. Shortest accepted: `1d` for `versioned_work`, `omp_sessions`, `omp_session_artifacts` and `gitmoot_job_logs`, `7d` for `merged_worktrees`, `14d` otherwise. |
 | `archive.directory`, `expect_mount_source`, `expect_fstype` | Same approval rules as `workspace_archives` destinations. The directory must also be outside every inventory root. |
 | `local_retention` | `none`, `30d` (default) or `90d`, measured from archive creation. `none` proposes quarantine as soon as the verified archive binds the local tree. The quarantine retention (`retention.default`) still applies before deletion, and deletion still re-binds the quarantined copy. |
-| `max_items_per_cycle` | Default 20, at most 200. Extra candidates are `deferred`, oldest first. |
-| `max_bytes_per_item` | Default 10 GiB. Larger or unmeasured trees are refused. |
+| `max_items_per_cycle` | Default 20, at most 200. Extra candidates are `deferred`, oldest first. For `omp_session_artifacts` it counts batches (session folders). |
+| `max_bytes_per_item` | Default 10 GiB. Larger or unmeasured trees are refused. For `omp_session_artifacts` it bounds one batch: files beyond it wait for a later cycle, and a single larger file is refused. |
+| `max_files_per_batch` | `omp_session_artifacts` only. Default 5000, at most 50000: the most files one session folder's batch archives in a cycle; the rest wait for a later cycle. |
 
 Categories require the Git, process and service collectors. A candidate must
 be a directory directly inside a category root. It is refused by any of these:
@@ -713,8 +714,8 @@ run. See [recovery](recovery.md#category-archive-items).
 #### OMP sessions and Gitmoot job logs
 
 Raw runtime stores (`.omp`, `.gitmoot`, `.claude`, `.codex`, credential
-directories) are never category roots, with two owner-approved exceptions, each
-for its own kind and its exact store only:
+directories) are never category roots, with three owner-approved exceptions,
+each for its own kind and its exact store only:
 
 - `omp_sessions`: the root must be exactly a `.../.omp/agent/sessions`
   directory (not `.omp/agent`, `.omp/run/daemons` or anything else), with no
@@ -736,6 +737,10 @@ for its own kind and its exact store only:
   other protection applies, and the plan keeps it unless an active category
   archive binds it. A Gitmoot ledger reference to the exact log path still
   keeps it.
+- `omp_session_artifacts`: the root must be exactly a `.../.omp/agent/sessions`
+  directory, as for `omp_sessions` (both kinds may share it). A unit is each
+  regular file anywhere inside a session folder `<project>/<session>/...`,
+  live sessions included; see [below](#omp-session-artifacts).
 
 Every other kind still refuses these roots. Besides every refusal above, a
 state-store unit is kept while any of these hold:
@@ -756,6 +761,77 @@ the run. The checks run at selection, before and after the copy, and again at
 the quarantine move and at expiry, for both the original and quarantined
 paths. The category run observes the sessions root one project directory at a
 time; a listing above `limits.max_dir_entries` refuses the run.
+
+##### OMP session artifacts
+
+`omp_session_artifacts` (owner, 2026-11-09) moves the old per-file artifacts
+of session folders that live seats still write to, which `omp_sessions` (one
+session is one unit) can never move: subagent transcripts, `__advisor*.jsonl`
+and tool logs. OMP resumes a session from `<project>/<session>.jsonl` alone,
+so archiving these files never breaks a resume. It does break the
+`artifact://` and `agent://` links, Agent Hub views and HTML exports that
+show them, until the file is restored.
+
+Each file is its own unit. A file is selected when all of these hold:
+
+- it is a single-link regular file strictly inside a session folder (a real
+  directory `<project>/<session>` on the root's mount), at any depth.
+  Symlinks (never followed), hard-linked files, FIFOs, sockets and devices,
+  files with extended attributes, secret-like names and anything across a
+  mount boundary are never units. The session's own `<project>/<session>.jsonl`
+  lies beside its folder and is never one.
+- its own mtime is at least `idle` old (the host uses 14d)
+- no process holds it as an open descriptor, mapped file, executable, cwd or
+  root. Unlike `omp_sessions`, a process whose command line or environment
+  names the session does not keep its files: every live session is named so.
+  The per-file open state and the file's own mtime are the guard.
+- no `workspace_archive_keep` or `protect.paths` entry (or any other policy
+  refusal above) covers it, and no raw-state or credential component (`.git`,
+  `.ssh`, ...) lies between the session folder and the file
+- it is not already archived unchanged: archived in a batch that has not been
+  quarantined yet, or archived, moved and then restored (from quarantine or
+  from the archive) with the size and mtime it was archived with
+- `omp_sessions` does not archive its session folder whole in the same run
+  (`would_archive`, `archived`, `deferred` or `already_archived` there)
+
+Every cycle archives, per session folder, one batch: one tar holding that
+folder's selected files (at most `max_files_per_batch` files and
+`max_bytes_per_item` bytes; the rest wait for a later cycle), whose members
+are the files' paths relative to the root (`<project>/<session>/...`), and a
+manifest with each file's identity, size, mtime, mode, owner and SHA-256.
+`max_items_per_cycle` caps the batches, the longest idle first. The tar is
+re-read and compared with the manifest before it is published, and the
+batch, its files and the cleanup id its quarantine will use are recorded in
+Janitor's state (`artifact_batches`). `janitor archive --categories` previews
+each batch's file count and bytes and, per reason, how many files of the
+folder it leaves out, with an example.
+
+A batch is quarantined, after `local_retention`, by `janitor apply --quarantine
+--artifacts` (the cycle runs it under `prevention.auto_quarantine`). Its whole
+tar is verified first; a batch whose archive does not verify moves nothing.
+Then each file must still be the archived file (inode, size, mtime and
+contents), not covered by policy, and unused (one `/proc` pass per batch);
+its identity is re-checked immediately before its rename. Each moved file is
+its own cleanup item and audit row under the batch's cleanup id. A file that
+changed, was opened, was removed or became protected after archiving stays in
+place and is reported; the rest of the batch still moves and the batch is
+settled. A file kept this way is batched again once it is idle and unused. A batch waits while an `omp_sessions` archive of its session folder
+has expiry authority: that quarantine moves the folder whole.
+
+Expiry deletes a quarantined file only while its category still holds the
+batch (same name, kind, root and archive directory), the batch tar still
+verifies, the quarantined copy is still the archived file (identity, size,
+mtime and contents), policy does not cover the original path and no process
+uses the copy or the original path. Otherwise the item is investigated.
+
+Live-use checks fail closed at selection, at quarantine and at expiry: an
+unreadable `/proc`, or a process whose descriptors or maps cannot be read,
+keeps every file, and the run reports a failure. A session folder that
+cannot be walked completely, or holds more than
+`limits.deep_size_max_entries` entries, is refused; a root or project listing
+above `limits.max_dir_entries` refuses the category. Restore with `janitor
+restore <cleanup-id> [original path ...]`; see
+[recovery](recovery.md#category-archive-items).
 
 ### Stale-workspace report
 

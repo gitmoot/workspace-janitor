@@ -105,13 +105,21 @@ const (
 	// CategoryGitmootJobLogs selects idle regular files directly inside a
 	// ".../.gitmoot/logs/jobs" root (owner, 2026-11-08).
 	CategoryGitmootJobLogs WorkspaceArchiveCategoryKind = "gitmoot_job_logs"
+	// CategoryOMPSessionArtifacts selects idle regular files anywhere inside
+	// the session folders "<project>/<session>/..." of an
+	// ".../.omp/agent/sessions" root, live sessions included (owner,
+	// 2026-11-09). Each file is its own unit; one cycle archives a session
+	// folder's eligible files as one batch. The session's own
+	// "<project>/<session>.jsonl" is never one of them.
+	CategoryOMPSessionArtifacts WorkspaceArchiveCategoryKind = "omp_session_artifacts"
 )
 
 // stateRootShapes are the only raw runtime-state directory shapes a
 // category may use as a root, each for its own kind.
 var stateRootShapes = map[WorkspaceArchiveCategoryKind][]string{
-	CategoryOMPSessions:    {".omp", "agent", "sessions"},
-	CategoryGitmootJobLogs: {".gitmoot", "logs", "jobs"},
+	CategoryOMPSessions:         {".omp", "agent", "sessions"},
+	CategoryGitmootJobLogs:      {".gitmoot", "logs", "jobs"},
+	CategoryOMPSessionArtifacts: {".omp", "agent", "sessions"},
 }
 
 // StateStore reports whether the kind archives a raw runtime-state store
@@ -181,14 +189,42 @@ func (k WorkspaceArchiveCategoryKind) UnitMentions(path string) []string {
 }
 
 // ItemRoot is the root that holds path as one of the category's units: the
-// grandparent for OMP sessions, the parent otherwise. ok is false when that
-// directory is not one of the category's roots.
+// grandparent for OMP sessions, the parent for other kinds, and for OMP
+// session artifacts the root a file lies at least three levels below
+// ("<project>/<session>/<file>"). ok is false when that directory is not one
+// of the category's roots.
 func (c WorkspaceArchiveCategory) ItemRoot(path string) (string, bool) {
+	if c.Kind == CategoryOMPSessionArtifacts {
+		session, ok := c.ArtifactSession(path)
+		return filepath.Dir(filepath.Dir(session)), ok
+	}
 	root := filepath.Dir(path)
 	if c.Kind.UnitDepth() == 2 {
 		root = filepath.Dir(root)
 	}
 	return root, slices.Contains(c.Roots, root)
+}
+
+// ArtifactSession is the session folder "<root>/<project>/<session>" that
+// holds path, a file inside it, for an omp_session_artifacts category. ok is
+// false for any other kind, for a path outside its roots, and for a path
+// that is not strictly inside a session folder, such as the session's own
+// "<project>/<session>.jsonl".
+func (c WorkspaceArchiveCategory) ArtifactSession(path string) (string, bool) {
+	if c.Kind != CategoryOMPSessionArtifacts || !core.IsCanonicalPath(path) {
+		return "", false
+	}
+	for _, root := range c.Roots {
+		rel, ok := strings.CutPrefix(path, root+"/")
+		if !ok {
+			continue
+		}
+		parts := strings.SplitN(rel, "/", 3)
+		if len(parts) == 3 && parts[2] != "" {
+			return root + "/" + parts[0] + "/" + parts[1], true
+		}
+	}
+	return "", false
 }
 
 // stateStoreUnit reports whether path lies at unit depth in a root of a
@@ -272,7 +308,7 @@ func (k WorkspaceArchiveCategoryKind) MinIdle() time.Duration {
 func (k WorkspaceArchiveCategoryKind) Valid() bool {
 	switch k {
 	case CategoryMergedWorktrees, CategoryPushedClones, CategoryRootScratch, CategoryVersionedWork,
-		CategoryOMPSessions, CategoryGitmootJobLogs:
+		CategoryOMPSessions, CategoryGitmootJobLogs, CategoryOMPSessionArtifacts:
 		return true
 	}
 	return false
@@ -283,6 +319,10 @@ const (
 	DefaultCategoryMaxItemsPerCycle = 20
 	MaxCategoryItemsPerCycle        = 200
 	DefaultCategoryMaxBytesPerItem  = int64(10) << 30
+	// DefaultCategoryMaxFilesPerBatch and MaxCategoryFilesPerBatch bound
+	// the files of one omp_session_artifacts batch.
+	DefaultCategoryMaxFilesPerBatch = 5000
+	MaxCategoryFilesPerBatch        = 50000
 	maxWorkspaceArchiveCategories   = 16
 )
 
@@ -305,6 +345,10 @@ type WorkspaceArchiveCategory struct {
 	LocalRetention   core.Retention `yaml:"local_retention" json:"local_retention"`
 	MaxItemsPerCycle int            `yaml:"max_items_per_cycle" json:"max_items_per_cycle"`
 	MaxBytesPerItem  int64          `yaml:"max_bytes_per_item" json:"max_bytes_per_item"`
+	// MaxFilesPerBatch applies to omp_session_artifacts only: the most files
+	// one session folder's batch archives in a cycle. For that kind
+	// MaxItemsPerCycle counts batches and MaxBytesPerItem bounds one batch.
+	MaxFilesPerBatch int `yaml:"max_files_per_batch,omitempty" json:"max_files_per_batch,omitempty"`
 	// Match and KeepNewest apply to versioned_work only. Match is a base-name
 	// glob with exactly one '*'; the leading digits of the text it matches
 	// are the version (admin-v*-work: "admin-v0116-reset-r5-work" is 116).
@@ -360,8 +404,10 @@ func (p *Policy) WorkspaceArchiveCategory(name string) (WorkspaceArchiveCategory
 // overlaps, and raw runtime/credential stores. Live evidence (processes,
 // Git, Gitmoot, services) is checked separately by the collectors and the
 // safety engine. The only raw-state paths a category may archive are the
-// units of an omp_sessions or gitmoot_job_logs root; a Gitmoot job log is
-// also exempt from Gitmoot's own home protection, and from nothing else.
+// units of an omp_sessions, omp_session_artifacts or gitmoot_job_logs root;
+// a Gitmoot job log is also exempt from Gitmoot's own home protection, and
+// from nothing else. Below a session folder, raw-state and credential
+// components still refuse an artifact.
 func (p *Policy) CategoryArchiveRefusals(path string) []string {
 	var out []string
 	if !core.IsCanonicalPath(path) || path == "/" {
@@ -374,6 +420,14 @@ func (p *Policy) CategoryArchiveRefusals(path string) []string {
 	}
 	if !stateUnit && rawStateOrCredentialPath(path) {
 		out = append(out, "raw runtime/session stores and credential containers are never archived by category")
+	}
+	if stateUnit && stateKind == CategoryOMPSessionArtifacts {
+		for _, category := range p.WorkspaceArchiveCategories {
+			if session, ok := category.ArtifactSession(path); ok && rawStateOrCredentialPath(strings.TrimPrefix(path, session)) {
+				out = append(out, "raw runtime/session stores and credential containers inside a session folder are never archived")
+				break
+			}
+		}
 	}
 	for _, keep := range p.WorkspaceArchiveKeep {
 		if core.PathsOverlap(path, keep.Path) {
@@ -473,6 +527,9 @@ func (p *Policy) normalizeWorkspaceArchiveCategories(expand func(string, string)
 		if category.MaxBytesPerItem == 0 {
 			category.MaxBytesPerItem = DefaultCategoryMaxBytesPerItem
 		}
+		if category.MaxFilesPerBatch == 0 && category.Kind == CategoryOMPSessionArtifacts {
+			category.MaxFilesPerBatch = DefaultCategoryMaxFilesPerBatch
+		}
 	}
 	if p.WorkspaceArchiveCategories == nil {
 		p.WorkspaceArchiveCategories = []WorkspaceArchiveCategory{}
@@ -501,7 +558,7 @@ func (p *Policy) validateWorkspaceArchiveCategories(errs *core.FieldErrors) {
 			names[category.Name] = i
 		}
 		if !category.Kind.Valid() {
-			errs.Add(field+".kind", "must be merged_worktrees, pushed_clones, root_scratch, versioned_work, omp_sessions or gitmoot_job_logs, got %q", category.Kind)
+			errs.Add(field+".kind", "must be merged_worktrees, pushed_clones, root_scratch, versioned_work, omp_sessions, omp_session_artifacts or gitmoot_job_logs, got %q", category.Kind)
 		} else if category.Idle.Duration() < category.Kind.MinIdle() {
 			errs.Add(field+".idle", "must be at least %s for %s, got %s", IdleDuration(category.Kind.MinIdle()), category.Kind, category.Idle)
 		}
@@ -550,6 +607,13 @@ func (p *Policy) validateWorkspaceArchiveCategories(errs *core.FieldErrors) {
 		}
 		if category.MaxBytesPerItem <= 0 {
 			errs.Add(field+".max_bytes_per_item", "must be greater than zero, got %d", category.MaxBytesPerItem)
+		}
+		if category.Kind == CategoryOMPSessionArtifacts {
+			if category.MaxFilesPerBatch < 1 || category.MaxFilesPerBatch > MaxCategoryFilesPerBatch {
+				errs.Add(field+".max_files_per_batch", "must be between 1 and %d, got %d", MaxCategoryFilesPerBatch, category.MaxFilesPerBatch)
+			}
+		} else if category.MaxFilesPerBatch != 0 {
+			errs.Add(field+".max_files_per_batch", "applies to omp_session_artifacts only")
 		}
 	}
 }
