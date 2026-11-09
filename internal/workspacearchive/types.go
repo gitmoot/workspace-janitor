@@ -238,6 +238,12 @@ type ArtifactFile struct {
 	st artifactState
 }
 
+// VerifiedArtifact is the exact state of a file whose contents were just
+// verified against its archive; Same and SameCopy compare it in full.
+type VerifiedArtifact struct {
+	st artifactState
+}
+
 // ArtifactSkip is a session folder entry that is never an artifact unit
 // (symlinks, other file types, hard links, sensitive names, extended
 // attributes, mount crossings), with the reason.

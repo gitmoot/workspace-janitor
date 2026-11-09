@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/action"
+	"github.com/gitmoot/workspace-janitor/internal/collect"
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 	"github.com/gitmoot/workspace-janitor/internal/output"
@@ -178,7 +179,7 @@ func observeArtifacts(ctx context.Context, policy config.Policy, category config
 					}
 					continue
 				}
-				if refusals := policy.CategoryArchiveRefusals(path); len(refusals) != 0 {
+				if refusals := artifactRefusals(policy, category, path); len(refusals) != 0 {
 					plan.notes.add(refusals[0], file.Path, false)
 					continue
 				}
@@ -335,6 +336,28 @@ func createArtifactBatch(ctx context.Context, db *store.Store, paths config.Path
 
 func artifactActionID(i int) string { return fmt.Sprintf("file-%05d", i) }
 
+// artifactRefusals is CategoryArchiveRefusals for a session artifact plus
+// the current protected-name screen (built-in secret names and
+// protect.name_patterns) on every name from the session folder down to the
+// file, so a pattern added after selection keeps the file at every later
+// boundary: before publication, at quarantine and at expiry.
+func artifactRefusals(policy config.Policy, category config.WorkspaceArchiveCategory, path string) []string {
+	out := policy.CategoryArchiveRefusals(path)
+	session, ok := category.ArtifactSession(path)
+	if !ok {
+		return append(out, "not a file inside a session folder of the category")
+	}
+	parent := session
+	for _, name := range strings.Split(strings.TrimPrefix(path, session+"/"), "/") {
+		if workspacearchive.SensitiveName(name, parent, policy.Protect.NamePatterns) {
+			out = append(out, fmt.Sprintf("protected name %q (built-in secret screen or protect.name_patterns)", name))
+			break
+		}
+		parent += "/" + name
+	}
+	return out
+}
+
 // artifactPreflight re-reads the policy file before and after the copy: a
 // withdrawn or changed category, or a KEEP or protection that now covers one
 // of the files, refuses the batch and leaves every file untouched.
@@ -349,7 +372,7 @@ func artifactPreflight(paths config.Paths, category config.WorkspaceArchiveCateg
 		return fmt.Errorf("archive category %q was withdrawn or changed during archiving; files retained", category.Name)
 	}
 	for _, file := range files {
-		if refusals := current.CategoryArchiveRefusals(file); len(refusals) != 0 {
+		if refusals := artifactRefusals(current, latest, file); len(refusals) != 0 {
 			return fmt.Errorf("policy now refuses %s: %s; files retained", file, strings.Join(refusals, "; "))
 		}
 	}
@@ -515,6 +538,7 @@ func quarantineArtifactBatch(ctx context.Context, engine *action.Engine, policy 
 	type verified struct {
 		file   store.ArtifactFile
 		member workspacearchive.ArtifactMember
+		state  workspacearchive.VerifiedArtifact
 	}
 	var ready []verified
 	for _, file := range files {
@@ -525,11 +549,12 @@ func quarantineArtifactBatch(ctx context.Context, engine *action.Engine, policy 
 		if journaled[file.ActionID] {
 			continue // an earlier, interrupted run journaled it already
 		}
-		if refusals := policy.CategoryArchiveRefusals(file.Path); len(refusals) != 0 {
+		if refusals := artifactRefusals(policy, category, file.Path); len(refusals) != 0 {
 			notes.add(refusals[0], file.Path, false)
 			continue
 		}
-		if err := root.VerifyFile(ctx, member); err != nil {
+		state, err := root.VerifyFile(ctx, member)
+		if err != nil {
 			reason := "changed since archiving: " + err.Error()
 			if errors.Is(err, os.ErrNotExist) {
 				reason = "no longer present"
@@ -537,7 +562,7 @@ func quarantineArtifactBatch(ctx context.Context, engine *action.Engine, policy 
 			notes.add(reason, file.Path, false)
 			continue
 		}
-		ready = append(ready, verified{file, member})
+		ready = append(ready, verified{file, member, state})
 	}
 	candidates := make([]string, len(ready))
 	for i, r := range ready {
@@ -560,8 +585,8 @@ func quarantineArtifactBatch(ctx context.Context, engine *action.Engine, policy 
 			out.MovedBytes += r.file.Size
 			continue
 		}
-		member := r.member
-		_, err := engine.QuarantineArtifact(ctx, artifactCleanupItem(policy, batch, r.file, member.Identity, now), func() error { return root.Same(member) })
+		member, state := r.member, r.state
+		_, err := engine.QuarantineArtifact(ctx, artifactCleanupItem(policy, batch, r.file, member.Identity, now), func() error { return root.Same(member, state) })
 		switch {
 		case err == nil:
 			out.Moved++
@@ -669,7 +694,12 @@ func (g *artifactExpiry) Eligible(ctx context.Context, item core.CleanupItem) er
 	if inactive != "" {
 		return fmt.Errorf("no expiry authority: %s", inactive)
 	}
-	if refusals := g.policy.CategoryArchiveRefusals(item.Source); len(refusals) != 0 {
+	// The current local_retention decides, as for workspace archives: one
+	// raised after quarantine still holds the copy.
+	if refusal := collect.LocalExpiryRefusal(config.WorkspaceArchiveRule{LocalRetention: category.LocalRetention, LocalExpiryEnabled: true}, batch.CreatedAt, time.Now().UTC()); refusal != "" {
+		return fmt.Errorf("no expiry authority: %s", refusal)
+	}
+	if refusals := artifactRefusals(g.policy, category, item.Source); len(refusals) != 0 {
 		return fmt.Errorf("policy now keeps %s: %s", item.Source, strings.Join(refusals, "; "))
 	}
 	check, ok := g.checked[name]
@@ -692,7 +722,8 @@ func (g *artifactExpiry) Eligible(ctx context.Context, item core.CleanupItem) er
 	if !ok {
 		return errors.New("batch archive holds no such file")
 	}
-	if err := workspacearchive.VerifyArtifactCopy(ctx, item.Destination, member); err != nil {
+	verified, err := workspacearchive.VerifyArtifactCopy(ctx, item.Destination, member)
+	if err != nil {
 		return fmt.Errorf("quarantined copy is not the archived file: %w", err)
 	}
 	if !g.scanned {
@@ -712,6 +743,12 @@ func (g *artifactExpiry) Eligible(ctx context.Context, item core.CleanupItem) er
 		if use, ok := g.used[path]; ok {
 			return fmt.Errorf("%s is in use (%s)", path, use)
 		}
+	}
+	// The process scan can take long: the copy must still be exactly the
+	// state verified against the archive before it, or an append made
+	// meanwhile would be deleted without ever having been archived.
+	if err := workspacearchive.SameCopy(item.Destination, verified); err != nil {
+		return fmt.Errorf("quarantined copy is not the archived file: %w", err)
 	}
 	return nil
 }

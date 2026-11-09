@@ -499,26 +499,29 @@ func CheckArtifacts(ctx context.Context, dest config.WorkspaceArchiveCategoryDes
 
 // VerifyFile checks that the file member names below the root is still
 // exactly what was archived: a single-link regular file with the archived
-// identity, size and mtime, whose contents hash to the archived SHA-256.
-func (r *ArtifactRoot) VerifyFile(ctx context.Context, member ArtifactMember) error {
+// identity, size, mtime, mode and ownership, no extended attributes (which
+// the archive does not hold), whose contents hash to the archived SHA-256.
+// It returns the verified state, which Same compares in full (ctime
+// included) immediately before the file moves.
+func (r *ArtifactRoot) VerifyFile(ctx context.Context, member ArtifactMember) (VerifiedArtifact, error) {
 	if !validMemberPath(member.Path) {
-		return fmt.Errorf("invalid artifact path %q", member.Path)
+		return VerifiedArtifact{}, fmt.Errorf("invalid artifact path %q", member.Path)
 	}
 	f, err := openBeneath(r.dir, member.Path, unix.O_PATH|unix.O_NOFOLLOW)
 	if err != nil {
-		return err
+		return VerifiedArtifact{}, err
 	}
 	st, err := fstate(f)
 	f.Close()
 	if err != nil {
-		return err
+		return VerifiedArtifact{}, err
 	}
 	if st.kind() != unix.S_IFREG {
-		return errors.New("no longer a regular file")
+		return VerifiedArtifact{}, errors.New("no longer a regular file")
 	}
 	f, err = openBeneath(r.dir, member.Path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK)
 	if err != nil {
-		return err
+		return VerifiedArtifact{}, err
 	}
 	defer f.Close()
 	return verifyArtifact(ctx, f, member)
@@ -526,46 +529,52 @@ func (r *ArtifactRoot) VerifyFile(ctx context.Context, member ArtifactMember) er
 
 // VerifyArtifactCopy is VerifyFile for a quarantined copy at the absolute
 // path, which is walked without following any symlink.
-func VerifyArtifactCopy(ctx context.Context, path string, member ArtifactMember) error {
+func VerifyArtifactCopy(ctx context.Context, path string, member ArtifactMember) (VerifiedArtifact, error) {
 	f, err := openPath(path, unix.O_PATH)
 	if err != nil {
-		return err
+		return VerifiedArtifact{}, err
 	}
 	st, err := fstate(f)
 	f.Close()
 	if err != nil {
-		return err
+		return VerifiedArtifact{}, err
 	}
 	if st.kind() != unix.S_IFREG {
-		return errors.New("no longer a regular file")
+		return VerifiedArtifact{}, errors.New("no longer a regular file")
 	}
 	f, err = openPath(path, unix.O_RDONLY)
 	if err != nil {
-		return err
+		return VerifiedArtifact{}, err
 	}
 	defer f.Close()
 	return verifyArtifact(ctx, f, member)
 }
 
-func verifyArtifact(ctx context.Context, f *os.File, member ArtifactMember) error {
+func verifyArtifact(ctx context.Context, f *os.File, member ArtifactMember) (VerifiedArtifact, error) {
 	before, err := fstate(f)
 	if err != nil {
-		return err
+		return VerifiedArtifact{}, err
 	}
 	if before.kind() != unix.S_IFREG || before.nlink != 1 || before.id != member.Identity || before.size != member.Size || before.mtimeNS != member.ModifiedNS {
-		return errors.New("its identity, size or mtime differs from the archived file")
+		return VerifiedArtifact{}, errors.New("its identity, size or mtime differs from the archived file")
+	}
+	if before.mode&07777 != member.Mode || before.uid != member.UID || before.gid != member.GID {
+		return VerifiedArtifact{}, errors.New("its mode or ownership differs from the archived file")
+	}
+	if hasXattrs(unix.Flistxattr(int(f.Fd()), nil)) {
+		return VerifiedArtifact{}, errors.New("it has extended attributes, which the archive does not hold")
 	}
 	sum, err := hashRegular(ctx, f, member.Size, member.Path)
 	if err != nil {
-		return err
+		return VerifiedArtifact{}, err
 	}
 	if sum != member.SHA256 {
-		return errors.New("its contents differ from the archived file")
+		return VerifiedArtifact{}, errors.New("its contents differ from the archived file")
 	}
 	if after, err := fstate(f); err != nil || after != before {
-		return errors.New("it changed while being verified")
+		return VerifiedArtifact{}, errors.New("it changed while being verified")
 	}
-	return nil
+	return VerifiedArtifact{st: before}, nil
 }
 
 // OpenFiles makes one pass over procfs and returns, for every path in paths
@@ -595,10 +604,12 @@ func OpenFiles(ctx context.Context, procRoot string, paths []string) (map[string
 	return used, nil
 }
 
-// Same is VerifyFile without reading contents: the file is still a
-// single-link regular file with the archived identity, size and mtime. It is
-// the cheap re-check made immediately before a verified file moves.
-func (r *ArtifactRoot) Same(member ArtifactMember) error {
+// Same reports whether the file at member's path still has exactly the
+// state VerifyFile verified: identity, mount, type, mode, ownership, size,
+// link count, mtime and ctime. Any write, truncation, chmod, chown or
+// extended-attribute change since then changes it. It is the cheap re-check
+// made immediately before a verified file moves.
+func (r *ArtifactRoot) Same(member ArtifactMember, verified VerifiedArtifact) error {
 	if !validMemberPath(member.Path) {
 		return fmt.Errorf("invalid artifact path %q", member.Path)
 	}
@@ -606,8 +617,32 @@ func (r *ArtifactRoot) Same(member ArtifactMember) error {
 	if err != nil {
 		return err
 	}
-	if st.kind() != unix.S_IFREG || st.nlink != 1 || st.id != member.Identity || st.size != member.Size || st.mtimeNS != member.ModifiedNS {
+	if verified.st.kind() != unix.S_IFREG || st != verified.st {
 		return errors.New("it changed after it was verified")
 	}
 	return nil
+}
+
+// SameCopy is Same for a quarantined copy at the absolute path.
+func SameCopy(path string, verified VerifiedArtifact) error {
+	f, err := openPath(path, unix.O_PATH)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	st, err := fstate(f)
+	if err != nil {
+		return err
+	}
+	if verified.st.kind() != unix.S_IFREG || st != verified.st {
+		return errors.New("it changed after it was verified")
+	}
+	return nil
+}
+
+// SensitiveName reports whether name, a file or directory directly inside
+// parent, matches the built-in secret screen or one of patterns (normally the
+// current protect.name_patterns).
+func SensitiveName(name, parent string, patterns []string) bool {
+	return secretLike(name, parent, patterns)
 }

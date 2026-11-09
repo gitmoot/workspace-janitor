@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/gitmoot/workspace-janitor/internal/config"
 )
 
 // artifactFixture is the state-store fixture with an omp_session_artifacts
@@ -29,6 +31,8 @@ type artifactFixture struct {
 	// four spaces; extra goes before workspace_archive_categories, and
 	// prevention under prevention:.
 	category, extra, prevention string
+	// protect holds extra lines under protect:, each indented two spaces.
+	protect string
 }
 
 func newArtifactFixture(t *testing.T) *artifactFixture {
@@ -56,7 +60,7 @@ func (x *artifactFixture) writeArtifacts(t *testing.T) {
     max_depth: 2
 protect:
   paths: [%s]
-collectors:
+%scollectors:
   git: true
   processes: true
   services: true
@@ -83,7 +87,7 @@ gitmoot:
     local_retention: %s
     archive:
       directory: %s
-%s`, x.sessions, x.archive, x.proc, x.services, x.prevention, x.gitmoot, filepath.Join(x.gitmoot, "gitmoot.db"), x.extra, sessions, x.sessions,
+%s`, x.sessions, x.archive, x.protect, x.proc, x.services, x.prevention, x.gitmoot, filepath.Join(x.gitmoot, "gitmoot.db"), x.extra, sessions, x.sessions,
 		retention(x.retention), x.archive, x.category))
 }
 
@@ -837,5 +841,204 @@ func TestSessionArtifactsNeedTheirCategory(t *testing.T) {
 	}
 	if _, err := os.Lstat(receipts["a.log"]); err != nil {
 		t.Fatalf("quarantined file deleted without category authority: %v", err)
+	}
+}
+
+// pauseScan makes pid's maps a FIFO, so the next procfs pass blocks on it
+// until change has run: a write that lands while a live-process scan runs.
+func (x *artifactFixture) pauseScan(t *testing.T, pid string, change func() error) <-chan error {
+	t.Helper()
+	maps := filepath.Join(x.proc, pid, "maps")
+	if err := syscall.Mkfifo(maps, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		w, err := os.OpenFile(maps, os.O_WRONLY, 0)
+		if err == nil {
+			err = change()
+			w.Close()
+		}
+		done <- err
+	}()
+	return done
+}
+
+// An append to a quarantined copy that lands during expiry's process scan,
+// after the copy was verified against the archive, keeps the copy: it holds
+// bytes that were never archived.
+func TestSessionArtifactsExpiryRechecksTheCopyAfterTheProcessScan(t *testing.T) {
+	x := newArtifactFixture(t)
+	session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"a.log": oldArtifact})
+	item := categoryItem(t, x.categories(t, false), session)
+	x.quarantineArtifacts(t)
+	copy := x.artifactReceipts(t, item.CleanupID)["a.log"]
+	done := x.pauseScan(t, "4242", func() error {
+		f, err := os.OpenFile(copy, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = f.WriteString("never archived\n")
+		return err
+	})
+	out, _, code := x.run(t, "apply", "--expire", "--dry-run=false", "--confirm")
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if code == ExitOK {
+		t.Fatalf("expiry of a copy appended to during the scan succeeded: %s", out)
+	}
+	if data, err := os.ReadFile(copy); err != nil || !strings.HasSuffix(string(data), "never archived\n") {
+		t.Fatalf("copy with unarchived bytes deleted: %v", err)
+	}
+}
+
+// protect.name_patterns added after selection keep a file at every later
+// boundary: the archive preflight, the quarantine and the expiry.
+func TestSessionArtifactsCurrentNamePatternsAtEveryBoundary(t *testing.T) {
+	setup := func(t *testing.T) (*artifactFixture, string, categoryArchiveItem) {
+		x := newArtifactFixture(t)
+		session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"review.log": oldArtifact, "free.log": oldArtifact})
+		return x, session, categoryItem(t, x.categories(t, false), session)
+	}
+	protect := func(x *artifactFixture) {
+		x.protect = "  name_patterns: [review.log]\n"
+		x.writeArtifacts(t)
+	}
+	t.Run("preflight", func(t *testing.T) {
+		x := newArtifactFixture(t)
+		session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"review.log": oldArtifact})
+		protect(x)
+		policy, err := config.LoadPolicy(x.paths(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		category, _ := policy.WorkspaceArchiveCategory("artifacts")
+		if err := artifactPreflight(x.paths(t), category, x.sessions, []string{filepath.Join(session, "review.log")}); err == nil || !strings.Contains(err.Error(), "protected name") {
+			t.Fatalf("preflight accepted a file protect.name_patterns now names: %v", err)
+		}
+	})
+	t.Run("quarantine", func(t *testing.T) {
+		x, session, _ := setup(t)
+		protect(x)
+		report := x.quarantineArtifacts(t)
+		if len(report.Batches) != 1 || report.Batches[0].Moved != 1 || report.Batches[0].Kept != 1 {
+			t.Fatalf("protected name not kept at quarantine: %+v", report)
+		}
+		if got := contents(t, session, "review.log", "free.log"); got["review.log"] == "<absent>" || got["free.log"] != "<absent>" {
+			t.Fatalf("wrong files moved: %v", got)
+		}
+	})
+	t.Run("expiry", func(t *testing.T) {
+		x, _, item := setup(t)
+		x.quarantineArtifacts(t)
+		receipts := x.artifactReceipts(t, item.CleanupID)
+		protect(x)
+		if _, _, code := x.run(t, "apply", "--expire", "--dry-run=false", "--confirm"); code == ExitOK {
+			t.Fatal("expiry refused nothing")
+		}
+		if _, err := os.Lstat(receipts["review.log"]); err != nil {
+			t.Fatalf("copy of a protected name deleted: %v", err)
+		}
+		if _, err := os.Lstat(receipts["free.log"]); !os.IsNotExist(err) {
+			t.Fatalf("unprotected copy not deleted: %v", err)
+		}
+	})
+}
+
+// Metadata the batch tar records but cannot carry differently (mode), or
+// does not hold at all (extended attributes), changing after archiving keeps
+// the file in place at quarantine and its copy at expiry.
+func TestSessionArtifactsMetadataTheArchiveCannotPreserve(t *testing.T) {
+	setxattr := func(t *testing.T, path string) {
+		t.Helper()
+		if err := syscall.Setxattr(path, "user.janitor-test", []byte("x"), 0); err != nil {
+			t.Skipf("user extended attributes unsupported here: %v", err)
+		}
+	}
+	t.Run("quarantine", func(t *testing.T) {
+		x := newArtifactFixture(t)
+		session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"mode.log": oldArtifact, "xattr.log": oldArtifact, "free.log": oldArtifact})
+		categoryItem(t, x.categories(t, false), session)
+		if err := os.Chmod(filepath.Join(session, "mode.log"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		setxattr(t, filepath.Join(session, "xattr.log"))
+		report := x.quarantineArtifacts(t)
+		reasons := strings.Join(report.Batches[0].Reasons, "\n")
+		if report.Batches[0].Moved != 1 || !strings.Contains(reasons, "mode or ownership") || !strings.Contains(reasons, "extended attributes") {
+			t.Fatalf("changed metadata not kept: %+v", report)
+		}
+		if got := contents(t, session, "mode.log", "xattr.log", "free.log"); got["mode.log"] == "<absent>" || got["xattr.log"] == "<absent>" || got["free.log"] != "<absent>" {
+			t.Fatalf("wrong files moved: %v", got)
+		}
+	})
+	t.Run("expiry", func(t *testing.T) {
+		x := newArtifactFixture(t)
+		session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"mode.log": oldArtifact, "xattr.log": oldArtifact})
+		item := categoryItem(t, x.categories(t, false), session)
+		x.quarantineArtifacts(t)
+		receipts := x.artifactReceipts(t, item.CleanupID)
+		if err := os.Chmod(receipts["mode.log"], 0o600); err != nil {
+			t.Fatal(err)
+		}
+		setxattr(t, receipts["xattr.log"])
+		if _, _, code := x.run(t, "apply", "--expire", "--dry-run=false", "--confirm"); code == ExitOK {
+			t.Fatal("expiry refused nothing")
+		}
+		for name, copy := range receipts {
+			if _, err := os.Lstat(copy); err != nil {
+				t.Fatalf("%s copy deleted although the archive cannot restore it as it is: %v", name, err)
+			}
+		}
+	})
+}
+
+// An equal-length rewrite that restores the mtime, landing during the
+// quarantine's process scan after the contents were verified, keeps the
+// file: the final check compares the full verified state, ctime included.
+func TestSessionArtifactsSameLengthRewriteDuringQuarantineStaysLocal(t *testing.T) {
+	x := newArtifactFixture(t)
+	session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"racy.log": oldArtifact, "calm.log": oldArtifact})
+	categoryItem(t, x.categories(t, false), session)
+	racy := filepath.Join(session, "racy.log")
+	done := x.pauseScan(t, "4242", func() error {
+		info, err := os.Stat(racy)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(racy, []byte(strings.Repeat("Z", int(info.Size()))), 0o644); err != nil {
+			return err
+		}
+		return os.Chtimes(racy, info.ModTime(), info.ModTime())
+	})
+	report := x.quarantineArtifacts(t)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Batches) != 1 || report.Batches[0].Moved != 1 || !strings.Contains(strings.Join(report.Batches[0].Reasons, "\n"), "changed after it was verified") {
+		t.Fatalf("rewrite during quarantine not kept: %+v", report)
+	}
+	if got := contents(t, session, "racy.log", "calm.log"); !strings.HasPrefix(got["racy.log"], "ZZ") || got["calm.log"] != "<absent>" {
+		t.Fatalf("rewritten file moved or calm sibling kept: %v", got)
+	}
+}
+
+// A local_retention raised after quarantine holds the copies until it has
+// elapsed since the batch was archived, as for workspace archives.
+func TestSessionArtifactsExpiryAppliesTheCurrentLocalRetention(t *testing.T) {
+	x := newArtifactFixture(t)
+	session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"a.log": oldArtifact})
+	item := categoryItem(t, x.categories(t, false), session)
+	x.quarantineArtifacts(t)
+	copy := x.artifactReceipts(t, item.CleanupID)["a.log"]
+	x.retention = "90d"
+	x.writeArtifacts(t)
+	if out, _, code := x.run(t, "apply", "--expire", "--dry-run=false", "--confirm"); code == ExitOK || !strings.Contains(out, "local retention") {
+		t.Fatalf("expiry ignored the raised local_retention: exit %d %s", code, out)
+	}
+	if _, err := os.Lstat(copy); err != nil {
+		t.Fatalf("copy deleted inside the raised local retention: %v", err)
 	}
 }

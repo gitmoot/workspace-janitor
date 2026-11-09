@@ -786,7 +786,9 @@ Each file is its own unit. A file is selected when all of these hold:
   names the session does not keep its files: every live session is named so.
   The per-file open state and the file's own mtime are the guard.
 - no `workspace_archive_keep` or `protect.paths` entry (or any other policy
-  refusal above) covers it, and no raw-state or credential component (`.git`,
+  refusal above) covers it, and no name from the session folder down matches
+  the built-in secret screen or `protect.name_patterns` (re-applied, from the
+  current policy, before the batch is published, at quarantine and at expiry), and no raw-state or credential component (`.git`,
   `.ssh`, ...) lies between the session folder and the file
 - it is not already archived unchanged: archived in a batch that has not been
   quarantined yet, or archived, moved and then restored (from quarantine or
@@ -809,9 +811,12 @@ folder it leaves out, with an example.
 A batch is quarantined, after `local_retention`, by `janitor apply --quarantine
 --artifacts` (the cycle runs it under `prevention.auto_quarantine`). Its whole
 tar is verified first; a batch whose archive does not verify moves nothing.
-Then each file must still be the archived file (inode, size, mtime and
-contents), not covered by policy, and unused (one `/proc` pass per batch);
-its identity is re-checked immediately before its rename. Each moved file is
+Then each file must still be the archived file (inode, size, mtime, mode,
+ownership and contents, with no extended attributes), not covered by policy
+or by a current protected name (`protect.name_patterns` and the built-in
+screen, on every name below the session folder), and unused (one `/proc`
+pass per batch). Immediately before its rename, its full verified state
+(ctime included) is compared again, so a write after the hash keeps it. Each moved file is
 its own cleanup item and audit row under the batch's cleanup id. A file that
 changed, was opened, was removed or became protected after archiving stays in
 place and is reported; the rest of the batch still moves and the batch is
@@ -819,10 +824,13 @@ settled. A file kept this way is batched again once it is idle and unused. A bat
 has expiry authority: that quarantine moves the folder whole.
 
 Expiry deletes a quarantined file only while its category still holds the
-batch (same name, kind, root and archive directory), the batch tar still
-verifies, the quarantined copy is still the archived file (identity, size,
-mtime and contents), policy does not cover the original path and no process
-uses the copy or the original path. Otherwise the item is investigated.
+batch (same name, kind, root and archive directory), the category's current
+`local_retention` has elapsed since the batch was archived, the batch tar
+still verifies, the quarantined copy is still the archived file (identity,
+size, mtime, mode, ownership and contents, with no extended attributes),
+neither policy nor a current protected name covers the original path, and no
+process uses the copy or the original path. The copy's verified state is
+compared again after the process scan. Otherwise the item is investigated.
 
 Live-use checks fail closed at selection, at quarantine and at expiry: an
 unreadable `/proc`, or a process whose descriptors or maps cannot be read,
