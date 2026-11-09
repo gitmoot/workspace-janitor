@@ -101,7 +101,7 @@ func changeProtections(in RevalidateInput, fresh core.Entry) []core.Protection {
 	}
 
 	planned, known := collect.SnapshotFingerprint(in.Planned)
-	current := collect.Fingerprint(fresh)
+	current := collect.Fingerprint(boundDeepSize(in.Planned, fresh))
 	if !known {
 		out = append(out, protect(core.ProtectIdentityChanged, core.SourceFilesystem,
 			"saved fingerprint has an unknown format or insufficient legacy evidence"))
@@ -111,6 +111,26 @@ func changeProtections(in RevalidateInput, fresh core.Entry) []core.Protection {
 				shortFingerprint(planned), shortFingerprint(current))))
 	}
 	return out
+}
+
+// boundDeepSize returns fresh with the planned deep-size facts when both
+// observations bind a workspace archive and either deep size is a lower
+// bound. A lower bound records how far a shared entry budget reached, not
+// the tree: an inventory scan sizes a whole root with one budget, so an
+// entry walked after its siblings can be measured at zero entries, while
+// this re-observation measures it again on a fresh budget. Comparing those
+// numbers would refuse every such unchanged tree. Nothing is lost, because
+// the fresh binding has just matched every member of the local tree (path,
+// type, size, mode, owner, modification time) to the pinned manifest, and
+// the fingerprint still requires the same binding: any change refuses.
+// Without a binding, the planned lower bound stays compared as it is.
+func boundDeepSize(planned, fresh core.Entry) core.Entry {
+	if planned.WorkspaceArchive == nil || fresh.WorkspaceArchive == nil ||
+		!planned.SizeIsDeep || !fresh.SizeIsDeep || !(planned.SizeIsLowerBound || fresh.SizeIsLowerBound) {
+		return fresh
+	}
+	fresh.SizeBytes, fresh.SizeIsLowerBound, fresh.LatestModifiedAt = planned.SizeBytes, planned.SizeIsLowerBound, planned.LatestModifiedAt
+	return fresh
 }
 
 // handleProtections compares the object opened at plan time with what the

@@ -620,7 +620,14 @@ history bundle and every local file, and requires every per-file SHA-256 to
 match. A binding that cannot be re-established (archive corrupted, missing or
 unmounted, manifest re-pinned or unpinned, rule removed, file changed inside
 the quarantined copy) changes the fingerprint and refuses the move or the
-expiry; `janitor restore` remains available. Ancestor directories of a
+expiry; `janitor restore` remains available. While both the planned and the
+fresh observation carry the same binding, a deep size that is a lower bound on
+either side (an inventory scan shares one `limits.deep_size_max_entries`
+budget per root, so an entry sized after its siblings can be measured at zero
+entries) is not compared: the binding has just matched every member of the
+local tree, which a lower bound cannot, so an unchanged tree past the scan's
+budget is still moved and a changed one still refuses. Without a binding,
+lower-bound sizes are compared as recorded. Ancestor directories of a
 released workspace are protected so a broader rule cannot remove it wholesale.
 Full verification runs inside `limits.command_timeout`; a timeout holds the
 workspace. After expiry, recover with
