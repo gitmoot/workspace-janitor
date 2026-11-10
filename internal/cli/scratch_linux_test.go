@@ -335,6 +335,73 @@ func TestScratchKeepsInUseAndRecentlyChangedEntries(t *testing.T) {
 	}
 }
 
+// The deletion-time in-use recheck reads processes from the freshly loaded
+// policy's proc_root, like every other deletion-time check.
+func TestScratchInUseRecheckUsesFreshProcRoot(t *testing.T) {
+	x := newScratchFixture(t)
+	live := x.entry(t, "plain", map[string]string{"a": "a\n"})
+	proc := filepath.Join(x.home, "proc-late")
+	pid := filepath.Join(proc, "424242")
+	if err := os.MkdirAll(pid, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(live, "a"), filepath.Join(pid, "cwd")); err != nil {
+		t.Fatal(err)
+	}
+	previous := scratchBeforeDeletion
+	t.Cleanup(func() { scratchBeforeDeletion = previous })
+	scratchBeforeDeletion = func() {
+		x.proc = proc
+		x.write(t)
+	}
+	report := x.mustCleanup(t, true)
+	if item := scratchStatus(t, report, "plain"); item.Status != scratchKept || !strings.Contains(item.Reason, "in use at deletion time") || !exists(t, live) {
+		t.Fatalf("entry in use under the fresh proc_root = %+v", item)
+	}
+}
+
+// A preview sizes the run receipt with a run ID as long as an acting run's,
+// so it never promises to archive an entry the acting run defers.
+func TestScratchPreviewReceiptBoundMatchesActingRun(t *testing.T) {
+	x := newScratchFixture(t)
+	now := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Second).Add(123456789)
+	previous := scratchNow
+	scratchNow = func() time.Time { return now }
+	t.Cleanup(func() { scratchNow = previous })
+	runID := now.Format("20060102T150405.000000000Z") // the acting run's ID
+	base := store.ScratchRunReceiptBytes(store.ScratchRun{RunID: runID, Path: x.scratch, StartedAt: now, RecordedAt: now,
+		ArchiveDirectory: x.archive, ArchiveManifest: filepath.Join(x.archive, workspacearchive.ScratchArchiveName(runID)+".manifest.json"),
+		ArchiveManifestSHA256: strings.Repeat("0", 64)})
+	available := store.ScratchRunReceiptMaxBytes - base
+	// Pick a name length whose last fitting entry leaves less room than one
+	// more entry needs, but more than that room minus the run ID's share of
+	// the receipt (26 bytes in run_id and 26 in the manifest name).
+	length := 0
+	for n := 120; n <= 250; n++ {
+		cost := n + 3 // two quotes and a separator
+		if rest := available % cost; rest+52 >= cost+2 {
+			length = n
+			break
+		}
+	}
+	if length == 0 {
+		t.Fatalf("no name length fits the receipt window for %d available bytes", available)
+	}
+	count := available/(length+3) + 2
+	for i := range count {
+		x.entry(t, fmt.Sprintf("%04d-%s", i, strings.Repeat("n", length-5)), nil)
+	}
+	preview := x.mustCleanup(t, false)
+	acting := x.mustCleanup(t, true)
+	if acting.Archived == 0 || acting.Deferred == 0 {
+		t.Fatalf("acting run must archive some entries and defer the rest: %+v", acting)
+	}
+	if preview.WouldArchive != acting.Archived || preview.Deferred != acting.Deferred {
+		t.Fatalf("preview would archive %d and defer %d; the acting run archived %d and deferred %d",
+			preview.WouldArchive, preview.Deferred, acting.Archived, acting.Deferred)
+	}
+}
+
 // A published archive that fails the read-back before deletion deletes
 // nothing at all, regenerable entries included, and records no deletion.
 func TestScratchArchiveMismatchDeletesNothing(t *testing.T) {

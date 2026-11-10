@@ -145,6 +145,11 @@ func collectDeepSize(ctx context.Context, opts *Options, entries []core.Entry, n
 		}
 		report.Detail = fmt.Sprintf("sized %d director(ies) within %d entrie(s)%s",
 			report.Recorded, opts.Limits.DeepSizeMaxEntries, each)
+		if report.Unknowns > 0 {
+			// A blind or failed walk is still recorded, so say how many of
+			// those directories were not fully observed.
+			report.Detail += fmt.Sprintf("; %d size(s) are incomplete", report.Unknowns)
+		}
 		if lowerBounds > 0 {
 			report.Detail += fmt.Sprintf("; %d size(s) are lower bounds", lowerBounds)
 		}

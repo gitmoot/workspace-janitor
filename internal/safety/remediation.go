@@ -25,7 +25,7 @@ var remediations = map[core.ProtectionKind]string{
 	core.ProtectInsufficientSpace:  "free space on the destination filesystem, or lower safety.min_free_bytes deliberately",
 	core.ProtectCrossFilesystem:    "point retention.quarantine_dir at the same filesystem, or set safety.allow_cross_filesystem_quarantine",
 	core.ProtectCollectorFailure:   "re-run the scan so the failed collector can observe this path; unknown state is treated as unsafe",
-	core.ProtectPolicyProtected:    "adjust protect.paths if this location should not be protected; core locations stay protected regardless",
+	core.ProtectPolicyProtected:    "adjust protect.paths if this location should not be protected; for a protected name inside a worktree, adjust protect.name_patterns or classification.evidence_names, or record an exact source_name_approvals entry; core locations stay protected regardless",
 	core.ProtectArchiveOnlyRoot:    "only an owner-approved workspace_archive_categories entry may archive this; it is never cleaned up otherwise",
 }
 

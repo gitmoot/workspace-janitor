@@ -656,7 +656,10 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 		if ok && record.Unchanged(entry.LatestModifiedAt) {
 			item.Status, item.Name = categoryAlreadyArchived, record.Name
 			follow := "its local retention and quarantine follow that archive"
-			if _, inactive := activeCategoryRule(policy, record); inactive != "" {
+			if keep, kept := keeps[entry.Path]; kept {
+				// loadPolicy withholds a kept item's pinned rule.
+				follow = fmt.Sprintf("it has no local expiry authority: kept by %s (report reply %d)", keep.Role, keep.Sequence)
+			} else if _, inactive := activeCategoryRule(policy, record); inactive != "" {
 				follow = "it has no local expiry authority: " + inactive
 			}
 			item.Reasons = []string{fmt.Sprintf("archived as %s at %s and unchanged since; %s", record.Name, record.CreatedAt.Format(time.RFC3339), follow)}
