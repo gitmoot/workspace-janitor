@@ -39,6 +39,10 @@ var createScratchArchive = (*workspacearchive.ScratchDir).CreateScratch
 // move it forward: a ctime can never be moved into the past.
 var scratchNow = func() time.Time { return time.Now().UTC() }
 
+// scratchRunID names the acting run started at now; it always has the same
+// length, which the run receipt estimate relies on.
+func scratchRunID(now time.Time) string { return now.Format("20060102T150405.000000000Z") }
+
 type scratchItem struct {
 	Entry     string `json:"entry"`
 	Path      string `json:"path"`
@@ -196,8 +200,12 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	now := scratchNow()
 	report := scratchRunReport{Path: scratch.Path, DryRun: dryRun, Status: "preview", Items: []scratchItem{},
 		Attribution: "Sizes are the local bytes of regular files. Archived bytes on the archive mount are never counted as local headroom."}
+	// A preview records nothing, so it reports no run ID, but its receipt
+	// estimate still sizes one: otherwise it would admit entries an acting
+	// run defers.
+	runID := scratchRunID(now)
 	if !dryRun {
-		report.RunID = now.Format("20060102T150405.000000000Z")
+		report.RunID = runID
 	}
 	fail := func(err error) (scratchRunReport, error) {
 		report.Status, report.Error = "failed", err.Error()
@@ -273,8 +281,8 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	// The run receipt names every archived entry and has a fixed size bound;
 	// entries that would overflow it are deferred before any archive exists.
 	// The manifest name and checksum are sized at their final lengths.
-	receipt := store.ScratchRunReceiptBytes(store.ScratchRun{RunID: report.RunID, Path: scratch.Path, StartedAt: now, RecordedAt: now,
-		ArchiveDirectory: scratch.Archive.Directory, ArchiveManifest: filepath.Join(scratch.Archive.Directory, workspacearchive.ScratchArchiveName(report.RunID)+".manifest.json"),
+	receipt := store.ScratchRunReceiptBytes(store.ScratchRun{RunID: runID, Path: scratch.Path, StartedAt: now, RecordedAt: now,
+		ArchiveDirectory: scratch.Archive.Directory, ArchiveManifest: filepath.Join(scratch.Archive.Directory, workspacearchive.ScratchArchiveName(runID)+".manifest.json"),
 		ArchiveManifestSHA256: strings.Repeat("0", 64)})
 	for _, next := range found {
 		item := scratchItem{Entry: next.name, Path: filepath.Join(scratch.Path, next.name), SizeBytes: next.size,
@@ -373,13 +381,10 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	if err := db.Write(ctx, func(tx *store.Tx) error { return tx.RecordScratchRun(ctx, run) }); err != nil {
 		return failAll(err)
 	}
-	used, err = workspacearchive.ScratchReferences(ctx, policy.Collectors.ProcRoot, scratch.Path)
-	if err != nil {
-		return failAll(fmt.Errorf("in-use recheck: %w", err))
-	}
 	// The policy decides again, freshly loaded, immediately before anything
-	// is deleted: a protect.paths, KEEP, skip, regenerable or name-pattern
-	// change made while the run was in flight still stops its deletions.
+	// is deleted: a protect.paths, KEEP, skip, regenerable, name-pattern,
+	// idle or proc_root change made while the run was in flight still stops
+	// its deletions.
 	scratchBeforeDeletion()
 	latest, err := config.LoadPolicy(paths)
 	if err != nil {
@@ -388,6 +393,10 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	current, ok := latest.ScratchCleanupFor(scratch.Path)
 	if !ok {
 		return failAll(fmt.Errorf("scratch_cleanup for %s was withdrawn during the run", scratch.Path))
+	}
+	used, err = workspacearchive.ScratchReferences(ctx, latest.Collectors.ProcRoot, scratch.Path)
+	if err != nil {
+		return failAll(fmt.Errorf("in-use recheck: %w", err))
 	}
 	var failures []error
 	for i := range selected {

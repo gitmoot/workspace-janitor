@@ -483,7 +483,7 @@ func (s *Store) migrate(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	if current > SchemaVersion() {
-		return 0, fmt.Errorf("store: database schema version %d is newer than this build supports (%d); upgrade workspace-janitor", current, SchemaVersion())
+		return 0, newerSchema(current)
 	}
 	for _, m := range migrations {
 		if m.version <= current {
@@ -510,10 +510,15 @@ func (s *Store) applyMigration(ctx context.Context, m migration) error {
 	}()
 	// The DSN makes every transaction BEGIN IMMEDIATE, so this read happens
 	// under the write lock: another process that migrated after migrate()
-	// read the version is visible here, and its step must not run again.
+	// read the version is visible here, and its step must not run again. A
+	// newer build may have migrated past this one in that window; its schema
+	// is refused exactly as if migrate() had read it.
 	var applied int
 	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&applied); err != nil {
 		return fmt.Errorf("store: read user_version for migration %d: %w", m.version, err)
+	}
+	if applied > SchemaVersion() {
+		return newerSchema(applied)
 	}
 	if applied >= m.version {
 		return nil
@@ -547,6 +552,10 @@ func (s *Store) userVersion(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("store: read user_version: %w", err)
 	}
 	return version, nil
+}
+
+func newerSchema(version int) error {
+	return fmt.Errorf("store: database schema version %d is newer than this build supports (%d); upgrade workspace-janitor", version, SchemaVersion())
 }
 
 func (t *Tx) schemaVersion(ctx context.Context) (int, error) {

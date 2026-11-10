@@ -8,7 +8,7 @@ The policy defaults to `<config-dir>/policy.yaml`; `--policy` overrides `JANITOR
 
 | Section | Meaning |
 | --- | --- |
-| `roots` | Discovery paths, `max_depth`, symlink and filesystem traversal, `report_only` (no mutations under that root). With `cross_filesystem: false`, a mount point inside a root is listed but neither the metadata walk nor deep sizing enters it; its size is reported as unknown, never zero. Do not use a mounted archive or network share as part of a local root. |
+| `roots` | Discovery paths, `max_depth`, symlink and filesystem traversal, `report_only` (no mutations under that root). With `cross_filesystem: false`, a mount point inside a root is listed but neither the metadata walk nor deep sizing enters it; its deep size is reported as unknown, never as a measured total: `size_is_lower_bound: true` with an `unknown:deep_size_partial` observation, and `size_bytes` is 0 only because nothing behind the boundary was counted. Do not use a mounted archive or network share as part of a local root. |
 | `protect` | Additive protected paths and basename patterns; built-in credential names, Gitmoot home, state and effective quarantine remain protected. |
 | `retention` | Default quarantine period (`none`, `3d`, `7d`, `30d`, `90d`, `permanent`), quarantine directory, and separate deletion opt-in. |
 | `prevention` | Deep-scan interval, disk alert thresholds/cooldown, per-filesystem capacity targets, and opt-in automatic quarantine and expiry; a policy never installs a timer. |
@@ -512,7 +512,11 @@ quarantine/expiry workflow and is permitted only through
 archive that exactly matches the local tree. Outputs are published without
 ever replacing an existing name: by `renameat2(RENAME_NOREPLACE)`, or, where
 the filesystem rejects that flag (SSHFS does), by a hard link that refuses an
-existing name followed by removal of the staged file.
+existing name followed by removal of the staged file. A directory cannot be
+hard-linked, so publishing one still needs no-replace rename: a restore
+(`--restore-to`, `--restore-category-item`, `scratch restore`) into, or an
+evidence export into, such a filesystem fails with `invalid argument` and
+publishes nothing. Restore to a local destination and move the tree afterwards.
 
 | Field | Contract |
 | --- | --- |
@@ -923,7 +927,7 @@ entries Janitor removes. Entries that match no list are archived first.
 
 | Field | Contract |
 | --- | --- |
-| `path` | Absolute directory other than `/`. It must not overlap another `scratch_cleanup` path, the quarantine directory, Gitmoot's state, a workspace archive, a category archive directory or a cache rule. It must not lie inside `protect.paths` or a `workspace_archive_keep` path. |
+| `path` | Absolute directory other than `/`. It must not overlap another `scratch_cleanup` path, an inventory root (plan/quarantine already cleans it), the quarantine directory, Gitmoot's state, a workspace archive, a category archive directory or a cache rule. It must not lie inside `protect.paths` or a `workspace_archive_keep` path. |
 | `idle` | Default `72h`, at least `24h`. Measured from the newest mtime or ctime of anything in the entry. |
 | `every` | Default `48h`, at least `24h`. `janitor cycle` runs the directory once this long has passed since its last recorded run. |
 | `skip` | `filepath.Match` globs on the entry name. A match is never touched. |

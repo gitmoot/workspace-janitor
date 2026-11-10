@@ -39,7 +39,9 @@ var renameat2 = unix.Renameat2
 // existing name. Some filesystems, sshfs among them, reject RENAME_NOREPLACE
 // with EINVAL; a plain rename there would silently overwrite. For a regular
 // file a hard link gives the same guarantee, because linkat refuses an
-// existing name, and removing the staged name then completes the move.
+// existing name, and removing the staged name then completes the move. Only
+// EINVAL takes this path: any other error, EOPNOTSUPP or ENOSYS included, is
+// returned as is.
 func publishNoReplace(fromDir int, from string, toDir int, to string) error {
 	err := renameat2(fromDir, from, toDir, to, unix.RENAME_NOREPLACE)
 	if !errors.Is(err, unix.EINVAL) {

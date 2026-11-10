@@ -140,6 +140,21 @@ func TestApplyMigrationSkipsStepAppliedByAnotherProcess(t *testing.T) {
 	}
 }
 
+// A newer build may migrate past this one between migrate()'s version read
+// and the write lock. The late process must refuse that schema, not skip
+// every step and run against tables it does not know.
+func TestApplyMigrationRefusesSchemaNewerThanBuild(t *testing.T) {
+	ctx := context.Background()
+	db := openFixture(t)
+	if _, err := db.db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion()+1)); err != nil {
+		t.Fatalf("set user_version: %v", err)
+	}
+	err := db.applyMigration(ctx, migrations[len(migrations)-1])
+	if err == nil || !strings.Contains(err.Error(), "newer than this build supports") {
+		t.Fatalf("applyMigration on a newer schema = %v, want the newer-than-build refusal", err)
+	}
+}
+
 func TestConcurrentOpenMigratesOnce(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "janitor.db")
