@@ -262,7 +262,10 @@ janitor explain /path/to/thing            # trace one decision
 
 `explain` prints the winning rules and their reasons, the alternatives that
 were rejected and why, the collected evidence, the safety verdict, and
-whether the action is approved.
+whether the action is approved. For a path with an active cleanup receipt it
+also prints the receipt; a `prepared` one (a quarantine that was refused and
+is skipped by later plans) is revalidated read-only exactly as its move would
+be, and every refusing protection is listed with its reason.
 
 ### Quarantine, restore, and expiry
 

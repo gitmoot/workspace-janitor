@@ -116,6 +116,24 @@ func (v *Verdict) Summary() string {
 	return "refuse: " + strings.Join(parts, ",")
 }
 
+// Detail renders the refusal with the reason of every blocking protection,
+// so an error names the exact check that refused and not only its kind:
+// several checks share one kind (identity_changed covers the path, the
+// filesystem identity, the planned action, the open handle and the
+// fingerprint), and the kind alone cannot be acted on.
+func (v *Verdict) Detail() string {
+	if !v.Refused() {
+		return "allow"
+	}
+	reasons := make([]string, 0, len(v.Protections))
+	for _, protection := range v.Protections {
+		if protection.Blocking {
+			reasons = append(reasons, string(protection.Kind)+": "+protection.Reason)
+		}
+	}
+	return v.Summary() + " (" + strings.Join(reasons, "; ") + ")"
+}
+
 // Validate reports every field-level problem with the verdict.
 func (v *Verdict) Validate() error {
 	var errs FieldErrors
