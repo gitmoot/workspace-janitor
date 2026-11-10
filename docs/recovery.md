@@ -66,6 +66,14 @@ algorithm, without changing historical receipts. Unknown formats or incomplete
 legacy evidence still refuse; so do changed identity, activity, content and
 live protections. Never copy current metadata into an old receipt to make it pass.
 
+A refusal always lists each blocking protection with its reason, because one
+kind covers several checks: `identity_changed` can be the path, the device
+and inode, the planned action's identity, the open handle, or the metadata
+fingerprint. A fingerprint refusal names every input that differs (for
+example `changed: size 0 -> 58473656, latest_modified absent -> ...`). While
+a receipt stays `prepared`, `janitor explain <path>` shows the check that
+currently refuses its move.
+
 Use `janitor apply --expire --cleanup <cleanup-id>` to preview one cleanup
 batch. This scope includes every item in that batch; expiry does not support
 `--action`. Review the whole batch before separately approving execution.

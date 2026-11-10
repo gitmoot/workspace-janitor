@@ -3,6 +3,7 @@ package safety
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/collect"
@@ -101,14 +102,18 @@ func changeProtections(in RevalidateInput, fresh core.Entry) []core.Protection {
 	}
 
 	planned, known := collect.SnapshotFingerprint(in.Planned)
-	current := collect.Fingerprint(boundDeepSize(in.Planned, fresh))
+	compared := boundDeepSize(in.Planned, fresh)
+	current := collect.Fingerprint(compared)
 	if !known {
 		out = append(out, protect(core.ProtectIdentityChanged, core.SourceFilesystem,
 			"saved fingerprint has an unknown format or insufficient legacy evidence"))
 	} else if planned != current {
+		// Name the inputs that differ: the digests alone cannot tell a
+		// starved deep size from a changed tree or a lost archive binding.
 		out = append(out, protect(core.ProtectIdentityChanged, core.SourceFilesystem,
-			fmt.Sprintf("metadata changed since planning: fingerprint was %s, now %s",
-				shortFingerprint(planned), shortFingerprint(current))))
+			fmt.Sprintf("metadata changed since planning: fingerprint was %s, now %s; changed: %s",
+				shortFingerprint(planned), shortFingerprint(current),
+				strings.Join(collect.FingerprintChanges(in.Planned, compared), ", "))))
 	}
 	return out
 }

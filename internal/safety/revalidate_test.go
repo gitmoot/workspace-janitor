@@ -3,6 +3,7 @@ package safety
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,6 +146,12 @@ func TestRevalidateRefusesWhenMetadataChangedInPlace(t *testing.T) {
 	})
 	if !verdict.Refused() || !hasKind(verdict, core.ProtectIdentityChanged) {
 		t.Fatalf("verdict = %+v, want identity_changed after an in-place rewrite", verdict)
+	}
+	// The refusal names the check and the input that changed, not only
+	// its kind.
+	if detail := fmt.Sprint(verdict.Protections); !strings.Contains(detail, "metadata changed since planning") ||
+		!strings.Contains(detail, "changed: size 6 -> 29") {
+		t.Fatalf("protections = %s, want the changed fingerprint input", detail)
 	}
 }
 

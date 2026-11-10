@@ -29,6 +29,24 @@ type explainReport struct {
 	Entry    *core.Entry    `json:"entry,omitempty"`
 	Verdict  *core.Verdict  `json:"safety_verdict,omitempty"`
 	Approved *core.Approval `json:"approval,omitempty"`
+	// Receipt is the active cleanup receipt for the path. Planning skips a
+	// path while it has one, so the plan's verdict does not say what the
+	// receipt is waiting on.
+	Receipt *explainReceipt `json:"receipt,omitempty"`
+}
+
+// explainReceipt is an active cleanup receipt. A prepared one is checked
+// read-only exactly as its quarantine move would be, so a refusal names the
+// failing check (each protection's reason) instead of only its kind.
+type explainReceipt struct {
+	CleanupID    string            `json:"cleanup_id"`
+	PlanID       string            `json:"plan_id"`
+	ActionID     string            `json:"action_id"`
+	State        core.CleanupState `json:"state"`
+	Revalidation *core.Verdict     `json:"revalidation,omitempty"`
+	// RevalidationError is a check that failed outside the verdict: the
+	// source could not be opened, or the bound companion was refused.
+	RevalidationError string `json:"revalidation_error,omitempty"`
 }
 
 func runExplain(ctx context.Context, e *env, args []string, opts explainOptions) error {
@@ -62,6 +80,7 @@ func runExplain(ctx context.Context, e *env, args []string, opts explainOptions)
 	defer db.Close()
 
 	report := explainReport{Path: path}
+	var pending core.CleanupItem
 	err = db.Read(ctx, func(tx *store.Tx) error {
 		var stored core.Plan
 		var err error
@@ -112,10 +131,31 @@ func runExplain(ctx context.Context, e *env, args []string, opts explainOptions)
 				break
 			}
 		}
+
+		items, err := tx.PendingCleanupItems(ctx)
+		if err != nil {
+			return err
+		}
+		for _, item := range items {
+			if item.Source == path {
+				pending = item
+				report.Receipt = &explainReceipt{CleanupID: item.CleanupID, PlanID: item.PlanID, ActionID: item.ActionID, State: item.State}
+				break
+			}
+		}
 		return nil
 	})
 	if err != nil {
 		return err
+	}
+	if report.Receipt != nil && pending.State == core.CleanupPrepared {
+		verdict, err := cleanupEngine(e, db, paths, policy).QuarantineCheck(ctx, pending)
+		if verdict.Path != "" {
+			report.Receipt.Revalidation = &verdict
+		}
+		if err != nil {
+			report.Receipt.RevalidationError = err.Error()
+		}
 	}
 
 	if format == output.FormatJSON {
@@ -201,16 +241,36 @@ func writeExplainText(e *env, report explainReport) error {
 	}
 
 	if report.Verdict != nil {
-		if _, err := fmt.Fprintf(e.stdout, "\nSafety: %s\n", report.Verdict.Summary()); err != nil {
-			return err
-		}
-		rows := make([][]string, 0, len(report.Verdict.Protections))
-		for _, protection := range report.Verdict.Protections {
-			rows = append(rows, []string{"  " + string(protection.Kind), protection.Reason, "-> " + protection.Remediation})
-		}
-		if err := output.WriteTable(e.stdout, nil, rows); err != nil {
+		if err := writeVerdictText(e, "Safety", *report.Verdict); err != nil {
 			return err
 		}
 	}
+
+	if receipt := report.Receipt; receipt != nil {
+		if _, err := fmt.Fprintf(e.stdout, "\nActive receipt: %s %s (%s, plan %s)\n", receipt.CleanupID, receipt.ActionID, receipt.State, receipt.PlanID); err != nil {
+			return err
+		}
+		if receipt.Revalidation != nil {
+			if err := writeVerdictText(e, "Quarantine revalidation", *receipt.Revalidation); err != nil {
+				return err
+			}
+		}
+		if receipt.RevalidationError != "" {
+			if _, err := fmt.Fprintf(e.stdout, "Quarantine revalidation refused: %s\n", receipt.RevalidationError); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+func writeVerdictText(e *env, label string, verdict core.Verdict) error {
+	if _, err := fmt.Fprintf(e.stdout, "\n%s: %s\n", label, verdict.Summary()); err != nil {
+		return err
+	}
+	rows := make([][]string, 0, len(verdict.Protections))
+	for _, protection := range verdict.Protections {
+		rows = append(rows, []string{"  " + string(protection.Kind), protection.Reason, "-> " + protection.Remediation})
+	}
+	return output.WriteTable(e.stdout, nil, rows)
 }

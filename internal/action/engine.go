@@ -108,7 +108,7 @@ func (e *Engine) PreflightExport(ctx context.Context, entry core.Entry, action c
 	}
 	initial := safety.Evaluate(safety.Input{Entry: entry, Policy: e.Policy, Now: e.now()})
 	if !initial.Allows(action.Kind) {
-		return fmt.Errorf("archive source remains protected: %s", initial.Summary())
+		return fmt.Errorf("archive source remains protected: %s", initial.Detail())
 	}
 	return e.preflightEntry(ctx, entry, action, "export archive")
 }
@@ -127,7 +127,7 @@ func (e *Engine) preflightEntry(ctx context.Context, entry core.Entry, action co
 		},
 	})
 	if !verdict.Allows(action.Kind) {
-		return fmt.Errorf("%s refused %s: %s (%v)", label, entry.Path, verdict.Summary(), verdict.Protections)
+		return fmt.Errorf("%s refused %s: %s", label, entry.Path, verdict.Detail())
 	}
 	return nil
 }
@@ -148,16 +148,8 @@ func (e *Engine) Quarantine(ctx context.Context, item core.CleanupItem) (core.Cl
 		return item, err
 	}
 	defer handle.Close()
-	target := safety.ResolveTarget(filepath.Dir(item.Destination))
-	verdict := safety.Revalidate(ctx, safety.RevalidateInput{
-		Planned: item.Entry, Action: item.Action, Policy: e.Policy,
-		Target: &target, Now: e.now(), Handle: handle,
-		Recollect: func(ctx context.Context, path string) (core.Entry, error) {
-			return e.recollectWithSize(ctx, path, item.Entry.SizeIsDeep)
-		},
-	})
-	if !verdict.Allows(item.Action.Kind) {
-		return item, fmt.Errorf("revalidation refused %s: %s", item.Source, verdict.Summary())
+	if verdict := e.revalidatePrepared(ctx, item, handle); !verdict.Allows(item.Action.Kind) {
+		return item, fmt.Errorf("revalidation refused %s: %s", item.Source, verdict.Detail())
 	}
 	if err := e.moveUnit(ctx, item, handle.Identity()); err != nil {
 		return item, err
@@ -171,6 +163,42 @@ func (e *Engine) Quarantine(ctx context.Context, item core.CleanupItem) (core.Cl
 		return item, err
 	}
 	return e.finishMove(ctx, item)
+}
+
+// QuarantineCheck runs the revalidation Quarantine performs on a prepared
+// item, without installing its manifest or moving anything: the fresh
+// verdict on the item, and the refusal a bound companion would meet when it
+// moves. It shows an operator exactly which check keeps a receipt prepared.
+func (e *Engine) QuarantineCheck(ctx context.Context, item core.CleanupItem) (core.Verdict, error) {
+	if item.State != core.CleanupPrepared {
+		return core.Verdict{}, fmt.Errorf("item %s is not prepared", item.ActionID)
+	}
+	if err := sameFilesystem(item.Source, filepath.Dir(item.Destination)); err != nil {
+		return core.Verdict{}, err
+	}
+	handle, err := safety.Open(item.Source)
+	if err != nil {
+		return core.Verdict{}, err
+	}
+	defer handle.Close()
+	verdict := e.revalidatePrepared(ctx, item, handle)
+	if suffix, id := companionOf(item); verdict.Allows(item.Action.Kind) && suffix != "" && !id.Zero() {
+		return verdict, e.revalidateCompanion(ctx, item, item.Source+suffix, id)
+	}
+	return verdict, nil
+}
+
+// revalidatePrepared is the fresh complete safety verdict on a prepared item
+// opened through handle, immediately before its move.
+func (e *Engine) revalidatePrepared(ctx context.Context, item core.CleanupItem, handle *safety.Handle) core.Verdict {
+	target := safety.ResolveTarget(filepath.Dir(item.Destination))
+	return safety.Revalidate(ctx, safety.RevalidateInput{
+		Planned: item.Entry, Action: item.Action, Policy: e.Policy,
+		Target: &target, Now: e.now(), Handle: handle,
+		Recollect: func(ctx context.Context, path string) (core.Entry, error) {
+			return e.recollectWithSize(ctx, path, item.Entry.SizeIsDeep)
+		},
+	})
 }
 
 // moveUnit renames the prepared object, and a bound companion before it, into
@@ -232,7 +260,7 @@ func (e *Engine) revalidateCompanion(ctx context.Context, item core.CleanupItem,
 	target := safety.ResolveTarget(filepath.Dir(item.Destination))
 	verdict := safety.Evaluate(safety.Input{Entry: unitCompanion(fresh, item.Source), Policy: e.Policy, Target: &target, Now: e.now()})
 	if !verdict.Allows(item.Action.Kind) {
-		return fmt.Errorf("companion revalidation refused %s: %s", path, verdict.Summary())
+		return fmt.Errorf("companion revalidation refused %s: %s", path, verdict.Detail())
 	}
 	return nil
 }

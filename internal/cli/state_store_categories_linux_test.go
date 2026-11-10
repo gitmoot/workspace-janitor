@@ -477,3 +477,89 @@ func TestQuarantineRefusesASessionPastTheRootDeepSizeBudgetThatChanged(t *testin
 		t.Fatalf("changed session moved: %v", err)
 	}
 }
+
+// explainedReceipt is the active cleanup receipt that `explain` reports.
+type explainedReceipt struct {
+	CleanupID         string        `json:"cleanup_id"`
+	State             string        `json:"state"`
+	Revalidation      *core.Verdict `json:"revalidation"`
+	RevalidationError string        `json:"revalidation_error"`
+}
+
+// A refused quarantine names the check that refused, in the cleanup error
+// and in `explain`, which planning cannot show once the path has an active
+// receipt (live 2026-11-08: an archived omp session with its transcript
+// was refused only as "identity_changed" and its receipt stayed prepared
+// every night after). The real shape: a session past its root's deep-size
+// budget with its transcript bound, and its project directory modified
+// after planning. Put back exactly as archived, the same receipt
+// revalidates and quarantines with its transcript.
+func TestRefusedArchivedSessionQuarantineNamesTheFailedCheck(t *testing.T) {
+	x, session := pastRootBudget(t, "")
+	if item := categoryItem(t, x.categories(t, false), session); item.Status != categoryArchived {
+		t.Fatalf("session not archived: %+v", item)
+	}
+	x.data(t, "scan", "--deep-size")
+	var plan core.Plan
+	field(t, x.data(t, "plan", "--no-jev"), "plan", &plan)
+	var action core.Action
+	for _, planned := range plan.Actions {
+		if planned.Path == session {
+			action = planned
+		}
+	}
+	var entry core.Entry
+	field(t, x.data(t, "explain", session), "entry", &entry)
+	if action.Kind != core.ActionQuarantine || !entry.SizeIsDeep || !entry.SizeIsLowerBound ||
+		entry.WorkspaceArchive == nil || entry.WorkspaceArchive.CompanionID.Zero() {
+		t.Fatalf("plan did not see a starved session with its bound transcript: %+v %+v", action, entry)
+	}
+	x.data(t, "plan", "--plan", plan.ID, "--approve", action.ID, "--no-jev")
+	// Another session of the project starts after planning, as on the host.
+	if err := os.WriteFile(filepath.Join(filepath.Dir(session), "next.jsonl"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	changed := filepath.Join(session, "sub", "1.read.log")
+	archived, err := os.ReadFile(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(changed, []byte("rewritten after planning\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, code := x.run(t, "apply", "--quarantine", "--action", action.ID, "--dry-run=false", "--confirm")
+	const check = "metadata changed since planning"
+	if code == ExitOK || !strings.Contains(out+stderr, "identity_changed") || !strings.Contains(out+stderr, check) ||
+		!strings.Contains(out+stderr, "changed: size ") {
+		t.Fatalf("refusal does not name the failed check: exit=%d %s %s", code, out, stderr)
+	}
+	for _, path := range []string{changed, session + ".jsonl"} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("refused unit moved: %v", err)
+		}
+	}
+	var receipt explainedReceipt
+	field(t, x.data(t, "explain", session), "receipt", &receipt)
+	if receipt.State != string(core.CleanupPrepared) || receipt.Revalidation == nil || !receipt.Revalidation.Refused() ||
+		!strings.Contains(fmt.Sprint(receipt.Revalidation.Protections), check) {
+		t.Fatalf("explain does not name the check keeping the receipt prepared: %+v", receipt)
+	}
+
+	if err := os.WriteFile(changed, archived, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(changed, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	field(t, x.data(t, "explain", session), "receipt", &receipt)
+	if receipt.Revalidation == nil || receipt.Revalidation.Refused() || receipt.RevalidationError != "" {
+		t.Fatalf("the session as archived does not revalidate: %+v", receipt)
+	}
+	x.data(t, "apply", "--quarantine", "--action", action.ID, "--dry-run=false", "--confirm")
+	absentPaths(t, session, session+".jsonl")
+}

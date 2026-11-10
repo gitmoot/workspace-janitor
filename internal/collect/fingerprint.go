@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"strconv"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -43,55 +45,112 @@ func SnapshotFingerprint(entry core.Entry) (string, bool) {
 
 func fingerprint(entry core.Entry, gitActivity bool) string {
 	h := sha256.New()
-	write := func(format string, args ...any) {
-		fmt.Fprintf(h, format+"\x00", args...)
+	fingerprintInputs(entry, gitActivity, func(name, format string, args ...any) {
+		io.WriteString(h, name)
+		io.WriteString(h, "=")
+		fmt.Fprintf(h, format, args...)
+		io.WriteString(h, "\x00")
+	})
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// FingerprintChanges names every fingerprint input that differs between two
+// observations, in fingerprint order, as "name was -> now" ("absent" for an
+// input only one of them has). It explains a fingerprint mismatch: two
+// entries whose Fingerprint differs always have at least one change.
+func FingerprintChanges(before, after core.Entry) []string {
+	was, now := fingerprintValues(before), fingerprintValues(after)
+	var changes []string
+	seen := make(map[string]bool, len(was)+len(now))
+	for _, input := range append(was, now...) {
+		if seen[input.name] {
+			continue
+		}
+		seen[input.name] = true
+		a, b := fingerprintValue(was, input.name), fingerprintValue(now, input.name)
+		if a != b {
+			changes = append(changes, input.name+" "+a+" -> "+b)
+		}
 	}
-	write("path=%s", entry.Path)
-	write("kind=%s", entry.Kind)
-	write("device=%d", entry.FilesystemID.Device)
-	write("inode=%d", entry.FilesystemID.Inode)
-	write("uid=%d", entry.Ownership.UID)
-	write("gid=%d", entry.Ownership.GID)
-	write("mode=%s", entry.Ownership.Mode)
-	write("size=%d", entry.SizeBytes)
-	write("deep=%t", entry.SizeIsDeep)
-	write("modified=%d", entry.ModifiedAt.UTC().UnixNano())
+	return changes
+}
+
+type fingerprintInput struct{ name, value string }
+
+func fingerprintValues(entry core.Entry) []fingerprintInput {
+	var inputs []fingerprintInput
+	fingerprintInputs(entry, true, func(name, format string, args ...any) {
+		inputs = append(inputs, fingerprintInput{name, fmt.Sprintf(format, args...)})
+	})
+	return inputs
+}
+
+// fingerprintValue renders one input for a reader: nanosecond timestamps as
+// RFC 3339 times.
+func fingerprintValue(inputs []fingerprintInput, name string) string {
+	for _, input := range inputs {
+		if input.name != name {
+			continue
+		}
+		switch name {
+		case "modified", "latest_modified", "git_activity":
+			if nanos, err := strconv.ParseInt(input.value, 10, 64); err == nil {
+				return time.Unix(0, nanos).UTC().Format(time.RFC3339Nano)
+			}
+		}
+		return input.value
+	}
+	return "absent"
+}
+
+// fingerprintInputs emits, in order, every named input of an entry's
+// fingerprint. The digest hashes "name=value\x00" for each.
+func fingerprintInputs(entry core.Entry, gitActivity bool, emit func(name, format string, args ...any)) {
+	emit("path", "%s", entry.Path)
+	emit("kind", "%s", entry.Kind)
+	emit("device", "%d", entry.FilesystemID.Device)
+	emit("inode", "%d", entry.FilesystemID.Inode)
+	emit("uid", "%d", entry.Ownership.UID)
+	emit("gid", "%d", entry.Ownership.GID)
+	emit("mode", "%s", entry.Ownership.Mode)
+	emit("size", "%d", entry.SizeBytes)
+	emit("deep", "%t", entry.SizeIsDeep)
+	emit("modified", "%d", entry.ModifiedAt.UTC().UnixNano())
 	if !entry.LatestModifiedAt.IsZero() {
-		write("latest_modified=%d", entry.LatestModifiedAt.UTC().UnixNano())
+		emit("latest_modified", "%d", entry.LatestModifiedAt.UTC().UnixNano())
 	}
-	write("link=%s", entry.SymlinkTarget)
+	emit("link", "%s", entry.SymlinkTarget)
 	if entry.ExportArchive != nil {
-		write("export_archive=%s|%s", entry.ExportArchive.Manifest, entry.ExportArchive.ManifestSHA256)
+		emit("export_archive", "%s|%s", entry.ExportArchive.Manifest, entry.ExportArchive.ManifestSHA256)
 	}
 	if entry.WorkspaceArchive != nil {
 		b := entry.WorkspaceArchive
-		write("workspace_archive=%s|%s|%d|%s|%d", b.Manifest, b.ManifestSHA256, b.MemberCount, b.TreeDigest, b.CreatedAt.UTC().UnixNano())
+		emit("workspace_archive", "%s|%s|%d|%s|%d", b.Manifest, b.ManifestSHA256, b.MemberCount, b.TreeDigest, b.CreatedAt.UTC().UnixNano())
 		// Only a companion unit adds this line, so digests saved for bindings
 		// without a companion stay valid.
 		if b.CompanionSuffix != "" {
-			write("workspace_archive_companion=%s|%d|%d", b.CompanionSuffix, b.CompanionID.Device, b.CompanionID.Inode)
+			emit("workspace_archive_companion", "%s|%d|%d", b.CompanionSuffix, b.CompanionID.Device, b.CompanionID.Inode)
 		}
 	}
 	if entry.Git == nil {
-		write("git=none")
+		emit("git", "none")
 	} else {
 		// Publication, bareness, worktree ownership, and the remote all
 		// feed protections, so a change in any of them must change the
 		// fingerprint. Measuring publication at the same HEAD removes the
 		// unknown-publication protection; if that were excluded here, the
 		// entry would still compare as unchanged.
-		write("git=%s|%s|%d|%d|%d|%t|%t|%t|%t|%t|%s|%s",
+		emit("git", "%s|%s|%d|%d|%d|%t|%t|%t|%t|%t|%s|%s",
 			entry.Git.Head, entry.Git.Branch, entry.Git.DirtyFiles, entry.Git.Stashes,
 			entry.Git.UnpublishedCommits, entry.Git.Locked, entry.Git.Degraded,
 			entry.Git.UpstreamKnown, entry.Git.PublicationKnown, entry.Git.Bare, entry.Git.WorktreeOf, entry.Git.Remote)
 		if gitActivity {
-			write("git_activity=%d", entry.Git.LastActivity.UTC().UnixNano())
+			emit("git_activity", "%d", entry.Git.LastActivity.UTC().UnixNano())
 		}
 		if entry.Git.SourceApprovalFingerprint != "" {
-			write("source_approvals=%s", entry.Git.SourceApprovalFingerprint)
+			emit("source_approvals", "%s", entry.Git.SourceApprovalFingerprint)
 		}
 	}
-	return hex.EncodeToString(h.Sum(nil))
 }
 
 // applyFingerprints stamps each entry's fingerprint and compares it with the
