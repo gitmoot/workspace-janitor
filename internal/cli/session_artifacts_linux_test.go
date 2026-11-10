@@ -4,6 +4,7 @@ package cli
 
 import (
 	"archive/tar"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/workspace-janitor/internal/action"
 	"github.com/gitmoot/workspace-janitor/internal/config"
+	"github.com/gitmoot/workspace-janitor/internal/core"
+	"github.com/gitmoot/workspace-janitor/internal/store"
 )
 
 // artifactFixture is the state-store fixture with an omp_session_artifacts
@@ -1040,5 +1044,92 @@ func TestSessionArtifactsExpiryAppliesTheCurrentLocalRetention(t *testing.T) {
 	}
 	if _, err := os.Lstat(copy); err != nil {
 		t.Fatalf("copy deleted inside the raised local retention: %v", err)
+	}
+}
+
+// A file renamed into its receipt whose state write then failed (a lock
+// held too long, a crash) leaves its receipt prepared. The next scheduled
+// artifact quarantine finishes that move from the receipt: it is journaled
+// as quarantined, the rest of the batch moves, and the batch settles.
+func TestSessionArtifactsNextRunFinishesAMoveItCouldNotJournal(t *testing.T) {
+	x := newArtifactFixture(t)
+	session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"a.log": oldArtifact, "b.log": oldArtifact})
+	item := categoryItem(t, x.categories(t, false), session)
+	ctx := context.Background()
+	paths := x.paths(t)
+	receipts := func() []core.CleanupItem {
+		t.Helper()
+		db, err := store.Open(ctx, paths.DatabaseFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		var items []core.CleanupItem
+		if err := db.Read(ctx, func(tx *store.Tx) error {
+			items, err = tx.CleanupItems(ctx, item.CleanupID)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return items
+	}
+
+	db, err := store.Open(ctx, paths.DatabaseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var batch store.ArtifactBatch
+	var files []store.ArtifactFile
+	if err := db.Read(ctx, func(tx *store.Tx) error {
+		batches, err := tx.ArtifactBatches(ctx)
+		if err != nil {
+			return err
+		}
+		for _, b := range batches {
+			if b.Name == item.Name {
+				batch = b
+			}
+		}
+		files, err = tx.ArtifactBatchFiles(ctx, item.Name)
+		return err
+	}); err != nil || len(files) != 2 {
+		t.Fatalf("batch files: %v %v", files, err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Lstat(files[0].Path, &st); err != nil {
+		t.Fatal(err)
+	}
+	interrupted := artifactCleanupItem(config.Policy{Retention: config.RetentionPolicy{Default: core.RetentionNone}}, batch, files[0],
+		core.FilesystemID{Device: st.Dev, Inode: st.Ino}, time.Now().UTC())
+	journal, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// The state write after the rename fails: its context ends just before.
+	engine := &action.Engine{DB: db, QuarantineDir: paths.QuarantineDir}
+	if _, err := engine.QuarantineArtifact(journal, interrupted, func() error { cancel(); return nil }); err == nil {
+		t.Fatal("receipt write with an ended context succeeded")
+	}
+	db.Close()
+	if _, err := os.Lstat(files[0].Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("file not renamed before its state write failed: %v", err)
+	}
+	if items := receipts(); len(items) != 1 || items[0].State != core.CleanupPrepared {
+		t.Fatalf("interrupted move left %+v, want one prepared receipt", items)
+	}
+
+	report := x.quarantineArtifacts(t)
+	if len(report.Batches) != 1 || report.Batches[0].Status != artifactQuarantined || report.Batches[0].Moved != 2 || report.Batches[0].Kept != 0 {
+		t.Fatalf("next run did not finish the interrupted batch: %+v", report)
+	}
+	items := receipts()
+	if len(items) != 2 {
+		t.Fatalf("receipts after the next run: %+v", items)
+	}
+	for _, it := range items {
+		if it.State != core.CleanupQuarantined || it.MovedAt == nil {
+			t.Fatalf("%s receipt is %s after the next run", it.Source, it.State)
+		}
+	}
+	if got := contents(t, session, "a.log", "b.log"); got["a.log"] != "<absent>" || got["b.log"] != "<absent>" {
+		t.Fatalf("files left in the session folder: %v", got)
 	}
 }

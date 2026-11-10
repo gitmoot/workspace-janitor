@@ -17,7 +17,8 @@ import (
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
-	_ "modernc.org/sqlite" // pure-Go SQLite driver; no cgo
+	"modernc.org/sqlite" // pure-Go SQLite driver; no cgo
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // ErrNotFound is returned when a requested record does not exist.
@@ -32,6 +33,19 @@ const (
 	DirMode  os.FileMode = 0o700
 	FileMode os.FileMode = 0o600
 )
+
+// writeLockWait bounds how long Write waits for another process's write
+// lock. Janitor's processes share one database: the watcher persists a whole
+// inventory (and trims old ones) in a single write transaction while a cycle
+// journals tens of thousands of per-file receipts. On a multi-gigabyte
+// database under load that transaction holds the write lock longer than the
+// connection's five-second busy_timeout (about 5.7 and 9.4 s on 2026-11-10),
+// and a receipt write that gives up after its file was renamed leaves a
+// prepared receipt and fails the cycle. Waiting is safe: a write transaction
+// begins IMMEDIATE, so BEGIN takes the lock before any work and a refused
+// BEGIN changed nothing. Two minutes outlasts any expected writer; a lock
+// held longer is a stuck process worth failing on.
+const writeLockWait = 2 * time.Minute
 
 // Store is an open database handle with the current schema applied.
 type Store struct {
@@ -153,7 +167,7 @@ func (s *Store) Write(ctx context.Context, fn func(*Tx) error) error {
 	if s.readOnly {
 		return fmt.Errorf("store: %s is open read-only", s.path)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return fmt.Errorf("store: begin transaction: %w", err)
 	}
@@ -171,6 +185,26 @@ func (s *Store) Write(ctx context.Context, fn func(*Tx) error) error {
 	}
 	committed = true
 	return nil
+}
+
+// beginWrite begins a write transaction, waiting up to writeLockWait for
+// another process's write lock. Each BEGIN waits at most busy_timeout, which
+// cancellation does not cut short, so the wait is repeated in steps of
+// busy_timeout and ctx is honoured between them.
+func (s *Store) beginWrite(ctx context.Context) (*sql.Tx, error) {
+	deadline := time.Now().Add(writeLockWait)
+	for {
+		tx, err := s.db.BeginTx(ctx, nil)
+		var sqliteErr *sqlite.Error
+		if err == nil || !errors.As(err, &sqliteErr) || sqliteErr.Code()&0xff != sqlite3.SQLITE_BUSY || !time.Now().Before(deadline) {
+			return tx, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, errors.Join(err, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // Read runs fn inside a read-only transaction.
