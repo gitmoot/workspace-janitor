@@ -953,7 +953,9 @@ archived nor deleted, while any of these hold:
 - it is, or contains, a socket, fifo or device, a mount crossing, extended
   attributes, or Git history outside it
 - anything in it was modified (mtime) within `idle`, or has an mtime in the
-  future, or its mtime or anything else about it cannot be read
+  future, or its mtime or anything else about it cannot be read. An mtime
+  or ctime past 2262 or before 1677 cannot be represented and counts as
+  unreadable.
 
 `janitor scratch` previews by default. `--dry-run=false --confirm` acts under
 the apply lock:

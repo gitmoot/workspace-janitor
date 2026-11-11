@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,6 +111,11 @@ func statxAt(dirfd int, name string, flags int) (state, error) {
 	if sx.Mask&(unix.STATX_MTIME|unix.STATX_CTIME) != unix.STATX_MTIME|unix.STATX_CTIME {
 		return state{}, errors.New("modification or change time unavailable; retain the original")
 	}
+	mtimeNS, mtimeOK := statxNS(sx.Mtime)
+	ctimeNS, ctimeOK := statxNS(sx.Ctime)
+	if !mtimeOK || !ctimeOK {
+		return state{}, errors.New("modification or change time outside the representable range; retain the original")
+	}
 	return state{
 		id:      core.FilesystemID{Device: unix.Mkdev(sx.Dev_major, sx.Dev_minor), Inode: sx.Ino},
 		mountID: sx.Mnt_id,
@@ -117,10 +123,21 @@ func statxAt(dirfd int, name string, flags int) (state, error) {
 		uid:     sx.Uid,
 		gid:     sx.Gid,
 		size:    int64(sx.Size),
-		mtimeNS: sx.Mtime.Sec*1e9 + int64(sx.Mtime.Nsec),
-		ctimeNS: sx.Ctime.Sec*1e9 + int64(sx.Ctime.Nsec),
+		mtimeNS: mtimeNS,
+		ctimeNS: ctimeNS,
 		nlink:   sx.Nlink,
 	}, nil
+}
+
+// statxNS converts a statx time to nanoseconds since the epoch. A time past
+// about 2262 or before about 1677 does not fit and is refused: wrapped, a
+// far-future mtime would read as centuries idle.
+func statxNS(ts unix.StatxTimestamp) (int64, bool) {
+	const second = 1_000_000_000
+	if ts.Nsec >= second || ts.Sec >= math.MaxInt64/second || ts.Sec < math.MinInt64/second {
+		return 0, false
+	}
+	return ts.Sec*second + int64(ts.Nsec), true
 }
 
 func fstate(f *os.File) (state, error) { return statxAt(int(f.Fd()), "", unix.AT_EMPTY_PATH) }

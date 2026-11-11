@@ -420,6 +420,32 @@ func TestScratchRegenerableIdleIsMeasuredFromMtimeNotCtime(t *testing.T) {
 	}
 }
 
+// An mtime past 2262 does not fit in int64 nanoseconds. Wrapped, 2300-01-01
+// read as 1715 and a regenerable entry looked centuries idle; it must be
+// kept as unobservable instead.
+func TestScratchKeepsAnEntryWithAnUnrepresentableMtime(t *testing.T) {
+	x := newScratchFixture(t)
+	far := x.entry(t, "go-build-2300", map[string]string{"b/c.a": "object\n"})
+	// os.Chtimes goes through UnixNano, which cannot hold 2300 either.
+	when := time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+	member := filepath.Join(far, "b", "c.a")
+	if err := unix.UtimesNanoAt(unix.AT_FDCWD, member, []unix.Timespec{{Sec: when}, {Sec: when}}, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		t.Skipf("the test filesystem refuses an mtime of 2300-01-01: %v", err)
+	}
+	var sx unix.Statx_t
+	if err := unix.Statx(unix.AT_FDCWD, member, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_MTIME, &sx); err != nil {
+		t.Fatal(err)
+	}
+	if sx.Mtime.Sec != when {
+		t.Skipf("the test filesystem stored the 2300-01-01 mtime as %d", sx.Mtime.Sec)
+	}
+
+	report := x.mustCleanup(t, true)
+	if item := scratchStatus(t, report, "go-build-2300"); item.Status != scratchKept || !strings.Contains(item.Reason, "could not be observed") || !exists(t, far) {
+		t.Fatalf("entry with an mtime of 2300-01-01 = %+v", item)
+	}
+}
+
 // The deletion-time in-use recheck reads processes from the freshly loaded
 // policy's proc_root, like every other deletion-time check.
 func TestScratchInUseRecheckUsesFreshProcRoot(t *testing.T) {
