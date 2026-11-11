@@ -20,35 +20,31 @@ const (
 	ScratchRegenerable = "regenerable"
 )
 
-// ScratchRunReceiptMaxBytes bounds one encoded run receipt. Runs select no
-// more archived entries than fit, before writing any archive.
-const ScratchRunReceiptMaxBytes = 65536
-
-// ScratchRunReceiptBytes is the encoded size of r with no archived entries.
-// Each archived entry adds its JSON-encoded name plus one separator byte.
-// RecordedAt is taken only after archiving, so it is sized at its longest
-// encoding: a nine-digit fraction, which RFC 3339 never trims.
-func ScratchRunReceiptBytes(r ScratchRun) int {
-	r.ArchivedEntries = []string{}
-	r.StartedAt = r.StartedAt.UTC()
-	r.RecordedAt = time.Date(9999, 12, 31, 23, 59, 59, 123456789, time.UTC)
-	data, _ := json.Marshal(r)
-	return len(data)
-}
+// scratchRunDocumentMaxBytes mirrors the scratch_runs document CHECK. A run
+// receipt no longer grows with the entries it archived, so it stays far
+// below this.
+const scratchRunDocumentMaxBytes = 65536
 
 // ScratchRun is the immutable receipt of one acting scratch cleanup run. It
 // is recorded once the run's archive (if any) is published and verified, and
 // before anything is deleted; its start time schedules the next run.
+//
+// The receipt pins the run's archive manifest by path and SHA-256. That
+// manifest, durable and read back before the receipt is written, names every
+// archived entry, so a run may archive more entries than one database row
+// could list. Receipts recorded by earlier versions also list the names, in
+// archived_entries; they decode with ArchivedCount set from that list.
 type ScratchRun struct {
 	RunID     string    `json:"run_id"`
 	Path      string    `json:"path"`
 	StartedAt time.Time `json:"started_at"`
 	// The archive binding is empty when the run archived nothing.
-	ArchiveDirectory      string    `json:"archive_directory,omitempty"`
-	ArchiveManifest       string    `json:"archive_manifest,omitempty"`
-	ArchiveManifestSHA256 string    `json:"archive_manifest_sha256,omitempty"`
-	ArchivedEntries       []string  `json:"archived_entries"`
-	RecordedAt            time.Time `json:"recorded_at"`
+	ArchiveDirectory      string `json:"archive_directory,omitempty"`
+	ArchiveManifest       string `json:"archive_manifest,omitempty"`
+	ArchiveManifestSHA256 string `json:"archive_manifest_sha256,omitempty"`
+	// ArchivedCount is the number of entries the pinned manifest names.
+	ArchivedCount int       `json:"archived_count,omitempty"`
+	RecordedAt    time.Time `json:"recorded_at"`
 	// Kind is empty for a full sweep and ScratchRunRegenerable for a pass
 	// that only deletes regenerable entries. Each kind has its own cadence.
 	Kind string `json:"kind,omitempty"`
@@ -73,8 +69,8 @@ func (r ScratchRun) validate() error {
 	if strings.TrimSpace(r.RunID) == "" || strings.TrimSpace(r.Path) == "" || r.StartedAt.IsZero() || r.RecordedAt.IsZero() {
 		return errors.New("store: scratch run requires a run id, path and times")
 	}
-	if (r.ArchiveManifest == "") != (r.ArchiveManifestSHA256 == "") || (r.ArchiveManifest == "") != (len(r.ArchivedEntries) == 0) {
-		return errors.New("store: a scratch run archive needs its manifest, checksum and entries together")
+	if (r.ArchiveManifest == "") != (r.ArchiveManifestSHA256 == "") || (r.ArchiveManifest == "") != (r.ArchivedCount == 0) || r.ArchivedCount < 0 {
+		return errors.New("store: a scratch run archive needs its manifest, checksum and entry count together")
 	}
 	if r.Kind != "" && r.Kind != ScratchRunRegenerable {
 		return fmt.Errorf("store: unknown scratch run kind %q", r.Kind)
@@ -110,9 +106,6 @@ func (d ScratchDeletion) validate() error {
 // RecordScratchRun appends one run receipt; a duplicate run id is refused.
 func (t *Tx) RecordScratchRun(ctx context.Context, r ScratchRun) error {
 	r.StartedAt, r.RecordedAt = r.StartedAt.UTC(), r.RecordedAt.UTC()
-	if r.ArchivedEntries == nil {
-		r.ArchivedEntries = []string{}
-	}
 	if err := r.validate(); err != nil {
 		return err
 	}
@@ -120,7 +113,7 @@ func (t *Tx) RecordScratchRun(ctx context.Context, r ScratchRun) error {
 	if err != nil {
 		return err
 	}
-	if len(data) > ScratchRunReceiptMaxBytes {
+	if len(data) > scratchRunDocumentMaxBytes {
 		return errors.New("store: scratch run receipt exceeds its size bound")
 	}
 	if _, err := t.tx.ExecContext(ctx, `INSERT INTO scratch_runs (run_id, path, started_at, document) VALUES (?, ?, ?, ?)`,
@@ -171,11 +164,18 @@ func (t *Tx) ScratchRunByID(ctx context.Context, runID string) (ScratchRun, bool
 	if err != nil {
 		return ScratchRun{}, false, fmt.Errorf("store: scratch run %s: %w", runID, err)
 	}
-	var r ScratchRun
+	// archived_entries is only present in receipts of earlier versions.
+	var r struct {
+		ScratchRun
+		LegacyEntries []string `json:"archived_entries"`
+	}
 	if err := json.Unmarshal([]byte(data), &r); err != nil {
 		return ScratchRun{}, false, fmt.Errorf("store: invalid scratch run receipt: %w", err)
 	}
-	return r, true, r.validate()
+	if r.ArchivedCount == 0 {
+		r.ArchivedCount = len(r.LegacyEntries)
+	}
+	return r.ScratchRun, true, r.ScratchRun.validate()
 }
 
 // ScratchDeletions returns the deletion receipts of one run in order.

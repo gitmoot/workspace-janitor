@@ -19,6 +19,9 @@ const (
 	// DefaultScratchMaxEntries bounds one scratch directory's listing,
 	// independently of limits.max_dir_entries.
 	DefaultScratchMaxEntries = 100000
+	// DefaultScratchMaxArchiveEntriesPerRun bounds the entries one run
+	// archives into its single tar.
+	DefaultScratchMaxArchiveEntriesPerRun = 50000
 )
 
 // ScratchCleanup is one opt-in scratch directory (for example /tmp) whose
@@ -54,6 +57,10 @@ type ScratchCleanup struct {
 	// MaxEntries bounds the depth-1 listing; a larger directory refuses the
 	// whole run rather than cleaning a partial listing.
 	MaxEntries int `yaml:"max_entries" json:"max_entries"`
+	// MaxArchiveEntriesPerRun bounds the entries one run archives (and so
+	// names in its archive manifest); further ones are deferred. Regenerable
+	// entries are deleted without an archive and are not counted.
+	MaxArchiveEntriesPerRun int `yaml:"max_archive_entries_per_run" json:"max_archive_entries_per_run"`
 }
 
 // minRegenerableIdle is the shortest regenerable_idle accepted: long enough
@@ -122,6 +129,9 @@ func (p *Policy) normalizeScratchCleanup(expand func(string, string) string) {
 		}
 		if scratch.MaxEntries == 0 {
 			scratch.MaxEntries = DefaultScratchMaxEntries
+		}
+		if scratch.MaxArchiveEntriesPerRun == 0 {
+			scratch.MaxArchiveEntriesPerRun = DefaultScratchMaxArchiveEntriesPerRun
 		}
 		if scratch.Skip == nil {
 			scratch.Skip = []string{}
@@ -211,6 +221,9 @@ func (p *Policy) validateScratchCleanup(errs *core.FieldErrors) {
 		}
 		if scratch.MaxEntries < 1 {
 			errs.Add(field+".max_entries", "must be at least 1, got %d", scratch.MaxEntries)
+		}
+		if scratch.MaxArchiveEntriesPerRun < 1 {
+			errs.Add(field+".max_archive_entries_per_run", "must be at least 1, got %d", scratch.MaxArchiveEntriesPerRun)
 		}
 		if scratch.MaxBytesPerRun < 0 {
 			errs.Add(field+".max_bytes_per_run", "must be zero (no bound) or positive, got %d", scratch.MaxBytesPerRun)

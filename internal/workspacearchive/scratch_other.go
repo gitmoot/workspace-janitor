@@ -24,6 +24,11 @@ func (s *ScratchDir) Unchanged(ScratchEntry) error { return errUnsupported }
 // SensitiveMember cannot screen off Linux, so every entry stays local.
 func (e ScratchEntry) SensitiveMember(string, []string) string { return e.Name }
 
+// ScratchManifestEntryBudget is zero off Linux: nothing is archived.
+const ScratchManifestEntryBudget = 0
+
+func (e ScratchEntry) ManifestBytes() int { return 0 }
+
 func (s *ScratchDir) Observe(context.Context, string, []string, int) (ScratchEntry, error) {
 	return ScratchEntry{}, errUnsupported
 }
@@ -34,6 +39,10 @@ func ScratchReferences(context.Context, string, string) (map[string]string, erro
 
 func (s *ScratchDir) CreateScratch(context.Context, config.WorkspaceArchiveCategoryDestination, string, []ScratchEntry, func() error) (ScratchManifest, *Binding, error) {
 	return ScratchManifest{}, nil, errUnsupported
+}
+
+func ReadScratchManifest(context.Context, config.WorkspaceArchiveCategoryDestination, Binding) (ScratchManifest, error) {
+	return ScratchManifest{}, errUnsupported
 }
 
 func CheckScratch(context.Context, config.WorkspaceArchiveCategoryDestination, Binding) (ScratchManifest, error) {

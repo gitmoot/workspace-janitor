@@ -2,11 +2,11 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -47,8 +47,7 @@ func scratchIdle(now time.Time, newestMtimeNS int64) time.Duration {
 	return max(0, now.Sub(time.Unix(0, newestMtimeNS)))
 }
 
-// scratchRunID names the acting run started at now; it always has the same
-// length, which the run receipt estimate relies on.
+// scratchRunID names the acting run started at now.
 func scratchRunID(now time.Time) string { return now.Format("20060102T150405.000000000Z") }
 
 type scratchItem struct {
@@ -61,11 +60,14 @@ type scratchItem struct {
 }
 
 type scratchArchiveSummary struct {
-	Manifest       string   `json:"manifest"`
-	ManifestSHA256 string   `json:"manifest_sha256"`
-	TarBytes       int64    `json:"tar_bytes"`
-	Files          int      `json:"files_verified"`
-	Entries        []string `json:"entries"`
+	Manifest       string `json:"manifest"`
+	ManifestSHA256 string `json:"manifest_sha256"`
+	TarBytes       int64  `json:"tar_bytes"`
+	Files          int    `json:"files_verified"`
+	EntryCount     int    `json:"entry_count"`
+	// Entries lists the first scratchListedMax archived entries; the
+	// manifest names all EntryCount of them.
+	Entries []string `json:"entries"`
 }
 
 type scratchRunReport struct {
@@ -208,12 +210,8 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	now := scratchNow()
 	report := scratchRunReport{Path: scratch.Path, DryRun: dryRun, Status: "preview", Items: []scratchItem{},
 		Attribution: "Sizes are the local bytes of regular files. Archived bytes on the archive mount are never counted as local headroom."}
-	// A preview records nothing, so it reports no run ID, but its receipt
-	// estimate still sizes one: otherwise it would admit entries an acting
-	// run defers.
-	runID := scratchRunID(now)
 	if !dryRun {
-		report.RunID = runID
+		report.RunID = scratchRunID(now)
 	}
 	fail := func(err error) (scratchRunReport, error) {
 		report.Status, report.Error = "failed", err.Error()
@@ -280,18 +278,28 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	}
 
 	names = nil
-	// Oldest first: the bound keeps the longest-idle entries. Pass 2 observes
-	// only the selected entries again; their member lists are the run's
-	// archive, bounded by max_bytes_per_run.
-	sort.SliceStable(found, func(i, j int) bool { return found[i].newestMtimeNS < found[j].newestMtimeNS })
+	// Largest first: a run bounded by max_bytes_per_run or
+	// max_archive_entries_per_run frees the most local bytes it can, and a
+	// large entry never waits behind thousands of tiny older ones. Ties go
+	// to the longest idle, then the name, so the order is deterministic.
+	// Pass 2 observes only the selected entries again; their member lists
+	// are the run's archive.
+	sort.Slice(found, func(i, j int) bool {
+		a, b := found[i], found[j]
+		if a.size != b.size {
+			return a.size > b.size
+		}
+		if a.newestMtimeNS != b.newestMtimeNS {
+			return a.newestMtimeNS < b.newestMtimeNS
+		}
+		return a.name < b.name
+	})
 	var selected, archive []scratchCandidate
 	var total int64
-	// The run receipt names every archived entry and has a fixed size bound;
-	// entries that would overflow it are deferred before any archive exists.
-	// The manifest name and checksum are sized at their final lengths.
-	receipt := store.ScratchRunReceiptBytes(store.ScratchRun{RunID: runID, Path: scratch.Path, StartedAt: now, RecordedAt: now,
-		ArchiveDirectory: scratch.Archive.Directory, ArchiveManifest: filepath.Join(scratch.Archive.Directory, workspacearchive.ScratchArchiveName(runID)+".manifest.json"),
-		ArchiveManifestSHA256: strings.Repeat("0", 64)})
+	// The archive manifest names every archived entry and member and has a
+	// fixed size bound; entries that would overflow it, or the entry cap,
+	// are deferred before any archive exists.
+	manifest := 0
 	for _, next := range found {
 		item := scratchItem{Entry: next.name, Path: filepath.Join(scratch.Path, next.name), SizeBytes: next.size,
 			IdleFor: scratchIdle(now, next.newestMtimeNS).Truncate(time.Second).String()}
@@ -305,13 +313,10 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 			report.list(item)
 			continue
 		}
-		if !next.regenerable {
-			encoded, _ := json.Marshal(next.name)
-			if receipt+len(encoded)+1 > store.ScratchRunReceiptMaxBytes {
-				item.Status, item.Reason = scratchDeferred, "run receipt size bound reached; retried next run"
-				report.list(item)
-				continue
-			}
+		if !next.regenerable && len(archive) >= scratch.MaxArchiveEntriesPerRun {
+			item.Status, item.Reason = scratchDeferred, fmt.Sprintf("max_archive_entries_per_run %d reached; retried next run", scratch.MaxArchiveEntriesPerRun)
+			report.list(item)
+			continue
 		}
 		entry, reason := scratchCheck(ctx, dir, policy, scratch, used, next.name, now)
 		if reason == "" && entry.Identity != next.identity {
@@ -322,11 +327,16 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 			report.list(item)
 			continue
 		}
-		total += entry.SizeBytes
 		if !next.regenerable {
-			encoded, _ := json.Marshal(next.name)
-			receipt += len(encoded) + 1
+			cost := entry.ManifestBytes()
+			if manifest+cost > workspacearchive.ScratchManifestEntryBudget {
+				item.Status, item.Reason = scratchDeferred, "archive manifest size bound reached; retried next run"
+				report.list(item)
+				continue
+			}
+			manifest += cost
 		}
+		total += entry.SizeBytes
 		item.SizeBytes = entry.SizeBytes
 		item.Status, item.Reason = scratchWouldArchive, "would be archived, verified and then deleted"
 		if next.regenerable {
@@ -352,7 +362,7 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 		report.Status, report.Error = "failed", err.Error()
 		return report, fmt.Errorf("scratch cleanup of %s: %w", scratch.Path, err)
 	}
-	run := store.ScratchRun{RunID: report.RunID, Path: scratch.Path, StartedAt: now, ArchivedEntries: []string{}}
+	run := store.ScratchRun{RunID: report.RunID, Path: scratch.Path, StartedAt: now}
 	if regenerableOnly {
 		run.Kind = store.ScratchRunRegenerable
 	}
@@ -367,9 +377,25 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 			return failAll(fmt.Errorf("archive: %w", err))
 		}
 		// Read the published archive back once more, from the archive
-		// directory alone, before anything is deleted.
-		if _, err := workspacearchive.CheckScratch(ctx, scratch.Archive, *binding); err != nil {
+		// directory alone, before anything is deleted. The run receipt pins
+		// this manifest instead of listing the entries, so it must name
+		// exactly the entries this run deletes as archived.
+		checked, err := workspacearchive.CheckScratch(ctx, scratch.Archive, *binding)
+		if err != nil {
 			return failAll(fmt.Errorf("archive verification: %w", err))
+		}
+		// Manifest entries are unique, so equal counts and every selected
+		// name present mean the same set.
+		named := make(map[string]bool, len(checked.Entries))
+		for _, name := range checked.Entries {
+			named[name] = true
+		}
+		exact := len(checked.Entries) == len(archive)
+		for _, candidate := range archive {
+			exact = exact && named[candidate.entry.Name]
+		}
+		if !exact {
+			return failAll(errors.New("archive verification: the manifest does not name exactly the entries selected for archiving"))
 		}
 		files := 0
 		for _, member := range m.Members {
@@ -377,8 +403,9 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 				files++
 			}
 		}
-		report.Archive = &scratchArchiveSummary{Manifest: binding.Manifest, ManifestSHA256: binding.ManifestSHA256, TarBytes: m.TarBytes, Files: files, Entries: m.Entries}
-		run.ArchiveDirectory, run.ArchiveManifest, run.ArchiveManifestSHA256, run.ArchivedEntries = scratch.Archive.Directory, binding.Manifest, binding.ManifestSHA256, m.Entries
+		report.Archive = &scratchArchiveSummary{Manifest: binding.Manifest, ManifestSHA256: binding.ManifestSHA256, TarBytes: m.TarBytes, Files: files,
+			EntryCount: len(m.Entries), Entries: m.Entries[:min(len(m.Entries), scratchListedMax)]}
+		run.ArchiveDirectory, run.ArchiveManifest, run.ArchiveManifestSHA256, run.ArchivedCount = scratch.Archive.Directory, binding.Manifest, binding.ManifestSHA256, len(m.Entries)
 	}
 	db, err := store.Open(ctx, paths.DatabaseFile)
 	if err != nil {
@@ -733,7 +760,7 @@ func writeScratchReport(e *env, format output.Format, report scratchReport) erro
 			fmt.Fprintf(&b, "error: %s\n", run.Error)
 		}
 		if run.Archive != nil {
-			fmt.Fprintf(&b, "archive: %s (%d files verified)\n", run.Archive.Manifest, run.Archive.Files)
+			fmt.Fprintf(&b, "archive: %s (%d entries, %d files verified)\n", run.Archive.Manifest, run.Archive.EntryCount, run.Archive.Files)
 		}
 		if run.DryRun {
 			fmt.Fprintf(&b, "would archive+delete: %d  would delete (regenerable): %d  would free local bytes: %d\n", run.WouldArchive, run.WouldDelete, run.WouldFreeBytes)
@@ -787,11 +814,9 @@ func runScratchRestore(ctx context.Context, e *env, runID, entry string, opts sc
 	if err != nil {
 		return err
 	}
-	archived := false
-	for _, name := range run.ArchivedEntries {
-		archived = archived || name == entry
-	}
-	if !found || !archived {
+	// The receipt pins the run's manifest by path and SHA-256; that manifest
+	// names every archived entry and is checked for entry below.
+	if !found || run.ArchiveManifest == "" {
 		return fmt.Errorf("scratch run %q archived no entry %q", runID, entry)
 	}
 	destination := opts.restoreTo
@@ -807,6 +832,13 @@ func runScratchRestore(ctx context.Context, e *env, runID, entry string, opts sc
 	binding := workspacearchive.Binding{Manifest: run.ArchiveManifest, ManifestSHA256: run.ArchiveManifestSHA256}
 	report := scratchRestoreReport{Mode: "scratch_restore", DryRun: opts.dryRun, RunID: runID, Entry: entry, Manifest: run.ArchiveManifest, RestoredTo: destination, Status: "verified"}
 	if opts.dryRun {
+		m, err := workspacearchive.ReadScratchManifest(ctx, dest, binding)
+		if err != nil {
+			return err
+		}
+		if !slices.Contains(m.Entries, entry) {
+			return fmt.Errorf("scratch run %q archived no entry %q", runID, entry)
+		}
 		if _, err := workspacearchive.CheckScratch(ctx, dest, binding); err != nil {
 			return err
 		}

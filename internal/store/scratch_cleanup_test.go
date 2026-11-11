@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +18,7 @@ func TestScratchReceiptsAreAppendOnly(t *testing.T) {
 		for i, runID := range []string{"run-a", "run-b"} {
 			run := ScratchRun{RunID: runID, Path: "/tmp", StartedAt: start.Add(time.Duration(i) * 48 * time.Hour), RecordedAt: start,
 				ArchiveDirectory: "/srv/archive", ArchiveManifest: "/srv/archive/scratch-" + runID + ".manifest.json",
-				ArchiveManifestSHA256: strings.Repeat("a", 64), ArchivedEntries: []string{"old"}}
+				ArchiveManifestSHA256: strings.Repeat("a", 64), ArchivedCount: 1}
 			if err := tx.RecordScratchRun(ctx, run); err != nil {
 				return err
 			}
@@ -66,21 +65,31 @@ func TestScratchReceiptsAreAppendOnly(t *testing.T) {
 	}
 }
 
-// The run receipt is recorded after archiving, at a later time whose encoding
-// can be up to ten bytes longer than a whole-second start. The size estimate
-// used for selection must never be smaller than the receipt actually stored.
-func TestScratchRunReceiptBytesCoversALaterRecordedAt(t *testing.T) {
-	start := time.Date(2026, 11, 1, 16, 0, 0, 0, time.UTC)
-	r := ScratchRun{RunID: "20261101T160000Z", Path: "/tmp", StartedAt: start, RecordedAt: start,
-		ArchiveDirectory: "/a", ArchiveManifest: "/a/m.json", ArchiveManifestSHA256: strings.Repeat("0", 64)}
-	estimate := ScratchRunReceiptBytes(r)
-	r.RecordedAt = start.Add(987654321 * time.Nanosecond)
-	r.ArchivedEntries = []string{}
-	data, err := json.Marshal(r)
-	if err != nil {
+// A receipt of an earlier version lists its archived entries by name instead
+// of counting them. It still reads back as a valid run of that many entries,
+// so its archive stays restorable.
+func TestScratchRunReceiptOfAnEarlierVersionStillReads(t *testing.T) {
+	ctx := context.Background()
+	db := openFixture(t)
+	legacy := `{"run_id":"20261101T160000.000000000Z","path":"/tmp","started_at":"2026-11-01T16:00:00Z",` +
+		`"archive_directory":"/srv/archive","archive_manifest":"/srv/archive/scratch-20261101T160000.000000000Z.manifest.json",` +
+		`"archive_manifest_sha256":"` + strings.Repeat("b", 64) + `","archived_entries":["one","two"],"recorded_at":"2026-11-01T16:05:00Z"}`
+	var (
+		run   ScratchRun
+		found bool
+	)
+	if err := db.Write(ctx, func(tx *Tx) error {
+		if _, err := tx.tx.ExecContext(ctx, `INSERT INTO scratch_runs (run_id, path, started_at, document) VALUES (?, ?, ?, ?)`,
+			"20261101T160000.000000000Z", "/tmp", "2026-11-01T16:00:00Z", legacy); err != nil {
+			return err
+		}
+		var err error
+		run, found, err = tx.ScratchRunByID(ctx, "20261101T160000.000000000Z")
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(data) > estimate {
-		t.Fatalf("estimate %d bytes is below the recorded receipt %d bytes", estimate, len(data))
+	if !found || run.ArchivedCount != 2 || run.ArchiveManifestSHA256 != strings.Repeat("b", 64) {
+		t.Fatalf("legacy receipt = %+v found=%v, want 2 archived entries", run, found)
 	}
 }
