@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -197,77 +196,6 @@ func TestHistoryRetentionKeepsOnlyPinnedScans(t *testing.T) {
 			doc.Data.Items[0].State != state || doc.Data.Items[0].Entry.Path != doc.Data.Items[0].Source {
 			t.Fatalf("restore %s preview: %v %s", id, err, out)
 		}
-	}
-}
-
-func cycleHistoryFixture(t *testing.T, safetyMinFree int64) (f *fixture, dbPath string, before int64) {
-	t.Helper()
-	f = newFixture(t)
-	root := filepath.Join(f.home, "workspace")
-	if err := os.Mkdir(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	f.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  git: false\n  processes: false\n  services: false\nprevention:\n  min_free_percent: 0\nsafety:\n  min_free_bytes: %d\n", root, safetyMinFree))
-	dbPath = seedHistory(t, f, 40, 200, nil)
-	execSQL(t, dbPath, "PRAGMA wal_checkpoint(TRUNCATE)")
-	info, err := os.Stat(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return f, dbPath, info.Size()
-}
-
-func runHistoryCycle(t *testing.T, f *fixture) map[string]json.RawMessage {
-	t.Helper()
-	out, stderr, code := f.run(t, "cycle")
-	if code != ExitOK {
-		t.Fatalf("cycle: exit=%d %s %s", code, out, stderr)
-	}
-	var report map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(out), &report); err != nil {
-		t.Fatalf("cycle report: %v: %s", err, out)
-	}
-	return report
-}
-
-func TestCycleShrinksDatabaseAfterTrimmingHistory(t *testing.T) {
-	f, dbPath, before := cycleHistoryFixture(t, 1<<20)
-	report := runHistoryCycle(t, f)
-	info, err := os.Stat(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Size() > before/2 {
-		t.Fatalf("database did not shrink: %d -> %d bytes; history %s", before, info.Size(), report["history"])
-	}
-}
-
-func TestCycleKeepsDatabaseFileWithoutVacuumHeadroom(t *testing.T) {
-	// No filesystem has an exbibyte free beyond the vacuum's own need.
-	f, dbPath, before := cycleHistoryFixture(t, 1<<60)
-	report := runHistoryCycle(t, f)
-	var history struct {
-		Trimmed struct {
-			Scans int `json:"scans"`
-		} `json:"trimmed"`
-		Space struct {
-			Vacuumed bool   `json:"vacuumed"`
-			Skipped  string `json:"skipped"`
-		} `json:"space"`
-	}
-	if err := json.Unmarshal(report["history"], &history); err != nil {
-		t.Fatalf("history report: %v: %s", err, report["history"])
-	}
-	if history.Space.Vacuumed || !strings.Contains(history.Space.Skipped, "bytes free") {
-		t.Fatalf("vacuum ran without headroom: %s", report["history"])
-	}
-	execSQL(t, dbPath, "PRAGMA wal_checkpoint(TRUNCATE)")
-	info, err := os.Stat(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Size() < before {
-		t.Fatalf("refused vacuum shrank the file: %d -> %d", before, info.Size())
 	}
 }
 

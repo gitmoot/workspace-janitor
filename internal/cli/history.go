@@ -100,6 +100,13 @@ type historyMaintenance struct {
 // wait for it rather than time out on the write lock; other writers wait up
 // to the store's write-lock bound. safety.min_free_bytes is the headroom the
 // vacuum must leave on the database's filesystem.
+//
+// The vacuum also holds the apply lock. A confirmed quarantine, restore or
+// archive moves files before it journals the move; if a long vacuum held the
+// write lock past that journal write's wait, the file would be moved under a
+// receipt left prepared. A mutation already holding the lock skips the
+// vacuum until the next cycle instead. The cycle calls this after every
+// apply it runs has returned, so it never holds the apply lock itself here.
 func maintainHistory(ctx context.Context, db *store.Store, paths config.Paths, policy config.Policy) (*historyMaintenance, error) {
 	unlock, err := lockScan(ctx, paths.StateDir)
 	if err != nil {
@@ -116,6 +123,15 @@ func maintainHistory(ctx context.Context, db *store.Store, paths config.Paths, p
 		out.Space = &store.SpaceReclaim{Skipped: "free space unmeasured: " + err.Error()}
 		return out, nil
 	}
+	unlockApply, held, err := tryLockApply(paths.StateDir)
+	if err != nil {
+		return out, err
+	}
+	if !held {
+		out.Space = &store.SpaceReclaim{Skipped: "apply lock held by a confirmed filesystem mutation; retried next cycle"}
+		return out, nil
+	}
+	defer unlockApply()
 	space, err := db.ReclaimSpace(ctx, volume.FreeBytes, uint64(policy.Safety.MinFreeBytes))
 	out.Space = &space
 	return out, err

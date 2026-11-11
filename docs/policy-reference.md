@@ -336,13 +336,14 @@ rest in transactions of 16 scans. The cycle then reclaims the freed file
 space: when free pages are at least 25% of `janitor.db`, and the database's
 filesystem has free at least the larger of the file size and twice its live
 pages, plus `safety.min_free_bytes`, it runs `VACUUM` and truncates the WAL.
-Otherwise, or when another writer holds the database past SQLite's busy
-timeout, the cycle report's `history.space.skipped` says why, and freed pages
-are reused by later scans. SQLite builds the vacuum's temporary copy in
-`SQLITE_TMPDIR`, `TMPDIR` or `/var/tmp`; the guard measures the database's
-filesystem, so keep that directory on it. The vacuum holds the scan lock and
-SQLite's write lock while it rewrites the file; only the cycle runs it, never
-the watcher.
+Otherwise, when a confirmed apply, restore or archive holds the apply lock, or
+when another writer holds the database past SQLite's busy timeout, the cycle
+report's `history.space.skipped` says why, and freed pages are reused by later
+scans. SQLite builds the vacuum's temporary copy in `SQLITE_TMPDIR`, `TMPDIR`
+or `/var/tmp`; the guard measures the database's filesystem, so keep that
+directory on it. The vacuum holds the scan lock, the apply lock and SQLite's
+write lock while it rewrites the file, so no confirmed filesystem mutation
+waits on it; only the cycle runs it, never the watcher.
 
 ## Admission consumer hook
 

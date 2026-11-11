@@ -58,11 +58,6 @@ type ScanHistoryReduction struct {
 // discarded; its row remains only for the audit record naming it.
 var ErrInventoryReleased = errors.New("store: scan inventory was released by history retention")
 
-// activeCleanupStates are the receipt states whose items still sit in, or
-// are moving to, quarantine. Restored, deleted and superseded receipts are
-// terminal and carry their own entry and action snapshots.
-const activeCleanupStates = `'prepared', 'quarantined', 'investigate'`
-
 type historyScan struct {
 	id       string
 	status   string

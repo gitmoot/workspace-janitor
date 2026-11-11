@@ -11,6 +11,12 @@ func lockApply(string) (func(), error) {
 	return nil, errors.New("confirmed apply requires Linux process locking")
 }
 
+// Restore runs unlocked here, so nothing can be serialized with it.
+func tryLockApply(stateDir string) (func(), bool, error) {
+	_, err := lockApply(stateDir)
+	return nil, false, err
+}
+
 // Confirmed restore worked before Linux-only process locking was introduced.
 // Preserve that path; confirmed apply still fails closed on this platform.
 func lockRestore(string) (func(), error) { return func() {}, nil }

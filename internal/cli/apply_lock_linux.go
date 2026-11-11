@@ -28,6 +28,19 @@ func lockApply(stateDir string) (func(), error) {
 	return func() { _ = syscall.Flock(fd, syscall.LOCK_UN); _ = file.Close() }, nil
 }
 
+// tryLockApply takes the apply lock without waiting. held is false, with no
+// error, when another confirmed mutation holds it.
+func tryLockApply(stateDir string) (unlock func(), held bool, err error) {
+	unlock, err = lockApply(stateDir)
+	if errors.Is(err, syscall.EWOULDBLOCK) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return unlock, true, nil
+}
+
 // lockScan serializes the cycle's scan, plan and quarantine with the
 // watcher's scans. Apply accepts only a plan bound to the latest completed
 // scan, so a watcher scan recorded between the cycle's plan and its apply
