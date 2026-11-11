@@ -117,11 +117,18 @@ func (t *Tx) CleanupItems(ctx context.Context, cleanupID string) ([]core.Cleanup
 	return t.listCleanup(ctx, query, args...)
 }
 
+// activeCleanupStates is the SQL list of receipt states whose items still sit
+// in, or are moving to, quarantine. Pending cleanup selection and history
+// retention share it. Restored, deleted and superseded receipts are terminal
+// and carry their own entry and action snapshots.
+const activeCleanupStates = `'` + string(core.CleanupPrepared) + `', '` + string(core.CleanupQuarantined) +
+	`', '` + string(core.CleanupInvestigate) + `'`
+
 // PendingCleanupItems returns records needing recovery or retention review.
 func (t *Tx) PendingCleanupItems(ctx context.Context) ([]core.CleanupItem, error) {
 	return t.listCleanup(ctx,
 		`SELECT `+cleanupColumns+` FROM cleanup_items
-		 WHERE state IN ('prepared', 'quarantined', 'investigate')
+		 WHERE state IN (`+activeCleanupStates+`)
 		 ORDER BY updated_at, cleanup_id, action_id`)
 }
 

@@ -167,7 +167,9 @@ func (t *Tx) Entry(ctx context.Context, scanID, path string) (core.Entry, error)
 	return decodeEntry(doc)
 }
 
-// Entries lists every inventory entry of a scan, ordered by path.
+// Entries lists every inventory entry of a scan, ordered by path. A scan whose
+// inventory history retention released reports ErrInventoryReleased rather
+// than an empty inventory.
 func (t *Tx) Entries(ctx context.Context, scanID string) ([]core.Entry, error) {
 	rows, err := t.tx.QueryContext(ctx,
 		`SELECT document FROM inventories WHERE scan_id = ? ORDER BY path`, scanID)
@@ -189,6 +191,20 @@ func (t *Tx) Entries(ctx context.Context, scanID string) ([]core.Entry, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: list entries: %w", err)
+	}
+	if len(out) != 0 {
+		return out, nil
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("store: list entries: %w", err)
+	}
+	var recorded int64
+	err = t.tx.QueryRowContext(ctx, `SELECT entry_count FROM scans WHERE id = ?`, scanID).Scan(&recorded)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("store: list entries: %w", err)
+	}
+	if recorded != 0 {
+		return nil, fmt.Errorf("%w: scan %s", ErrInventoryReleased, scanID)
 	}
 	return out, nil
 }
