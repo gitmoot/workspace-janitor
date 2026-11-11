@@ -928,7 +928,7 @@ entries Janitor removes. Entries that match no list are archived first.
 | Field | Contract |
 | --- | --- |
 | `path` | Absolute directory other than `/`. It must not overlap another `scratch_cleanup` path, an inventory root (plan/quarantine already cleans it), the quarantine directory, Gitmoot's state, a workspace archive, a category archive directory or a cache rule. It must not lie inside `protect.paths` or a `workspace_archive_keep` path. |
-| `idle` | Default `72h`, at least `24h`. Measured from the newest mtime or ctime of anything in the entry. |
+| `idle` | Default `72h`, at least `24h`. Measured from the newest mtime of anything in the entry; `regenerable_idle` is measured the same way. ctime is not used, because `systemd-tmpfiles-clean` restores the times of everything it scans each day, which moves every ctime to that moment. ctime still anchors removal (see step 5 below). An mtime in the future counts as a change now. |
 | `every` | Default `48h`, at least `24h`. `janitor cycle` runs the directory once this long has passed since its last recorded run. |
 | `skip` | `filepath.Match` globs on the entry name. A match is never touched. |
 | `regenerable` | Globs on the entry name. An idle, unused match is deleted without an archive. |
@@ -952,7 +952,8 @@ archived nor deleted, while any of these hold:
   regenerable entries too.
 - it is, or contains, a socket, fifo or device, a mount crossing, extended
   attributes, or Git history outside it
-- anything in it changed within `idle`, or it cannot be read
+- anything in it was modified (mtime) within `idle`, or has an mtime in the
+  future, or its mtime or anything else about it cannot be read
 
 `janitor scratch` previews by default. `--dry-run=false --confirm` acts under
 the apply lock:
@@ -973,10 +974,12 @@ the apply lock:
    `workspace_archive_keep`), skips it, no longer classifies an unarchived
    entry as regenerable, or finds a sensitive name in it.
 5. Each entry is checked again just before deletion: still unused, every
-   member unchanged since it was observed, still idle. It is then removed
-   without following symlinks or crossing filesystems, and only while it
-   still has the observed device, inode and ctime. An immutable receipt
-   records the entry, its run, its archive (if any) and its size.
+   member unchanged since it was observed (ctime included), still idle. It
+   is then removed without following symlinks or crossing filesystems, and
+   only while it still has the observed device, inode and ctime. An entry
+   whose ctime moved during the run, even by `systemd-tmpfiles-clean`, is
+   kept until a later run. An immutable receipt records the entry, its run,
+   its archive (if any) and its size.
 
 The receipts are in the `scratch_runs` and `scratch_deletions` tables
 (schema 13). Reported sizes are local bytes. Free space on the archive mount is

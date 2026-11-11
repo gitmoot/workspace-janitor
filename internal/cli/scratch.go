@@ -36,8 +36,16 @@ const (
 var createScratchArchive = (*workspacearchive.ScratchDir).CreateScratch
 
 // scratchNow is the clock idle ages and due times are measured with. Tests
-// move it forward: a ctime can never be moved into the past.
+// move it forward rather than set every member's mtime back.
 var scratchNow = func() time.Time { return time.Now().UTC() }
+
+// scratchIdle is how long an entry has gone unmodified: since the newest
+// mtime of any member. ctime is not used, because systemd-tmpfiles-clean
+// bumps it daily on everything it scans; it only anchors the unchanged
+// check and removal. An mtime in the future counts as modified now.
+func scratchIdle(now time.Time, newestMtimeNS int64) time.Duration {
+	return max(0, now.Sub(time.Unix(0, newestMtimeNS)))
+}
 
 // scratchRunID names the acting run started at now; it always has the same
 // length, which the run receipt estimate relies on.
@@ -188,10 +196,10 @@ func (r *scratchRunReport) count() {
 
 // scratchCleanup runs one scratch directory: it observes every depth-1
 // entry, keeps whatever policy, a process, a sensitive name, an unsupported
-// member or a recent change protects, and (unless dryRun) archives the rest
-// that is not regenerable into one verified archive. Only after that archive
-// is published and read back does it delete anything, each entry after a
-// fresh in-use and unchanged check, recording a receipt per entry.
+// member or a recent change protects, and (unless dryRun) archives the
+// rest that is not regenerable into one verified archive. Only after that
+// archive is published and read back does it delete anything, each entry
+// after a fresh in-use and unchanged check, recording a receipt per entry.
 //
 // A regenerableOnly run selects only regenerable entries, archives nothing
 // and is recorded as its own kind, so it never resets the full sweep's
@@ -243,11 +251,11 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	// Pass 1 keeps only a fixed-size record per candidate. Every entry is
 	// counted, and listed only up to a bound.
 	type pending struct {
-		name        string
-		newestNS    int64
-		size        int64
-		identity    core.FilesystemID
-		regenerable bool
+		name          string
+		newestMtimeNS int64
+		size          int64
+		identity      core.FilesystemID
+		regenerable   bool
 	}
 	var found []pending
 	for _, name := range names {
@@ -259,15 +267,15 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 		}
 		entry, reason := scratchCheck(ctx, dir, policy, scratch, used, name, now)
 		item.SizeBytes = entry.SizeBytes
-		if entry.NewestNS != 0 {
-			item.IdleFor = now.Sub(time.Unix(0, entry.NewestNS)).Truncate(time.Second).String()
+		if entry.Members != 0 {
+			item.IdleFor = scratchIdle(now, entry.NewestMtimeNS).Truncate(time.Second).String()
 		}
 		if reason != "" {
 			item.Reason = reason
 			report.list(item)
 			continue
 		}
-		found = append(found, pending{name: name, newestNS: entry.NewestNS, size: entry.SizeBytes, identity: entry.Identity,
+		found = append(found, pending{name: name, newestMtimeNS: entry.NewestMtimeNS, size: entry.SizeBytes, identity: entry.Identity,
 			regenerable: config.MatchesAny(name, scratch.Regenerable)})
 	}
 
@@ -275,7 +283,7 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	// Oldest first: the bound keeps the longest-idle entries. Pass 2 observes
 	// only the selected entries again; their member lists are the run's
 	// archive, bounded by max_bytes_per_run.
-	sort.SliceStable(found, func(i, j int) bool { return found[i].newestNS < found[j].newestNS })
+	sort.SliceStable(found, func(i, j int) bool { return found[i].newestMtimeNS < found[j].newestMtimeNS })
 	var selected, archive []scratchCandidate
 	var total int64
 	// The run receipt names every archived entry and has a fixed size bound;
@@ -286,7 +294,7 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 		ArchiveManifestSHA256: strings.Repeat("0", 64)})
 	for _, next := range found {
 		item := scratchItem{Entry: next.name, Path: filepath.Join(scratch.Path, next.name), SizeBytes: next.size,
-			IdleFor: now.Sub(time.Unix(0, next.newestNS)).Truncate(time.Second).String()}
+			IdleFor: scratchIdle(now, next.newestMtimeNS).Truncate(time.Second).String()}
 		if regenerableOnly && !next.regenerable {
 			item.Status, item.Reason = scratchKept, "not regenerable; left for the full sweep"
 			report.list(item)
@@ -416,7 +424,7 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 		}
 		// Judge idleness by the freshly loaded policy: withdrawing or raising
 		// regenerable_idle (or idle) mid-run still stops the deletion.
-		if idle := scratchNow().Sub(time.Unix(0, candidate.entry.NewestNS)); idle < current.IdleFor(config.MatchesAny(candidate.entry.Name, current.Regenerable)) {
+		if idle := scratchIdle(scratchNow(), candidate.entry.NewestMtimeNS); idle < current.IdleFor(config.MatchesAny(candidate.entry.Name, current.Regenerable)) {
 			report.set(candidate, scratchKept, "no longer idle at deletion time")
 			continue
 		}
@@ -473,7 +481,7 @@ func scratchDeletionRefusal(policy config.Policy, scratch config.ScratchCleanup,
 
 // scratchCheck observes one entry and returns why it must stay, if it must:
 // policy, a process, an unobservable or unsupported member, a sensitive name
-// or a recent change. It never touches the entry.
+// or a recent (or future) mtime. It never touches the entry.
 func scratchCheck(ctx context.Context, dir *workspacearchive.ScratchDir, policy config.Policy, scratch config.ScratchCleanup, used map[string]string, name string, now time.Time) (workspacearchive.ScratchEntry, string) {
 	if reason := policy.ScratchRefusal(filepath.Join(scratch.Path, name)); reason != "" {
 		return workspacearchive.ScratchEntry{Name: name}, reason
@@ -485,12 +493,14 @@ func scratchCheck(ctx context.Context, dir *workspacearchive.ScratchDir, policy 
 	if err != nil {
 		return entry, "could not be observed: " + err.Error()
 	}
-	idle := now.Sub(time.Unix(0, entry.NewestNS))
+	newest, idle := time.Unix(0, entry.NewestMtimeNS), scratchIdle(now, entry.NewestMtimeNS)
 	switch {
 	case entry.Refusal != "":
 		return entry, entry.Refusal
 	case entry.Sensitive != "":
 		return entry, fmt.Sprintf("sensitive name %s keeps the entry local", entry.Sensitive)
+	case newest.After(now):
+		return entry, fmt.Sprintf("a member's mtime %s is in the future; counted as changed now", newest.UTC().Format(time.RFC3339))
 	case idle < scratch.IdleFor(config.MatchesAny(name, scratch.Regenerable)):
 		return entry, fmt.Sprintf("changed %s ago; scratch entries must be unchanged for %s", idle.Truncate(time.Second), scratch.IdleFor(config.MatchesAny(name, scratch.Regenerable)))
 	}

@@ -263,7 +263,7 @@ workspace_archive_categories: []
 #     "*htpasswd*", "*.jks", "auth.json", "config.json.bak*"]
 # See policy-reference.md#scratch-cleanup and recovery.md#scratch-cleanup.
 # - path: /tmp                    # never inside an inventory root
-#   idle: 72h                     # newest mtime/ctime anywhere; minimum 24h
+#   idle: 72h                     # newest mtime anywhere (not ctime); minimum 24h
 #   every: 48h                    # janitor cycle runs it when due; minimum 24h
 #   skip: ["systemd-private-*", ".X*", ".ICE*", ".font*", ".Test*",
 #     "snap-private*", "tmux-*", "ssh-*", ".s.PGSQL*", "herdr*", "gitmoot*",

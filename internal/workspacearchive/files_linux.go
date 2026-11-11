@@ -104,6 +104,12 @@ func statxAt(dirfd int, name string, flags int) (state, error) {
 	if sx.Mask&unix.STATX_MNT_ID == 0 {
 		return state{}, errors.New("mount identity unavailable; retain the original")
 	}
+	// A filesystem that cannot report a time fills in a dummy value: an
+	// mtime of 0 would look idle for decades, and a dummy ctime voids every
+	// unchanged check.
+	if sx.Mask&(unix.STATX_MTIME|unix.STATX_CTIME) != unix.STATX_MTIME|unix.STATX_CTIME {
+		return state{}, errors.New("modification or change time unavailable; retain the original")
+	}
 	return state{
 		id:      core.FilesystemID{Device: unix.Mkdev(sx.Dev_major, sx.Dev_minor), Inode: sx.Ino},
 		mountID: sx.Mnt_id,

@@ -26,11 +26,11 @@ import (
 type scratchFixture struct {
 	*fixture
 	work, scratch, archive, proc string
-	// extra is appended at the top level, limits under limits: and
-	// options under the scratch_cleanup entry. protect, patterns and
-	// regenerable extend protect.paths, protect.name_patterns and the
-	// regenerable list.
-	extra, limits, options         string
+	// idle replaces the default 24h idle. extra is appended at the top
+	// level, limits under limits: and options under the scratch_cleanup
+	// entry. protect, patterns and regenerable extend protect.paths,
+	// protect.name_patterns and the regenerable list.
+	idle, extra, limits, options   string
 	protect, patterns, regenerable []string
 }
 
@@ -50,8 +50,8 @@ func newScratchFixture(t *testing.T) *scratchFixture {
 		}
 	}
 	x.write(t)
-	// Every fixture entry is created now and its ctime cannot be moved
-	// back, so idle ages are measured on a clock two days ahead.
+	// Every fixture entry is created now, so idle ages are measured on a
+	// clock two days ahead.
 	x.shift(t, 48*time.Hour)
 	return x
 }
@@ -65,6 +65,10 @@ func (x *scratchFixture) shift(t *testing.T, by time.Duration) {
 
 func (x *scratchFixture) write(t *testing.T) {
 	t.Helper()
+	idle := x.idle
+	if idle == "" {
+		idle = "24h"
+	}
 	x.writePolicy(t, fmt.Sprintf(`roots:
   - path: %s
     max_depth: 1
@@ -83,14 +87,14 @@ limits:
   command_timeout: 30s
 %sscratch_cleanup:
   - path: %s
-    idle: 24h
+    idle: %s
     every: 48h
     skip: ["keep-me-*", "tmux-*"]
     regenerable: [%s]
     archive:
       directory: %s
 %s%s`, x.work, strings.Join(append([]string{x.archive}, x.protect...), ", "), quoted(append([]string{"*token*", "notes.private", "[^a-z]*.DAT"}, x.patterns...)),
-		x.proc, x.limits, x.scratch, quoted(x.regenerable), x.archive, x.options, x.extra))
+		x.proc, x.limits, x.scratch, idle, quoted(x.regenerable), x.archive, x.options, x.extra))
 }
 
 func quoted(values []string) string {
@@ -332,6 +336,87 @@ func TestScratchKeepsInUseAndRecentlyChangedEntries(t *testing.T) {
 	report = x.mustCleanup(t, true)
 	if item := scratchStatus(t, report, "recent"); item.Status != scratchKept || !strings.Contains(item.Reason, "changed") || !exists(t, recent) {
 		t.Fatalf("recently changed entry = %+v", item)
+	}
+}
+
+// gitmoot/workspace-janitor#197: systemd-tmpfiles-clean restores the times
+// of what it scans every day, which bumps their ctime, so an idle measured
+// from ctime is never reached under /tmp. Idle is measured from the newest
+// mtime in the entry; a member modified within idle, or in the future,
+// still keeps the whole entry.
+func TestScratchIdleIsMeasuredFromMtimeNotCtime(t *testing.T) {
+	x := newScratchFixture(t)
+	x.idle = "72h"
+	x.write(t)
+	// Chtimes cannot set a ctime: like systemd-tmpfiles-clean restoring the
+	// times of what it scanned, backdate moves every ctime to now. On a
+	// clock one hour ahead, those ctimes are 1h old and every age below is
+	// one hour older than written.
+	x.shift(t, time.Hour)
+	stale := x.entry(t, "stale", map[string]string{"a": "a\n", "sub/b": "b\n"})
+	backdate(t, stale, 95*time.Hour)
+	recentMember := x.entry(t, "recent-member", map[string]string{"a": "a\n", "sub/b": "b\n"})
+	backdate(t, recentMember, 95*time.Hour)
+	if err := os.Chtimes(filepath.Join(recentMember, "sub", "b"), time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	future := x.entry(t, "future", map[string]string{"a": "a\n"})
+	backdate(t, future, 95*time.Hour)
+	if err := os.Chtimes(filepath.Join(future, "a"), time.Now(), time.Now().Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	preview := x.mustCleanup(t, false)
+	item := scratchStatus(t, preview, "stale")
+	if item.Status != scratchWouldArchive {
+		t.Fatalf("entry with mtime 4 days old and ctime 1h old under idle 72h = %+v", item)
+	}
+	if idle, err := time.ParseDuration(item.IdleFor); err != nil || idle < 95*time.Hour {
+		t.Fatalf("stale idle_for = %q, want about 96h from its mtime", item.IdleFor)
+	}
+	if item := scratchStatus(t, preview, "recent-member"); item.Status != scratchKept || !strings.Contains(item.Reason, "changed") {
+		t.Fatalf("entry with a member modified 1h ago = %+v", item)
+	}
+	if item := scratchStatus(t, preview, "future"); item.Status != scratchKept || !strings.Contains(item.Reason, "future") {
+		t.Fatalf("entry with a future mtime = %+v", item)
+	}
+
+	report := x.mustCleanup(t, true)
+	if item := scratchStatus(t, report, "stale"); item.Status != scratchArchived || exists(t, stale) {
+		t.Fatalf("stale entry after the run = %+v", item)
+	}
+	if !exists(t, recentMember) || !exists(t, future) {
+		t.Fatal("an entry modified within idle, or in the future, was removed")
+	}
+}
+
+// The same holds for regenerable_idle: a regenerable entry whose mtime is
+// past it is deleted although its ctime was bumped within it.
+func TestScratchRegenerableIdleIsMeasuredFromMtimeNotCtime(t *testing.T) {
+	x := newScratchFixture(t)
+	x.idle = "72h"
+	x.options = "    regenerable_idle: 2h\n"
+	x.write(t)
+	// On a clock one hour ahead, every ctime is 1h old, and so is young's
+	// mtime; go-build-old's mtime is 3h old.
+	x.shift(t, time.Hour)
+	regen := x.entry(t, "go-build-old", map[string]string{"b/c.a": "object\n"})
+	backdate(t, regen, 2*time.Hour)
+	young := x.entry(t, "go-build-young", map[string]string{"b/c.a": "object\n"})
+
+	preview := x.mustCleanup(t, false)
+	if item := scratchStatus(t, preview, "go-build-old"); item.Status != scratchWouldDelete {
+		t.Fatalf("regenerable entry with mtime 3h old and ctime 1h old under regenerable_idle 2h = %+v", item)
+	}
+	if item := scratchStatus(t, preview, "go-build-young"); item.Status != scratchKept || !strings.Contains(item.Reason, "changed") {
+		t.Fatalf("regenerable entry modified 1h ago = %+v", item)
+	}
+	report := x.mustCleanup(t, true)
+	if item := scratchStatus(t, report, "go-build-old"); item.Status != scratchDeleted || exists(t, regen) {
+		t.Fatalf("regenerable entry after the run = %+v", item)
+	}
+	if !exists(t, young) {
+		t.Fatal("a regenerable entry modified within regenerable_idle was removed")
 	}
 }
 

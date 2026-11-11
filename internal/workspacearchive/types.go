@@ -186,8 +186,11 @@ type ScratchEntry struct {
 	Members int   `json:"members"`
 	// SizeBytes sums the sizes of the regular files in the entry.
 	SizeBytes int64 `json:"size_bytes"`
-	// NewestNS is the newest mtime or ctime of any member.
-	NewestNS int64 `json:"newest_ns"`
+	// NewestMtimeNS is the newest mtime of any member; idle is measured from
+	// it. ctime is not: systemd-tmpfiles-clean restores the times of what it
+	// scans, which bumps their ctime daily. ctime still anchors the
+	// unchanged check and removal.
+	NewestMtimeNS int64 `json:"newest_mtime_ns"`
 	// Sensitive names the first member whose name matches the built-in
 	// secret screen or protect.name_patterns: the entry stays local.
 	Sensitive string `json:"sensitive,omitempty"`
