@@ -179,8 +179,8 @@ janitor scan                   # inventory the configured roots
 janitor scan /repos --deep-size    # one root, with bounded recursive sizes
 janitor scan --no-git --no-processes --no-services   # filesystem metadata only
 janitor --format json scan     # machine-readable inventory and collector reports
-janitor history              # read-only count of old, unreferenced scan snapshots
-janitor history --confirm    # discard only those snapshots; does not shrink SQLite file
+janitor history              # read-only count of scan history beyond prevention.history
+janitor history --confirm    # discard it; the next cycle reclaims the file space
 ```
 
 Weekly stale-workspace report (opt-in through `report.enabled`): a host timer
@@ -349,24 +349,30 @@ Startup, inotify overflow, and two-second settling still reconcile. The
 hourly bound applies to protected-directory churn alone: overflow or real
 changes can require more scans. Protected metadata may be up to one hour
 stale between scans; safety protections remain in force, and the daily cycle
-does its own full scan. Completed scans keep a bounded recent history (256)
-plus scans pinned by audit records or the two latest completed deep-size scans. The
-`janitor history` command previews eligible scan and inventory row counts;
-trimming runs in a transaction and never deletes a referenced plan/action,
-cycle, advisory attempt, model usage or cleanup receipt. Row deletion leaves
-SQLite pages allocated; freeing filesystem bytes requires a separately
-coordinated offline compaction after a durable read-back-verified backup and
-with every writer stopped. Neither history trimming nor compaction changes
-filesystem cleanup policy. Overflow and real changes can still make the
-watcher expensive; monitor its scan rate and disk use.
+does its own full scan. Scan history is bounded by
+`prevention.history` (default: the 12 newest scans and the newest scan of each
+of the last 14 days), plus the scans still needed: the latest, the two latest
+completed deep-size scans and the growth report's pair, the latest plan's, and
+those whose plans active cleanup receipts came from. Terminal receipts keep
+their own entry and action snapshots and pin nothing; see
+[scan history retention](docs/policy-reference.md#scan-history-retention).
+Each persisted scan trims at most two old scans; `janitor history --confirm`
+and every `cycle` drain the rest in short transactions and never delete an
+audit record or cleanup receipt. The cycle then runs a guarded `VACUUM` when
+at least a quarter of the file is free pages and the filesystem has room for
+the rewrite plus `safety.min_free_bytes`; its report's `history` field shows
+what it trimmed and why it skipped the vacuum. Neither trimming nor vacuuming
+changes filesystem cleanup policy. Overflow and real changes can still make
+the watcher expensive; monitor its scan rate and disk use.
 
-On first upgrade, a large backlog trim can hold SQLite's write lock longer
-than its five-second busy timeout. Stop watch and cycle writers, take and
-read back a durable backup, then run `janitor history --confirm` before
-restarting them; otherwise a competing scan can fail. Invalid collector
-documents remain pinned for investigation rather than blocking every new
-scan or being silently discarded. A newly persisted scan is also pinned
-during its own trim if host time moves backwards.
+On first upgrade, the first cycle trims the whole backlog and rewrites the
+database file; on a multi-gigabyte database the rewrite holds the write lock
+for minutes, and other writers wait up to two minutes for it. Running
+`janitor history --confirm` beforehand drains the backlog in short
+transactions. Invalid collector documents remain pinned for investigation
+rather than blocking every new scan or being silently discarded. A newly
+persisted scan is also pinned during its own trim if host time moves
+backwards.
 
 `janitor cycle` is a one-shot timer target: each invocation records a metadata
 scan, or a deep scan if `prevention.deep_interval` has elapsed since the last

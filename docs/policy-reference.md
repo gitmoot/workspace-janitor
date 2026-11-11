@@ -273,9 +273,10 @@ baseline needs the same roots, traversal settings, limits and sizing version,
 non-overlapping observation windows, known matching identity/kind, and complete
 size evidence. `configured_scope_mismatch` includes both changed configuration
 and scans made with different CLI roots or bounds. Missing/incomplete evidence
-is unknown, not zero growth. The two most recently completed deep scans remain
-pinned during history reduction; a matching older baseline is not guaranteed.
-Directory rows may overlap, so do not sum them.
+is unknown, not zero growth. The two most recently completed deep scans and
+the pair the report currently compares remain pinned during history
+retention; a matching older baseline is not guaranteed. Directory rows may
+overlap, so do not sum them.
 
 Inventory measurements describe the scan, before any subsequent cycle actions.
 Operation records describe later effects; they do not rewrite an old inventory
@@ -297,6 +298,51 @@ up to eight skipped-path/owner/reason rows and count omissions. This reporting
 bound does not delete authoritative audit records or shrink the SQLite file.
 Schema 10 adds reporting metadata; old observations without a recorded scope
 cannot establish growth.
+
+### Scan history retention
+
+Every persisted scan stores its whole inventory (about 3,300 rows and 6 MB
+with indexes on a typical host), and the watcher persists one every few
+minutes, so history must be bounded. A scan is kept while any of these holds:
+
+- it is the latest scan, a running scan, or one whose stored timestamps or
+  collector reports cannot be parsed (kept for investigation);
+- it is one of the newest `prevention.history.keep_recent` scans (default
+  `12`, accepted `1`..`1000`);
+- it is the newest completed scan of one of the last
+  `prevention.history.keep_days` UTC days, today included (default `14`,
+  accepted `0`..`366`);
+- it is one of the two most recently completed deep scans, or a scan the
+  growth report compares now;
+- it holds the latest plan, or a plan from which an active (`prepared`,
+  `quarantined` or `investigate`) cleanup receipt came.
+
+Every other scan is deleted with its inventory, plans, actions, approvals and
+measurements. Cleanup receipts are never deleted: each carries its own entry
+and action snapshot, which is what `restore`, expiry and `explain` read, so a
+terminal (`restored`, `deleted`, `superseded_by_original`) receipt does not
+pin its plan's scan. A scan named by a completed-cycle, advisory or model-usage
+record keeps its row for that record, but its inventory and plans are
+released; reading that inventory reports that retention released it.
+
+The defaults keep at most about 30 inventories (12 recent, 14 daily, the deep
+baselines and the few plans active receipts depend on), roughly 200 MB on a
+host whose scans hold 3,300 entries, against the 2.9 GB that a few weeks of
+watcher scans reached under a count-only bound.
+
+Each persisted scan trims at most two eligible scans, oldest first, inside its
+own write transaction. `janitor history --confirm` and every `cycle` drain the
+rest in transactions of 16 scans. The cycle then reclaims the freed file
+space: when free pages are at least 25% of `janitor.db`, and the database's
+filesystem has free at least the larger of the file size and twice its live
+pages, plus `safety.min_free_bytes`, it runs `VACUUM` and truncates the WAL.
+Otherwise, or when another writer holds the database past SQLite's busy
+timeout, the cycle report's `history.space.skipped` says why, and freed pages
+are reused by later scans. SQLite builds the vacuum's temporary copy in
+`SQLITE_TMPDIR`, `TMPDIR` or `/var/tmp`; the guard measures the database's
+filesystem, so keep that directory on it. The vacuum holds the scan lock and
+SQLite's write lock while it rewrites the file; only the cycle runs it, never
+the watcher.
 
 ## Admission consumer hook
 

@@ -38,12 +38,43 @@ const inventoryFinishedKey = `substr(s.finished_at, 1, 19) || '.' || substr(repl
 // to callers. Legacy observations without scope metadata have no growth baseline.
 func (t *Tx) InventoryComparison(ctx context.Context) (InventoryPair, error) {
 	var out InventoryPair
-	var id string
+	ids, err := t.inventoryComparisonIDs(ctx)
+	if err != nil {
+		return out, err
+	}
+	out.Scope, out.Deep = ids.scope, ids.deep
+	out.Current, err = t.Scan(ctx, ids.current)
+	if err != nil {
+		return out, err
+	}
+	out.CurrentEntries, err = t.Entries(ctx, ids.current)
+	if err != nil || ids.previous == "" {
+		return out, err
+	}
+	previous, err := t.Scan(ctx, ids.previous)
+	if err != nil {
+		return out, err
+	}
+	out.Previous = &previous
+	out.PreviousEntries, err = t.Entries(ctx, ids.previous)
+	return out, err
+}
+
+// comparisonIDs names the scans InventoryComparison reads; history retention
+// pins both.
+type comparisonIDs struct {
+	current, previous string
+	scope             string
+	deep              bool
+}
+
+func (t *Tx) inventoryComparisonIDs(ctx context.Context) (comparisonIDs, error) {
+	var out comparisonIDs
 	err := t.tx.QueryRowContext(ctx, `SELECT s.id FROM scans s JOIN inventory_measurements m ON m.scan_id=s.id
-		WHERE s.status='completed' AND m.deep=1 ORDER BY `+inventoryStartedKey+` DESC, s.id DESC LIMIT 1`).Scan(&id)
+		WHERE s.status='completed' AND m.deep=1 ORDER BY `+inventoryStartedKey+` DESC, s.id DESC LIMIT 1`).Scan(&out.current)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = t.tx.QueryRowContext(ctx, `SELECT s.id FROM scans s WHERE s.status='completed'
-			ORDER BY `+inventoryStartedKey+` DESC, s.id DESC LIMIT 1`).Scan(&id)
+			ORDER BY `+inventoryStartedKey+` DESC, s.id DESC LIMIT 1`).Scan(&out.current)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, ErrNotFound
@@ -51,36 +82,25 @@ func (t *Tx) InventoryComparison(ctx context.Context) (InventoryPair, error) {
 	if err != nil {
 		return out, err
 	}
-	out.Current, err = t.Scan(ctx, id)
-	if err != nil {
-		return out, err
-	}
-	out.CurrentEntries, err = t.Entries(ctx, id)
-	if err != nil {
-		return out, err
-	}
-	err = t.tx.QueryRowContext(ctx, `SELECT scope, deep FROM inventory_measurements WHERE scan_id=?`, id).Scan(&out.Scope, &out.Deep)
+	var started string
+	err = t.tx.QueryRowContext(ctx, `SELECT s.started_at, m.scope, m.deep FROM scans s
+		JOIN inventory_measurements m ON m.scan_id=s.id WHERE s.id=?`, out.current).Scan(&started, &out.scope, &out.deep)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, nil
 	}
 	if err != nil {
 		return out, err
 	}
-	cutoff := out.Current.StartedAt.UTC().Format("2006-01-02T15:04:05.000000000")
+	startedAt, err := parseTime(started)
+	if err != nil {
+		return out, err
+	}
+	cutoff := startedAt.Format("2006-01-02T15:04:05.000000000")
 	err = t.tx.QueryRowContext(ctx, `SELECT s.id FROM scans s JOIN inventory_measurements m ON m.scan_id=s.id
 		WHERE s.status='completed' AND m.scope=? AND `+inventoryStartedKey+` < ? AND `+inventoryFinishedKey+` <= ?
-		ORDER BY `+inventoryStartedKey+` DESC, s.id DESC LIMIT 1`, out.Scope, cutoff, cutoff).Scan(&id)
+		ORDER BY `+inventoryStartedKey+` DESC, s.id DESC LIMIT 1`, out.scope, cutoff, cutoff).Scan(&out.previous)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, nil
 	}
-	if err != nil {
-		return out, err
-	}
-	previous, err := t.Scan(ctx, id)
-	if err != nil {
-		return out, err
-	}
-	out.Previous = &previous
-	out.PreviousEntries, err = t.Entries(ctx, id)
 	return out, err
 }

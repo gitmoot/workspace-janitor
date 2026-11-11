@@ -294,6 +294,9 @@ type Prevention struct {
 	// CacheTrimInterval is how often the watcher re-checks the cache trims
 	// between daily cycles. Each check trims only a cache over its bound.
 	CacheTrimInterval Duration `yaml:"cache_trim_interval" json:"cache_trim_interval"`
+	// History bounds the stored scan history beyond the scans that live
+	// records pin.
+	History HistoryPolicy `yaml:"history" json:"history"`
 }
 
 // InArchiveOnlyRoot reports whether path is, or lies inside, any archive_only
@@ -426,6 +429,13 @@ type RecoveryPolicy struct {
 	TimeBudget Duration `yaml:"time_budget" json:"time_budget"`
 }
 
+// HistoryPolicy bounds unpinned scan history: the newest KeepRecent scans and
+// the newest completed scan of each of the last KeepDays UTC days are kept.
+type HistoryPolicy struct {
+	KeepRecent int `yaml:"keep_recent" json:"keep_recent"`
+	KeepDays   int `yaml:"keep_days" json:"keep_days"`
+}
+
 // Policy is the validated policy document.
 type Policy struct {
 	Version         int                  `yaml:"version" json:"version"`
@@ -556,6 +566,7 @@ func DefaultPolicy(p Paths) Policy {
 			CapacityInterval:  Duration(time.Minute),
 			CacheTrimInterval: Duration(15 * time.Minute),
 			Recovery:          RecoveryPolicy{MaxStores: 1, MaxBytes: 1 << 30, Interval: Duration(24 * time.Hour), TimeBudget: Duration(time.Minute)},
+			History:           HistoryPolicy{KeepRecent: 12, KeepDays: 14},
 		},
 		Report:   defaultStaleReport(),
 		Source:   "built-in defaults",
@@ -907,6 +918,12 @@ func (p *Policy) Validate() core.FieldErrors {
 	}
 	if p.Prevention.CacheTrimInterval.Duration() < time.Minute || p.Prevention.CacheTrimInterval.Duration() > 2*time.Hour {
 		errs.Add("prevention.cache_trim_interval", "must be between 1m and 2h")
+	}
+	if p.Prevention.History.KeepRecent < 1 || p.Prevention.History.KeepRecent > 1000 {
+		errs.Add("prevention.history.keep_recent", "must be between 1 and 1000")
+	}
+	if p.Prevention.History.KeepDays < 0 || p.Prevention.History.KeepDays > 366 {
+		errs.Add("prevention.history.keep_days", "must be between 0 and 366")
 	}
 	if p.Prevention.CapacityInterval.Duration() < time.Second || p.Prevention.CapacityInterval.Duration() > time.Hour {
 		errs.Add("prevention.capacity_interval", "must be between 1s and 1h")

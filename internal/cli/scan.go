@@ -227,7 +227,7 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 	}
 
 	if !opts.noPersist {
-		if err := persistScan(ctx, db, scan, result.Entries, scope, deep); err != nil {
+		if err := persistScan(ctx, db, scan, result.Entries, scope, deep, historyRetention(policy)); err != nil {
 			return err
 		}
 		report.Persisted = true
@@ -336,7 +336,13 @@ func priorInventory(ctx context.Context, db *store.Store, opts scanOptions) ([]c
 	return entries, scanID, nil
 }
 
-func persistScan(ctx context.Context, db *store.Store, scan core.Scan, entries []core.Entry, scope string, deep bool) error {
+// persistTrimBatch bounds the history one persisted scan trims inside its own
+// write transaction: one more than the scan it adds, so a backlog shrinks
+// without the watcher holding the write lock much longer than for its own
+// inventory. The cycle drains any remainder in separate transactions.
+const persistTrimBatch = 2
+
+func persistScan(ctx context.Context, db *store.Store, scan core.Scan, entries []core.Entry, scope string, deep bool, retention store.HistoryRetention) error {
 	return db.Write(ctx, func(tx *store.Tx) error {
 		if err := tx.CreateScan(ctx, scan); err != nil {
 			return err
@@ -349,7 +355,8 @@ func persistScan(ctx context.Context, db *store.Store, scan core.Scan, entries [
 				return err
 			}
 		}
-		_, err := tx.TrimScanHistory(ctx, scan.ID)
+		_, err := tx.TrimScanHistory(ctx, store.HistoryTrim{Retention: retention, Now: time.Now().UTC(),
+			PreserveID: scan.ID, MaxScans: persistTrimBatch})
 		return err
 	})
 }

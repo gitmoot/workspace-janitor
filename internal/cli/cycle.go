@@ -33,6 +33,8 @@ type cycleReport struct {
 	ScratchCleanup     []scratchRunReport     `json:"scratch_cleanup,omitempty"`
 	CacheTrims         []cacheTrimReport      `json:"cache_trims,omitempty"`
 	Inventory          *inventoryReport       `json:"inventory_report"`
+	// History is the end-of-cycle scan history trim and guarded VACUUM.
+	History *historyMaintenance `json:"history,omitempty"`
 }
 
 // runCycle is the one-shot daily timer target. A deep scan subsumes that day's
@@ -216,6 +218,13 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 			report.Inventory.Activities, err = tx.CapacityActivities(ctx)
 			return err
 		})
+	}
+	if err == nil {
+		var historyErr error
+		report.History, historyErr = maintainHistory(ctx, db, paths, policy)
+		if historyErr != nil {
+			categoryErr = errors.Join(categoryErr, fmt.Errorf("scheduled history maintenance: %w", historyErr))
+		}
 	}
 	closeErr := db.Close()
 	if err != nil {

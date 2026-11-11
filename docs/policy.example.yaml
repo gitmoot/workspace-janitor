@@ -55,6 +55,12 @@ prevention:
   min_free_bytes: 0
   min_free_percent: 10
   alert_interval: 24h
+  # Scan history kept beyond the scans live records pin: the newest
+  # keep_recent scans and the newest scan of each of the last keep_days days.
+  # Each cycle vacuums the database when enough of it is free and disk allows.
+  history:
+    keep_recent: 12
+    keep_days: 14
   # Read-only capacity sampling; empty targets disables it.
   capacity_interval: 1m
   targets: []
