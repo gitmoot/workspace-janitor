@@ -84,7 +84,13 @@ type Protect struct {
 
 // RetentionPolicy configures quarantine retention.
 type RetentionPolicy struct {
-	Default       core.Retention `yaml:"default" json:"default"`
+	Default core.Retention `yaml:"default" json:"default"`
+	// Archived, when set, replaces Default for quarantined items whose
+	// receipt records a verified archive of their content (a workspace
+	// archive binding, or an omp_session_artifacts batch). Expiry applies
+	// the current value to existing receipts as well. Unset, such receipts
+	// keep the retention they were quarantined with (Default).
+	Archived      core.Retention `yaml:"archived" json:"archived,omitempty"`
 	QuarantineDir string         `yaml:"quarantine_dir" json:"quarantine_dir"`
 	// DeleteEnabled is an explicit policy opt-in. Expiry alone never deletes.
 	DeleteEnabled bool `yaml:"delete_enabled" json:"delete_enabled"`
@@ -835,6 +841,9 @@ func (p *Policy) Validate() core.FieldErrors {
 	}
 	if !p.Retention.Default.Valid() {
 		errs.Add("retention.default", "unknown retention %q (allowed: %s)", string(p.Retention.Default), joinRetentions())
+	}
+	if p.Retention.Archived != "" && !p.Retention.Archived.Valid() {
+		errs.Add("retention.archived", "unknown retention %q (allowed: %s)", string(p.Retention.Archived), joinRetentions())
 	}
 	if p.Retention.QuarantineDir != "" && !core.IsCanonicalPath(p.Retention.QuarantineDir) {
 		errs.Add("retention.quarantine_dir", "must be an absolute path, got %q", p.Retention.QuarantineDir)

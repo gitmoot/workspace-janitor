@@ -45,6 +45,7 @@ func writePolicyText(e *env, report policyCheckReport) error {
 		{Key: "source:", Value: report.Effective.Source},
 		{Key: "version:", Value: strconv.Itoa(report.Effective.Version)},
 		{Key: "retention default:", Value: string(report.Effective.Retention.Default)},
+		{Key: "retention archived:", Value: archivedRetentionSummary(report.Effective.Retention)},
 		{Key: "quarantine dir:", Value: report.Effective.Retention.QuarantineDir},
 		{Key: "jev:", Value: jevSummary(report.Effective)},
 		{Key: "limits:", Value: fmt.Sprintf("git=%s command=%s max-entries=%d", report.Effective.Limits.GitTimeout, report.Effective.Limits.CommandTimeout, report.Effective.Limits.MaxEntries)},
@@ -98,6 +99,15 @@ func writePolicyText(e *env, report policyCheckReport) error {
 	}
 	_, err := fmt.Fprintln(e.stdout, "\npolicy is valid")
 	return err
+}
+
+// archivedRetentionSummary is retention.archived, or what archive-backed
+// receipts follow while it is unset.
+func archivedRetentionSummary(retention config.RetentionPolicy) string {
+	if retention.Archived == "" {
+		return "unset (archive-backed items follow retention.default)"
+	}
+	return string(retention.Archived)
 }
 
 func jevSummary(policy config.Policy) string {

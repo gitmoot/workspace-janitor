@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/action"
 	"github.com/gitmoot/workspace-janitor/internal/collect"
@@ -47,11 +46,29 @@ type cleanupReport struct {
 	EstimateError string                  `json:"estimate_unavailable,omitempty"`
 	Errors        []string                `json:"errors"`
 	Activity      *core.CapacityActivity  `json:"activity,omitempty"`
+	// ArchivedDue lists the expiry items that are due only because of
+	// retention.archived: the retention their receipt recorded still holds
+	// them. Being due is never deletion authority on its own.
+	ArchivedDue []archivedRetentionDue `json:"archived_retention_due,omitempty"`
+}
+
+// archivedRetentionDue is one receipt that retention.archived made due.
+type archivedRetentionDue struct {
+	CleanupID string         `json:"cleanup_id"`
+	ActionID  string         `json:"action_id"`
+	Source    string         `json:"source"`
+	Retention core.Retention `json:"retention"`
+	Recorded  core.Retention `json:"recorded_retention"`
+}
+
+func archivedDue(engine *action.Engine, item core.CleanupItem) archivedRetentionDue {
+	return archivedRetentionDue{CleanupID: item.CleanupID, ActionID: item.ActionID, Source: item.Source,
+		Retention: engine.Retention(item), Recorded: item.Action.Retention}
 }
 
 func cleanupEngine(e *env, db *store.Store, paths config.Paths, policy config.Policy) *action.Engine {
 	return &action.Engine{
-		DB: db, QuarantineDir: policy.Retention.QuarantineDir,
+		DB: db, QuarantineDir: policy.Retention.QuarantineDir, ArchivedRetention: policy.Retention.Archived,
 		Policy: enginePolicy(paths, policy),
 		Collect: collect.Options{
 			Limits: collectLimits(policy, scanOptions{}), Git: true, Processes: true, Services: true,
@@ -385,7 +402,7 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 		}
 		report.Activity = &monitor.activity
 		for _, item := range items {
-			if item.State == core.CleanupQuarantined && item.MovedAt != nil && item.Action.Retention.Expired(*item.MovedAt, time.Now().UTC()) {
+			if item.State == core.CleanupQuarantined && engine.Due(item) {
 				entry := item.Entry
 				entry.Path = item.Destination
 				eligible = append(eligible, entry)
@@ -402,6 +419,9 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 	for _, item := range items {
 		if item.State == core.CleanupInvestigate {
 			if opts.dryRun {
+				if engine.DueByArchivedRetention(item) {
+					report.ArchivedDue = append(report.ArchivedDue, archivedDue(engine, item))
+				}
 				// Mirror the confirmed path: Reconcile's guard, then retention.
 				err = engine.RetryPreview(ctx, item)
 				if err != nil {
@@ -423,9 +443,12 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 			}
 			continue
 		}
-		if item.MovedAt == nil || !item.Action.Retention.Expired(*item.MovedAt, time.Now().UTC()) {
+		if !engine.Due(item) {
 			report.Items = append(report.Items, item)
 			continue
+		}
+		if engine.DueByArchivedRetention(item) {
+			report.ArchivedDue = append(report.ArchivedDue, archivedDue(engine, item))
 		}
 		if opts.dryRun {
 			err = engine.ExpiryPreview(ctx, item)
@@ -498,8 +521,21 @@ func writeCleanup(out io.Writer, format output.Format, report cleanupReport) err
 			return err
 		}
 	}
+	archived := make(map[[2]string]archivedRetentionDue, len(report.ArchivedDue))
+	for _, due := range report.ArchivedDue {
+		archived[[2]string{due.CleanupID, due.ActionID}] = due
+	}
 	for _, item := range report.Items {
-		if _, err := fmt.Fprintf(out, "  %s %s -> %s (%s)\n", item.ActionID, item.Source, item.Destination, item.State); err != nil {
+		note := ""
+		if due, ok := archived[[2]string{item.CleanupID, item.ActionID}]; ok {
+			note = fmt.Sprintf(" due by retention.archived %s (recorded %s)", due.Retention, due.Recorded)
+		}
+		if _, err := fmt.Fprintf(out, "  %s %s -> %s (%s)%s\n", item.ActionID, item.Source, item.Destination, item.State, note); err != nil {
+			return err
+		}
+	}
+	if len(report.ArchivedDue) != 0 {
+		if _, err := fmt.Fprintf(out, "  due by retention.archived: %d archive-backed item(s)\n", len(report.ArchivedDue)); err != nil {
 			return err
 		}
 	}

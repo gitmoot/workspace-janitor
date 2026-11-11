@@ -55,6 +55,7 @@ func TestParsePolicyReportsEveryInvalidField(t *testing.T) {
 		"  - path: /repos",
 		"retention:",
 		"  default: 45d",
+		"  archived: 2d",
 		"jev:",
 		"  enabled: true",
 		"  model: \"\"",
@@ -73,6 +74,7 @@ func TestParsePolicyReportsEveryInvalidField(t *testing.T) {
 		"roots[0].max_depth",
 		"roots[2].path",
 		"retention.default",
+		"retention.archived",
 		"jev.model",
 	}
 	got := map[string]string{}

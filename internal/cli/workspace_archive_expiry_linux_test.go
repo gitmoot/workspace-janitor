@@ -31,13 +31,16 @@ type workspaceExpiryFixture struct {
 	sha       string
 	expiry    bool
 	retention string
-	extra     string
-	files     map[string][]byte
+	// defaultRetention and archivedRetention are retention.default (default
+	// none) and retention.archived (omitted when empty).
+	defaultRetention, archivedRetention string
+	extra                               string
+	files                               map[string][]byte
 }
 
 func newWorkspaceExpiryFixture(t *testing.T) *workspaceExpiryFixture {
 	t.Helper()
-	x := &workspaceExpiryFixture{workspaceArchiveFixture: newWorkspaceArchiveFixture(t), retention: "30d", files: map[string][]byte{}}
+	x := &workspaceExpiryFixture{workspaceArchiveFixture: newWorkspaceArchiveFixture(t), retention: "30d", defaultRetention: "none", files: map[string][]byte{}}
 	x.services = filepath.Join(x.home, "services")
 	if err := os.MkdirAll(x.services, 0o700); err != nil {
 		t.Fatal(err)
@@ -59,6 +62,10 @@ func (x *workspaceExpiryFixture) write(t *testing.T) {
 	if x.manifest != "" {
 		pin = fmt.Sprintf("      manifest: %s\n      manifest_sha256: %s\n", x.manifest, x.sha)
 	}
+	archived := ""
+	if x.archivedRetention != "" {
+		archived = "  archived: " + x.archivedRetention + "\n"
+	}
 	x.writePolicy(t, fmt.Sprintf(`roots:
   - path: %s
     max_depth: 1
@@ -73,8 +80,8 @@ collectors:
   cron_paths: []
   pm2_dumps: []
 retention:
-  default: none
-  delete_enabled: true
+  default: %s
+%s  delete_enabled: true
 prevention:
   min_free_bytes: 0
   min_free_percent: 0
@@ -89,7 +96,7 @@ workspace_archives:
     local_expiry_enabled: %t
     archive:
       directory: %s
-%s%s`, x.work, x.archive, x.proc, x.services, x.source, x.retention, x.expiry, x.archive, pin, x.extra))
+%s%s`, x.work, x.archive, x.proc, x.services, x.defaultRetention, archived, x.source, x.retention, x.expiry, x.archive, pin, x.extra))
 }
 
 // archiveAndPin creates and pins the archive, then backdates its manifest by age
@@ -165,6 +172,12 @@ func (x *workspaceExpiryFixture) quarantine(t *testing.T) core.CleanupItem {
 
 func (x *workspaceExpiryFixture) receipt(t *testing.T) core.CleanupItem {
 	t.Helper()
+	return x.receiptOf(t, x.source)
+}
+
+// receiptOf is the pending cleanup receipt of the item moved from source.
+func (x *workspaceExpiryFixture) receiptOf(t *testing.T, source string) core.CleanupItem {
+	t.Helper()
 	paths, err := config.ResolvePaths(config.MapLookup(x.env), config.Overrides{})
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +191,7 @@ func (x *workspaceExpiryFixture) receipt(t *testing.T) core.CleanupItem {
 	err = db.Read(context.Background(), func(tx *store.Tx) error {
 		items, err := tx.PendingCleanupItems(context.Background())
 		for _, item := range items {
-			if item.Source == x.source {
+			if item.Source == source {
 				found = item
 			}
 		}

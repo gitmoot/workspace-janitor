@@ -15,6 +15,51 @@ import (
 	"github.com/gitmoot/workspace-janitor/internal/workspacearchive"
 )
 
+// ArchiveBacked reports whether item's receipt records a verified archive of
+// its content, which keeps it restorable once the local copy is deleted. It
+// is read from the receipt's recorded binding, never inferred from a path: a
+// session artifact names the verified batch it was archived in
+// (ArtifactBatch), whose receipt pins the batch manifest and its SHA-256;
+// any other item needs the workspace archive binding (manifest and SHA-256)
+// recorded on the snapshot of its quarantined copy. Expiry still verifies
+// that archive, as it always has, before deleting anything.
+func ArchiveBacked(item core.CleanupItem) bool {
+	if _, ok := ArtifactBatch(item); ok {
+		return true
+	}
+	if item.Quarantined == nil {
+		return false
+	}
+	binding := item.Quarantined.WorkspaceArchive
+	return binding != nil && binding.Manifest != "" && binding.ManifestSHA256 != ""
+}
+
+// Retention is the quarantine retention of item under the current policy:
+// ArchivedRetention for an archive-backed receipt when it is set, otherwise
+// the retention its action recorded.
+func (e *Engine) Retention(item core.CleanupItem) core.Retention {
+	if e.ArchivedRetention != "" && ArchiveBacked(item) {
+		return e.ArchivedRetention
+	}
+	return item.Action.Retention
+}
+
+// Due reports whether item's current retention (Retention) has elapsed
+// since it was moved. It is a precondition of expiry, never an authority.
+func (e *Engine) Due(item core.CleanupItem) bool {
+	return item.MovedAt != nil && e.Retention(item).Expired(*item.MovedAt, e.now())
+}
+
+// DueByArchivedRetention reports whether item is due only because of
+// ArchivedRetention: the retention its action recorded still holds it.
+func (e *Engine) DueByArchivedRetention(item core.CleanupItem) bool {
+	if item.MovedAt == nil {
+		return false
+	}
+	now := e.now()
+	return e.Retention(item).Expired(*item.MovedAt, now) && !item.Action.Retention.Expired(*item.MovedAt, now)
+}
+
 // recollect refuses incomplete reference observation, rather than interpreting
 // a partial or skipped collector as proof that nobody uses a path.
 func (e *Engine) recollect(ctx context.Context, path string) (core.Entry, error) {
@@ -105,7 +150,7 @@ func (e *Engine) expiryReady(item core.CleanupItem) error {
 	if item.State != core.CleanupQuarantined {
 		return fmt.Errorf("%s is not quarantined", item.ActionID)
 	}
-	if item.MovedAt == nil || !item.Action.Retention.Expired(*item.MovedAt, e.now()) {
+	if !e.Due(item) {
 		return errors.New("retention has not expired")
 	}
 	if item.Quarantined == nil {
@@ -197,7 +242,7 @@ func (e *Engine) eligible(ctx context.Context, item core.CleanupItem, original b
 // Delete is a distinct, explicit operation, never part of Quarantine. The
 // caller must gate it on both policy opt-in and operator confirmation.
 func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.CleanupItem, error) {
-	if item.State != core.CleanupQuarantined || item.MovedAt == nil || !item.Action.Retention.Expired(*item.MovedAt, e.now()) {
+	if item.State != core.CleanupQuarantined || !e.Due(item) {
 		return item, errors.New("retention has not expired or item is not quarantined")
 	}
 	// Deleting comes before journaling it, so a crash or a failed journal
