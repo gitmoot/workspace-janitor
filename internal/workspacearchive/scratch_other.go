@@ -41,10 +41,6 @@ func (s *ScratchDir) CreateScratch(context.Context, config.WorkspaceArchiveCateg
 	return ScratchManifest{}, nil, errUnsupported
 }
 
-func ReadScratchManifest(context.Context, config.WorkspaceArchiveCategoryDestination, Binding) (ScratchManifest, error) {
-	return ScratchManifest{}, errUnsupported
-}
-
 func CheckScratch(context.Context, config.WorkspaceArchiveCategoryDestination, Binding) (ScratchManifest, error) {
 	return ScratchManifest{}, errUnsupported
 }

@@ -432,18 +432,6 @@ func loadScratch(ctx context.Context, dest config.WorkspaceArchiveCategoryDestin
 	return m, root, tarFile, nil
 }
 
-// ReadScratchManifest reads and validates the pinned manifest of binding
-// without reading its tar.
-func ReadScratchManifest(ctx context.Context, dest config.WorkspaceArchiveCategoryDestination, binding Binding) (ScratchManifest, error) {
-	m, root, tarFile, err := loadScratch(ctx, dest, binding)
-	if err != nil {
-		return m, err
-	}
-	root.Close()
-	tarFile.Close()
-	return m, nil
-}
-
 // CheckScratch re-reads the whole published tar of binding and compares the
 // stream hash, member list, metadata and every file's SHA-256 with the
 // manifest.

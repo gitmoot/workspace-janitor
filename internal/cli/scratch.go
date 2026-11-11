@@ -832,15 +832,12 @@ func runScratchRestore(ctx context.Context, e *env, runID, entry string, opts sc
 	binding := workspacearchive.Binding{Manifest: run.ArchiveManifest, ManifestSHA256: run.ArchiveManifestSHA256}
 	report := scratchRestoreReport{Mode: "scratch_restore", DryRun: opts.dryRun, RunID: runID, Entry: entry, Manifest: run.ArchiveManifest, RestoredTo: destination, Status: "verified"}
 	if opts.dryRun {
-		m, err := workspacearchive.ReadScratchManifest(ctx, dest, binding)
+		m, err := workspacearchive.CheckScratch(ctx, dest, binding)
 		if err != nil {
 			return err
 		}
 		if !slices.Contains(m.Entries, entry) {
 			return fmt.Errorf("scratch run %q archived no entry %q", runID, entry)
-		}
-		if _, err := workspacearchive.CheckScratch(ctx, dest, binding); err != nil {
-			return err
 		}
 	} else {
 		// Restores serialize with apply, quarantine restore and scratch runs.
