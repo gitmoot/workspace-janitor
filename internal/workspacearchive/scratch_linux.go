@@ -53,7 +53,7 @@ func (s *ScratchDir) Names(limit int) ([]string, error) {
 }
 
 // Observe records one depth-1 entry without reading file contents: every
-// member's identity and metadata, its size and newest change, and the
+// member's identity and metadata, its size and newest mtime, and the
 // screens (sensitive names anywhere inside, sockets, fifos and other
 // unsupported types, mount crossings, extended attributes, outbound Git
 // pointers). An error means the entry could not be observed; callers keep it.
@@ -78,9 +78,9 @@ func (s *ScratchDir) Observe(ctx context.Context, name string, patterns []string
 		return entry, nil
 	}
 	top := w.inv.states[0]
-	entry.Type, entry.Identity, entry.CtimeNS = w.inv.members[0].Type, top.id, top.ctimeNS
+	entry.Type, entry.Identity, entry.CtimeNS, entry.NewestMtimeNS = w.inv.members[0].Type, top.id, top.ctimeNS, top.mtimeNS
 	for i, st := range w.inv.states {
-		entry.NewestNS = max(entry.NewestNS, st.mtimeNS, st.ctimeNS)
+		entry.NewestMtimeNS = max(entry.NewestMtimeNS, st.mtimeNS)
 		if w.inv.members[i].Type == TypeFile {
 			entry.SizeBytes += st.size
 		}

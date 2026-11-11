@@ -29,7 +29,9 @@ const (
 // protect.name_patterns keep any entry that holds a matching name local.
 type ScratchCleanup struct {
 	Path string `yaml:"path" json:"path"`
-	// Idle is measured from the newest mtime or ctime anywhere in the entry.
+	// Idle is measured from the newest mtime anywhere in the entry; ctime
+	// is not used (systemd-tmpfiles-clean bumps it daily). RegenerableIdle
+	// is measured the same way.
 	Idle IdleDuration `yaml:"idle" json:"idle"`
 	// RegenerableIdle, when set, is the idle time required of entries that
 	// match Regenerable, which are deleted without an archive. It may be
