@@ -74,10 +74,10 @@ func (e *Engine) QuarantineArtifact(ctx context.Context, item core.CleanupItem, 
 	fresh := item.Entry
 	fresh.Path, fresh.ObservedAt = item.Destination, moved
 	item.State, item.UpdatedAt, item.MovedAt = core.CleanupQuarantined, moved, &moved
-	if expiry, ok := item.Action.Retention.ExpiresAt(moved); ok {
+	item.Quarantined = &fresh
+	if expiry, ok := e.Retention(item).ExpiresAt(moved); ok {
 		item.ExpiresAt = &expiry
 	}
-	item.Quarantined = &fresh
 	if err := e.update(ctx, item, core.CleanupPrepared); err != nil {
 		return item, err
 	}

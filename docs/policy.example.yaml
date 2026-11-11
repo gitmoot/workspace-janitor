@@ -36,6 +36,13 @@ retention:
   # How long quarantined items are kept: none, 3d, 7d, 30d, 90d, or permanent.
   # Expiry alone never deletes anything; a second safety evaluation must pass.
   default: 30d
+  # Quarantine retention of items whose receipt records a verified archive
+  # (a workspace archive binding, or an omp_session_artifacts batch), which
+  # stay restorable from that archive. Same values as default; none expires
+  # them at the next expiry. Expiry re-verifies the archive and repeats every
+  # other check. The current value also applies to items already in
+  # quarantine. Unset, such items follow default.
+  # archived: none
   # Defaults to <state-dir>/quarantine. Wherever it points, it is added to
   # protect.paths automatically: the janitor never acts on its own staging area.
   quarantine_dir: ~/.local/state/workspace-janitor/quarantine

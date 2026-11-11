@@ -31,6 +31,9 @@ type artifactFixture struct {
 	// sessionsRetention and retention are the local_retention of the
 	// omp_sessions and omp_session_artifacts categories (default none).
 	sessionsRetention, retention string
+	// defaultRetention and archivedRetention are retention.default (default
+	// none) and retention.archived (omitted when empty).
+	defaultRetention, archivedRetention string
 	// category holds extra lines of the artifacts category, each indented
 	// four spaces; extra goes before workspace_archive_categories, and
 	// prevention under prevention:.
@@ -55,6 +58,10 @@ func (x *artifactFixture) writeArtifacts(t *testing.T) {
 		return r
 	}
 	sessions := ""
+	archived := ""
+	if x.archivedRetention != "" {
+		archived = "  archived: " + x.archivedRetention + "\n"
+	}
 	if x.sessionsCategory {
 		sessions = fmt.Sprintf("  - name: sessions\n    kind: omp_sessions\n    roots: [%s]\n    idle: 1d\n    local_retention: %s\n    archive:\n      directory: %s\n",
 			x.sessions, retention(x.sessionsRetention), x.archive)
@@ -73,8 +80,8 @@ protect:
   cron_paths: []
   pm2_dumps: []
 retention:
-  default: none
-  delete_enabled: true
+  default: %s
+%s  delete_enabled: true
 prevention:
   min_free_bytes: 0
   min_free_percent: 0
@@ -91,7 +98,7 @@ gitmoot:
     local_retention: %s
     archive:
       directory: %s
-%s`, x.sessions, x.archive, x.protect, x.proc, x.services, x.prevention, x.gitmoot, filepath.Join(x.gitmoot, "gitmoot.db"), x.extra, sessions, x.sessions,
+%s`, x.sessions, x.archive, x.protect, x.proc, x.services, retention(x.defaultRetention), archived, x.prevention, x.gitmoot, filepath.Join(x.gitmoot, "gitmoot.db"), x.extra, sessions, x.sessions,
 		retention(x.retention), x.archive, x.category))
 }
 

@@ -27,6 +27,11 @@ type Engine struct {
 	// Artifacts decides the expiry of quarantined omp_session_artifacts
 	// files (ArtifactBatch); nil refuses it.
 	Artifacts ArtifactGuard
+	// ArchivedRetention, when set, is the quarantine retention of every
+	// archive-backed receipt (ArchiveBacked) in place of the retention its
+	// action recorded: at the move, and again at every expiry, so a changed
+	// value applies to receipts already in quarantine.
+	ArchivedRetention core.Retention
 }
 
 func (e *Engine) now() time.Time {
@@ -286,10 +291,10 @@ func (e *Engine) finishMove(ctx context.Context, item core.CleanupItem) (core.Cl
 	}
 	moved := e.now()
 	item.State, item.UpdatedAt, item.MovedAt = core.CleanupQuarantined, moved, &moved
-	if expiry, ok := item.Action.Retention.ExpiresAt(moved); ok {
+	item.Quarantined = &fresh
+	if expiry, ok := e.Retention(item).ExpiresAt(moved); ok {
 		item.ExpiresAt = &expiry
 	}
-	item.Quarantined = &fresh
 	if err := e.update(ctx, item, core.CleanupPrepared); err != nil {
 		return item, err
 	}
@@ -307,7 +312,7 @@ func (e *Engine) RetryPreview(ctx context.Context, item core.CleanupItem) error 
 			return err
 		}
 	}
-	if candidate.MovedAt == nil || !candidate.Action.Retention.Expired(*candidate.MovedAt, e.now()) {
+	if !e.Due(candidate) {
 		return errors.New("retention has not expired")
 	}
 	return e.ExpiryPreview(ctx, candidate)
