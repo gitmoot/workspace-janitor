@@ -283,6 +283,7 @@ workspace_archive_categories: []
 #     expect_mount_source: backup.example:/export
 #     expect_fstype: nfs4
 #   max_bytes_per_run: 0          # 0 = no bound
+#   max_archive_entries_per_run: 50000  # entries archived per run; more are deferred
 #   max_entries: 100000           # depth-1 listing bound; more refuses the run
 scratch_cleanup: []
 

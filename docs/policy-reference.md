@@ -933,8 +933,9 @@ entries Janitor removes. Entries that match no list are archived first.
 | `skip` | `filepath.Match` globs on the entry name. A match is never touched. |
 | `regenerable` | Globs on the entry name. An idle, unused match is deleted without an archive. |
 | `archive.directory`, `expect_mount_source`, `expect_fstype` | Every other idle, unused entry is archived here before deletion. The same approval rules apply as for `workspace_archives` destinations: covered by an independent `protect.paths` rule, outside every inventory root and scratch directory, and the mount expectations are checked before writing. |
-| `max_bytes_per_run` | Default `0` (no bound). The total local bytes one run may remove. Entries past the bound are `deferred`, oldest first. |
-| `max_entries` | Default `100000`, at least `1`. Bounds the depth-1 listing of this directory, independently of `limits.max_dir_entries` (which bounds inventory scans). A directory with more entries refuses the whole run before anything is touched; a partial listing is never cleaned. Only the names are held for every entry. Each entry is observed and then released, and member lists are kept only for the entries this run removes. The run report lists up to 1000 entries of any status; every entry is still counted by status, and those left out of the list are also counted under `unlisted`. A preview counts `would_archive`, `would_delete` and `would_free_bytes`; an acting run counts what it did. |
+| `max_bytes_per_run` | Default `0` (no bound). The total local bytes one run may remove. Entries are selected largest first (ties: longest idle, then name), so a bounded run frees the most it can and a large entry never waits behind many small ones; entries past the bound are `deferred` to the next run. |
+| `max_archive_entries_per_run` | Default `50000`, at least `1`. The entries one run may archive into its single tar; further non-regenerable entries are `deferred` to the next run. Regenerable entries are not archived and not counted. The archive manifest's 128 MiB size bound also defers entries, before any archive is written. |
+| `max_entries` | Default `100000`, at least `1`. Bounds the depth-1 listing of this directory, independently of `limits.max_dir_entries` (which bounds inventory scans). A directory with more entries refuses the whole run before anything is touched; a partial listing is never cleaned. Only the names are held for every entry. Each entry is observed and then released, and member lists are kept only for the entries this run removes. The run report lists up to 1000 entries of any status; every entry is still counted by status, and those left out of the list are also counted under `unlisted`. Its `archive.entries` likewise lists at most 1000 names, and `archive.entry_count` counts them all. A preview counts `would_archive`, `would_delete` and `would_free_bytes`; an acting run counts what it did. |
 
 Scratch cleanup requires the process collector. An entry is kept, neither
 archived nor deleted, while any of these hold:
@@ -969,7 +970,11 @@ the apply lock:
    the copy.
 2. The published archive is read back again, from the archive directory
    alone. Any mismatch deletes nothing at all, regenerable entries included.
-3. An immutable run receipt is recorded, with the manifest path and SHA-256.
+3. An immutable run receipt is recorded, with the manifest path, its SHA-256
+   and the number of archived entries. The pinned manifest, not the receipt,
+   names the entries, so the receipt's size does not limit how many one run
+   archives. Before this is recorded, the run checks that the verified
+   manifest names exactly the entries selected for archiving.
 4. Immediately before deletion the policy file is loaded again, for every
    run, including runs with only regenerable entries. Each selected entry is
    kept if the fresh policy now protects it (`protect.paths`,

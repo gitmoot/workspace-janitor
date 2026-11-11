@@ -225,14 +225,17 @@ policy.
 Each acting [scratch cleanup](policy-reference.md#scratch-cleanup) run that
 archived anything leaves `scratch-<run>.tar` and `scratch-<run>.manifest.json`
 in the configured archive directory. Run and deletion receipts are in
-Janitor's state (`scratch_runs`, `scratch_deletions`). The run id is shown in
+Janitor's state (`scratch_runs`, `scratch_deletions`). A run receipt pins its
+manifest by path and SHA-256; the manifest names every archived entry, and
+`scratch_deletions` has one row per deleted entry. The run id is shown in
 the `janitor scratch` and `janitor cycle` reports. Regenerable entries were
 deleted without an archive and cannot be restored.
 
-- `janitor scratch restore <run> <entry>` re-reads the whole archive and
-  verifies it without writing anything. Janitor's state is only read; a
-  database from before the scratch receipts holds no runs and is not
-  migrated.
+- `janitor scratch restore <run> <entry>` reads the run's receipt, checks
+  that its pinned manifest (SHA-256 verified) names the entry, re-reads the
+  whole archive and verifies it without writing anything. Janitor's state is
+  only read; a database from before the scratch receipts holds no runs and
+  is not migrated.
 - `janitor scratch restore <run> <entry> --dry-run=false --confirm` restores
   the entry to its original path under the apply/restore lock. `--restore-to PATH` restores it elsewhere.
   The destination must not exist; nothing is ever overwritten. The entry is

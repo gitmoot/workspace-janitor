@@ -24,6 +24,11 @@ func (s *ScratchDir) Unchanged(ScratchEntry) error { return errUnsupported }
 // SensitiveMember cannot screen off Linux, so every entry stays local.
 func (e ScratchEntry) SensitiveMember(string, []string) string { return e.Name }
 
+// ScratchManifestEntryBudget is zero off Linux: nothing is archived.
+const ScratchManifestEntryBudget = 0
+
+func (e ScratchEntry) ManifestBytes() int { return 0 }
+
 func (s *ScratchDir) Observe(context.Context, string, []string, int) (ScratchEntry, error) {
 	return ScratchEntry{}, errUnsupported
 }

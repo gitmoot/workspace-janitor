@@ -111,6 +111,28 @@ func (e ScratchEntry) SensitiveMember(dir string, patterns []string) string {
 	return ""
 }
 
+// ScratchManifestEntryBudget is how much of the manifest size bound one
+// run's entries and members may take; 1 MiB is left for the fixed fields.
+const ScratchManifestEntryBudget = maxManifestBytes - 1<<20
+
+// ManifestBytes is what entry adds to its run's archive manifest: its name
+// in the entry list and every member's record, a file's SHA-256 included,
+// each with a separator. A run selects no more entries than fit, before
+// writing any archive.
+func (e ScratchEntry) ManifestBytes() int {
+	name, _ := json.Marshal(e.Name)
+	n := len(name) + 1
+	sum := strings.Repeat("0", sha256.Size*2)
+	for _, member := range e.inv.members {
+		if member.Type == TypeFile {
+			member.SHA256 = sum
+		}
+		data, _ := json.Marshal(member)
+		n += len(data) + 1
+	}
+	return n
+}
+
 // Unchanged reports whether every member of entry still has the identity,
 // type, size, ownership, mode, mtime and ctime it was observed with. A new or
 // removed child changes its directory's times, so it is caught too.

@@ -200,31 +200,96 @@ func (x *scratchFixture) paths(t *testing.T) config.Paths {
 	return paths
 }
 
-// A directory holding more idle entries than one run receipt can name must
-// still clean up: the overflow is deferred before archiving, and the next run
-// takes the rest. Formerly the run archived everything, then failed to record
-// its receipt and deleted nothing.
-func TestScratchDefersEntriesBeyondTheRunReceiptBound(t *testing.T) {
+// Thousands of idle entries are archived by one run: the run receipt pins
+// the archive manifest, which names every entry, instead of listing them
+// itself. Formerly a 64 KiB receipt deferred all but about 1,500 of these
+// 40-byte names, so a /tmp backlog of tens of thousands took weeks. An
+// entry of such a run still restores by name. (Each deletion receipt is its
+// own synced commit, so the count stays modest to keep the suite fast.)
+func TestScratchArchivesThousandsOfEntriesInOneRun(t *testing.T) {
 	x := newScratchFixture(t)
-	const count = 400 // 400 encoded 200-byte names exceed the 64 KiB receipt
-	for i := 0; i < count; i++ {
-		x.entry(t, fmt.Sprintf("%04d-%s", i, strings.Repeat("n", 195)), nil)
+	const count = 2000
+	for i := range count {
+		x.entry(t, fmt.Sprintf("%05d-%s", i, strings.Repeat("n", 34)), nil)
 	}
+	report := x.mustCleanup(t, true)
+	if report.Status != "completed" || report.Archived != count || report.Deferred != 0 {
+		t.Fatalf("one run must archive all %d entries: archived=%d deferred=%d status=%s", count, report.Archived, report.Deferred, report.Status)
+	}
+	if names, err := os.ReadDir(x.scratch); err != nil || len(names) != 0 {
+		t.Fatalf("%d entries left after the run (%v)", len(names), err)
+	}
+	if receipts := x.deletions(t, report.RunID); len(receipts) != count {
+		t.Fatalf("%d deletion receipts, want %d", len(receipts), count)
+	}
+	entry := fmt.Sprintf("%05d-%s", 1234, strings.Repeat("n", 34))
+	for _, args := range [][]string{nil, {"--dry-run=false", "--confirm"}} {
+		if out, stderr, code := x.run(t, append([]string{"scratch", "restore", report.RunID, entry}, args...)...); code != ExitOK {
+			t.Fatalf("restore %v: exit=%d %s %s", args, code, out, stderr)
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(x.scratch, entry)); err != nil || string(data) != entry+"\n" {
+		t.Fatalf("restored %s = %q %v", entry, data, err)
+	}
+	if out, stderr, code := x.run(t, "scratch", "restore", report.RunID, "never-archived"); code == ExitOK || !strings.Contains(stderr, "archived no entry") {
+		t.Fatalf("verify of an entry the run never archived: exit=%d %s %s", code, out, stderr)
+	}
+}
+
+// max_archive_entries_per_run bounds the entries one run archives; the rest
+// is deferred before any archive exists and taken by the next run.
+// Regenerable entries are not archived and not counted. A preview defers
+// exactly what the acting run defers.
+func TestScratchDefersArchivedEntriesBeyondTheEntryCap(t *testing.T) {
+	x := newScratchFixture(t)
+	x.options = "    max_archive_entries_per_run: 3\n"
+	x.write(t)
+	for i := range 5 {
+		x.entry(t, fmt.Sprintf("entry-%d", i), map[string]string{"a": fmt.Sprintf("%d\n", i)})
+	}
+	regen := x.entry(t, "go-build1", map[string]string{"o": "obj\n"})
+	preview := x.mustCleanup(t, false)
 	first := x.mustCleanup(t, true)
-	if first.Status == "failed" || first.Archived == 0 || first.Deferred == 0 {
-		t.Fatalf("first run must archive some entries and defer the rest: %+v", first)
+	if first.Archived != 3 || first.Deferred != 2 || first.Deleted != 1 || exists(t, regen) {
+		t.Fatalf("first run: archived=%d deferred=%d regenerable=%d, want 3/2/1", first.Archived, first.Deferred, first.Deleted)
 	}
-	second := x.mustCleanup(t, true)
-	if second.Status == "failed" || first.Archived+second.Archived != count || second.Deferred != 0 {
-		t.Fatalf("second run must take the deferred remainder: first=%d second=%d deferred=%d status=%s",
-			first.Archived, second.Archived, second.Deferred, second.Status)
+	if preview.WouldArchive != first.Archived || preview.Deferred != first.Deferred {
+		t.Fatalf("preview would archive %d and defer %d; the acting run archived %d and deferred %d",
+			preview.WouldArchive, preview.Deferred, first.Archived, first.Deferred)
 	}
-	names, err := os.ReadDir(x.scratch)
-	if err != nil {
-		t.Fatal(err)
+	for _, item := range first.Items {
+		if item.Status == scratchDeferred && !strings.Contains(item.Reason, "max_archive_entries_per_run 3") {
+			t.Fatalf("deferred reason = %q", item.Reason)
+		}
 	}
-	if len(names) != 0 {
-		t.Fatalf("%d entries left after two runs", len(names))
+	if second := x.mustCleanup(t, true); second.Archived != 2 || second.Deferred != 0 {
+		t.Fatalf("second run: archived=%d deferred=%d, want 2/0", second.Archived, second.Deferred)
+	}
+}
+
+// When max_bytes_per_run defers entries, the largest go first, so a big
+// entry is not starved behind many small, longer-idle ones; the leftover
+// budget still takes small entries.
+func TestScratchBoundedRunTakesTheLargestEntriesFirst(t *testing.T) {
+	x := newScratchFixture(t)
+	x.options = "    max_bytes_per_run: 1000\n"
+	x.write(t)
+	older := time.Now().Add(-10 * time.Hour)
+	for i := range 10 {
+		small := x.entry(t, fmt.Sprintf("small-%d", i), map[string]string{"a": strings.Repeat("s", 100)})
+		for _, path := range []string{filepath.Join(small, "a"), small} {
+			if err := os.Chtimes(path, older, older); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	big := x.entry(t, "big", map[string]string{"a": strings.Repeat("b", 900)})
+	report := x.mustCleanup(t, true)
+	if exists(t, big) || report.Archived != 2 || report.Deferred != 9 || report.FreedBytes != 1000 {
+		t.Fatalf("big kept=%v archived=%d deferred=%d freed=%d, want the 900-byte entry and one small one", exists(t, big), report.Archived, report.Deferred, report.FreedBytes)
+	}
+	if item := scratchStatus(t, report, "small-0"); item.Status != scratchArchived {
+		t.Fatalf("leftover budget goes to the longest idle, then by name: small-0 = %+v", item)
 	}
 }
 
@@ -468,48 +533,6 @@ func TestScratchInUseRecheckUsesFreshProcRoot(t *testing.T) {
 	report := x.mustCleanup(t, true)
 	if item := scratchStatus(t, report, "plain"); item.Status != scratchKept || !strings.Contains(item.Reason, "in use at deletion time") || !exists(t, live) {
 		t.Fatalf("entry in use under the fresh proc_root = %+v", item)
-	}
-}
-
-// A preview sizes the run receipt with a run ID as long as an acting run's,
-// so it never promises to archive an entry the acting run defers.
-func TestScratchPreviewReceiptBoundMatchesActingRun(t *testing.T) {
-	x := newScratchFixture(t)
-	now := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Second).Add(123456789)
-	previous := scratchNow
-	scratchNow = func() time.Time { return now }
-	t.Cleanup(func() { scratchNow = previous })
-	runID := now.Format("20060102T150405.000000000Z") // the acting run's ID
-	base := store.ScratchRunReceiptBytes(store.ScratchRun{RunID: runID, Path: x.scratch, StartedAt: now, RecordedAt: now,
-		ArchiveDirectory: x.archive, ArchiveManifest: filepath.Join(x.archive, workspacearchive.ScratchArchiveName(runID)+".manifest.json"),
-		ArchiveManifestSHA256: strings.Repeat("0", 64)})
-	available := store.ScratchRunReceiptMaxBytes - base
-	// Pick a name length whose last fitting entry leaves less room than one
-	// more entry needs, but more than that room minus the run ID's share of
-	// the receipt (26 bytes in run_id and 26 in the manifest name).
-	length := 0
-	for n := 120; n <= 250; n++ {
-		cost := n + 3 // two quotes and a separator
-		if rest := available % cost; rest+52 >= cost+2 {
-			length = n
-			break
-		}
-	}
-	if length == 0 {
-		t.Fatalf("no name length fits the receipt window for %d available bytes", available)
-	}
-	count := available/(length+3) + 2
-	for i := range count {
-		x.entry(t, fmt.Sprintf("%04d-%s", i, strings.Repeat("n", length-5)), nil)
-	}
-	preview := x.mustCleanup(t, false)
-	acting := x.mustCleanup(t, true)
-	if acting.Archived == 0 || acting.Deferred == 0 {
-		t.Fatalf("acting run must archive some entries and defer the rest: %+v", acting)
-	}
-	if preview.WouldArchive != acting.Archived || preview.Deferred != acting.Deferred {
-		t.Fatalf("preview would archive %d and defer %d; the acting run archived %d and deferred %d",
-			preview.WouldArchive, preview.Deferred, acting.Archived, acting.Deferred)
 	}
 }
 
