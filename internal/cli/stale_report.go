@@ -210,22 +210,35 @@ func staleInUseReason(entry core.Entry, verdict core.Verdict) string {
 }
 
 // ownerLookup is the owner attribution of a set of paths. A failed lookup
-// attributes nothing: every owner is then unknown, never inferred.
+// attributes nothing: every owner is then unknown, never inferred. When the
+// ledger names no role at all, the policy owners entry covering a path stands
+// in for the coordinator fallback; registration and producer evidence,
+// including a contested ledger, always takes precedence over it.
 type ownerLookup struct {
 	owners map[string]collect.OwnerAttribution
+	policy config.Policy
 	status string
 	err    error
 }
 
 func lookupOwners(ctx context.Context, policy config.Policy, paths []string) ownerLookup {
 	if len(paths) == 0 {
-		return ownerLookup{owners: map[string]collect.OwnerAttribution{}, status: "no paths to attribute"}
+		return ownerLookup{owners: map[string]collect.OwnerAttribution{}, policy: policy, status: "no paths to attribute"}
 	}
 	owners, status, err := collect.GitmootOwners(ctx, policy.Gitmoot, paths, policy.Limits.MaxEntries, policy.Limits.CommandTimeout.Duration())
 	if err != nil {
 		return ownerLookup{status: "Gitmoot owner evidence unavailable: " + err.Error(), err: err}
 	}
-	return ownerLookup{owners: owners, status: status}
+	return ownerLookup{owners: owners, policy: policy, status: status}
+}
+
+// policyOwner is the policy owners entry that routes path, if the ledger
+// names no role for it.
+func (o ownerLookup) policyOwner(path string) (config.OwnerRule, int, bool) {
+	if attribution := o.owners[path]; attribution.Role != "" || attribution.Contested {
+		return config.OwnerRule{}, -1, false
+	}
+	return o.policy.PolicyOwner(path)
 }
 
 // owner is the attributed role of path, "unknown", or "" when evidence is
@@ -237,6 +250,9 @@ func (o ownerLookup) owner(path string) string {
 	if attribution, ok := o.owners[path]; ok && attribution.Role != "" {
 		return attribution.Role
 	}
+	if rule, _, ok := o.policyOwner(path); ok {
+		return rule.Owner
+	}
 	return config.UnknownOwner
 }
 
@@ -244,7 +260,12 @@ func (o ownerLookup) evidence(path string) []string {
 	if o.err != nil {
 		return []string{o.status}
 	}
-	if attribution, ok := o.owners[path]; ok {
+	attribution, attributed := o.owners[path]
+	if rule, i, ok := o.policyOwner(path); ok {
+		return append(append([]string(nil), attribution.Evidence...),
+			fmt.Sprintf("policy %s names decision owner %s; no registration or producer evidence names one", policyOwnerSource(i, rule), rule.Owner))
+	}
+	if attributed {
 		return attribution.Evidence
 	}
 	return []string{"no registration or producer evidence names an owner"}
@@ -351,7 +372,7 @@ func releaseStillEffective(ctx context.Context, paths config.Paths, reply store.
 // archive-category check today; otherwise ask.
 func staleSuggestion(policy config.Policy, entry core.Entry, verdict core.Verdict, owner, git, gitDetail string, now time.Time) (string, []string) {
 	if owner == config.UnknownOwner {
-		return staleSuggestAsk, []string{"owner unknown: no registration or producer evidence names an owning role; the coordinator must find the owner, and nothing is archived on inference"}
+		return staleSuggestAsk, []string{"owner unknown: no registration or producer evidence or policy owners entry names an owning role; the coordinator must find the owner, and nothing is archived on inference"}
 	}
 	if git == staleGitDirty || git == staleGitUnpushed {
 		return staleSuggestKeep, []string{"unsaved Git work: " + gitDetail}
@@ -381,7 +402,7 @@ func observeStale(ctx context.Context, e *env, paths config.Paths, policy config
 	obs.report = staleReport{Mode: "stale_report", GeneratedAt: now, Idle: r.Idle.String(), Roots: r.Roots,
 		CoordinatorRole: r.CoordinatorRole, ReleaseAction: string(r.ReleaseAction),
 		Groups: []staleGroup{}, Released: []staleReleased{}, Kept: []staleKept{}, Unmeasured: []staleUnmeasured{},
-		Attribution: "Owners come only from registration and producer evidence. Unknown-owner items go to the coordinator and are never treated as disposable. Sizes are local bytes; remote archive space is never counted as local headroom."}
+		Attribution: "Owners come from registration and producer evidence, then from the policy owners entry covering an item no such evidence attributes. Unknown-owner items go to the coordinator and are never treated as disposable. Sizes are local bytes; remote archive space is never counted as local headroom."}
 	if !r.Enabled {
 		return obs, errors.New("the stale-workspace report is off: set report.enabled in the policy")
 	}
@@ -932,8 +953,9 @@ func reportCommand() *command {
 				name:    "stale",
 				usage:   "janitor report stale [--role ROLE]",
 				summary: "List items unchanged for report.idle and not in use, grouped by owning role",
-				long: "Owners come only from registration and producer evidence; unknown-owner items are\n" +
-					"addressed to report.coordinator_role and never suggested for archiving.\n" +
+				long: "Owners come from registration and producer evidence, then from the policy owners\n" +
+					"entry covering an item; unknown-owner items are addressed to report.coordinator_role\n" +
+					"and never suggested for archiving.\n" +
 					"--role ROLE --format text renders the message a host timer can send to that role.",
 				register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
 					role := fs.String("role", "", "only the entries addressed to this role")

@@ -446,7 +446,10 @@ func EvidenceDigest(entries []core.Entry) string {
 func PolicyDigest(policy config.Policy) string {
 	// The effective policy is marshalled in full: any field that can move
 	// a decision is part of it, and hashing the whole document means a new
-	// field cannot be forgotten here.
+	// field cannot be forgotten here. The one exception is owners: a
+	// decision owner is information that cannot move a decision, so
+	// naming one neither changes a plan's identity nor voids its approvals.
+	policy.Owners = nil
 	encoded, err := core.MarshalJSON(policy)
 	if err != nil {
 		// Marshalling a validated policy cannot fail; if it somehow did, a

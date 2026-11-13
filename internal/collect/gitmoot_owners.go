@@ -17,11 +17,14 @@ import (
 
 // OwnerAttribution is the owning role Gitmoot's producer ledger names for one
 // exact path. Role is empty when the ledger names none, or more than one.
+// Contested marks a ledger that names roles but no single routable one: that
+// is evidence about the owner, so a policy owner must not stand in for it.
 // Active describes nonterminal ledger work on the path: the path is in use.
 type OwnerAttribution struct {
-	Role     string   `json:"role,omitempty"`
-	Active   string   `json:"active,omitempty"`
-	Evidence []string `json:"evidence"`
+	Role      string   `json:"role,omitempty"`
+	Contested bool     `json:"contested,omitempty"`
+	Active    string   `json:"active,omitempty"`
+	Evidence  []string `json:"evidence"`
 }
 
 // GitmootOwners reads, read-only and in one snapshot, which role Gitmoot's
@@ -144,8 +147,10 @@ func GitmootOwners(ctx context.Context, policy config.GitmootPolicy, paths []str
 		case len(named) == 1 && config.ValidRole(named[0]):
 			attribution.Role = named[0]
 		case len(named) == 1:
+			attribution.Contested = true
 			attribution.Evidence = append(attribution.Evidence, fmt.Sprintf("%q is not a routable role name", named[0]))
 		case len(named) > 1:
+			attribution.Contested = true
 			attribution.Evidence = append(attribution.Evidence, "ambiguous: the ledger names roles "+strings.Join(named, ", "))
 		}
 		out[path] = attribution

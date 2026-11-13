@@ -154,6 +154,15 @@ gitmoot:
   home: ~/.gitmoot
   database: ~/.gitmoot/gitmoot.db
 
+# Decision owners of arbitrary paths, for reports and `janitor explain` only;
+# empty by default. The longest covering path wins (entries may nest). An
+# owner is information, never authority: it approves, releases, protects or
+# unprotects nothing. See policy-reference.md#decision-owners.
+# - path: ~/adspower2
+#   owner: adspower
+#   note: live fleet API + dashboard
+owners: []
+
 # Known regenerable caches. action is one of keep, quarantine,
 # delete_candidate, or investigate (the default when omitted).
 caches:

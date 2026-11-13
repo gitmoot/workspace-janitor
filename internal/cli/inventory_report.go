@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -101,18 +102,43 @@ func completeDiscovery(scan core.Scan) bool {
 	return false
 }
 
-func inventoryOwner(path string, policy config.Policy) string {
-	for _, rule := range policy.Caches {
+// unassignedOwner is the inventory owner of a path no policy entry names.
+const unassignedOwner = "unassigned"
+
+// decisionOwner is the owner a report states for a path, with where it
+// came from. It is information only: nothing approves, releases or protects
+// because of it.
+type decisionOwner struct {
+	Owner  string `json:"owner"`
+	Source string `json:"source"`
+}
+
+// resolveDecisionOwner applies the documented order: an exact cache rule's
+// recovery.owner, then an exact evidence export's owner, then the longest
+// policy owners entry covering path, then unassigned.
+func resolveDecisionOwner(path string, policy config.Policy) decisionOwner {
+	for i, rule := range policy.Caches {
 		if path == rule.Path && rule.Recovery.Owner != "" {
-			return rule.Recovery.Owner
+			return decisionOwner{Owner: rule.Recovery.Owner, Source: fmt.Sprintf("caches[%d].recovery.owner (cache rule %q)", i, rule.Name)}
 		}
 	}
-	for _, rule := range policy.EvidenceExports {
+	for i, rule := range policy.EvidenceExports {
 		if path == rule.Path {
-			return rule.Owner
+			return decisionOwner{Owner: rule.Owner, Source: fmt.Sprintf("evidence_exports[%d].owner (export %q)", i, rule.Name)}
 		}
 	}
-	return "unassigned"
+	if rule, i, ok := policy.PolicyOwner(path); ok {
+		return decisionOwner{Owner: rule.Owner, Source: policyOwnerSource(i, rule)}
+	}
+	return decisionOwner{Owner: unassignedOwner, Source: "no cache recovery.owner, evidence export or owners entry covers this path"}
+}
+
+func policyOwnerSource(i int, rule config.OwnerRule) string {
+	return fmt.Sprintf("owners[%d] %s", i, rule.Path)
+}
+
+func inventoryOwner(path string, policy config.Policy) string {
+	return resolveDecisionOwner(path, policy).Owner
 }
 
 func growthMagnitude(change inventoryChange) int64 {
@@ -249,7 +275,7 @@ func buildInventoryReport(ctx context.Context, tx *store.Tx, policy config.Polic
 		} else {
 			row.Reasons = append(row.Reasons, "no approved automatic prune cap")
 		}
-		if row.Owner == "unassigned" || row.Approval == "" {
+		if row.Owner == unassignedOwner || row.Approval == "" {
 			report.Unresolved = append(report.Unresolved, rule.Path+": owner and scoped approval required")
 		}
 		if !policy.Prevention.Recovery.Enabled {

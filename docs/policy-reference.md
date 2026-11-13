@@ -13,6 +13,7 @@ The policy defaults to `<config-dir>/policy.yaml`; `--policy` overrides `JANITOR
 | `retention` | Default quarantine period (`none`, `3d`, `7d`, `30d`, `90d`, `permanent`), quarantine directory, and separate deletion opt-in. `archived` (same values; unset follows `default`) is the quarantine period of items whose receipt records a verified archive of their content, so they stay restorable from it: a released workspace or category item whose quarantined snapshot carries a workspace archive binding (manifest and SHA-256), or an `omp_session_artifacts` file whose receipt names its verified batch. `none` expires them at the next expiry. It is measured from the move and the current value applies at every expiry, so changing it also shortens or extends the hold of items already in quarantine. It never relaxes expiry: the archive is re-bound or re-verified, and in-use, keep, `local_retention`/`local_expiry_enabled` and safety checks still apply. `janitor apply --expire` lists items due only because of it under `archived_retention_due`. |
 | `prevention` | Deep-scan interval, disk alert thresholds/cooldown, per-filesystem capacity targets, and opt-in automatic quarantine and expiry; a policy never installs a timer. |
 | `canonical_roots`, `classification`, `ownership`, `gitmoot` | Canonical project locations, literal project markers and name signals, foreign ownership checks, and read-only Gitmoot ledger location. |
+| `owners` | Decision owner role of arbitrary paths, for reports and `explain` only. Never approves, releases, protects or unprotects anything. See [decision owners](#decision-owners). |
 | `caches` | Exact declared cache roots; `action` is `keep`, `quarantine`, `delete_candidate`, or `investigate`. Omitted action means `investigate`; TTL/size bounds need complete evidence for directories. Dedicated irreversible prune has further restrictions. |
 | `jev` | Disabled by default; model, endpoint, key **environment variable name**, request bounds, thresholds, caching and redaction. See [privacy](privacy.md). |
 | `collectors`, `limits`, `safety` | Explicit collector sources, bounded work/timeouts, and destination headroom. `allow_cross_filesystem_quarantine` does not enable a copy path: the Linux action engine still refuses cross-filesystem quarantine. |
@@ -344,6 +345,53 @@ or `/var/tmp`; the guard measures the database's filesystem, so keep that
 directory on it. The vacuum holds the scan lock, the apply lock and SQLite's
 write lock while it rewrites the file, so no confirmed filesystem mutation
 waits on it; only the cycle runs it, never the watcher.
+
+## Decision owners
+
+`owners` is empty by default. Each entry names the role that decides about one
+path and everything under it, so reports can name someone instead of
+`unassigned` or the coordinator:
+
+```yaml
+owners:
+  - path: /root/adspower2
+    owner: adspower
+    note: live fleet API + dashboard
+```
+
+| Key | Contract |
+| --- | --- |
+| `path` | Required. An absolute path (`~` expands; the result is cleaned), unique across `owners`. It covers itself and everything under it. Entries may nest: the longest matching path wins, and a path that only shares a name prefix (`/root/adspower2-old`) is not covered. The path need not exist or lie under a root. |
+| `owner` | Required. A role name, validated like `report.coordinator_role`: 1-64 letters, digits, `.`, `_` or `-`, starting with a letter or digit, and not `unknown`. |
+| `note` | Optional free text for people reading the policy. |
+
+**An owner is information, never authority.** It does not approve, release,
+protect or unprotect anything, and it changes no plan action, safety verdict or
+approval. Protection stays in `protect.paths` and `workspace_archive_keep`, and
+a release stays a reply from the role itself. `owners` is therefore left out
+of a plan's policy digest: adding, changing or removing an entry neither
+changes a plan's identity nor voids its approvals.
+
+Where an owner is shown, it resolves in this order:
+
+- **Inventory report** (`owner` of `growth` and `store_budgets` rows) and
+  `janitor explain`: an exact `caches` rule's `recovery.owner`, then an exact
+  `evidence_exports` rule's `owner`, then the longest `owners` entry covering
+  the path, then `unassigned`. `explain` prints the owner with its source, for
+  example `owners[0] /root/adspower2` (JSON `data.owner.owner` and
+  `data.owner.source`).
+- **Stale-workspace report**: Gitmoot's registration and producer evidence
+  first. If that ledger names a role, or names roles but no single routable
+  one, the ledger decides. Otherwise the longest `owners` entry covering the
+  item replaces the coordinator fallback: the item is grouped and addressed
+  to that role, its `owner_evidence` names the entry, only that role may
+  reply for it, and it gets the same suggestion as any owned item. A reply
+  snapshots that owner, so changing the covering entry voids it like any
+  other owner change. An item neither covers stays in the `unknown` group for
+  `report.coordinator_role`.
+
+A policy that uses `owners` is rejected as an unknown field by binaries that
+predate it.
 
 ## Admission consumer hook
 
@@ -912,7 +960,7 @@ text` once a week as a Gitmoot message to each role.
 | `report.enabled` | Default `false`. |
 | `report.roots` | Configured inventory roots. With `release_action: archive` they follow the category root rules. |
 | `report.idle` | Default `14d`, at least `1d`. Measured from the newest modification in the tree (bounded deep walk). |
-| `report.coordinator_role` | Required when enabled. Receives the `unknown` owner group and is the only role that may reply for it. |
+| `report.coordinator_role` | Required when enabled. Receives the `unknown` owner group (items no ledger evidence or `owners` entry attributes) and is the only role that may reply for it. |
 | `report.release_action` | `none` (default) records a release and lists it for the operator. `archive` makes the next cycle archive released items. |
 | `report.archive`, `local_retention`, `max_items_per_cycle`, `max_bytes_per_item` | Used only with `archive`. They follow the same rules and defaults as a category. |
 
@@ -930,10 +978,12 @@ incomplete, no entry is suggested for archiving, and every reply is refused.
 
 Each entry shows its path, size (`deep`, `lower_bound` or `metadata`), Git
 state (`merged`, `pushed`, `unpushed`, `dirty`, `not_git` or `unknown`), owner
-and suggested action (`archive`, `keep` or `ask`). Owners come only from
-Gitmoot's ledger: `tasks.disposal_escalation_role` and `jobs.dispatched_by`
-for the exact path. Anything else is in the `unknown` group, addressed to the
-coordinator, and is always `ask`. It is never treated as disposable. Gitmoot's
+and suggested action (`archive`, `keep` or `ask`). Owners come from Gitmoot's
+ledger, `tasks.disposal_escalation_role` and `jobs.dispatched_by` for the exact
+path, and, where the ledger names no role, from the longest covering
+[`owners`](#decision-owners) entry. Anything else is in the `unknown` group,
+addressed to the coordinator, and is always `ask`. It is never treated as
+disposable. Gitmoot's
 existing provenance guard still applies to ledger-referenced paths outside its
 home, so these are suggested `ask`, and the archive step refuses them.
 
