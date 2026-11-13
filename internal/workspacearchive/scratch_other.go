@@ -33,6 +33,13 @@ func (s *ScratchDir) Observe(context.Context, string, []string, int) (ScratchEnt
 	return ScratchEntry{}, errUnsupported
 }
 
+// ObserveShape recognizes no shape off Linux.
+func (s *ScratchDir) ObserveShape(_ context.Context, name string, _, _ []string) (ScratchEntry, bool) {
+	return ScratchEntry{Name: name}, false
+}
+
+func ListeningUnixSockets() (UnixListeners, error) { return nil, errUnsupported }
+
 func ScratchReferences(context.Context, string, string) (map[string]string, error) {
 	return nil, errUnsupported
 }

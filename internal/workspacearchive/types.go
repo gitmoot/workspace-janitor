@@ -198,9 +198,41 @@ type ScratchEntry struct {
 	// faithfully: a socket, fifo or device, a mount crossing, extended
 	// attributes or Git history outside it.
 	Refusal string `json:"refusal,omitempty"`
+	// Shape names the built-in regenerable shape (config.ScratchShapes) the
+	// entry was observed as, exactly; empty for every other entry. A shape
+	// entry is never archived.
+	Shape string `json:"shape,omitempty"`
 
-	inv scratchInventory
+	// socket is a shape entry's observed socket file identity.
+	socket core.FilesystemID
+	inv    scratchInventory
 }
+
+// The fixed members of a config.ScratchShapeChromeSingletonLock entry.
+const (
+	ChromeSingletonCookie = "SingletonCookie"
+	ChromeSingletonSocket = "SingletonSocket"
+)
+
+// ShapeSocket returns the entry-relative path and observed identity of a
+// shape entry's socket, which must not be listening when the entry is
+// removed; ok is false for every other entry.
+func (e ScratchEntry) ShapeSocket() (path string, id core.FilesystemID, ok bool) {
+	if e.Shape == config.ScratchShapeChromeSingletonLock {
+		return e.Name + "/" + ChromeSingletonSocket, e.socket, true
+	}
+	return "", core.FilesystemID{}, false
+}
+
+// UnixListeners holds the inode of every file a listening Unix socket is
+// bound to, as sock_diag reports it: its low 32 bits, and no device that a
+// statx device could be compared with (btrfs subvolumes and overlayfs report
+// another one). A file elsewhere that merely shares those bits also counts
+// as listening, which can only keep an entry, never remove one.
+type UnixListeners map[uint32]bool
+
+// Bound reports whether a listening socket may be bound to the file id.
+func (l UnixListeners) Bound(id core.FilesystemID) bool { return l[uint32(id.Inode)] }
 
 // ScratchManifest is the durable receipt of one scratch run's verified
 // archive. Member paths start with their entry name.

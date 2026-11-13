@@ -101,9 +101,14 @@ func (s *ScratchDir) Observe(ctx context.Context, name string, patterns []string
 
 // SensitiveMember re-applies the sensitive-name screen (built-in and
 // patterns) to every observed member name of entry, and returns the first
-// match or "".
+// match or "". A shape entry's fixed member names are not screened; its own
+// name is.
 func (e ScratchEntry) SensitiveMember(dir string, patterns []string) string {
-	for _, member := range e.inv.members {
+	members := e.inv.members
+	if e.Shape != "" {
+		members = members[:min(len(members), 1)]
+	}
+	for _, member := range members {
 		if secretLike(filepath.Base(member.Path), filepath.Join(dir, filepath.Dir(member.Path)), patterns) {
 			return member.Path
 		}
@@ -214,7 +219,7 @@ func (s *ScratchDir) CreateScratch(ctx context.Context, dest config.WorkspaceArc
 	}
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if len(entry.inv.members) == 0 || entry.Refusal != "" || entry.Sensitive != "" {
+		if len(entry.inv.members) == 0 || entry.Refusal != "" || entry.Sensitive != "" || entry.Shape != "" {
 			return m, nil, fmt.Errorf("%s is not archivable", entry.Name)
 		}
 		in.inv.members = append(in.inv.members, entry.inv.members...)

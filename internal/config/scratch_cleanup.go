@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -48,9 +49,15 @@ type ScratchCleanup struct {
 	// Every is the shortest interval between two runs started by the cycle.
 	Every IdleDuration `yaml:"every" json:"every"`
 	// Skip and Regenerable are filepath.Match globs on the entry name.
-	Skip        []string                            `yaml:"skip" json:"skip"`
-	Regenerable []string                            `yaml:"regenerable" json:"regenerable"`
-	Archive     WorkspaceArchiveCategoryDestination `yaml:"archive" json:"archive"`
+	Skip        []string `yaml:"skip" json:"skip"`
+	Regenerable []string `yaml:"regenerable" json:"regenerable"`
+	// RegenerableShapes opts in built-in recognizers (ScratchShapes) for
+	// regenerable entries of one exact, known shape whose screens would
+	// otherwise keep them forever. Only an entry that matches Regenerable
+	// and exactly one enabled shape has the sensitive-name and file-type
+	// screens waived; every other check still applies.
+	RegenerableShapes []string                            `yaml:"regenerable_shapes" json:"regenerable_shapes,omitempty"`
+	Archive           WorkspaceArchiveCategoryDestination `yaml:"archive" json:"archive"`
 	// MaxBytesPerRun bounds the bytes one run removes (archived and
 	// regenerable together); 0 means no bound.
 	MaxBytesPerRun int64 `yaml:"max_bytes_per_run" json:"max_bytes_per_run"`
@@ -66,6 +73,16 @@ type ScratchCleanup struct {
 // minRegenerableIdle is the shortest regenerable_idle accepted: long enough
 // that a build which pauses between steps is not swept mid-run.
 const minRegenerableIdle = time.Hour
+
+// ScratchShapeChromeSingletonLock names Chrome's per-process lock directory
+// (com.google.Chrome.XXXXXX in the temp directory): exactly a SingletonCookie
+// symlink to a decimal number and a SingletonSocket Unix socket, nothing
+// else. Chrome leaves one behind per process; it holds no data, and it only
+// matters while its socket is listening.
+const ScratchShapeChromeSingletonLock = "chrome_singleton_lock"
+
+// ScratchShapes lists the built-in shapes regenerable_shapes may enable.
+var ScratchShapes = []string{ScratchShapeChromeSingletonLock}
 
 // IdleFor is the idle time an entry must reach before cleanup:
 // RegenerableIdle for a regenerable entry when set, Idle otherwise.
@@ -186,6 +203,17 @@ func (p *Policy) validateScratchCleanup(errs *core.FieldErrors) {
 		}
 		if r := scratch.RegenerableIdle.Duration(); r != 0 && r < minRegenerableIdle {
 			errs.Add(field+".regenerable_idle", "must be at least %s, got %s", IdleDuration(minRegenerableIdle), scratch.RegenerableIdle)
+		}
+		if len(scratch.RegenerableShapes) != 0 && len(scratch.Regenerable) == 0 {
+			errs.Add(field+".regenerable_shapes", "requires regenerable patterns: a shape only applies to an entry that matches one")
+		}
+		for j, shape := range scratch.RegenerableShapes {
+			switch {
+			case !slices.Contains(ScratchShapes, shape):
+				errs.Add(fmt.Sprintf("%s.regenerable_shapes[%d]", field, j), "unknown shape %q; known shapes: %v", shape, ScratchShapes)
+			case slices.Contains(scratch.RegenerableShapes[:j], shape):
+				errs.Add(fmt.Sprintf("%s.regenerable_shapes[%d]", field, j), "duplicate shape %q", shape)
+			}
 		}
 		if scratch.Every.Duration() < minScratchInterval {
 			errs.Add(field+".every", "must be at least %s, got %s", IdleDuration(minScratchInterval), scratch.Every)

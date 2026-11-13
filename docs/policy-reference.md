@@ -979,6 +979,7 @@ entries Janitor removes. Entries that match no list are archived first.
 | `every` | Default `48h`, at least `24h`. `janitor cycle` runs the directory once this long has passed since its last recorded run. |
 | `skip` | `filepath.Match` globs on the entry name. A match is never touched. |
 | `regenerable` | Globs on the entry name. An idle, unused match is deleted without an archive. |
+| `regenerable_shapes` | Default empty. Opt-in built-in recognizers for regenerable entries of one exact shape that the screens below would otherwise keep forever. Requires `regenerable` patterns; each shape may be listed once. See [regenerable shapes](#regenerable-shapes). |
 | `archive.directory`, `expect_mount_source`, `expect_fstype` | Every other idle, unused entry is archived here before deletion. The same approval rules apply as for `workspace_archives` destinations: covered by an independent `protect.paths` rule, outside every inventory root and scratch directory, and the mount expectations are checked before writing. |
 | `max_bytes_per_run` | Default `0` (no bound). The total local bytes one run may remove. Entries are selected largest first (ties: longest idle, then name), so a bounded run frees the most it can and a large entry never waits behind many small ones; entries past the bound are `deferred` to the next run. |
 | `max_archive_entries_per_run` | Default `50000`, at least `1`. The entries one run may archive into its single tar; further non-regenerable entries are `deferred` to the next run. Regenerable entries are not archived and not counted. The archive manifest's 128 MiB size bound also defers entries, before any archive is written. |
@@ -999,7 +1000,9 @@ archived nor deleted, while any of these hold:
   protect. This is the same screen workspace archives use, and it applies to
   regenerable entries too.
 - it is, or contains, a socket, fifo or device, a mount crossing, extended
-  attributes, or Git history outside it
+  attributes, or Git history outside it. An entry that is exactly an enabled
+  [regenerable shape](#regenerable-shapes) is the only exception to this and
+  the sensitive-name screen.
 - anything in it was modified (mtime) within `idle`, or has an mtime in the
   future, or its mtime or anything else about it cannot be read. An mtime
   or ctime past 2262 or before 1677 cannot be represented and counts as
@@ -1039,3 +1042,33 @@ The receipts are in the `scratch_runs` and `scratch_deletions` tables
 (schema 13). Reported sizes are local bytes. Free space on the archive mount is
 never counted as local headroom. To restore an entry, see
 [recovery](recovery.md#scratch-cleanup).
+
+### Regenerable shapes
+
+`regenerable_shapes` names built-in recognizers. A recognizer only looks at
+an entry whose name matches `regenerable`. It accepts only the exact shape
+described below. Any deviation, such as an extra or missing member, another
+type, a different symlink target, a mount crossing or an extended attribute,
+means the entry is observed and screened as if no shape were enabled, so
+it is kept for the same reasons as before.
+
+For an entry that matches exactly, two screens are waived: the
+sensitive-name screen for the shape's fixed member names, and the refusal of
+its socket. The entry's own name is still screened. Everything else still
+applies: `protect.paths` and KEEP, `skip`, the process check (cwd, open
+descriptor, mapping), `regenerable_idle` by newest mtime, the policy reload,
+unchanged and in-use checks just before deletion, and removal anchored to the
+observed device, inode and ctime. A shape entry is deleted without an archive
+and never archived.
+
+| Shape | Exact shape |
+| --- | --- |
+| `chrome_singleton_lock` | A directory holding exactly two entries: `SingletonCookie`, a symlink whose target is a decimal number of at most 20 digits, and `SingletonSocket`, a Unix socket. Chrome leaves one of these process locks (`com.google.Chrome.XXXXXX`) in the temp directory per process. Without the shape, the socket alone keeps it forever, and a `*cookie*` or `*socket*` name pattern would too. The entry is also kept while `SingletonSocket` is listening. Janitor asks the kernel's `sock_diag` interface (what `ss -xl` reads) which files the listening Unix sockets are bound to and compares the inode of `SingletonSocket`, so the listener is found however its bind path was spelled: relative, through `.`, `..`, `//` or a symlink, a hard link, or renamed since. `/proc/net/unix` cannot be used for this: it prints the bind path as written, and its `Inode` column is the socket's inode, not the file's. `sock_diag` reports only the low 32 bits of the file inode and no comparable device, so a file elsewhere that shares them also counts as listening; that can only keep an entry. If the listening sockets cannot be read, every shape entry is kept. Only listeners in Janitor's own network namespace are visible. |
+
+```yaml
+scratch_cleanup:
+  - path: /tmp
+    regenerable: ["com.google.Chrome.*"]
+    regenerable_idle: 2h
+    regenerable_shapes: [chrome_singleton_lock]
+```
