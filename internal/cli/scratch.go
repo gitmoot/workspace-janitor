@@ -238,6 +238,7 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	if err != nil {
 		return fail(fmt.Errorf("nothing is touched: %w", err))
 	}
+	listening := scratchListeners(policy, scratch)
 	// The name listing is the only structure that grows with the directory:
 	// a scratch directory may hold far more entries than an inventory scan
 	// directory, so it has its own bound, and exceeding it refuses the run
@@ -263,7 +264,7 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 			report.list(item)
 			continue
 		}
-		entry, reason := scratchCheck(ctx, dir, policy, scratch, used, name, now)
+		entry, reason := scratchCheck(ctx, dir, policy, scratch, used, listening, name, now)
 		item.SizeBytes = entry.SizeBytes
 		if entry.Members != 0 {
 			item.IdleFor = scratchIdle(now, entry.NewestMtimeNS).Truncate(time.Second).String()
@@ -318,7 +319,7 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 			report.list(item)
 			continue
 		}
-		entry, reason := scratchCheck(ctx, dir, policy, scratch, used, next.name, now)
+		entry, reason := scratchCheck(ctx, dir, policy, scratch, used, listening, next.name, now)
 		if reason == "" && entry.Identity != next.identity {
 			reason = "replaced while the directory was being listed"
 		}
@@ -341,6 +342,9 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 		item.Status, item.Reason = scratchWouldArchive, "would be archived, verified and then deleted"
 		if next.regenerable {
 			item.Status, item.Reason = scratchWouldDelete, "would be deleted without an archive (matches a regenerable pattern)"
+			if entry.Shape != "" {
+				item.Reason = fmt.Sprintf("would be deleted without an archive (matches a regenerable pattern and the %s shape)", entry.Shape)
+			}
 		}
 		candidate := scratchCandidate{item: report.slot(item), entry: entry, regenerable: next.regenerable, status: item.Status, reason: item.Reason}
 		if !candidate.regenerable {
@@ -433,6 +437,7 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	if err != nil {
 		return failAll(fmt.Errorf("in-use recheck: %w", err))
 	}
+	listening = scratchListeners(latest, current)
 	var failures []error
 	for i := range selected {
 		candidate := &selected[i]
@@ -443,6 +448,10 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 		}
 		if ref, ok := used[candidate.entry.Name]; ok {
 			report.set(candidate, scratchKept, "in use at deletion time: "+ref)
+			continue
+		}
+		if reason := listening.refusal(current.Path, candidate.entry); reason != "" {
+			report.set(candidate, scratchKept, reason+" at deletion time")
 			continue
 		}
 		if err := dir.Unchanged(candidate.entry); err != nil {
@@ -488,7 +497,8 @@ var scratchBeforeDeletion = func() {}
 // scratchDeletionRefusal re-applies the freshly loaded policy to one
 // selected entry: protect.paths and KEEP, the skip list, the regenerable
 // classification it was selected under (an entry deleted without an archive
-// must still be regenerable) and the sensitive-name screen over every member.
+// must still be regenerable), the regenerable shape it was observed as, and
+// the sensitive-name screen over every member (a shape entry's own name).
 func scratchDeletionRefusal(policy config.Policy, scratch config.ScratchCleanup, c scratchCandidate) string {
 	path := filepath.Join(scratch.Path, c.entry.Name)
 	if reason := policy.ScratchRefusal(path); reason != "" {
@@ -500,6 +510,9 @@ func scratchDeletionRefusal(policy config.Policy, scratch config.ScratchCleanup,
 	if c.regenerable && !config.MatchesAny(c.entry.Name, scratch.Regenerable) {
 		return "no longer matches a regenerable pattern and was not archived; kept local"
 	}
+	if c.entry.Shape != "" && !slices.Contains(scratch.RegenerableShapes, c.entry.Shape) {
+		return fmt.Sprintf("regenerable_shapes no longer enables %s; kept local", c.entry.Shape)
+	}
 	if name := c.entry.SensitiveMember(scratch.Path, policy.Protect.NamePatterns); name != "" {
 		return fmt.Sprintf("sensitive name %s now keeps the entry local", name)
 	}
@@ -507,31 +520,79 @@ func scratchDeletionRefusal(policy config.Policy, scratch config.ScratchCleanup,
 }
 
 // scratchCheck observes one entry and returns why it must stay, if it must:
-// policy, a process, an unobservable or unsupported member, a sensitive name
-// or a recent (or future) mtime. It never touches the entry.
-func scratchCheck(ctx context.Context, dir *workspacearchive.ScratchDir, policy config.Policy, scratch config.ScratchCleanup, used map[string]string, name string, now time.Time) (workspacearchive.ScratchEntry, string) {
+// policy, a process, an unobservable or unsupported member, a sensitive name,
+// a shape entry's listening socket or a recent (or future) mtime. It never
+// touches the entry.
+func scratchCheck(ctx context.Context, dir *workspacearchive.ScratchDir, policy config.Policy, scratch config.ScratchCleanup, used map[string]string, listening scratchListening, name string, now time.Time) (workspacearchive.ScratchEntry, string) {
 	if reason := policy.ScratchRefusal(filepath.Join(scratch.Path, name)); reason != "" {
 		return workspacearchive.ScratchEntry{Name: name}, reason
 	}
 	if ref, ok := used[name]; ok {
 		return workspacearchive.ScratchEntry{Name: name}, "in use: " + ref
 	}
-	entry, err := dir.Observe(ctx, name, policy.Protect.NamePatterns, policy.Limits.DeepSizeMaxEntries)
-	if err != nil {
-		return entry, "could not be observed: " + err.Error()
+	// An entry of an enabled shape is observed as exactly that shape; any
+	// deviation from it is observed and screened as if none were enabled.
+	entry, shaped := workspacearchive.ScratchEntry{}, false
+	if len(scratch.RegenerableShapes) != 0 && config.MatchesAny(name, scratch.Regenerable) {
+		entry, shaped = dir.ObserveShape(ctx, name, scratch.RegenerableShapes, policy.Protect.NamePatterns)
+	}
+	if !shaped {
+		var err error
+		if entry, err = dir.Observe(ctx, name, policy.Protect.NamePatterns, policy.Limits.DeepSizeMaxEntries); err != nil {
+			return entry, "could not be observed: " + err.Error()
+		}
 	}
 	newest, idle := time.Unix(0, entry.NewestMtimeNS), scratchIdle(now, entry.NewestMtimeNS)
+	live := listening.refusal(scratch.Path, entry)
 	switch {
 	case entry.Refusal != "":
 		return entry, entry.Refusal
 	case entry.Sensitive != "":
 		return entry, fmt.Sprintf("sensitive name %s keeps the entry local", entry.Sensitive)
+	case live != "":
+		return entry, live
 	case newest.After(now):
 		return entry, fmt.Sprintf("a member's mtime %s is in the future; counted as changed now", newest.UTC().Format(time.RFC3339))
 	case idle < scratch.IdleFor(config.MatchesAny(name, scratch.Regenerable)):
 		return entry, fmt.Sprintf("changed %s ago; scratch entries must be unchanged for %s", idle.Truncate(time.Second), scratch.IdleFor(config.MatchesAny(name, scratch.Regenerable)))
 	}
 	return entry, ""
+}
+
+// scratchListening is one snapshot of the listening Unix sockets inside a
+// scratch directory, read only when it enables a regenerable shape. A shape
+// entry whose socket is listening, or whose listening state is unknown, is
+// kept.
+type scratchListening struct {
+	paths map[string]bool
+	err   error
+}
+
+func scratchListeners(policy config.Policy, scratch config.ScratchCleanup) scratchListening {
+	if len(scratch.RegenerableShapes) == 0 {
+		return scratchListening{err: errors.New("no regenerable shape is enabled")}
+	}
+	paths, err := workspacearchive.ListeningUnixSockets(policy.Collectors.ProcRoot, scratch.Path)
+	return scratchListening{paths: paths, err: err}
+}
+
+// refusal returns why entry must stay because of its socket, or "". Only a
+// shape entry has one.
+func (l scratchListening) refusal(dir string, entry workspacearchive.ScratchEntry) string {
+	rel := entry.ShapeSocket()
+	if rel == "" {
+		return ""
+	}
+	socket := filepath.Join(dir, rel)
+	switch {
+	case l.err != nil:
+		return fmt.Sprintf("%s may be listening (%v); kept local", socket, l.err)
+	case strings.ContainsRune(socket, '\n'):
+		return fmt.Sprintf("%q cannot be matched against /proc/net/unix; kept local", socket)
+	case l.paths[socket]:
+		return socket + " is a listening socket; its process still holds the lock"
+	}
+	return ""
 }
 
 // scratchPreflight re-reads the policy file before and after the slow copy:

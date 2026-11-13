@@ -284,13 +284,18 @@ workspace_archive_categories: []
 #   regenerable: ["go-build[0-9]*", "go-link*", "bunx-*", "pip-*",
 #     "node-compile-cache", "v8-compile-cache*", "gopls-*", "tsx-[0-9]*",
 #     "npm*", ".npm*", "yarn*", "pnpm*", "esbuild*", "vite*", "jiti",
-#     "deno*", "uv-*", "cargo*"]
+#     "deno*", "uv-*", "cargo*", "com.google.Chrome.*"]
 #   regenerable_idle: 2h          # optional shorter idle for regenerable entries;
 #                                 # minimum 1h; entries in use are kept either way
 #   regenerable_every: 1h         # optional: the watcher also runs a pass this
 #                                 # often that only deletes regenerable entries idle
 #                                 # for regenerable_idle (minimum 1h; needs
 #                                 # regenerable_idle); the full sweep keeps `every`
+#   regenerable_shapes: [chrome_singleton_lock]  # optional, opt-in: also deletes
+#                                 # a regenerable entry that is EXACTLY Chrome's
+#                                 # process lock (SingletonCookie -> number,
+#                                 # SingletonSocket), which its socket otherwise
+#                                 # keeps forever; kept while the socket listens
 #   archive:
 #     directory: /mnt/backup/janitor-scratch   # protected, outside every root
 #     expect_mount_source: backup.example:/export

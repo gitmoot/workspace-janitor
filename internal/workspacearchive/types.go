@@ -198,8 +198,27 @@ type ScratchEntry struct {
 	// faithfully: a socket, fifo or device, a mount crossing, extended
 	// attributes or Git history outside it.
 	Refusal string `json:"refusal,omitempty"`
+	// Shape names the built-in regenerable shape (config.ScratchShapes) the
+	// entry was observed as, exactly; empty for every other entry. A shape
+	// entry is never archived.
+	Shape string `json:"shape,omitempty"`
 
 	inv scratchInventory
+}
+
+// The fixed members of a config.ScratchShapeChromeSingletonLock entry.
+const (
+	ChromeSingletonCookie = "SingletonCookie"
+	ChromeSingletonSocket = "SingletonSocket"
+)
+
+// ShapeSocket is the entry-relative path of a shape entry's socket, which
+// must not be listening when the entry is removed; "" for other entries.
+func (e ScratchEntry) ShapeSocket() string {
+	if e.Shape == config.ScratchShapeChromeSingletonLock {
+		return e.Name + "/" + ChromeSingletonSocket
+	}
+	return ""
 }
 
 // ScratchManifest is the durable receipt of one scratch run's verified
