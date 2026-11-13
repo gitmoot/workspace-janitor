@@ -165,15 +165,31 @@ At most one trim per kind and path is accepted.
   that must survive regardless belong in `keep`, which is checked first.
 
   Candidates are removed oldest first (by the later of creation and last
-  tag time, then ID): an image with at most one tag by ID, an image with
-  several tags tag by tag (`docker rmi --no-prune <repo:tag>`, in sorted
-  order), because Docker refuses to remove an image with several tags by ID
-  without `--force`; removing the last tag deletes the image. Immediately
-  before each `docker rmi` the trim checks again that no image build or
-  pull runs and asks the daemon whether any container now uses the image
-  (`docker container ls --all --filter ancestor=<ID>`); one that does keeps
-  the image. A failed step stops that image's removal and leaves its
-  remaining tags. With `max_bytes` the trim
+  tag time, then ID). The image itself is always removed by ID (`docker rmi
+  --no-prune <ID>`), which cannot name another image. Docker refuses to
+  remove an image with several tags by ID without `--force`, so such an
+  image first loses its extra tags (all but the last, in sorted order), one
+  `docker rmi --no-prune <repo:tag>` each. Each step is bound to the
+  checked image:
+  - before the first step the image must still hold exactly the tags the
+    candidate list read (else `changed`);
+  - before each step the trim checks again that no image build or pull
+    runs, and asks the daemon whether any container now uses the image
+    (`docker container ls --all --filter ancestor=<ID>`); one that does
+    keeps the image;
+  - before untagging, the tag is resolved (`docker image inspect --format
+    {{.Id}} <repo:tag>`); a tag that now names another image (another
+    client ran `docker tag`, a build or a pull) stops that image's removal
+    as `tag_moved`;
+  - after each step every image's tags are compared with those before: the
+    image must hold exactly the tags expected (or be gone after the final
+    step), and no other image may have lost a tag or disappeared. Docker
+    has no untag-only operation, so a tag that moves in the instant between
+    resolving and untagging can still reach another image; that is reported
+    and stops the whole trim.
+
+  A failed step stops that image's removal and leaves its remaining
+  tags. With `max_bytes` the trim
   runs only while the reclaimable image space that `docker system df
   --format json` reports exceeds it (Docker prints that figure to four
   significant digits), and stops as soon as it no longer does; without it
@@ -183,9 +199,9 @@ At most one trim per kind and path is accepted.
   `commands` run for it, the tags it `untagged`, and `status`: `removed`,
   `failed` (with Docker's error; the trim then fails),
   `kept_in_use` (with the containers), `not_needed` (the bound was reached),
-  `postponed` (a build or pull started) or `not_reached` (the trim stopped
-  on a Docker error first). Containers, volumes, networks and build cache
-  are never touched.
+  `postponed` (a build or pull started), `tag_moved`, `changed` or
+  `not_reached` (the trim stopped on a Docker error first). Containers,
+  volumes, networks and build cache are never touched.
 - `go-mod`: when the module cache's allocated size exceeds `max_bytes`, runs
   `go clean -modcache` with that exact `GOMODCACHE`, `GOTOOLCHAIN=local`,
   `GOENV=off`, `GOPROXY=off` and empty `GOFLAGS`. Go removes the whole

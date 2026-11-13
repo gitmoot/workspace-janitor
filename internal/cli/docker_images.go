@@ -23,6 +23,8 @@ const (
 	imageNotNeeded  = "not_needed"
 	imagePostponed  = "postponed"
 	imageNotReached = "not_reached"
+	imageTagMoved   = "tag_moved"
+	imageChanged    = "changed"
 )
 
 // dockerImageOutcome reports one candidate image of a docker-images trim:
@@ -199,20 +201,41 @@ func trimDockerImages(ctx context.Context, procRoot string, trim config.CacheTri
 
 // removeImage removes one candidate with non-forced `docker rmi --no-prune`,
 // so Docker removes nothing else: by default rmi also deletes untagged parent
-// images, which were never checked. An image with at most one tag is removed
-// by ID. Docker refuses to remove an image with several tags by ID without
-// --force, so such an image is untagged tag by tag; removing its last tag
-// deletes it. Before each step removeImage checks again that no image build
-// or pull runs and that no container uses the image. A failed step stops the
-// image's removal, leaving its remaining tags. It returns the processes that
-// postponed the removal, and an error when Docker could not be asked.
+// images, which were never checked. The image itself is always removed by ID,
+// which cannot name another image. Docker refuses to remove an image with
+// several tags by ID without --force, so such an image first loses its extra
+// tags (all but the last in sorted order), one `docker rmi --no-prune
+// <repo:tag>` each.
+//
+// A tag can move to another image at any time (`docker tag`, a build or a
+// pull), so every step is bound to the candidate's identity. Before the first
+// step the candidate must still hold exactly the tags the candidate list
+// read. Before each step removeImage checks again that no image build or
+// pull runs and that no container uses the image, and before untagging it
+// resolves the tag: one that names another image now stops the image's
+// removal (tag_moved). After each step it compares every image's tags with
+// those before: the candidate must hold exactly the tags expected (or be gone
+// after the final removal), and no other image may have lost a tag or
+// disappeared. Docker offers no untag-only operation, so a tag moved between
+// resolving and untagging can still reach another image; that is detected,
+// reported and stops the whole trim.
+//
+// A failed step stops the image's removal, leaving its remaining tags. It
+// returns the processes that postponed the removal, and an error that stops
+// the trim: Docker could not be asked, or a step changed another image.
 func removeImage(ctx context.Context, procRoot string, trim config.CacheTrim, outcome *dockerImageOutcome) ([]string, error) {
-	refs := []string{outcome.ID}
-	if len(outcome.Tags) > 1 {
-		refs = append([]string(nil), outcome.Tags...)
-		sort.Strings(refs)
+	images, err := dockerImages(ctx, trim.Binary)
+	if err != nil {
+		return nil, err
 	}
-	for _, ref := range refs {
+	before := imageTagSets(images)
+	remaining := append([]string(nil), outcome.Tags...)
+	sort.Strings(remaining)
+	if current, ok := before[outcome.ID]; !ok || !sameStrings(current, remaining) {
+		outcome.Status, outcome.Error = imageChanged, "image or its tags changed since the candidate list was read"
+		return nil, nil
+	}
+	for {
 		if users := cacheUsers(procRoot, trim); len(users) != 0 {
 			outcome.Status = imagePostponed
 			return users, nil
@@ -228,6 +251,19 @@ func removeImage(ctx context.Context, procRoot string, trim config.CacheTrim, ou
 			outcome.Status, outcome.Containers = imageInUse, containers
 			return nil, nil
 		}
+		ref, expect := outcome.ID, []string(nil)
+		if len(remaining) > 1 {
+			ref, expect = remaining[0], remaining[1:]
+			out, err := dockerOutput(ctx, trim.Binary, "image", "inspect", "--format", "{{.Id}}", ref)
+			if err != nil {
+				outcome.Status, outcome.Error = imageTagMoved, fmt.Sprintf("tag moved: %s cannot be resolved: %v", ref, err)
+				return nil, nil
+			}
+			if now := strings.TrimSpace(string(out)); now != outcome.ID {
+				outcome.Status, outcome.Error = imageTagMoved, fmt.Sprintf("tag moved: %s now names %s", ref, now)
+				return nil, nil
+			}
+		}
 		args := []string{"rmi", "--no-prune", ref}
 		outcome.Commands = append(outcome.Commands, append([]string{trim.Binary}, args...))
 		out, err = dockerCombined(ctx, trim.Binary, args...)
@@ -239,9 +275,88 @@ func removeImage(ctx context.Context, procRoot string, trim config.CacheTrim, ou
 		if ref != outcome.ID {
 			outcome.Untagged = append(outcome.Untagged, ref)
 		}
+		images, err := dockerImages(ctx, trim.Binary)
+		if err != nil {
+			return nil, err
+		}
+		after := imageTagSets(images)
+		if problem := unexpectedImageChange(before, after, outcome.ID, expect, ref == outcome.ID); problem != "" {
+			outcome.Status, outcome.Error = imageRmiFailed, fmt.Sprintf("after docker rmi --no-prune %s: %s", ref, problem)
+			return nil, fmt.Errorf("%s: %s", outcome.ID, outcome.Error)
+		}
+		if ref == outcome.ID {
+			outcome.Status = imageRemoved
+			return nil, nil
+		}
+		before, remaining = after, expect
 	}
-	outcome.Status = imageRemoved
-	return nil, nil
+}
+
+// imageTagSets maps each image ID to its sorted tags.
+func imageTagSets(images []dockerImage) map[string][]string {
+	sets := make(map[string][]string, len(images))
+	for _, image := range images {
+		tags := append([]string{}, image.RepoTags...)
+		sort.Strings(tags)
+		sets[image.ID] = tags
+	}
+	return sets
+}
+
+// unexpectedImageChange says how a removal step changed more than it should
+// have, or "" when it did not: the candidate id must be gone (deleted) or
+// hold exactly the tags expect, and no other image may have lost a tag or
+// disappeared. Images that appeared or gained tags are someone else's work
+// and do not matter.
+func unexpectedImageChange(before, after map[string][]string, id string, expect []string, deleted bool) string {
+	current, exists := after[id]
+	switch {
+	case deleted && exists:
+		return "the image still exists"
+	case !deleted && !exists:
+		return "the image was deleted, not only untagged"
+	case !deleted && !sameStrings(current, expect):
+		return fmt.Sprintf("the image holds tags %q, expected %q", current, expect)
+	}
+	var problems []string
+	for other, tags := range before {
+		if other == id {
+			continue
+		}
+		now, ok := after[other]
+		if !ok {
+			problems = append(problems, fmt.Sprintf("image %s %q disappeared", other, tags))
+			continue
+		}
+		for _, tag := range tags {
+			if !containsString(now, tag) {
+				problems = append(problems, fmt.Sprintf("image %s lost tag %s", other, tag))
+			}
+		}
+	}
+	sort.Strings(problems)
+	return strings.Join(problems, "; ")
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // imagesPossiblyRunAs returns the IDs of every local image a container

@@ -87,11 +87,14 @@ func image(digit string, age time.Duration, size int64, tags ...string) fakeImag
 // ancestor=<id> (a container that appeared after the trim listed the
 // containers); events, the container create events in min_age;
 // history, the time of every event the daemon still holds (by default one
-// from 2020, so the history covers min_age); and events-fail, which makes
-// `docker events` fail. `docker rmi` behaves like Docker's: by ID it refuses
-// an image with several tags, by tag it untags, and an image left without
-// tags is deleted, its size leaving reclaimable; unless --no-prune is given,
-// its untagged parent is deleted with it.
+// from 2020, so the history covers min_age); events-fail, which makes
+// `docker events` fail; and hook-ancestor and hook-resolve, shell scripts run
+// once, after the first container query for an image and after the first
+// `image inspect --format {{.Id}} <ref>` (another client acting meanwhile).
+// `docker rmi` behaves like Docker's: by ID it refuses an image with several
+// tags, by tag it untags, and an image left without tags is deleted, its size
+// leaving reclaimable; unless --no-prune is given, its untagged parent is
+// deleted with it.
 func (x *trimFixture) fakeDocker(t *testing.T, images ...fakeImage) string {
 	t.Helper()
 	state := filepath.Join(x.home, "dockerd")
@@ -118,6 +121,7 @@ func (x *trimFixture) fakeDocker(t *testing.T, images ...fakeImage) string {
 	x.dockerState(t, "history", "1577836800000000000\n")
 	return x.fakeTool(t, "docker", `S=`+state+`
 tags() { grep -c . "$S/images/$1.tags"; }
+hook() { if [ -f "$S/hook-$1" ]; then sh "$S/hook-$1"; rm -f "$S/hook-$1"; fi; }
 case "$1" in
 info) echo /var/lib/docker ;;
 system)
@@ -126,7 +130,16 @@ system)
 image)
   case "$2" in
   ls) for f in $S/images/*.size; do if [ -f "$f" ]; then echo "sha256:$(basename "$f" .size)"; fi; done ;;
-  inspect) shift 2; printf '['; sep=''
+  inspect)
+    if [ "$3" = --format ]; then
+      case "$5" in
+      sha256:*) id=${5#sha256:} ;;
+      *) f=$(grep -lxF "$5" $S/images/*.tags) || { echo "Error: No such image: $5" >&2; exit 1; }; id=$(basename "$f" .tags) ;;
+      esac
+      [ -f "$S/images/$id.size" ] || { echo "Error: No such image: $5" >&2; exit 1; }
+      echo "sha256:$id"; hook resolve; exit 0
+    fi
+    shift 2; printf '['; sep=''
     for ref in "$@"; do
       id=${ref#sha256:}; [ -f "$S/images/$id.size" ] || { echo "Error: No such image: $ref" >&2; exit 1; }
       printf '%s{"Id":"sha256:%s","RepoTags":[' "$sep" "$id"; tsep=''
@@ -138,7 +151,7 @@ image)
   esac ;;
 container)
   case "$*" in
-  *ancestor=sha256:*) id="${*##*ancestor=sha256:}"; if [ -f "$S/ancestor-$id" ]; then cat "$S/ancestor-$id"; fi ;;
+  *ancestor=sha256:*) id="${*##*ancestor=sha256:}"; if [ -f "$S/ancestor-$id" ]; then cat "$S/ancestor-$id"; fi; hook ancestor ;;
   *) if [ -f $S/containers ]; then cat $S/containers; fi ;;
   esac ;;
 events)
@@ -386,21 +399,72 @@ func TestDockerImagesTrimKeepsEveryImageARecentTagMayHaveNamed(t *testing.T) {
 }
 
 // Review #207 P2: Docker refuses to remove an image with several tags by ID
-// without --force. An eligible one is untagged tag by tag (each without
-// pruning), and removing its last tag deletes it.
+// without --force. An eligible one loses its extra tags one by one, then is
+// removed by ID; no step prunes.
 func TestDockerImagesTrimRemovesAnImageWithSeveralTags(t *testing.T) {
 	x := newTrimFixture(t)
 	tagged := image("a", 30*day, 1_000_000_000, "app:rollback", "app:old")
 	docker := x.fakeDocker(t, tagged)
 	trims, code := x.cycleTrims(t, dockerImagesTrim(docker, ""))
 	trim := trims[0]
-	want := []string{"rmi --no-prune app:old", "rmi --no-prune app:rollback"}
+	want := []string{"rmi --no-prune app:old", "rmi --no-prune " + tagged.sha256ID}
 	if got := x.removals(t); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("removals %q, want %q", got, want)
 	}
 	if code != ExitOK || trim.Status != "trimmed" || len(trim.Images) != 1 || trim.Images[0].Status != "removed" ||
 		x.imageExists(t, tagged) {
 		t.Fatalf("image with several tags not removed as reported: exit %d %+v", code, trim)
+	}
+}
+
+// moveTagHook makes the fake daemon move tag from one image to another when
+// the named hook fires, as `docker tag` by another client would.
+func (x *trimFixture) moveTagHook(t *testing.T, hook, tag string, from, to fakeImage) {
+	t.Helper()
+	dir := filepath.Join(x.home, "dockerd", "images")
+	x.dockerState(t, "hook-"+hook, fmt.Sprintf("f=%s/%s.tags\ngrep -vxF '%s' \"$f\" > \"$f.new\"; mv \"$f.new\" \"$f\"\necho '%s' >> %s/%s.tags\n",
+		dir, from.id, tag, tag, dir, to.id))
+}
+
+// Review #207 round 2 P1: a tag captured when the candidates were listed may
+// name another image by the time it is untagged. Here app:old moves from the
+// old candidate A to a young untagged image B before A's removal starts;
+// untagging app:old then would delete B, which was never a candidate. The
+// tag is resolved first and A's removal stops.
+func TestDockerImagesTrimNeverUntagsATagThatMovedToAnotherImage(t *testing.T) {
+	x := newTrimFixture(t)
+	candidate := image("a", 30*day, 1_000_000_000, "app:old", "app:rollback")
+	young := image("b", 2*day, 1_000_000_000)
+	docker := x.fakeDocker(t, candidate, young)
+	x.moveTagHook(t, "ancestor", "app:old", candidate, young)
+	trims, code := x.cycleTrims(t, dockerImagesTrim(docker, ""))
+	trim := trims[0]
+	if got := x.removals(t); len(got) != 0 {
+		t.Fatalf("removed after the tag moved: %q", got)
+	}
+	if !x.imageExists(t, young) || !x.imageExists(t, candidate) || code != ExitOK || len(trim.Images) != 1 ||
+		trim.Images[0].Status != "tag_moved" {
+		t.Fatalf("moved tag not reported, or an image deleted: exit %d %+v", code, trim)
+	}
+}
+
+// If the tag moves after it was resolved and before it is untagged, Docker
+// may still delete the other image; the trim sees that the other image
+// disappeared, reports it, and stops before removing the candidate.
+func TestDockerImagesTrimStopsWhenAnUntagReachedAnotherImage(t *testing.T) {
+	x := newTrimFixture(t)
+	candidate := image("a", 30*day, 1_000_000_000, "app:old", "app:rollback")
+	young := image("b", 2*day, 1_000_000_000)
+	docker := x.fakeDocker(t, candidate, young)
+	x.moveTagHook(t, "resolve", "app:old", candidate, young)
+	trims, code := x.cycleTrims(t, dockerImagesTrim(docker, ""))
+	trim := trims[0]
+	if got, want := x.removals(t), []string{"rmi --no-prune app:old"}; strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("removals %q, want %q", got, want)
+	}
+	if code == ExitOK || trim.Status != "failed" || !strings.Contains(trim.Error, "disappeared") ||
+		!x.imageExists(t, candidate) {
+		t.Fatalf("untag reaching another image not reported as a stopped trim: exit %d %+v", code, trim)
 	}
 }
 
