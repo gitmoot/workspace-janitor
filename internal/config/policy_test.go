@@ -543,9 +543,10 @@ func TestCacheTrimsRejectUnsupportedOrUnbounded(t *testing.T) {
 }
 
 // The image, module-cache and pnpm-store trims each require their own fields:
-// docker-images an age of at least a day in whole hours and no path; go-mod
-// and pnpm-store a canonical path not holding their binary; and none may
-// target an archive_only root (for docker-images, containerd's root too).
+// docker-images an age of at least a day in whole hours, no path and only
+// repo:tag glob keep patterns; go-mod and pnpm-store a canonical path not
+// holding their binary and no keep; and none may target an archive_only root
+// (for docker-images, containerd's root too).
 func TestNewCacheTrimKindsRequireTheirFields(t *testing.T) {
 	paths := fixturePaths(t)
 	_, err := parse(t, paths, `roots:
@@ -558,6 +559,7 @@ prevention:
       binary: /usr/bin/docker
       min_age: 23h
       max_bytes: -1
+      keep: ['phobos-workspace-mcp:*', 'no-tag', 'bad:[', 'web:1@sha256:abc', 'registry:5000/app', 'app:']
     - kind: docker-images
       binary: /usr/bin/docker
       min_age: 36h30m
@@ -566,6 +568,7 @@ prevention:
       binary: /go/bin/go
       max_bytes: 0
       min_age: 48h
+      keep: ['go:*']
     - kind: pnpm-store
       path: /srv/pnpm-store/v11
       binary: /srv/pnpm-store/v11/pnpm
@@ -583,14 +586,15 @@ prevention:
 		t.Fatal("invalid cache trims were accepted")
 	}
 	for _, field := range []string{"cache_trims[0].path", "cache_trims[0].min_age", "cache_trims[0].max_bytes",
-		"cache_trims[1].min_age", `cache_trims[1].path: overlaps archive_only root "/var/lib/containerd"`,
-		"cache_trims[2].path", "cache_trims[2].max_bytes", "cache_trims[2].min_age", "cache_trims[3].binary",
-		"cache_trims[5]: duplicates"} {
+		"cache_trims[0].keep[1]", "cache_trims[0].keep[2]", "cache_trims[0].keep[3]", "cache_trims[0].keep[4]",
+		"cache_trims[0].keep[5]", "cache_trims[1].min_age", `cache_trims[1].path: overlaps archive_only root "/var/lib/containerd"`,
+		"cache_trims[2].path", "cache_trims[2].max_bytes", "cache_trims[2].min_age", "cache_trims[2].keep",
+		"cache_trims[3].binary", "cache_trims[5]: duplicates"} {
 		if !strings.Contains(err.Error(), field) {
 			t.Errorf("error %q does not identify %s", err, field)
 		}
 	}
-	for _, field := range []string{"cache_trims[4]"} {
+	for _, field := range []string{"cache_trims[4]", "cache_trims[0].keep[0]"} {
 		if strings.Contains(err.Error(), field) {
 			t.Errorf("valid trim refused: %q mentions %s", err, field)
 		}
@@ -621,6 +625,10 @@ prevention:
       binary: /usr/bin/docker
       min_age: 24h
       max_bytes: 10737418240
+      keep:
+        - 'phobos-workspace-mcp:*'
+        - 'openwa-location:*'
+        - 'registry.example:5000/team/*:v[0-9]*'
     - kind: go-mod
       path: /root/go/pkg/mod
       binary: /root/.local/toolchains/go1.26.4/bin/go

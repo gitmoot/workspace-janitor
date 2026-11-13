@@ -105,10 +105,13 @@ prevention:
   #   - kind: docker-builder
   #     binary: /usr/bin/docker
   #     max_bytes: 10737418240
-  #   - kind: docker-images        # unused images older than min_age
+  #   - kind: docker-images        # unused images older than min_age, one docker rmi each
   #     binary: /usr/bin/docker
   #     min_age: 168h
-  #     max_bytes: 10737418240     # optional: prune only above this reclaimable
+  #     max_bytes: 10737418240     # optional: remove only above this reclaimable
+  #     keep:                      # repo:tag globs never removed
+  #       - 'phobos-workspace-mcp:*'
+  #       - 'openwa-location:*'
   #   - kind: go-mod
   #     path: ~/go/pkg/mod
   #     binary: /usr/local/go/bin/go  # never a toolchain inside the cache

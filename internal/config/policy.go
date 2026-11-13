@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"net"
 	"net/url"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -339,6 +340,24 @@ func (t CacheTrim) TrimTarget() string {
 	return t.Path
 }
 
+// dockerImagePatternProblem says why pattern is not a usable docker-images
+// keep pattern, or "" when it is: a repo:tag glob in path.Match syntax
+// (e.g. phobos-workspace-mcp:*), with a non-empty repository and tag part
+// and no digest or whitespace.
+func dockerImagePatternProblem(pattern string) string {
+	if strings.ContainsAny(pattern, " \t\r\n@") {
+		return "must be a repo:tag pattern without whitespace or digest"
+	}
+	i := strings.LastIndex(pattern, ":")
+	if i <= 0 || i < strings.LastIndex(pattern, "/") || i == len(pattern)-1 {
+		return "must be a repo:tag pattern, for example phobos-workspace-mcp:*"
+	}
+	if _, err := path.Match(pattern, ""); err != nil {
+		return "is not a valid glob: " + err.Error()
+	}
+	return ""
+}
+
 // ResolvesIntoArchiveOnlyRoot reports whether path, as written or with every
 // symlink resolved, lies in or contains any archive_only root as written or
 // resolved. It fails closed: a path or root that exists but cannot be
@@ -398,14 +417,19 @@ const (
 // MinDockerImageAge is the youngest min_age a docker-images trim accepts.
 const MinDockerImageAge = 24 * time.Hour
 
+// MaxDockerImageKeep bounds a docker-images trim's keep list.
+const MaxDockerImageKeep = 64
+
 // CacheTrim bounds one live shared cache with its official command. go-build
 // runs `go clean -cache` for Path when its allocated size exceeds MaxBytes and
 // no Go build is running; docker-builder runs `docker builder prune
 // --max-used-space MaxBytes`, which removes only unused build cache and never
 // images, containers or volumes, and only when no image build is running.
-// docker-images runs `docker image prune --all --force --filter until=MinAge`,
-// which removes only images no container uses, when Docker reports more than
-// MaxBytes (if set) of reclaimable images and no image build or pull runs.
+// docker-images removes, one `docker rmi <id>` at a time, images that no
+// container uses, that were neither created nor tagged within MinAge, that
+// match no Keep pattern and that no container was created from within MinAge
+// by the daemon's event history, when Docker reports more than MaxBytes (if
+// set) of reclaimable images and no image build or pull runs.
 // go-mod runs `go clean -modcache` for Path, and pnpm-store runs `pnpm store
 // prune` for Path, when its allocated size exceeds MaxBytes and no process
 // using it runs.
@@ -416,6 +440,9 @@ type CacheTrim struct {
 	MaxBytes int64  `yaml:"max_bytes" json:"max_bytes"`
 	// MinAge is docker-images only: images younger than this are kept.
 	MinAge Duration `yaml:"min_age,omitempty" json:"min_age,omitempty"`
+	// Keep is docker-images only: repo:tag glob patterns (path.Match
+	// syntax, in Docker's short form) of images never removed.
+	Keep []string `yaml:"keep,omitempty" json:"keep,omitempty"`
 }
 
 // CapacityTarget names an inventory root whose filesystem needs headroom.
@@ -993,13 +1020,21 @@ func (p *Policy) Validate() core.FieldErrors {
 			errs.Add(field+".binary", "must be an absolute executable path")
 		}
 		if trim.Kind == CacheTrimDockerImages {
-			// max_bytes is optional: zero prunes on every run.
+			// max_bytes is optional: zero trims on every run.
 			if trim.MaxBytes < 0 {
 				errs.Add(field+".max_bytes", "must not be negative")
 			}
 			age := trim.MinAge.Duration()
 			if age < MinDockerImageAge || age%time.Hour != 0 {
 				errs.Add(field+".min_age", "docker-images requires a whole number of hours, at least %s", MinDockerImageAge)
+			}
+			if len(trim.Keep) > MaxDockerImageKeep {
+				errs.Add(field+".keep", "at most %d patterns", MaxDockerImageKeep)
+			}
+			for j, pattern := range trim.Keep {
+				if reason := dockerImagePatternProblem(pattern); reason != "" {
+					errs.Add(fmt.Sprintf("%s.keep[%d]", field, j), "%s", reason)
+				}
 			}
 			continue
 		}
@@ -1008,6 +1043,9 @@ func (p *Policy) Validate() core.FieldErrors {
 		}
 		if trim.MinAge != 0 {
 			errs.Add(field+".min_age", "only docker-images takes min_age")
+		}
+		if len(trim.Keep) != 0 {
+			errs.Add(field+".keep", "only docker-images takes keep")
 		}
 	}
 	targetPaths := make(map[string]bool, len(p.Prevention.Targets))

@@ -81,7 +81,8 @@ const (
 )
 
 // cacheTrimReport is one trim's outcome. For docker-images the sizes are the
-// reclaimable image bytes Docker reports, not a directory's allocated size.
+// reclaimable image bytes Docker reports, not a directory's allocated size,
+// and Images lists every candidate image with what happened to it.
 type cacheTrimReport struct {
 	Kind        string   `json:"kind"`
 	Path        string   `json:"path,omitempty"`
@@ -96,6 +97,10 @@ type cacheTrimReport struct {
 	ActiveUsers []string `json:"active_users,omitempty"`
 	Output      string   `json:"output,omitempty"`
 	Error       string   `json:"error,omitempty"`
+	// EventsCoveredSince is how far back the daemon's event history
+	// reached (docker-images only).
+	EventsCoveredSince string               `json:"events_covered_since,omitempty"`
+	Images             []dockerImageOutcome `json:"images,omitempty"`
 }
 
 // runCacheTrims applies every configured standing cache trim once. A cache in
@@ -204,21 +209,7 @@ func trimCache(ctx context.Context, procRoot string, trim config.CacheTrim) cach
 		args = []string{"builder", "prune", "--force", "--max-used-space", strconv.FormatInt(trim.MaxBytes, 10)}
 		env = dockerEnv()
 	case config.CacheTrimDockerImages:
-		reclaimable, err := dockerReclaimableImageBytes(ctx, trim.Binary)
-		if err != nil {
-			return fail(err)
-		}
-		report.SizeBefore = &reclaimable
-		if trim.MaxBytes > 0 && reclaimable <= trim.MaxBytes {
-			report.Status = cacheUnderBound
-			return report
-		}
-		// --all removes only images no container (running or stopped)
-		// uses, and the filter keeps every image younger than min_age.
-		// Containers, volumes, networks and build cache are never touched.
-		hours := int64(trim.MinAge.Duration() / time.Hour)
-		args = []string{"image", "prune", "--all", "--force", "--filter", "until=" + strconv.FormatInt(hours, 10) + "h"}
-		env = dockerEnv()
+		return trimDockerImages(ctx, procRoot, trim, report)
 	default:
 		return fail(fmt.Errorf("unsupported cache trim kind %q", trim.Kind))
 	}
@@ -240,10 +231,6 @@ func trimCache(ctx context.Context, procRoot string, trim config.CacheTrim) cach
 	switch trim.Kind {
 	case config.CacheTrimGoBuild, config.CacheTrimGoMod, config.CacheTrimPnpmStore:
 		if size, sizeErr := allocatedBytes(ctx, trim.Path); sizeErr == nil {
-			report.SizeAfter = &size
-		}
-	case config.CacheTrimDockerImages:
-		if size, sizeErr := dockerReclaimableImageBytes(ctx, trim.Binary); sizeErr == nil {
 			report.SizeAfter = &size
 		}
 	}

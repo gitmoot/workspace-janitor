@@ -122,6 +122,7 @@ deletion authority; configure it only with the owner's approval.
 | `binary` | Absolute path of the official `go`, `docker` or `pnpm` executable. For `go-mod` and `pnpm-store` it may not lie inside `path`. |
 | `max_bytes` | Positive bound. Optional for `docker-images` (see below). |
 | `min_age` | `docker-images` only, required: a whole number of hours, at least `24h`. |
+| `keep` | `docker-images` only, optional: up to 64 `repo:tag` glob patterns (Go `path.Match` syntax: `*`, `?`, `[...]`; `*` does not cross `/`), for example `phobos-workspace-mcp:*`. An image with any tag matching a pattern is never removed. Patterns and tags are compared in Docker's short form (`nginx:1.27`, not `docker.io/library/nginx:1.27`); a pattern needs a non-empty repository and tag part and no digest. |
 
 At most one trim per kind and path is accepted.
 
@@ -131,15 +132,46 @@ At most one trim per kind and path is accepted.
 - `docker-builder`: runs `docker builder prune --force --max-used-space
   <max_bytes>`. Docker removes only unused build cache, never images,
   containers or volumes.
-- `docker-images`: runs `docker image prune --all --force --filter
-  until=<min_age in hours>h`. Docker removes only images that no container,
-  running or stopped, uses and that are older than `min_age`; containers,
-  volumes, networks and build cache are never touched. With `max_bytes` the
-  prune runs only while the reclaimable image space that `docker system df
+- `docker-images`: removes old images nobody uses, one `docker rmi <image
+  ID>` at a time (never `--force`, never `docker image prune`). A
+  candidate is an image (by ID) that:
+  - no container, running or stopped, references
+    (`docker container ls --all`);
+  - was neither created nor last tagged within `min_age`;
+  - has no tag matching a `keep` pattern;
+  - no container was created from within `min_age`, according to the
+    daemon's event history (`docker events --since <now-min_age> --until
+    <now> --filter type=container --filter event=create --format json`;
+    the image each event names is resolved to local image IDs). This is
+    what keeps an image used only by short-lived containers (`docker run
+    --rm`), which no container references between runs.
+
+  If that event history cannot be read or parsed, or the command times
+  out, or the history does not reach back to `now - min_age`, the whole
+  trim is refused: it is reported as `failed` with the reason, and nothing
+  is removed. **The daemon keeps only its most recent 256 events in memory,
+  and none from before it last restarted**, so on a daemon with routine
+  activity (health checks, `exec` probes) the history typically covers
+  minutes, not days: such a host refuses the trim on every run. The report's
+  `events_covered_since` shows how far back the history reached. Images
+  that must survive regardless belong in `keep`, which is checked first.
+
+  Candidates are removed oldest first (by the later of creation and last
+  tag time, then ID). Immediately before each `docker rmi` the trim checks
+  again that no image build or pull runs and asks the daemon whether any
+  container now uses the image (`docker container ls --all --filter
+  ancestor=<ID>`); one that does keeps the image. With `max_bytes` the trim
+  runs only while the reclaimable image space that `docker system df
   --format json` reports exceeds it (Docker prints that figure to four
-  significant digits); without it every run prunes. The report's sizes are
-  that reclaimable space before and after, and `reclaimed_bytes` their
-  difference.
+  significant digits), and stops as soon as it no longer does; without it
+  every run removes every candidate. The report's sizes are that
+  reclaimable space before and after, and `reclaimed_bytes` their
+  difference. `images` lists every candidate with its tags, size and
+  `status`: `removed`, `failed` (with Docker's error; the trim then fails),
+  `kept_in_use` (with the containers), `not_needed` (the bound was reached),
+  `postponed` (a build or pull started) or `not_reached` (the trim stopped
+  on a Docker error first). Containers, volumes, networks and build cache
+  are never touched.
 - `go-mod`: when the module cache's allocated size exceeds `max_bytes`, runs
   `go clean -modcache` with that exact `GOMODCACHE`, `GOTOOLCHAIN=local`,
   `GOENV=off`, `GOPROXY=off` and empty `GOFLAGS`. Go removes the whole
@@ -178,7 +210,7 @@ one) or a handle under the store postpones `pnpm-store`. An image build
 (`docker build`, `docker buildx build`, `bake`, `buildctl build`) postpones
 the Docker build cache prune; an image build or pull (`docker pull`,
 `docker image pull`, `docker compose pull`, `docker-compose pull`) postpones
-the image prune. A postponed trim is reported as `skipped_in_use` and
+the image removal. A postponed trim is reported as `skipped_in_use` and
 retried next cycle; it is not an error. A process that cannot be inspected
 counts as a user. A trim command that fails is reported and makes the cycle
 exit non-zero. Results appear as `cache_trims` in the cycle report.
