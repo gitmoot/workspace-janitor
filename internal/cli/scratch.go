@@ -238,7 +238,7 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	if err != nil {
 		return fail(fmt.Errorf("nothing is touched: %w", err))
 	}
-	listening := scratchListeners(policy, scratch)
+	listening := scratchListeners(scratch)
 	// The name listing is the only structure that grows with the directory:
 	// a scratch directory may hold far more entries than an inventory scan
 	// directory, so it has its own bound, and exceeding it refuses the run
@@ -437,7 +437,7 @@ func scratchCleanup(ctx context.Context, paths config.Paths, policy config.Polic
 	if err != nil {
 		return failAll(fmt.Errorf("in-use recheck: %w", err))
 	}
-	listening = scratchListeners(latest, current)
+	listening = scratchListeners(current)
 	var failures []error
 	for i := range selected {
 		candidate := &selected[i]
@@ -559,37 +559,36 @@ func scratchCheck(ctx context.Context, dir *workspacearchive.ScratchDir, policy 
 	return entry, ""
 }
 
-// scratchListening is one snapshot of the listening Unix sockets inside a
-// scratch directory, read only when it enables a regenerable shape. A shape
-// entry whose socket is listening, or whose listening state is unknown, is
-// kept.
+// scratchListening is one snapshot of the files listening Unix sockets are
+// bound to, read only when a scratch directory enables a regenerable shape.
+// A shape entry whose socket is listening, or whose listening state is
+// unknown, is kept.
 type scratchListening struct {
-	paths map[string]bool
+	bound workspacearchive.UnixListeners
 	err   error
 }
 
-func scratchListeners(policy config.Policy, scratch config.ScratchCleanup) scratchListening {
+func scratchListeners(scratch config.ScratchCleanup) scratchListening {
 	if len(scratch.RegenerableShapes) == 0 {
 		return scratchListening{err: errors.New("no regenerable shape is enabled")}
 	}
-	paths, err := workspacearchive.ListeningUnixSockets(policy.Collectors.ProcRoot, scratch.Path)
-	return scratchListening{paths: paths, err: err}
+	bound, err := workspacearchive.ListeningUnixSockets()
+	return scratchListening{bound: bound, err: err}
 }
 
 // refusal returns why entry must stay because of its socket, or "". Only a
-// shape entry has one.
+// shape entry has one. The socket is matched by the identity of its file,
+// never by the path it was bound with.
 func (l scratchListening) refusal(dir string, entry workspacearchive.ScratchEntry) string {
-	rel := entry.ShapeSocket()
-	if rel == "" {
+	rel, id, ok := entry.ShapeSocket()
+	if !ok {
 		return ""
 	}
 	socket := filepath.Join(dir, rel)
 	switch {
 	case l.err != nil:
 		return fmt.Sprintf("%s may be listening (%v); kept local", socket, l.err)
-	case strings.ContainsRune(socket, '\n'):
-		return fmt.Sprintf("%q cannot be matched against /proc/net/unix; kept local", socket)
-	case l.paths[socket]:
+	case l.bound.Bound(id):
 		return socket + " is a listening socket; its process still holds the lock"
 	}
 	return ""

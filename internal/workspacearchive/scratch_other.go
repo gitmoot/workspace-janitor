@@ -38,7 +38,7 @@ func (s *ScratchDir) ObserveShape(_ context.Context, name string, _, _ []string)
 	return ScratchEntry{Name: name}, false
 }
 
-func ListeningUnixSockets(string, string) (map[string]bool, error) { return nil, errUnsupported }
+func ListeningUnixSockets() (UnixListeners, error) { return nil, errUnsupported }
 
 func ScratchReferences(context.Context, string, string) (map[string]string, error) {
 	return nil, errUnsupported
