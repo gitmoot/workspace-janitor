@@ -78,17 +78,20 @@ func image(digit string, age time.Duration, size int64, tags ...string) fakeImag
 }
 
 // fakeDocker is a Docker daemon holding images, with its state in
-// <home>/docker: images/<id>.json (as `docker image inspect` prints it) and
-// images/<id>.size; reclaimable, the reclaimable image bytes `docker system
-// df` reports (initially the sum of all image sizes); containers, the image
-// of each container as `docker container ls --format {{.Image}}` prints it;
+// <home>/dockerd: per image images/<id>.tags (one tag per line), .created,
+// .lasttag, .size and optionally .parent (the ID of its parent image);
+// reclaimable, the reclaimable image bytes `docker system df` reports
+// (initially the sum of all image sizes); containers, the image of each
+// container as `docker container ls --format {{.Image}}` prints it;
 // ancestor-<id>, the containers the daemon reports for --filter
 // ancestor=<id> (a container that appeared after the trim listed the
 // containers); events, the container create events in min_age;
 // history, the time of every event the daemon still holds (by default one
 // from 2020, so the history covers min_age); and events-fail, which makes
-// `docker events` fail. `docker rmi <id>` removes the image and its size from
-// reclaimable.
+// `docker events` fail. `docker rmi` behaves like Docker's: by ID it refuses
+// an image with several tags, by tag it untags, and an image left without
+// tags is deleted, its size leaving reclaimable; unless --no-prune is given,
+// its untagged parent is deleted with it.
 func (x *trimFixture) fakeDocker(t *testing.T, images ...fakeImage) string {
 	t.Helper()
 	state := filepath.Join(x.home, "dockerd")
@@ -102,15 +105,19 @@ func (x *trimFixture) fakeDocker(t *testing.T, images ...fakeImage) string {
 		if !image.lastTag.IsZero() {
 			lastTag = image.lastTag.UTC().Format(time.RFC3339Nano)
 		}
-		tags, _ := json.Marshal(image.tags)
-		doc := fmt.Sprintf(`{"Id":"%s","RepoTags":%s,"RepoDigests":[],"Created":"%s","Size":%d,"Metadata":{"LastTagTime":"%s"}}`,
-			image.sha256ID, tags, image.created.Format(time.RFC3339Nano), image.size, lastTag)
-		x.dockerState(t, "images/"+image.id+".json", doc)
+		tags := ""
+		for _, tag := range image.tags {
+			tags += tag + "\n"
+		}
+		x.dockerState(t, "images/"+image.id+".tags", tags)
+		x.dockerState(t, "images/"+image.id+".created", image.created.Format(time.RFC3339Nano))
+		x.dockerState(t, "images/"+image.id+".lasttag", lastTag)
 		x.dockerState(t, "images/"+image.id+".size", fmt.Sprint(image.size))
 	}
 	x.dockerState(t, "reclaimable", fmt.Sprint(total))
 	x.dockerState(t, "history", "1577836800000000000\n")
 	return x.fakeTool(t, "docker", `S=`+state+`
+tags() { grep -c . "$S/images/$1.tags"; }
 case "$1" in
 info) echo /var/lib/docker ;;
 system)
@@ -118,8 +125,16 @@ system)
   printf '{"Active":"2","Reclaimable":"9GB (99%%)","Size":"9GB","TotalCount":"2","Type":"Containers"}\n' ;;
 image)
   case "$2" in
-  ls) for f in $S/images/*.json; do if [ -f "$f" ]; then echo "sha256:$(basename "$f" .json)"; fi; done ;;
-  inspect) shift 2; printf '['; sep=''; for id in "$@"; do printf '%s' "$sep"; cat "$S/images/${id#sha256:}.json" || exit 1; sep=','; done; echo ']' ;;
+  ls) for f in $S/images/*.size; do if [ -f "$f" ]; then echo "sha256:$(basename "$f" .size)"; fi; done ;;
+  inspect) shift 2; printf '['; sep=''
+    for ref in "$@"; do
+      id=${ref#sha256:}; [ -f "$S/images/$id.size" ] || { echo "Error: No such image: $ref" >&2; exit 1; }
+      printf '%s{"Id":"sha256:%s","RepoTags":[' "$sep" "$id"; tsep=''
+      while read -r tag; do printf '%s"%s"' "$tsep" "$tag"; tsep=','; done < "$S/images/$id.tags"
+      printf '],"RepoDigests":[],"Created":"%s","Size":%s,"Metadata":{"LastTagTime":"%s"}}' \
+        "$(cat $S/images/$id.created)" "$(cat $S/images/$id.size)" "$(cat $S/images/$id.lasttag)"
+      sep=','
+    done; echo ']' ;;
   esac ;;
 container)
   case "$*" in
@@ -133,11 +148,33 @@ events)
   *) if [ -f $S/events ]; then cat $S/events; fi ;;
   esac ;;
 rmi)
-  id="${2#sha256:}"; size=$(cat "$S/images/$id.size") || exit 1
-  rm "$S/images/$id.json" "$S/images/$id.size"
-  echo $(( $(cat $S/reclaimable) - size )) > $S/reclaimable; echo "Deleted: $2" ;;
+  prune=yes; if [ "$2" = --no-prune ]; then prune=no; shift; fi
+  case "$2" in
+  sha256:*) id=${2#sha256:}
+    [ -f "$S/images/$id.size" ] || { echo "Error: No such image: $2" >&2; exit 1; }
+    if [ "$(tags $id)" -gt 1 ]; then
+      echo "Error response from daemon: conflict: unable to delete $id (must be forced) - image is referenced in multiple repositories" >&2; exit 1
+    fi
+    : > "$S/images/$id.tags" ;;
+  *) f=$(grep -lxF "$2" $S/images/*.tags) || { echo "Error: No such image: $2" >&2; exit 1; }
+    id=$(basename "$f" .tags); grep -vxF "$2" "$f" > "$f.new"; mv "$f.new" "$f"; echo "Untagged: $2" ;;
+  esac
+  gone=; if [ "$(tags $id)" -eq 0 ]; then gone=$id; fi
+  while [ -n "$gone" ]; do
+    echo $(( $(cat $S/reclaimable) - $(cat $S/images/$gone.size) )) > $S/reclaimable
+    parent=; if [ $prune = yes ] && [ -f "$S/images/$gone.parent" ]; then parent=$(cat "$S/images/$gone.parent"); fi
+    rm "$S/images/$gone".*; echo "Deleted: sha256:$gone"
+    gone=; if [ -n "$parent" ] && [ "$(tags $parent)" -eq 0 ]; then gone=$parent; fi
+  done ;;
 esac
 `)
+}
+
+// imageExists reports whether the fake daemon still holds image.
+func (x *trimFixture) imageExists(t *testing.T, image fakeImage) bool {
+	t.Helper()
+	_, err := os.Stat(filepath.Join(x.home, "dockerd", "images", image.id+".size"))
+	return err == nil
 }
 
 // dockerState writes a file of the fake daemon's state.
@@ -163,7 +200,7 @@ func (x *trimFixture) removals(t *testing.T) []string {
 func rmis(images ...fakeImage) []string {
 	var want []string
 	for _, image := range images {
-		want = append(want, "rmi "+image.sha256ID)
+		want = append(want, "rmi --no-prune "+image.sha256ID)
 	}
 	return want
 }
@@ -181,9 +218,9 @@ func createEvent(image string) string {
 
 const day = 24 * time.Hour
 
-// docker-images removes, with `docker rmi <id>` and nothing else, only an
-// image that is old, unused by any container (running or stopped) and not
-// re-tagged within min_age, and reports it.
+// docker-images removes, with `docker rmi --no-prune <id>` and nothing else,
+// only an image that is old, unused by any container (running or stopped)
+// and not re-tagged within min_age, and reports it.
 func TestDockerImagesTrimRemovesOnlyOldUnusedImages(t *testing.T) {
 	x := newTrimFixture(t)
 	old := image("a", 30*day, 1_000_000_000, "old-tool:1")
@@ -307,6 +344,63 @@ func TestDockerImagesTrimStopsAtItsBound(t *testing.T) {
 	}
 	if got := x.removals(t); len(got) != 2 || len(x.calls(t)) != before+2 {
 		t.Fatalf("under its bound the trim did more than measure: %q", x.calls(t)[before:])
+	}
+}
+
+// Review #207 P1: `docker rmi` deletes untagged parent images unless told
+// not to. The parent here was run within min_age, so it is no candidate;
+// removing its child must not take it along.
+func TestDockerImagesTrimNeverPrunesParents(t *testing.T) {
+	x := newTrimFixture(t)
+	parent := image("a", 30*day, 1_000_000_000)
+	child := image("b", 20*day, 1_000_000_000, "child:1")
+	docker := x.fakeDocker(t, parent, child)
+	x.dockerState(t, "images/"+child.id+".parent", parent.id)
+	x.dockerState(t, "events", createEvent(parent.sha256ID))
+	trims, code := x.cycleTrims(t, dockerImagesTrim(docker, ""))
+	if got, want := x.removals(t), rmis(child); strings.Join(got, "\n") != strings.Join(want, "\n") || code != ExitOK {
+		t.Fatalf("removals %q, want %q (exit %d %+v)", got, want, code, trims[0])
+	}
+	if !x.imageExists(t, parent) || x.imageExists(t, child) {
+		t.Fatalf("parent pruned with its child, or child kept: %+v", trims[0])
+	}
+}
+
+// Review #207 P1: a create event records the reference the container was
+// created from, and a tag may have named another image then. app:latest ran
+// image A within min_age and has since moved to B; A is still tagged
+// app:old, and an untagged image may be what the tag left behind. Every
+// image the tag may have named is kept.
+func TestDockerImagesTrimKeepsEveryImageARecentTagMayHaveNamed(t *testing.T) {
+	x := newTrimFixture(t)
+	ran := image("a", 30*day, 1_000_000_000, "app:old")
+	current := image("b", 20*day, 1_000_000_000, "app:latest")
+	untagged := image("c", 25*day, 1_000_000_000)
+	stale := image("d", 30*day, 1_000_000_000, "stale:1")
+	docker := x.fakeDocker(t, ran, current, untagged, stale)
+	x.dockerState(t, "events", createEvent("app:latest"))
+	trims, code := x.cycleTrims(t, dockerImagesTrim(docker, ""))
+	if got, want := x.removals(t), rmis(stale); strings.Join(got, "\n") != strings.Join(want, "\n") || code != ExitOK {
+		t.Fatalf("removals %q, want %q (exit %d %+v)", got, want, code, trims[0])
+	}
+}
+
+// Review #207 P2: Docker refuses to remove an image with several tags by ID
+// without --force. An eligible one is untagged tag by tag (each without
+// pruning), and removing its last tag deletes it.
+func TestDockerImagesTrimRemovesAnImageWithSeveralTags(t *testing.T) {
+	x := newTrimFixture(t)
+	tagged := image("a", 30*day, 1_000_000_000, "app:rollback", "app:old")
+	docker := x.fakeDocker(t, tagged)
+	trims, code := x.cycleTrims(t, dockerImagesTrim(docker, ""))
+	trim := trims[0]
+	want := []string{"rmi --no-prune app:old", "rmi --no-prune app:rollback"}
+	if got := x.removals(t); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("removals %q, want %q", got, want)
+	}
+	if code != ExitOK || trim.Status != "trimmed" || len(trim.Images) != 1 || trim.Images[0].Status != "removed" ||
+		x.imageExists(t, tagged) {
+		t.Fatalf("image with several tags not removed as reported: exit %d %+v", code, trim)
 	}
 }
 

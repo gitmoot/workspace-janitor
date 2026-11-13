@@ -425,11 +425,12 @@ const MaxDockerImageKeep = 64
 // no Go build is running; docker-builder runs `docker builder prune
 // --max-used-space MaxBytes`, which removes only unused build cache and never
 // images, containers or volumes, and only when no image build is running.
-// docker-images removes, one `docker rmi <id>` at a time, images that no
-// container uses, that were neither created nor tagged within MinAge, that
-// match no Keep pattern and that no container was created from within MinAge
-// by the daemon's event history, when Docker reports more than MaxBytes (if
-// set) of reclaimable images and no image build or pull runs.
+// docker-images removes, one non-forced `docker rmi --no-prune` at a time,
+// images that no container uses, that were neither created nor tagged within
+// MinAge, that match no Keep pattern and that no container may have been
+// created from within MinAge by the daemon's event history, when Docker
+// reports more than MaxBytes (if set) of reclaimable images and no image
+// build or pull runs.
 // go-mod runs `go clean -modcache` for Path, and pnpm-store runs `pnpm store
 // prune` for Path, when its allocated size exceeds MaxBytes and no process
 // using it runs.

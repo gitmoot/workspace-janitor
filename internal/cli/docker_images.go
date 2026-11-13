@@ -26,16 +26,17 @@ const (
 )
 
 // dockerImageOutcome reports one candidate image of a docker-images trim:
-// what it was, and whether `docker rmi` removed it.
+// what it was, every `docker rmi` run for it, and what happened to it.
 type dockerImageOutcome struct {
-	ID         string   `json:"id"`
-	Tags       []string `json:"tags,omitempty"`
-	SizeBytes  int64    `json:"size_bytes"`
-	Status     string   `json:"status"`
-	Command    []string `json:"command,omitempty"`
-	Containers []string `json:"containers,omitempty"`
-	Output     string   `json:"output,omitempty"`
-	Error      string   `json:"error,omitempty"`
+	ID         string     `json:"id"`
+	Tags       []string   `json:"tags,omitempty"`
+	SizeBytes  int64      `json:"size_bytes"`
+	Status     string     `json:"status"`
+	Commands   [][]string `json:"commands,omitempty"`
+	Untagged   []string   `json:"untagged,omitempty"`
+	Containers []string   `json:"containers,omitempty"`
+	Output     string     `json:"output,omitempty"`
+	Error      string     `json:"error,omitempty"`
 }
 
 // dockerImage is what the trim reads from `docker image inspect`.
@@ -50,16 +51,16 @@ type dockerImage struct {
 	} `json:"Metadata"`
 }
 
-// trimDockerImages removes old images nobody uses, one `docker rmi <id>` at a
-// time. A candidate is an image that no container (running or stopped)
-// references, that was neither created nor last tagged within min_age, that
-// matches no keep pattern, and that no container was created from within
-// min_age according to the daemon's event history. A history that cannot be
-// read, parsed, or shown to reach back to min_age refuses the whole trim.
-// Candidates go oldest first; the run stops once the reclaimable image space
-// is at or under max_bytes (if set). Immediately before each rmi the trim
-// re-checks that no image build or pull runs and no container references the
-// image.
+// trimDockerImages removes old images nobody uses, one non-forced `docker
+// rmi --no-prune` at a time. A candidate is an image that no container
+// (running or stopped) references, that was neither created nor last tagged
+// within min_age, that matches no keep pattern, and that no container may
+// have been created from within min_age according to the daemon's event
+// history. A history that cannot be read, parsed, or shown to reach back to
+// min_age refuses the whole trim. Candidates go oldest first; the run stops
+// once the reclaimable image space is at or under max_bytes (if set).
+// Immediately before each rmi the trim re-checks that no image build or pull
+// runs and no container references the image.
 func trimDockerImages(ctx context.Context, procRoot string, trim config.CacheTrim, report cacheTrimReport) cacheTrimReport {
 	fail := func(err error) cacheTrimReport {
 		report.Status, report.Error = cacheTrimFailed, err.Error()
@@ -104,7 +105,7 @@ func trimDockerImages(ctx context.Context, procRoot string, trim config.CacheTri
 		return fail(fmt.Errorf("refusing every image removal: recent use cannot be ruled out: %w", err))
 	}
 	for _, ref := range recent {
-		for _, id := range resolve(ref) {
+		for _, id := range imagesPossiblyRunAs(images, ref) {
 			inUse[id] = true
 		}
 	}
@@ -145,40 +146,31 @@ func trimDockerImages(ctx context.Context, procRoot string, trim config.CacheTri
 			}
 			break
 		}
-		if users := cacheUsers(procRoot, trim); len(users) != 0 {
-			report.ActiveUsers = users
-			for j := i; j < len(report.Images); j++ {
-				report.Images[j].Status = imagePostponed
-			}
-			break
-		}
-		// A container created since the candidate list was read keeps the
-		// image; the daemon matches it by image ID.
-		users, err := dockerOutput(ctx, trim.Binary, "container", "ls", "--all", "--quiet", "--no-trunc",
-			"--filter", "ancestor="+outcome.ID)
+		users, err := removeImage(ctx, procRoot, trim, outcome)
 		if err != nil {
 			stopErr = err
 			break
 		}
-		if containers := nonEmptyLines(users); len(containers) != 0 {
-			outcome.Status, outcome.Containers = imageInUse, containers
-			continue
-		}
-		outcome.Command = []string{trim.Binary, "rmi", outcome.ID}
-		out, err := dockerCombined(ctx, trim.Binary, "rmi", outcome.ID)
-		outcome.Output = boundedOutput(out)
-		if err != nil {
-			outcome.Status, outcome.Error = imageRmiFailed, err.Error()
-			failures = append(failures, outcome.ID+": "+err.Error())
-			continue
-		}
-		outcome.Status = imageRemoved
-		removed++
-		if trim.MaxBytes > 0 {
-			if reclaimable, err = dockerReclaimableImageBytes(ctx, trim.Binary); err != nil {
-				stopErr = err
-				break
+		if len(users) != 0 {
+			report.ActiveUsers = users
+			for j := i + 1; j < len(report.Images); j++ {
+				report.Images[j].Status = imagePostponed
 			}
+			break
+		}
+		switch outcome.Status {
+		case imageRmiFailed:
+			failures = append(failures, outcome.ID+": "+outcome.Error)
+		case imageRemoved:
+			removed++
+			if trim.MaxBytes > 0 {
+				if reclaimable, err = dockerReclaimableImageBytes(ctx, trim.Binary); err != nil {
+					stopErr = err
+				}
+			}
+		}
+		if stopErr != nil {
+			break
 		}
 	}
 	report.FreeAfter = freeBytes(trimFilesystem(trim))
@@ -203,6 +195,102 @@ func trimDockerImages(ctx context.Context, procRoot string, trim config.CacheTri
 		report.Status = cacheTrimmed
 	}
 	return report
+}
+
+// removeImage removes one candidate with non-forced `docker rmi --no-prune`,
+// so Docker removes nothing else: by default rmi also deletes untagged parent
+// images, which were never checked. An image with at most one tag is removed
+// by ID. Docker refuses to remove an image with several tags by ID without
+// --force, so such an image is untagged tag by tag; removing its last tag
+// deletes it. Before each step removeImage checks again that no image build
+// or pull runs and that no container uses the image. A failed step stops the
+// image's removal, leaving its remaining tags. It returns the processes that
+// postponed the removal, and an error when Docker could not be asked.
+func removeImage(ctx context.Context, procRoot string, trim config.CacheTrim, outcome *dockerImageOutcome) ([]string, error) {
+	refs := []string{outcome.ID}
+	if len(outcome.Tags) > 1 {
+		refs = append([]string(nil), outcome.Tags...)
+		sort.Strings(refs)
+	}
+	for _, ref := range refs {
+		if users := cacheUsers(procRoot, trim); len(users) != 0 {
+			outcome.Status = imagePostponed
+			return users, nil
+		}
+		// A container created since the candidate list was read keeps the
+		// image; the daemon matches it by image ID.
+		out, err := dockerOutput(ctx, trim.Binary, "container", "ls", "--all", "--quiet", "--no-trunc",
+			"--filter", "ancestor="+outcome.ID)
+		if err != nil {
+			return nil, err
+		}
+		if containers := nonEmptyLines(out); len(containers) != 0 {
+			outcome.Status, outcome.Containers = imageInUse, containers
+			return nil, nil
+		}
+		args := []string{"rmi", "--no-prune", ref}
+		outcome.Commands = append(outcome.Commands, append([]string{trim.Binary}, args...))
+		out, err = dockerCombined(ctx, trim.Binary, args...)
+		outcome.Output = boundedOutput([]byte(outcome.Output + "\n" + string(out)))
+		if err != nil {
+			outcome.Status, outcome.Error = imageRmiFailed, fmt.Sprintf("%s: %v", ref, err)
+			return nil, nil
+		}
+		if ref != outcome.ID {
+			outcome.Untagged = append(outcome.Untagged, ref)
+		}
+	}
+	outcome.Status = imageRemoved
+	return nil, nil
+}
+
+// imagesPossiblyRunAs returns the IDs of every local image a container
+// created from ref (as a create event records it) may have run. An image ID
+// (sha256:<hex>) names exactly that image. Any other reference is a tag or
+// digest that may have named another image then: tags move on every build,
+// tag or pull, and Docker keeps no tag history, so resolving ref against
+// today's tags could protect the new image and remove the one that ran. Such
+// a reference protects every image with a tag or digest in its repository,
+// and every untagged image, which is what a moved tag leaves behind and
+// whose past tags cannot be known. A bare hex string is treated as both.
+func imagesPossiblyRunAs(images []dockerImage, ref string) []string {
+	var ids []string
+	hex, isID := strings.CutPrefix(ref, "sha256:")
+	isID = isID && isLowerHex(hex)
+	if isLowerHex(hex) {
+		for _, image := range images {
+			if strings.HasPrefix(strings.TrimPrefix(image.ID, "sha256:"), hex) {
+				ids = append(ids, image.ID)
+			}
+		}
+	}
+	if isID {
+		return ids
+	}
+	repo := imageRepository(ref)
+	for _, image := range images {
+		if len(image.RepoTags) == 0 {
+			ids = append(ids, image.ID)
+			continue
+		}
+		for _, other := range append(append([]string(nil), image.RepoTags...), image.RepoDigests...) {
+			if imageRepository(other) == repo {
+				ids = append(ids, image.ID)
+				break
+			}
+		}
+	}
+	return ids
+}
+
+// imageRepository is the repository of an image reference in Docker's short
+// form, without tag or digest.
+func imageRepository(ref string) string {
+	normalized := normalizeImageRef(ref)
+	if name, _, ok := strings.Cut(normalized, "@"); ok {
+		return name
+	}
+	return normalized[:strings.LastIndex(normalized, ":")]
 }
 
 // dockerImages lists every top-level image with the details the candidate
@@ -321,10 +409,12 @@ func keptByPattern(image dockerImage, keep []string) bool {
 	return false
 }
 
-// imageResolver maps an image reference as containers and events record it
+// imageResolver maps an image reference as `docker container ls` prints it
 // (a name with or without tag, name@digest, a full or short image ID) to the
-// IDs of the local images it may mean. It errs towards more images: a hex
-// string matches both a name and every ID it prefixes.
+// IDs of the local images it may mean. The daemon prints a container's image
+// ID instead of its reference once that reference names another image, so
+// today's tags resolve a container exactly. It errs towards more images: a
+// hex string matches both a name and every ID it prefixes.
 func imageResolver(images []dockerImage) func(string) []string {
 	byRef := map[string][]string{}
 	for _, image := range images {
