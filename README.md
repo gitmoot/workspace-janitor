@@ -185,8 +185,9 @@ janitor history --confirm    # discard it; the next cycle reclaims the file spac
 
 Weekly stale-workspace report (opt-in through `report.enabled`): a host timer
 runs `janitor report stale --role <role> --format text` and sends the output to
-each owning role as a Gitmoot message. Items with an unknown owner go to
-`report.coordinator_role`. Owners reply with `janitor report release <path>...
+each owning role as a Gitmoot message. Items the ledger attributes to no role go
+to the covering policy [`owners`](docs/policy-reference.md#decision-owners)
+entry's role, else to `report.coordinator_role`. Owners reply with `janitor report release <path>...
 --role <role>` or `janitor report keep <path>... --role <role> [--until DATE]`.
 One call may name several paths; it records nothing unless every path is
 accepted.
@@ -261,8 +262,10 @@ janitor explain /path/to/thing            # trace one decision
 ```
 
 `explain` prints the winning rules and their reasons, the alternatives that
-were rejected and why, the collected evidence, the safety verdict, and
-whether the action is approved. For a path with an active cleanup receipt it
+were rejected and why, the collected evidence, the safety verdict, the
+decision owner and where it came from (see
+[decision owners](docs/policy-reference.md#decision-owners); information only),
+and whether the action is approved. For a path with an active cleanup receipt it
 also prints the receipt; a `prepared` one (a quarantine that was refused and
 is skipped by later plans) is revalidated read-only exactly as its move would
 be, and every refusing protection is listed with its reason.

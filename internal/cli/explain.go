@@ -29,6 +29,9 @@ type explainReport struct {
 	Entry    *core.Entry    `json:"entry,omitempty"`
 	Verdict  *core.Verdict  `json:"safety_verdict,omitempty"`
 	Approved *core.Approval `json:"approval,omitempty"`
+	// Owner is the decision owner the reports state for the path and where
+	// it came from. It is information only and never approves anything.
+	Owner decisionOwner `json:"owner"`
 	// Receipt is the active cleanup receipt for the path. Planning skips a
 	// path while it has one, so the plan's verdict does not say what the
 	// receipt is waiting on.
@@ -79,7 +82,7 @@ func runExplain(ctx context.Context, e *env, args []string, opts explainOptions)
 	}
 	defer db.Close()
 
-	report := explainReport{Path: path}
+	report := explainReport{Path: path, Owner: resolveDecisionOwner(path, policy)}
 	var pending core.CleanupItem
 	err = db.Read(ctx, func(tx *store.Tx) error {
 		var stored core.Plan
@@ -183,6 +186,7 @@ func writeExplainText(e *env, report explainReport) error {
 	if action.Destination != "" {
 		fields = append(fields, output.Field{Key: "destination:", Value: action.Destination})
 	}
+	fields = append(fields, output.Field{Key: "owner:", Value: fmt.Sprintf("%s (source: %s; information only, never an approval)", report.Owner.Owner, report.Owner.Source)})
 	if report.Approved != nil {
 		fields = append(fields, output.Field{
 			Key:   "approved by:",

@@ -469,6 +469,13 @@ type Policy struct {
 	// Janitor archives (or, when regenerable, deletes) and removes.
 	ScratchCleanup []ScratchCleanup `yaml:"scratch_cleanup" json:"scratch_cleanup"`
 
+	// Owners names the decision owner role of arbitrary paths, for reports
+	// and explanations only: the longest matching path wins. An owner never
+	// approves, releases, protects or unprotects anything. It is left out of
+	// the plan's policy digest (see plan.PolicyDigest) because it cannot
+	// move a decision.
+	Owners []OwnerRule `yaml:"owners" json:"owners,omitempty"`
+
 	Prevention     Prevention      `yaml:"prevention" json:"prevention"`
 	CanonicalRoots []CanonicalRoot `yaml:"canonical_roots" json:"canonical_roots"`
 	Classification Classification  `yaml:"classification" json:"classification"`
@@ -627,6 +634,7 @@ func (p Policy) clone() Policy {
 		out.ScratchCleanup[i].Skip = append([]string(nil), p.ScratchCleanup[i].Skip...)
 		out.ScratchCleanup[i].Regenerable = append([]string(nil), p.ScratchCleanup[i].Regenerable...)
 	}
+	out.Owners = append([]OwnerRule(nil), p.Owners...)
 	if p.SourceNameApprovals != nil {
 		approvals := *p.SourceNameApprovals
 		approvals.Reviewers = append([]string(nil), approvals.Reviewers...)
@@ -688,6 +696,7 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	p.normalizeWorkspaceArchiveCategories(expand)
 	p.normalizeStaleReport(expand)
 	p.normalizeScratchCleanup(expand)
+	p.normalizeOwners(expand)
 	if p.Gitmoot.Home != "" {
 		p.Gitmoot.Home = expand("gitmoot.home", p.Gitmoot.Home)
 	}
@@ -798,6 +807,7 @@ func (p *Policy) Validate() core.FieldErrors {
 	p.validateWorkspaceArchiveCategories(&errs)
 	p.validateStaleReport(&errs)
 	p.validateScratchCleanup(&errs)
+	p.validateOwners(&errs)
 	p.validateSourceNameApprovals(&errs)
 	if p.Version != PolicyVersion {
 		errs.Add("version", "must be %d, got %d", PolicyVersion, p.Version)
