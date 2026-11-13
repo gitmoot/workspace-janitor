@@ -132,76 +132,68 @@ At most one trim per kind and path is accepted.
 - `docker-builder`: runs `docker builder prune --force --max-used-space
   <max_bytes>`. Docker removes only unused build cache, never images,
   containers or volumes.
-- `docker-images`: removes old images nobody uses, one image at a time
-  with `docker rmi --no-prune` (never `--force`, never `docker image
-  prune`; `--no-prune` stops Docker from also deleting untagged parent
+- `docker-images`: removes old images nobody uses, each with one `docker
+  rmi --no-prune <image ID>` (never `--force`, never by tag, never `docker
+  image prune`; `--no-prune` stops Docker from also deleting untagged parent
   images, which were never checked). A candidate is an image (by ID) that:
   - no container, running or stopped, references
     (`docker container ls --all`);
   - was neither created nor last tagged within `min_age`;
   - has no tag matching a `keep` pattern;
-  - no container may have been created from within `min_age`, according
-    to the daemon's event history (`docker events --since <now-min_age>
-    --until <now> --filter type=container --filter event=create --format
-    json`). This is what keeps an image used only by short-lived
-    containers (`docker run --rm`), which no container references between
-    runs. An event records the reference the container was created from.
-    An image ID (`sha256:…`) keeps exactly that image. A tag or digest
-    (`app:latest`) may have named a different image then, since tags move
-    on every build, tag or pull and Docker keeps no tag history; so it
-    keeps every image with a tag or digest in that repository (`app:old`
-    too) and every untagged image (what a moved tag leaves behind).
-    An image that has since lost every tag in that repository but kept a
-    tag in another one cannot be recognised; put such images in `keep`.
+  - no container was created from within `min_age`, according to the
+    daemon's event history (`docker events --since <now-min_age> --until
+    <now> --filter type=container --filter event=create --format json`).
+    This is what keeps an image used only by short-lived containers
+    (`docker run --rm`), which no container references between runs.
 
-  If that event history cannot be read or parsed, or the command times
-  out, or the history does not reach back to `now - min_age`, the whole
-  trim is refused: it is reported as `failed` with the reason, and nothing
-  is removed. **The daemon keeps only its most recent 256 events in memory,
-  and none from before it last restarted**, so on a daemon with routine
-  activity (health checks, `exec` probes) the history typically covers
-  minutes, not days: such a host refuses the trim on every run. The report's
-  `events_covered_since` shows how far back the history reached. Images
-  that must survive regardless belong in `keep`, which is checked first.
+  The whole trim is refused (reported as `failed` with the reason; nothing
+  is removed) when that event history:
+  - cannot be read or parsed, or the command times out;
+  - does not reach back to `now - min_age`. **The daemon keeps only its most
+    recent 256 events in memory, and none from before it last restarted**,
+    so on a daemon with routine activity (health checks, `exec` probes) the
+    history typically covers minutes, not days. The report's
+    `events_covered_since` shows how far back it reached;
+  - holds any create event that names the image by tag or digest
+    (`app:latest`) rather than by full image ID (`sha256:<64 hex>`).
+    An event records the reference the container was created from, tags
+    move on every build, tag or pull, and Docker keeps no tag history, so
+    the image that tag named then cannot be known. **A host that starts
+    containers by tag (`docker run app:latest`, compose) therefore refuses
+    the trim** whenever such a container was created within `min_age`.
+    An event that names a full image ID keeps exactly that image.
+
+  On most hosts these rules keep the trim refusing; that is deliberate, as
+  a guard that cannot see `min_age` back cannot rule out recent use. A
+  persistent record of image IDs used, kept by the watcher, is planned
+  (issue #206). Images that must survive regardless belong in `keep`,
+  which is checked first.
 
   Candidates are removed oldest first (by the later of creation and last
-  tag time, then ID). The image itself is always removed by ID (`docker rmi
-  --no-prune <ID>`), which cannot name another image. Docker refuses to
-  remove an image with several tags by ID without `--force`, so such an
-  image first loses its extra tags (all but the last, in sorted order), one
-  `docker rmi --no-prune <repo:tag>` each. Each step is bound to the
-  checked image:
-  - before the first step the image must still hold exactly the tags the
-    candidate list read (else `changed`);
-  - before each step the trim checks again that no image build or pull
-    runs, and asks the daemon whether any container now uses the image
-    (`docker container ls --all --filter ancestor=<ID>`); one that does
-    keeps the image;
-  - before untagging, the tag is resolved (`docker image inspect --format
-    {{.Id}} <repo:tag>`); a tag that now names another image (another
-    client ran `docker tag`, a build or a pull) stops that image's removal
-    as `tag_moved`;
-  - after each step every image's tags are compared with those before: the
-    image must hold exactly the tags expected (or be gone after the final
-    step), and no other image may have lost a tag or disappeared. Docker
-    has no untag-only operation, so a tag that moves in the instant between
-    resolving and untagging can still reach another image; that is reported
-    and stops the whole trim.
-
-  A failed step stops that image's removal and leaves its remaining
-  tags. With `max_bytes` the trim
-  runs only while the reclaimable image space that `docker system df
-  --format json` reports exceeds it (Docker prints that figure to four
-  significant digits), and stops as soon as it no longer does; without it
-  every run removes every candidate. The report's sizes are that
-  reclaimable space before and after, and `reclaimed_bytes` their
+  tag time, then ID). Docker refuses to remove an image with several tags
+  by ID without `--force`, and a removal by tag cannot be bound to an image
+  (the tag can move to another image between checking and removing it), so
+  a candidate with several tags is kept and reported as
+  `kept_multiple_tags`; that is not a failure. Immediately before each
+  removal the trim checks again that no image build or pull runs, asks the
+  daemon whether any container now uses the image (`docker container ls
+  --all --filter ancestor=<ID>`; one that does keeps it, `kept_in_use`),
+  and reads the image again by ID (`docker image inspect <ID>`): one whose
+  tags or last tag time changed is kept (`kept_changed`), one that now has
+  several tags too. Any Docker query that fails, or answers what cannot be
+  parsed, stops the trim as `failed`; it is never taken as an answer. With
+  `max_bytes` the trim runs only while the reclaimable image space that
+  `docker system df --format json` reports exceeds it (Docker prints that
+  figure to four significant digits), and stops as soon as it no longer
+  does; without it every run removes every candidate. The report's sizes
+  are that reclaimable space before and after, and `reclaimed_bytes` their
   difference. `images` lists every candidate with its tags, size, the
-  `commands` run for it, the tags it `untagged`, and `status`: `removed`,
-  `failed` (with Docker's error; the trim then fails),
-  `kept_in_use` (with the containers), `not_needed` (the bound was reached),
-  `postponed` (a build or pull started), `tag_moved`, `changed` or
-  `not_reached` (the trim stopped on a Docker error first). Containers,
-  volumes, networks and build cache are never touched.
+  `command` run for it, and `status`: `removed`, `failed` (with Docker's
+  error; the trim then fails), `kept_in_use` (with the containers),
+  `kept_multiple_tags`, `kept_changed`, `not_needed` (the bound was
+  reached), `postponed` (a build or pull started) or `not_reached` (the
+  trim stopped on a Docker error first). Containers, volumes, networks and
+  build cache are never touched.
 - `go-mod`: when the module cache's allocated size exceeds `max_bytes`, runs
   `go clean -modcache` with that exact `GOMODCACHE`, `GOTOOLCHAIN=local`,
   `GOENV=off`, `GOPROXY=off` and empty `GOFLAGS`. Go removes the whole
