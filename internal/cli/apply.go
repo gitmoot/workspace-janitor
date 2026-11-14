@@ -243,20 +243,35 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	if err != nil {
 		return err
 	}
+	// Each action resumes from its own active receipt; the store allows at
+	// most one per source. Its batch is normally the plan's only one, but an
+	// action whose receipt there was closed without moving (a deferred
+	// archive verification, a restored prepared receipt) is retried under a
+	// fresh cleanup id: a receipt's id is (cleanup id, action id), the action
+	// id is the plan's, and a closed receipt stays closed. Its siblings keep
+	// their batch and are replayed from it.
 	byAction := make(map[string]core.CleanupItem)
+	journaled := make(map[[2]string]bool)
 	for _, item := range prior {
-		if item.PlanID != stored.ID || item.State == core.CleanupRestored || item.State == core.CleanupDeleted || item.State == core.CleanupSuperseded {
+		if item.PlanID != stored.ID {
 			continue
 		}
-		if report.ID != "" && item.CleanupID != report.ID {
-			return errors.New("plan has multiple active cleanup batches; investigate before continuing")
+		journaled[[2]string{item.CleanupID, item.ActionID}] = true
+		if item.State == core.CleanupRestored || item.State == core.CleanupDeleted || item.State == core.CleanupSuperseded {
+			continue
 		}
-		report.ID = item.CleanupID
+		if other, ok := byAction[item.ActionID]; ok {
+			return fmt.Errorf("plan action %s has active receipts in %s and %s; investigate before continuing", item.ActionID, other.CleanupID, item.CleanupID)
+		}
+		if report.ID == "" {
+			report.ID = item.CleanupID
+		}
 		byAction[item.ActionID] = item
 	}
 	if report.ID == "" {
 		report.ID = "cleanup-" + uuid.NewString()
 	}
+	retryID := ""
 	var monitor *activityMonitor
 	if !opts.dryRun {
 		monitor, err = startCapacityActivity(ctx, db, "quarantine", report.ID, "", "", policy.Retention.QuarantineDir, activityVolume)
@@ -268,8 +283,15 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	for _, a := range selected {
 		item, exists := byAction[a.ID]
 		if !exists {
-			item = core.CleanupItem{CleanupID: report.ID, PlanID: stored.ID, ActionID: a.ID, Source: a.Path, Entry: byPath[a.Path], Action: a,
-				Destination: filepath.Join(policy.Retention.QuarantineDir, report.ID, a.ID, "item"), State: core.CleanupPrepared}
+			cleanupID := report.ID
+			if journaled[[2]string{cleanupID, a.ID}] {
+				if retryID == "" {
+					retryID = "cleanup-" + uuid.NewString()
+				}
+				cleanupID = retryID
+			}
+			item = core.CleanupItem{CleanupID: cleanupID, PlanID: stored.ID, ActionID: a.ID, Source: a.Path, Entry: byPath[a.Path], Action: a,
+				Destination: filepath.Join(policy.Retention.QuarantineDir, cleanupID, a.ID, "item"), State: core.CleanupPrepared}
 		}
 		if opts.dryRun {
 			report.Items = append(report.Items, item)
@@ -298,7 +320,7 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 			continue
 		}
 		if err == nil && item.State != core.CleanupQuarantined {
-			err = fmt.Errorf("cleanup remains %s; inspect receipt %s before retrying", item.State, report.ID)
+			err = fmt.Errorf("cleanup remains %s; inspect receipt %s before retrying", item.State, item.CleanupID)
 		}
 		if err != nil {
 			report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", a.Path, err))

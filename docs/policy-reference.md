@@ -797,16 +797,19 @@ collector's own deadline is extended by the budget only for an observation
 that verifies in full, and binds still start only within the command
 timeout's binding budget.
 
-A verification that runs out of its budget, with nothing found wrong, is
-**deferred**, not refused: the item keeps its blocking protection
+A verification that stops on its own budget's deadline, with nothing found
+wrong, is **deferred**, not refused: the item keeps its blocking protection
 (`archive verification deferred: budget 30m0s exceeded; retried next
 cycle`) and stays where it is. Before a quarantine move nothing has moved,
 so the prepared receipt is closed as `restored` ("left in place: …") and the
-next cycle plans, verifies and moves the item again; an expiry leaves the
-copy `quarantined`, not `investigate`. Deferrals are listed under `deferred`
-in the apply report and do not fail `apply` or the cycle. A mismatch, an
-unreadable archive or any other error is refused exactly as before, and a
-timeout of the whole collection is still a collector failure. After expiry,
+next cycle plans, verifies and moves the item again. Repeating the same
+plan's apply retries it too, under a fresh cleanup id, while the other
+actions of its batch are replayed from their own receipts. An expiry leaves
+the copy `quarantined`, not `investigate`. Deferrals are listed under
+`deferred` in the apply report and do not fail `apply` or the cycle. A
+mismatch, an unreadable archive or any other error is refused exactly as
+before, even when it arrives after the budget ran out, and a timeout of the
+whole collection is still a collector failure. After expiry,
 recover with
 [`archive --workspace NAME --restore-to`](recovery.md#workspace-archives).
 

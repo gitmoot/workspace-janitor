@@ -104,6 +104,31 @@ func TestWorkspaceArchiveBindsARegularFileUnit(t *testing.T) {
 	}
 }
 
+// #213: a verification is deferred only when Bind stops on its own
+// deadline. A genuine read failure that arrives after that deadline (here
+// the manifest cannot be opened, which no context check precedes) is
+// refused like any other, not folded into a deferral.
+func TestWorkspaceArchiveReadErrorAfterTheVerifyDeadlineIsRefused(t *testing.T) {
+	opts, rule := archivedFile(t)
+	opts.Limits.ArchiveVerifyTimeout = 100 * time.Millisecond
+	BeforeWorkspaceArchiveBind = func() {
+		time.Sleep(300 * time.Millisecond)
+		if err := os.Rename(rule.Archive.Manifest, rule.Archive.Manifest+".unreadable"); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { BeforeWorkspaceArchiveBind = nil })
+	entries := []core.Entry{{Path: rule.Path, Kind: core.EntryKindFile}}
+	collectWorkspaceArchives(context.Background(), opts, entries, time.Now())
+	reason := blockingReason(entries[0], core.ProtectDurableEvidence)
+	if entries[0].WorkspaceArchive != nil || !strings.Contains(reason, "does not bind the local tree") {
+		t.Fatalf("read error after the deadline not refused: %q", reason)
+	}
+	if err := ArchiveVerifyDeferral(entries[0]); err != nil {
+		t.Fatalf("read error after the deadline deferred: %v", err)
+	}
+}
+
 // A bound unit with a companion carries the companion's identity, which the
 // fingerprint covers: a replaced companion invalidates a saved plan.
 func TestWorkspaceArchiveBindingCarriesItsCompanion(t *testing.T) {

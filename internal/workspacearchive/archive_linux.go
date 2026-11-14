@@ -556,16 +556,27 @@ func readTar(ctx context.Context, file *os.File, layout tarLayout, size int64, e
 			return "", err
 		}
 	}
-	if _, err := tr.Next(); !errors.Is(err, io.EOF) {
+	// Only a header that reads successfully is an extra member; an error
+	// reading the terminator (an I/O error, the context's deadline) is a
+	// read error and keeps its cause.
+	switch _, err := tr.Next(); {
+	case errors.Is(err, io.EOF):
+	case err != nil:
+		return "", fmt.Errorf("reading archive terminator: %w", err)
+	default:
 		return "", errors.New("archive holds members absent from the manifest")
 	}
 	if _, err := io.Copy(io.Discard, stream); err != nil {
-		return "", err
+		return "", fmt.Errorf("reading archive tail: %w", err)
 	}
 	if count.n != size {
 		return "", errors.New("archive tar length differs from its manifest")
 	}
-	if after, err := fstate(file); err != nil || after != st {
+	after, err := fstate(file)
+	if err != nil {
+		return "", fmt.Errorf("inspecting archive tar: %w", err)
+	}
+	if after != st {
 		return "", errors.New("archive tar changed while being read")
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil

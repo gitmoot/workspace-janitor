@@ -130,12 +130,13 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 					BeforeWorkspaceArchiveBind()
 				}
 				binding, err := workspacearchive.Bind(bindCtx, rule, scope, item.path, opts.VerifyArchiveContents)
-				// A read cut short by a deadline is not reported as one, so
-				// the verification budget is known spent from its context:
-				// it expired while the collector still had time. Nothing was
-				// found wrong, so the unit stays protected for a later
-				// cycle instead of being refused.
-				budgetSpent := ownBudget && err != nil && errors.Is(bindCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+				// Deferred only when Bind stopped on this verification's
+				// own deadline, and the collector still had time: nothing
+				// was found wrong, so the unit stays protected for a later
+				// cycle instead of being refused. Any other error, a read
+				// error that arrives after the deadline included, refuses.
+				budgetSpent := ownBudget && errors.Is(err, context.DeadlineExceeded) &&
+					errors.Is(bindCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 				cancelBind()
 				switch {
 				case budgetSpent:
