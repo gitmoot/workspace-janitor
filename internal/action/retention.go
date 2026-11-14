@@ -75,12 +75,36 @@ func (e *Engine) recollectReceipt(ctx context.Context, path, source string) (cor
 }
 
 func (e *Engine) recollectWithSize(ctx context.Context, path string, deep bool) (core.Entry, error) {
-	result, err := e.observeAround(ctx, path, deep)
+	return e.observeEntry(ctx, path, deep, true)
+}
+
+// recollectMoved observes a just-moved object at its receipt, for the
+// snapshot expiry later compares with. Its archive binding is recorded
+// without re-reading the archive: the binding does not depend on it, the
+// revalidation before the move verified it in full, and expiry verifies it
+// in full again before anything is deleted. A full read here would double
+// the move's archive reads and could run out of its budget after the
+// rename, where a deferral can no longer leave the object in place.
+func (e *Engine) recollectMoved(ctx context.Context, item core.CleanupItem) (core.Entry, error) {
+	copy := *e
+	copy.Collect.WorktreeOrigins = map[string]string{item.Destination: item.Source}
+	return copy.observeEntry(ctx, item.Destination, false, false)
+}
+
+// observeEntry is path's entry in observeAround. A full archive
+// verification of path that ran out of its own budget is returned as
+// collect.ErrArchiveVerifyDeferred along with the entry, which stays
+// protected.
+func (e *Engine) observeEntry(ctx context.Context, path string, deep, full bool) (core.Entry, error) {
+	result, err := e.observeAround(ctx, path, deep, full)
 	if err != nil {
 		return core.Entry{}, err
 	}
 	for _, entry := range result.Entries {
 		if entry.Path == path {
+			if err := collect.ArchiveVerifyDeferral(entry); err != nil {
+				return entry, fmt.Errorf("%s: %w", path, err)
+			}
 			return entry, nil
 		}
 	}
@@ -88,11 +112,12 @@ func (e *Engine) recollectWithSize(ctx context.Context, path string, deep bool) 
 }
 
 // observeAround collects path's directory one level deep and refuses a
-// result whose reference collectors did not all complete.
-func (e *Engine) observeAround(ctx context.Context, path string, deep bool) (collect.Result, error) {
+// result whose reference collectors did not all complete. With full, path's
+// workspace archive is verified in full, under its own budget.
+func (e *Engine) observeAround(ctx context.Context, path string, deep, full bool) (collect.Result, error) {
 	opts := e.Collect
 	opts.DeepSize = deep
-	opts.VerifyArchiveContents = true
+	opts.VerifyArchiveContents = full
 	// Only path is used; bind (and fully verify) its archive alone.
 	opts.ArchiveBindPaths = map[string]bool{path: true}
 	// Resolve a live source symlink only to check containment; quarantine
@@ -121,7 +146,9 @@ func (e *Engine) observeAround(ctx context.Context, path string, deep bool) (col
 // reference into it still does, because it may be waiting for the
 // original content.
 func (e *Engine) originalReferences(ctx context.Context, source string) error {
-	result, err := e.observeAround(ctx, source, false)
+	// Only references are read here, and no archive binding affects them,
+	// so the source's archive is not re-read.
+	result, err := e.observeAround(ctx, source, false, false)
 	if err != nil {
 		return err
 	}
@@ -202,8 +229,12 @@ func (e *Engine) eligible(ctx context.Context, item core.CleanupItem, original b
 		observer = e.withoutArchiveRulesAt(item.Source)
 	}
 	var observed core.Entry
+	var deferred error
 	probe := func(ctx context.Context, path string) (core.Entry, error) {
 		fresh, err := observer.recollectReceipt(ctx, path, item.Source)
+		if errors.Is(err, collect.ErrArchiveVerifyDeferred) {
+			deferred = err
+		}
 		fresh.Root = item.Entry.Root
 		if !original {
 			fresh.WorkspaceArchive = nil
@@ -216,6 +247,9 @@ func (e *Engine) eligible(ctx context.Context, item core.CleanupItem, original b
 	verdict := safety.Revalidate(ctx, safety.RevalidateInput{
 		Planned: planned, Action: action, Policy: policy, Now: e.now(), Handle: handle, Recollect: probe,
 	})
+	if deferred != nil {
+		return deferred
+	}
 	if !verdict.Allows(core.ActionDeleteCandidate) {
 		return fmt.Errorf("deletion safety refused: %s", verdict.Detail())
 	}
@@ -278,6 +312,11 @@ func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.Cleanu
 		return e.Reconcile(ctx, item)
 	}
 	proof, err := e.expiryEligible(ctx, item)
+	if errors.Is(err, collect.ErrArchiveVerifyDeferred) {
+		// Nothing was found wrong: the copy stays quarantined, and the
+		// next expiry verifies it again.
+		return item, err
+	}
 	if err != nil {
 		return e.investigate(ctx, item, err.Error())
 	}

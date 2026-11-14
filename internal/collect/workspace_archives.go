@@ -2,6 +2,7 @@ package collect
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -19,7 +20,9 @@ import (
 // local retention measured from the manifest's creation has elapsed. Only
 // then does the entry carry a WorkspaceArchive binding. Mutation-time
 // recollection sets VerifyArchiveContents, so the move and the expiry both
-// re-hash the archive and the local tree, including a quarantined copy.
+// re-hash the archive and the local tree, including a quarantined copy,
+// each under its own verification budget; one that runs out of it is
+// deferred (ArchiveVerifyDeferral), never bound.
 func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core.Entry, now time.Time) core.CollectorReport {
 	type candidate struct {
 		index     int
@@ -56,7 +59,18 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 			candidates = append(candidates, candidate{i, entries[i].Path, entries[i].Kind, protected, rule})
 		}
 	}
-	refs, report := runBounded(ctx, opts, CollectorWorkspaceArchives, func(ctx context.Context, _ *Options) ([]Reference, core.CollectorReport) {
+	// A full verification re-reads the whole archive, which can take far
+	// longer than collecting does (live 2026-11-14: a 1.5 GB tar over sshfs
+	// ran out of the 48 s a 60 s command timeout left it). It runs under
+	// its own budget, which extends this collector's deadline. Binds start
+	// only within the command timeout's binding budget, so one budget
+	// covers the last full verification to start.
+	timeout, what := opts.Limits.CommandTimeout, "command timeout"
+	if opts.VerifyArchiveContents && opts.Limits.ArchiveVerifyTimeout > 0 {
+		timeout += opts.Limits.ArchiveVerifyTimeout
+		what = "command timeout plus archive verification budget"
+	}
+	refs, report := runBoundedFor(ctx, opts, CollectorWorkspaceArchives, timeout, what, func(ctx context.Context, _ *Options) ([]Reference, core.CollectorReport) {
 		report := core.CollectorReport{Name: CollectorWorkspaceArchives, Status: core.CollectorRan}
 		refs := make([]Reference, 0, len(candidates))
 		// The collector's result is dropped whole if it misses its deadline,
@@ -64,9 +78,9 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 		// as deferred (still protected). Each scan then binds what it can
 		// and a later scan continues, instead of every scan timing out with
 		// nothing bound (live 2026-11-04: 155 binds at ~0.6 s against 60 s).
-		budgetCtx, cancelBudget := context.WithDeadline(ctx, bindingBudget(ctx))
+		budgetCtx, cancelBudget := context.WithDeadline(ctx, bindingBudget(ctx, opts.Limits.CommandTimeout))
 		defer cancelBudget()
-		deferred := 0
+		deferred, verifyDeferred := 0, 0
 		// Category archives search every inventory root for dependents; one
 		// snapshot walk serves all of them in this collection instead of one
 		// bounded walk per item. Explicit rules keep their own walk.
@@ -104,11 +118,30 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 				ref.Detail = LocalExpiryRefusal(rule, time.Time{}, now)
 			default:
 				scope := workspacearchive.BindingScope(budgetCtx, *policy, rule, opts.ProcRoot, &categoryDependents)
+				// A full verification runs under its own budget, which
+				// covers the test seam below too; any other bind under the
+				// binding budget.
+				bindCtx, cancelBind := budgetCtx, context.CancelFunc(func() {})
+				ownBudget := opts.VerifyArchiveContents && opts.Limits.ArchiveVerifyTimeout > 0
+				if ownBudget {
+					bindCtx, cancelBind = context.WithTimeout(ctx, opts.Limits.ArchiveVerifyTimeout)
+				}
 				if BeforeWorkspaceArchiveBind != nil {
 					BeforeWorkspaceArchiveBind()
 				}
-				binding, err := workspacearchive.Bind(budgetCtx, rule, scope, item.path, opts.VerifyArchiveContents)
+				binding, err := workspacearchive.Bind(bindCtx, rule, scope, item.path, opts.VerifyArchiveContents)
+				// A read cut short by a deadline is not reported as one, so
+				// the verification budget is known spent from its context:
+				// it expired while the collector still had time. Nothing was
+				// found wrong, so the unit stays protected for a later
+				// cycle instead of being refused.
+				budgetSpent := ownBudget && err != nil && errors.Is(bindCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+				cancelBind()
 				switch {
+				case budgetSpent:
+					verifyDeferred++
+					ref.Signal = signalArchiveVerifyDeferred
+					ref.Detail = fmt.Sprintf("%s: budget %s exceeded; retried next cycle", ErrArchiveVerifyDeferred, opts.Limits.ArchiveVerifyTimeout)
 				case err != nil:
 					ref.Detail = fmt.Sprintf("verified workspace archive does not bind the local tree: %v", err)
 				case LocalExpiryRefusal(rule, binding.CreatedAt, now) != "":
@@ -123,6 +156,9 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 		}
 		if deferred > 0 {
 			report.Detail = fmt.Sprintf("%d archive binding(s) deferred to a later scan by the binding budget", deferred)
+		}
+		if verifyDeferred > 0 {
+			report.Detail = appendDetail(report.Detail, fmt.Sprintf("%d archive verification(s) deferred by limits.archive_verify_timeout", verifyDeferred))
 		}
 		return refs, report
 	})
@@ -169,17 +205,46 @@ func protectedArchivePath(path string, kind core.EntryKind, category bool, polic
 }
 
 // bindingBudget is when workspace archive binding stops starting new work:
-// a fifth of the remaining collector time (at least 2 s, at most 15 s)
-// before its deadline, so the collector publishes in time. A bind or index
-// walk cut off by it fails, which refuses that tree, never binds it.
-func bindingBudget(ctx context.Context) time.Time {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return time.Now().Add(24 * time.Hour)
+// a fifth of the collector's remaining own time (at least 2 s, at most
+// 15 s) before its deadline, so the collector publishes in time. Its own
+// time ends own from now, or at ctx's deadline if that is earlier; a full
+// verification's budget extends the collector's deadline past it. A bind or
+// index walk cut off by it fails, which refuses that tree, never binds it.
+func bindingBudget(ctx context.Context, own time.Duration) time.Time {
+	deadline := time.Now().Add(own)
+	if inherited, ok := ctx.Deadline(); ok && inherited.Before(deadline) {
+		deadline = inherited
 	}
 	remaining := time.Until(deadline)
 	margin := min(max(remaining/5, 2*time.Second), 15*time.Second, remaining/2)
 	return deadline.Add(-margin)
+}
+
+// ErrArchiveVerifyDeferred marks a full archive verification that its own
+// budget (limits.archive_verify_timeout) cut short. Nothing was found wrong:
+// the unit stays protected, and a later cycle verifies it again.
+var ErrArchiveVerifyDeferred = errors.New("archive verification deferred")
+
+// signalArchiveVerifyDeferred is the evidence signal of such a deferral.
+const signalArchiveVerifyDeferred = "workspace_archive_verify_deferred"
+
+// archiveVerifyDeferral is the recorded deferral; it is
+// ErrArchiveVerifyDeferred.
+type archiveVerifyDeferral string
+
+func (d archiveVerifyDeferral) Error() string { return string(d) }
+
+func (archiveVerifyDeferral) Is(target error) bool { return target == ErrArchiveVerifyDeferred }
+
+// ArchiveVerifyDeferral is the deferral this collection recorded on entry,
+// or nil: its full archive verification ran out of its own budget.
+func ArchiveVerifyDeferral(entry core.Entry) error {
+	for _, evidence := range entry.Evidence {
+		if evidence.Signal == signalArchiveVerifyDeferred {
+			return archiveVerifyDeferral(evidence.Detail)
+		}
+	}
+	return nil
 }
 
 // BeforeWorkspaceArchiveBind is a test seam called before each archive

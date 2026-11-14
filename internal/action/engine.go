@@ -153,7 +153,11 @@ func (e *Engine) Quarantine(ctx context.Context, item core.CleanupItem) (core.Cl
 		return item, err
 	}
 	defer handle.Close()
-	if verdict := e.revalidatePrepared(ctx, item, handle); !verdict.Allows(item.Action.Kind) {
+	verdict, deferred := e.revalidatePrepared(ctx, item, handle)
+	if deferred != nil {
+		return e.deferPrepared(ctx, item, deferred)
+	}
+	if !verdict.Allows(item.Action.Kind) {
 		return item, fmt.Errorf("revalidation refused %s: %s", item.Source, verdict.Detail())
 	}
 	if err := e.moveUnit(ctx, item, handle.Identity()); err != nil {
@@ -186,7 +190,7 @@ func (e *Engine) QuarantineCheck(ctx context.Context, item core.CleanupItem) (co
 		return core.Verdict{}, err
 	}
 	defer handle.Close()
-	verdict := e.revalidatePrepared(ctx, item, handle)
+	verdict, _ := e.revalidatePrepared(ctx, item, handle)
 	if suffix, id := companionOf(item); verdict.Allows(item.Action.Kind) && suffix != "" && !id.Zero() {
 		return verdict, e.revalidateCompanion(ctx, item, item.Source+suffix, id)
 	}
@@ -194,16 +198,42 @@ func (e *Engine) QuarantineCheck(ctx context.Context, item core.CleanupItem) (co
 }
 
 // revalidatePrepared is the fresh complete safety verdict on a prepared item
-// opened through handle, immediately before its move.
-func (e *Engine) revalidatePrepared(ctx context.Context, item core.CleanupItem, handle *safety.Handle) core.Verdict {
+// opened through handle, immediately before its move, and the deferral, if
+// any, of its archive verification (collect.ErrArchiveVerifyDeferred).
+func (e *Engine) revalidatePrepared(ctx context.Context, item core.CleanupItem, handle *safety.Handle) (core.Verdict, error) {
 	target := safety.ResolveTarget(filepath.Dir(item.Destination))
-	return safety.Revalidate(ctx, safety.RevalidateInput{
+	var deferred error
+	verdict := safety.Revalidate(ctx, safety.RevalidateInput{
 		Planned: item.Entry, Action: item.Action, Policy: e.Policy,
 		Target: &target, Now: e.now(), Handle: handle,
 		Recollect: func(ctx context.Context, path string) (core.Entry, error) {
-			return e.recollectWithSize(ctx, path, item.Entry.SizeIsDeep)
+			entry, err := e.recollectWithSize(ctx, path, item.Entry.SizeIsDeep)
+			if errors.Is(err, collect.ErrArchiveVerifyDeferred) {
+				deferred = err
+			}
+			return entry, err
 		},
 	})
+	return verdict, deferred
+}
+
+// deferPrepared closes a prepared receipt whose revalidation ran out of its
+// archive verification budget before anything moved. The object stays in
+// place and protected. A receipt left prepared would hold its source until
+// an operator restored it (live 2026-11-14), while a closed one lets the
+// next cycle plan, verify and move it again. Like a restore of a prepared
+// item, it requires the source unmoved and the destination absent; when it
+// cannot close the receipt, the error is a refusal, not a deferral.
+func (e *Engine) deferPrepared(ctx context.Context, item core.CleanupItem, cause error) (core.CleanupItem, error) {
+	if !unmoved(item) {
+		return item, fmt.Errorf("%v; the prepared source or destination changed, so the receipt stays prepared", cause)
+	}
+	closed := item
+	closed.State, closed.UpdatedAt, closed.Reason = core.CleanupRestored, e.now(), "left in place: "+cause.Error()
+	if err := e.update(ctx, closed, core.CleanupPrepared); err != nil {
+		return item, fmt.Errorf("%v; closing its prepared receipt: %w", cause, err)
+	}
+	return closed, cause
 }
 
 // moveUnit renames the prepared object, and a bound companion before it, into
@@ -277,7 +307,7 @@ func (e *Engine) finishMove(ctx context.Context, item core.CleanupItem) (core.Cl
 	if err := companionMoved(item); err != nil {
 		return item, err
 	}
-	fresh, err := e.recollectReceipt(ctx, item.Destination, item.Source)
+	fresh, err := e.recollectMoved(ctx, item)
 	if err != nil {
 		return item, fmt.Errorf("moved object requires investigation: %w", err)
 	}
