@@ -89,25 +89,33 @@ func (x *categoryFixture) cycle(t *testing.T) (cycleReport, string, ExitCode) {
 // sourceReceipts lists every cleanup receipt of the released directory.
 func (x *categoryFixture) sourceReceipts(t *testing.T) []core.CleanupItem {
 	t.Helper()
+	var found []core.CleanupItem
+	for _, item := range x.items(t) {
+		if item.Source == x.source {
+			found = append(found, item)
+		}
+	}
+	return found
+}
+
+// items lists every cleanup receipt in creation order.
+func (x *categoryFixture) items(t *testing.T) []core.CleanupItem {
+	t.Helper()
 	db, err := store.OpenExisting(context.Background(), x.paths(t).DatabaseFile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	var found []core.CleanupItem
+	var items []core.CleanupItem
 	err = db.Read(context.Background(), func(tx *store.Tx) error {
-		items, err := tx.CleanupItems(context.Background(), "")
-		for _, item := range items {
-			if item.Source == x.source {
-				found = append(found, item)
-			}
-		}
+		var err error
+		items, err = tx.CleanupItems(context.Background(), "")
 		return err
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return found
+	return items
 }
 
 // A full verification that needs longer than the collector's binding budget
@@ -163,6 +171,67 @@ func TestCycleDefersAQuarantineWhoseArchiveVerificationRunsOutOfBudget(t *testin
 	}
 	if _, err := os.Lstat(x.source); !os.IsNotExist(err) {
 		t.Fatalf("next cycle did not retry the deferred item: %v", err)
+	}
+}
+
+// #214: in a batch where one action was deferred and another quarantined,
+// repeating the same plan's apply retries the deferred action under a fresh
+// receipt and replays the quarantined one; it used to fail on the deferred
+// action's closed (cleanup id, action id) receipt.
+func TestSamePlanApplyRetriesADeferredActionBesideAQuarantinedOne(t *testing.T) {
+	x := newVerifyBudgetFixture(t, "  archive_verify_timeout: 1s\n")
+	second := x.scratch(t, "second", map[string]string{"notes.txt": "second\n"})
+	backdate(t, second, categoryIdleAge)
+	if item := categoryItem(t, x.categories(t, false), second); item.Status != categoryArchived {
+		t.Fatalf("second directory not archived: %+v", item)
+	}
+	// Only the batch's first revalidation is slow: that action is deferred,
+	// the other moves.
+	quarantine := x.paths(t).QuarantineDir
+	slowed := false
+	slowBinds(t, slowVerification, func() bool {
+		if receipts, _ := os.ReadDir(quarantine); len(receipts) == 0 || slowed {
+			return false
+		}
+		slowed = true
+		return true
+	})
+	if _, output, code := x.cycle(t); code != ExitOK {
+		t.Fatalf("cycle: exit=%d %s", code, output)
+	}
+	collect.BeforeWorkspaceArchiveBind = nil
+	states := func() map[string][]core.CleanupState {
+		got := map[string][]core.CleanupState{}
+		for _, item := range x.items(t) {
+			got[item.Source] = append(got[item.Source], item.State)
+		}
+		return got
+	}
+	items := x.items(t)
+	if len(items) != 2 || items[0].CleanupID != items[1].CleanupID {
+		t.Fatalf("want one two-action batch, got %+v", states())
+	}
+	counts := map[core.CleanupState]int{}
+	for _, item := range items {
+		counts[item.State]++
+	}
+	if counts[core.CleanupRestored] != 1 || counts[core.CleanupQuarantined] != 1 {
+		t.Fatalf("want one deferred and one quarantined action, got %+v", states())
+	}
+	for run := 1; run <= 2; run++ {
+		if out, stderr, code := x.run(t, "apply", "--quarantine", "--plan", items[0].PlanID, "--dry-run=false", "--confirm"); code != ExitOK {
+			t.Fatalf("same-plan apply %d: exit=%d %s %s", run, code, out, stderr)
+		}
+	}
+	for _, path := range []string{x.source, second} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("%s not quarantined by the retry: %v (%+v)", path, err, states())
+		}
+	}
+	for source, got := range states() {
+		if got[len(got)-1] != core.CleanupQuarantined {
+			t.Fatalf("%s receipts %v", source, got)
+		}
 	}
 }
 

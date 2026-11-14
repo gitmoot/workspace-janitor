@@ -26,7 +26,9 @@ A quarantine whose workspace archive verification ran out of
 `limits.archive_verify_timeout` needs none of this: nothing moved, so its
 prepared receipt is closed as `restored` ("left in place: archive
 verification deferred …") and the next cycle verifies and moves the item
-again. An expiry deferred the same way leaves its receipt `quarantined`.
+again. Repeating the same confirmed apply also retries it, under a fresh
+cleanup id, and replays the rest of its batch. An expiry deferred the same
+way leaves its receipt `quarantined`.
 
 ## Expiry and irreversible paths
 
