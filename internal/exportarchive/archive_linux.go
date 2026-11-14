@@ -311,7 +311,13 @@ func verifyPayload(ctx context.Context, payload *os.File, m Manifest) error {
 		return err
 	}
 	digest, count, err := hashFile(ctx, payload, m.ArchiveBytes)
-	if err != nil || count != m.ArchiveBytes || digest != m.ArchiveSHA256 {
+	if err != nil {
+		return fmt.Errorf("reading archive payload: %w", err)
+	}
+	if count != m.ArchiveBytes {
+		return fmt.Errorf("archive payload size mismatch: read %d bytes, want %d", count, m.ArchiveBytes)
+	}
+	if digest != m.ArchiveSHA256 {
 		return errors.New("archive payload checksum mismatch")
 	}
 	if _, err = payload.Seek(0, io.SeekStart); err != nil {
@@ -325,7 +331,19 @@ func verifyPayload(ctx context.Context, payload *os.File, m Manifest) error {
 	hash := sha256.New()
 	count, err = io.Copy(hash, io.LimitReader(reader, m.Source.Size+1))
 	after, statErr := snapshot(payload)
-	if err != nil || statErr != nil || before != after || count != m.Source.Size || hex.EncodeToString(hash.Sum(nil)) != m.SourceSHA256 {
+	if err != nil {
+		return fmt.Errorf("reading archive payload content: %w", err)
+	}
+	if statErr != nil {
+		return fmt.Errorf("inspecting archive payload: %w", statErr)
+	}
+	if before != after {
+		return errors.New("archive payload changed while being read")
+	}
+	if count != m.Source.Size {
+		return fmt.Errorf("restored archive content size does not match the export: read %d bytes, want %d", count, m.Source.Size)
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != m.SourceSHA256 {
 		return errors.New("restored archive content or integrity does not match the export")
 	}
 	return nil
