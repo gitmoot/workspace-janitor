@@ -22,6 +22,12 @@ the prepared receipt. The store rejects a new active receipt for that source
 until this is resolved. Only then scan, plan and approve again. Do not use
 retry flags or manual database edits to bypass an unresolved receipt.
 
+A quarantine whose workspace archive verification ran out of
+`limits.archive_verify_timeout` needs none of this: nothing moved, so its
+prepared receipt is closed as `restored` ("left in place: archive
+verification deferred …") and the next cycle verifies and moves the item
+again. An expiry deferred the same way leaves its receipt `quarantined`.
+
 ## Expiry and irreversible paths
 
 Retention reaching its date alone never deletes an object. With `retention.delete_enabled: true`, `janitor apply --expire` previews eligible receipts; `janitor apply --expire --confirm --dry-run=false` separately requests deletion after fresh receipt, original-path, Git and live-reference checks. A changed or newly referenced item enters `investigate` and remains recoverable; address the evidence and re-run a separately confirmed evaluation, or restore it. Automatic expiry also requires `prevention.auto_expire: true` and an operator-installed timer; it uses the guarded path but is irreversible when it succeeds. `prevention.auto_quarantine: true` additionally lets that timer approve and move rule-based quarantine actions without an operator; restore them with `janitor restore <cleanup-id>` before their retention expires. Keep these switches off unless explicitly authorized.

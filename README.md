@@ -94,7 +94,9 @@ rather than upgraded silently.
 Every reference collector is bounded by `limits.command_timeout` in wall
 clock, enforced by the scan rather than by the collector's cooperation, so a
 stalled filesystem or an adapter that ignores cancellation cannot hang a
-scan; it becomes a partial report with an unknown.
+scan; it becomes a partial report with an unknown. A full workspace archive
+verification before a quarantine move or expiry also gets
+`limits.archive_verify_timeout` (default `30m`).
 
 ## Safety
 

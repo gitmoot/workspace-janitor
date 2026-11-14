@@ -411,3 +411,7 @@ limits:
   # that binds category archives) over every inventory root; exceeding it
   # refuses every category item.
   dependent_index_max_entries: 5000000
+  # Each full workspace archive verification (before a quarantine move and
+  # before expiry) re-reads the whole archive under this budget, independent
+  # of command_timeout. One that runs out of it is deferred to a later cycle.
+  archive_verify_timeout: 30m

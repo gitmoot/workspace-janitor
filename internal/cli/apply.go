@@ -45,11 +45,25 @@ type cleanupReport struct {
 	Estimate      *action.ReclaimEstimate `json:"expected_reclaim,omitempty"`
 	EstimateError string                  `json:"estimate_unavailable,omitempty"`
 	Errors        []string                `json:"errors"`
-	Activity      *core.CapacityActivity  `json:"activity,omitempty"`
+	// Deferred lists items whose archive verification ran out of
+	// limits.archive_verify_timeout. They are left as they were, still
+	// protected, and retried by a later run; they are not refusals.
+	Deferred []string               `json:"deferred,omitempty"`
+	Activity *core.CapacityActivity `json:"activity,omitempty"`
 	// ArchivedDue lists the expiry items that are due only because of
 	// retention.archived: the retention their receipt recorded still holds
 	// them. Being due is never deletion authority on its own.
 	ArchivedDue []archivedRetentionDue `json:"archived_retention_due,omitempty"`
+}
+
+// refuse records err for the item at path: a deferred archive verification
+// under Deferred, anything else under Errors.
+func (r *cleanupReport) refuse(path string, err error) {
+	if errors.Is(err, collect.ErrArchiveVerifyDeferred) {
+		r.Deferred = append(r.Deferred, fmt.Sprintf("%s: %v", path, err))
+		return
+	}
+	r.Errors = append(r.Errors, fmt.Sprintf("%s: %v", path, err))
 }
 
 // archivedRetentionDue is one receipt that retention.archived made due.
@@ -278,6 +292,11 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 		} else if err == nil && item.State == core.CleanupQuarantined {
 			monitor.activity.Replayed++
 		}
+		if errors.Is(err, collect.ErrArchiveVerifyDeferred) {
+			report.refuse(a.Path, err)
+			report.Items = append(report.Items, item)
+			continue
+		}
 		if err == nil && item.State != core.CleanupQuarantined {
 			err = fmt.Errorf("cleanup remains %s; inspect receipt %s before retrying", item.State, report.ID)
 		}
@@ -425,14 +444,14 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 				// Mirror the confirmed path: Reconcile's guard, then retention.
 				err = engine.RetryPreview(ctx, item)
 				if err != nil {
-					report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", item.Source, err))
+					report.refuse(item.Source, err)
 				}
 				report.Items = append(report.Items, item)
 				continue
 			}
 			item, err = engine.Reconcile(ctx, item)
 			if err != nil {
-				report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", item.Source, err))
+				report.refuse(item.Source, err)
 				report.Items = append(report.Items, item)
 				continue
 			}
@@ -460,7 +479,7 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 			}
 		}
 		if err != nil {
-			report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", item.Source, err))
+			report.refuse(item.Source, err)
 		}
 		if opts.dryRun && err == nil {
 			entry := item.Entry
@@ -541,6 +560,11 @@ func writeCleanup(out io.Writer, format output.Format, report cleanupReport) err
 	}
 	for _, reason := range report.Errors {
 		if _, err := fmt.Fprintf(out, "  refused: %s\n", reason); err != nil {
+			return err
+		}
+	}
+	for _, reason := range report.Deferred {
+		if _, err := fmt.Fprintf(out, "  deferred: %s\n", reason); err != nil {
 			return err
 		}
 	}

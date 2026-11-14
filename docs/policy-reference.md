@@ -16,7 +16,7 @@ The policy defaults to `<config-dir>/policy.yaml`; `--policy` overrides `JANITOR
 | `owners` | Decision owner role of arbitrary paths, for reports and `explain` only. Never approves, releases, protects or unprotects anything. See [decision owners](#decision-owners). |
 | `caches` | Exact declared cache roots; `action` is `keep`, `quarantine`, `delete_candidate`, or `investigate`. Omitted action means `investigate`; TTL/size bounds need complete evidence for directories. Dedicated irreversible prune has further restrictions. |
 | `jev` | Disabled by default; model, endpoint, key **environment variable name**, request bounds, thresholds, caching and redaction. See [privacy](privacy.md). |
-| `collectors`, `limits`, `safety` | Explicit collector sources, bounded work/timeouts, and destination headroom. `allow_cross_filesystem_quarantine` does not enable a copy path: the Linux action engine still refuses cross-filesystem quarantine. |
+| `collectors`, `limits`, `safety` | Explicit collector sources, bounded work/timeouts, and destination headroom. `allow_cross_filesystem_quarantine` does not enable a copy path: the Linux action engine still refuses cross-filesystem quarantine. `limits.archive_verify_timeout` (default `30m`, at most `24h`) bounds each full workspace archive verification on its own; see [workspace archive local expiry](#workspace-archive-local-expiry). |
 
 Safety is a first-precedence veto. Protected paths/canonical roots precede explicit cache rules, then built-in classification and investigate fallback. Within a tier, safer action wins, independently of YAML order. No policy field waives a core protection or enables generic direct deletion. `follow_symlinks` changes discovery, not symlink-containment safety. `delete_candidate` needs an exact cache rule and, for official pruning, a dedicated owned/idle cache plus an approved action, configured absolute supported executable, and a distinct confirmed `apply --prune` call. `retention.delete_enabled` alone never expires an item; a confirmed expiry also needs elapsed retention and fresh complete checks.
 
@@ -782,8 +782,32 @@ local tree, which a lower bound cannot, so an unchanged tree past the scan's
 budget is still moved and a changed one still refuses. Without a binding,
 lower-bound sizes are compared as recorded. Ancestor directories of a
 released workspace are protected so a broader rule cannot remove it wholesale.
-Full verification runs inside `limits.command_timeout`; a timeout holds the
-workspace. After expiry, recover with
+Full verification of one workspace archive runs under its own budget,
+`limits.archive_verify_timeout` (default `30m`, greater than zero and at most
+`24h`), independent of `limits.command_timeout`: re-reading a large archive
+over a network mount can take far longer than collecting does. It applies
+where the whole archive is re-read: the revalidation immediately before a
+quarantine move (the first full verification of a category archive's item)
+and the observation immediately before expiry. Inventory scans, which do not
+re-read archives, and the observation that records the quarantined copy
+right after its move, which records its binding from the pinned manifest and
+the local tree without re-reading the archive (expiry verifies it in full
+again), stay within `limits.command_timeout`. The workspace archive
+collector's own deadline is extended by the budget only for an observation
+that verifies in full, and binds still start only within the command
+timeout's binding budget.
+
+A verification that runs out of its budget, with nothing found wrong, is
+**deferred**, not refused: the item keeps its blocking protection
+(`archive verification deferred: budget 30m0s exceeded; retried next
+cycle`) and stays where it is. Before a quarantine move nothing has moved,
+so the prepared receipt is closed as `restored` ("left in place: …") and the
+next cycle plans, verifies and moves the item again; an expiry leaves the
+copy `quarantined`, not `investigate`. Deferrals are listed under `deferred`
+in the apply report and do not fail `apply` or the cycle. A mismatch, an
+unreadable archive or any other error is refused exactly as before, and a
+timeout of the whole collection is still a collector failure. After expiry,
+recover with
 [`archive --workspace NAME --restore-to`](recovery.md#workspace-archives).
 
 ### Workspace archive categories

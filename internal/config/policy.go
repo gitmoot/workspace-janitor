@@ -192,6 +192,10 @@ type Limits struct {
 	// category run (or a binding of category archives) makes over the
 	// inventory roots; exceeding it refuses every category item.
 	DependentIndexMaxEntries int `yaml:"dependent_index_max_entries" json:"dependent_index_max_entries"`
+	// ArchiveVerifyTimeout bounds each full workspace archive verification
+	// (before a quarantine move and before expiry), independently of
+	// CommandTimeout. One that runs out of it is deferred to a later cycle.
+	ArchiveVerifyTimeout Duration `yaml:"archive_verify_timeout" json:"archive_verify_timeout"`
 }
 
 // Collectors selects which evidence collectors run and where the reference
@@ -600,6 +604,7 @@ func DefaultPolicy(p Paths) Policy {
 			DeepSizeMaxDepth:   16,
 
 			DependentIndexMaxEntries: 5000000,
+			ArchiveVerifyTimeout:     Duration(30 * time.Minute),
 		},
 		Prevention: Prevention{
 			DeepInterval:      Duration(7 * 24 * time.Hour),
@@ -1086,6 +1091,9 @@ func (p *Policy) Validate() core.FieldErrors {
 	}
 	if p.Limits.CommandTimeout.Duration() <= 0 {
 		errs.Add("limits.command_timeout", "must be greater than zero, got %s", p.Limits.CommandTimeout)
+	}
+	if d := p.Limits.ArchiveVerifyTimeout.Duration(); d <= 0 || d > 24*time.Hour {
+		errs.Add("limits.archive_verify_timeout", "must be greater than zero and at most 24h, got %s", p.Limits.ArchiveVerifyTimeout)
 	}
 	for _, bound := range []struct {
 		field string

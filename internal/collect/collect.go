@@ -67,6 +67,11 @@ type Limits struct {
 	MaxDirEntries      int
 	DeepSizeMaxEntries int
 	DeepSizeMaxDepth   int
+	// ArchiveVerifyTimeout is the budget of each full workspace archive
+	// verification (VerifyArchiveContents), on top of CommandTimeout and
+	// independent of it. Zero gives full verification no budget of its own:
+	// it then shares the collector's binding budget.
+	ArchiveVerifyTimeout time.Duration
 }
 
 // ServiceSources lists where the service and scheduler collectors look.
@@ -115,7 +120,8 @@ type Options struct {
 	// ArchiveCreationPath relaxes only the missing archive/retention gate for
 	// this exact file while copying it; it never relaxes existing protections.
 	ArchiveCreationPath string
-	// VerifyArchiveContents is required for mutation-time recollection.
+	// VerifyArchiveContents is required for mutation-time recollection. Each
+	// full verification runs under Limits.ArchiveVerifyTimeout.
 	VerifyArchiveContents bool
 	// ArchiveBindPaths, when non-nil, limits workspace archive binding to
 	// these paths. Mutation-time recollection observes the target's whole
@@ -484,7 +490,19 @@ func runBounded(
 	name string,
 	gather func(context.Context, *Options) ([]Reference, core.CollectorReport),
 ) ([]Reference, core.CollectorReport) {
-	timeout := opts.Limits.CommandTimeout
+	return runBoundedFor(ctx, opts, name, opts.Limits.CommandTimeout, "command timeout", gather)
+}
+
+// runBoundedFor is runBounded with an explicit timeout, which the report
+// names as what.
+func runBoundedFor(
+	ctx context.Context,
+	opts *Options,
+	name string,
+	timeout time.Duration,
+	what string,
+	gather func(context.Context, *Options) ([]Reference, core.CollectorReport),
+) ([]Reference, core.CollectorReport) {
 	deadline := nowFunc().Add(timeout)
 	collectorCtx, cancel := context.WithDeadline(ctx, deadline)
 	// The caller may impose an earlier deadline than this collector's own.
@@ -539,8 +557,8 @@ func runBounded(
 			Name:     name,
 			Status:   core.CollectorPartial,
 			Unknowns: 1,
-			Detail: fmt.Sprintf("did not finish within the %s command timeout; references from this source are unknown",
-				timeout),
+			Detail: fmt.Sprintf("did not finish within the %s %s; references from this source are unknown",
+				timeout, what),
 		}
 	}
 }

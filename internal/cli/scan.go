@@ -301,6 +301,8 @@ func collectLimits(policy config.Policy, opts scanOptions) collect.Limits {
 		MaxDirEntries:      policy.Limits.MaxDirEntries,
 		DeepSizeMaxEntries: policy.Limits.DeepSizeMaxEntries,
 		DeepSizeMaxDepth:   policy.Limits.DeepSizeMaxDepth,
+
+		ArchiveVerifyTimeout: policy.Limits.ArchiveVerifyTimeout.Duration(),
 	}
 	if opts.entriesLimit > 0 {
 		limits.MaxEntries = opts.entriesLimit
