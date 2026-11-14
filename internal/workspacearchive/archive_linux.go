@@ -501,7 +501,10 @@ func verifyTar(ctx context.Context, file *os.File, layout tarLayout, size int64)
 // companion marks the companion, which follows the members.
 func readTar(ctx context.Context, file *os.File, layout tarLayout, size int64, extract func(m Member, companion bool, content io.Reader) error) (string, error) {
 	st, err := fstate(file)
-	if err != nil || st.size != size || st.kind() != unix.S_IFREG {
+	if err != nil {
+		return "", fmt.Errorf("inspecting archive tar: %w", err)
+	}
+	if st.size != size || st.kind() != unix.S_IFREG {
 		return "", errors.New("archive tar size or type differs from its manifest")
 	}
 	if _, err = file.Seek(0, io.SeekStart); err != nil {
@@ -531,7 +534,13 @@ func readTar(ctx context.Context, file *os.File, layout tarLayout, size int64, e
 		if m.Type == TypeFile {
 			content := sha256.New()
 			n, err := io.Copy(content, tr)
-			if err != nil || n != m.Size || hex.EncodeToString(content.Sum(nil)) != m.SHA256 {
+			if err != nil {
+				return fmt.Errorf("reading archive member %s: %w", m.Path, err)
+			}
+			if n != m.Size {
+				return fmt.Errorf("archive member %s size differs from the manifest: read %d bytes, want %d", m.Path, n, m.Size)
+			}
+			if hex.EncodeToString(content.Sum(nil)) != m.SHA256 {
 				return fmt.Errorf("archive member %s content differs from the manifest", m.Path)
 			}
 		}
