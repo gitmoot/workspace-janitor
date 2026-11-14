@@ -114,11 +114,17 @@ func createBundle(ctx context.Context, source, admin string, root, stage *os.Fil
 // HEAD. Listing heads needs no repository.
 func verifyBundle(ctx context.Context, file *os.File, b *Bundle) error {
 	st, err := fstate(file)
-	if err != nil || st.size != b.Bytes || st.kind() != unix.S_IFREG {
+	if err != nil {
+		return fmt.Errorf("inspecting history bundle: %w", err)
+	}
+	if st.size != b.Bytes || st.kind() != unix.S_IFREG {
 		return errors.New("history bundle size changed")
 	}
 	digest, n, err := hashFile(ctx, file, b.Bytes)
-	if err != nil || n != b.Bytes || digest != b.SHA256 {
+	if err != nil {
+		return fmt.Errorf("reading history bundle: %w", err)
+	}
+	if n != b.Bytes || digest != b.SHA256 {
 		return errors.New("history bundle checksum mismatch")
 	}
 	heads, err := runGit(ctx, "/", nil, file, "bundle", "list-heads", extraFilePath)
