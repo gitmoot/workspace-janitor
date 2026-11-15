@@ -210,6 +210,8 @@ func trimCache(ctx context.Context, procRoot string, trim config.CacheTrim) cach
 		env = dockerEnv()
 	case config.CacheTrimDockerImages:
 		return trimDockerImages(ctx, procRoot, trim, report)
+	case config.CacheTrimCargoTarget:
+		return trimCargoTarget(ctx, procRoot, trim, report)
 	default:
 		return fail(fmt.Errorf("unsupported cache trim kind %q", trim.Kind))
 	}
@@ -252,10 +254,11 @@ func trimFilesystem(trim config.CacheTrim) string {
 // cacheUsers lists processes that may be using the cache right now: Go
 // toolchain commands for go-build (plus any handle open under the cache); Go
 // commands and gopls for go-mod (plus any handle or executable under the
-// cache); pnpm for pnpm-store (plus any handle under the store); image builds
-// for docker-builder, and image builds or pulls for docker-images. It fails
-// closed: a process that cannot be inspected counts as a possible user. A
-// false positive only postpones the trim to the next cycle.
+// cache); pnpm for pnpm-store (plus any handle under the store); any process
+// cargoTargetUser names for cargo-target; image builds for docker-builder,
+// and image builds or pulls for docker-images. It fails closed: a process
+// that cannot be inspected counts as a possible user. A false positive only
+// postpones the trim to the next cycle.
 func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
@@ -331,6 +334,16 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 			}
 		case config.CacheTrimDockerBuilder:
 			busy = dockerBuildBusy(argv)
+		case config.CacheTrimCargoTarget:
+			here, err := cargoTargetUser(procDir, argv, trim.Path)
+			if processGone(err) {
+				continue
+			}
+			if err != nil {
+				users = append(users, fmt.Sprintf("%s (cannot inspect: %v)", pid, err))
+				continue
+			}
+			busy = here
 		case config.CacheTrimDockerImages:
 			busy = dockerImageBusy(argv)
 		}
@@ -340,6 +353,75 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 	}
 	sort.Strings(users)
 	return users
+}
+
+// cargoTools are the executables that build into a target directory, by
+// default <workspace root>/target.
+var cargoTools = map[string]bool{"cargo": true, "rustc": true, "clippy-driver": true, "rustdoc": true}
+
+// cargoTargetUser reports whether the process at procDir (/proc/<pid>) may
+// use the cargo target directory target: its CARGO_TARGET_DIR or
+// CARGO_BUILD_TARGET_DIR, or a --target-dir argument, names target (a
+// relative one resolved against its working directory); its executable, any
+// open handle or its working directory lies inside target; or it is a cargo
+// tool (cargo, rustc, clippy-driver, rustdoc) working at or below target's
+// parent while target is named "target", cargo's default. It fails closed: a
+// working directory or executable that cannot be read is an error, which
+// counts the process as a user.
+func cargoTargetUser(procDir string, argv []string, target string) (bool, error) {
+	raw, err := os.ReadFile(filepath.Join(procDir, "environ"))
+	if err != nil {
+		return false, err
+	}
+	cwd, cwdErr := os.Readlink(filepath.Join(procDir, "cwd"))
+	cwd = strings.TrimSuffix(cwd, " (deleted)")
+	names := func(dir string) (bool, error) {
+		if !filepath.IsAbs(dir) {
+			if cwdErr != nil {
+				return false, cwdErr
+			}
+			dir = filepath.Join(cwd, dir)
+		}
+		return samePath(dir, target), nil
+	}
+	var settings []string
+	for _, kv := range strings.Split(string(raw), "\x00") {
+		name, value, _ := strings.Cut(kv, "=")
+		if (name == "CARGO_TARGET_DIR" || name == "CARGO_BUILD_TARGET_DIR") && value != "" {
+			settings = append(settings, value)
+		}
+	}
+	for i, arg := range argv {
+		if value, ok := strings.CutPrefix(arg, "--target-dir="); ok {
+			settings = append(settings, value)
+		} else if arg == "--target-dir" && i+1 < len(argv) {
+			settings = append(settings, argv[i+1])
+		}
+	}
+	for _, dir := range settings {
+		if here, err := names(dir); err != nil || here {
+			return here, err
+		}
+	}
+	exe, err := os.Readlink(filepath.Join(procDir, "exe"))
+	if err != nil {
+		return false, err
+	}
+	exe = strings.TrimSuffix(exe, " (deleted)")
+	if core.PathWithin(exe, target) {
+		return true, nil
+	}
+	if holds, err := holdsHandleUnder(filepath.Join(procDir, "fd"), target); err != nil || holds {
+		return holds, err
+	}
+	if cwdErr != nil {
+		return false, cwdErr
+	}
+	if core.PathWithin(cwd, target) {
+		return true, nil
+	}
+	tool := cargoTools[filepath.Base(argv[0])] || cargoTools[filepath.Base(exe)]
+	return tool && filepath.Base(target) == "target" && core.PathWithin(cwd, filepath.Dir(target)), nil
 }
 
 // goProcessUsesCache reports whether the Go process at procDir

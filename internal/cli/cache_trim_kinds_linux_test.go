@@ -4,6 +4,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
+	"golang.org/x/sys/unix"
 )
 
 // kindResult decodes one entry of the public cycle report's cache_trims.
@@ -739,4 +741,193 @@ func TestPnpmStoreTrimRefusesAStoreDirPnpmWouldNotPrune(t *testing.T) {
 			t.Fatalf("pnpm pruned another store: %v", x.calls(t))
 		}
 	}
+}
+
+// cargoTargetFixture is a trim fixture with a cargo target directory over its
+// bound and untouched for two hours: release/ holding cargo's locks, deps and
+// a binary, tmp/, .rustc_info.json and cargo's CACHEDIR.TAG.
+func cargoTargetFixture(t *testing.T) (*trimFixture, string, string) {
+	t.Helper()
+	x := newTrimFixture(t)
+	target := filepath.Join(x.home, "herdr-net-target")
+	writeFile(t, filepath.Join(target, "CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n")
+	writeFile(t, filepath.Join(target, ".rustc_info.json"), "{}")
+	writeFile(t, filepath.Join(target, "tmp", "scratch"), "x")
+	for _, lock := range []string{".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"} {
+		writeFile(t, filepath.Join(target, "release", lock), "")
+	}
+	writeFile(t, filepath.Join(target, "release", "deps", "libbig.rlib"), string(make([]byte, 1<<20)))
+	writeFile(t, filepath.Join(target, "release", "herdr"), "binary")
+	trim := fmt.Sprintf("    - kind: cargo-target\n      path: %s\n      max_bytes: 65536\n", target)
+	return x, target, trim
+}
+
+// An idle, unlocked target over its bound loses what `cargo clean` removes;
+// the directory, its tag, cargo's locks and tmp itself stay, and a symlink
+// in a profile is removed without touching what it points to.
+func TestCargoTargetTrimRemovesBuildOutputs(t *testing.T) {
+	x, target, trim := cargoTargetFixture(t)
+	outside := filepath.Join(x.home, "outside", "keep.txt")
+	writeFile(t, outside, "keep")
+	if err := os.MkdirAll(filepath.Join(target, "release", "build"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(outside), filepath.Join(target, "release", "build", "linked")); err != nil {
+		t.Fatal(err)
+	}
+	backdate(t, target, 2*time.Hour)
+	trims, code := x.cycleTrims(t, trim)
+	if code != ExitOK || trims[0].Status != "trimmed" || trims[0].Reclaimed == nil || *trims[0].Reclaimed < 1<<20 {
+		t.Fatalf("cargo target not trimmed: exit %d %+v", code, trims[0])
+	}
+	for _, gone := range []string{"release/deps", "release/herdr", "release/build", "tmp/scratch", ".rustc_info.json"} {
+		if exists(t, filepath.Join(target, gone)) {
+			t.Errorf("%s survived the trim", gone)
+		}
+	}
+	for _, kept := range []string{"CACHEDIR.TAG", "release/.cargo-lock", "release/.cargo-build-lock", "release/.cargo-artifact-lock", "tmp"} {
+		if !exists(t, filepath.Join(target, kept)) {
+			t.Errorf("%s was removed", kept)
+		}
+	}
+	if data, err := os.ReadFile(outside); err != nil || string(data) != "keep" {
+		t.Fatalf("symlink target outside the target directory touched: %q %v", data, err)
+	}
+}
+
+// A running build (cargo's lock held through its own open file), a process
+// whose CARGO_TARGET_DIR names the target, or a change within min_idle
+// postpones the trim without an error.
+func TestCargoTargetTrimWaitsForBuilds(t *testing.T) {
+	for _, name := range []string{"lock held", "CARGO_TARGET_DIR", "recent change"} {
+		t.Run(name, func(t *testing.T) {
+			x, target, trim := cargoTargetFixture(t)
+			backdate(t, target, 2*time.Hour)
+			switch name {
+			case "lock held":
+				// Cargo takes .cargo-lock shared while it builds.
+				lock, err := os.Open(filepath.Join(target, "release", ".cargo-lock"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer lock.Close()
+				if err := unix.Flock(int(lock.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
+					t.Fatal(err)
+				}
+			case "CARGO_TARGET_DIR":
+				x.processEnv(t, "100", []string{"HOME=" + x.home, "CARGO_TARGET_DIR=" + target + "/"}, "/bin/bash")
+			case "recent change":
+				writeFile(t, filepath.Join(target, "release", "deps", "fresh.rlib"), "new")
+			}
+			trims, code := x.cycleTrims(t, trim)
+			if code != ExitOK || trims[0].Status != "skipped_in_use" || len(trims[0].ActiveUsers) == 0 {
+				t.Fatalf("cargo target trimmed despite %s: exit %d %+v", name, code, trims[0])
+			}
+			if !exists(t, filepath.Join(target, "release", "deps", "libbig.rlib")) {
+				t.Fatal("build outputs removed")
+			}
+		})
+	}
+}
+
+// A directory without cargo's CACHEDIR.TAG is not a cargo target directory:
+// the trim fails and removes nothing.
+func TestCargoTargetTrimRefusesUntaggedDirectory(t *testing.T) {
+	for name, tag := range map[string]string{"missing": "", "foreign": "# not a cache directory tag\n"} {
+		t.Run(name, func(t *testing.T) {
+			x, target, trim := cargoTargetFixture(t)
+			if tag == "" {
+				if err := os.Remove(filepath.Join(target, "CACHEDIR.TAG")); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				writeFile(t, filepath.Join(target, "CACHEDIR.TAG"), tag)
+			}
+			backdate(t, target, 2*time.Hour)
+			trims, code := x.cycleTrims(t, trim)
+			if code == ExitOK || trims[0].Status != "failed" || !strings.Contains(trims[0].Error, "CACHEDIR.TAG") {
+				t.Fatalf("untagged directory not refused: exit %d %+v", code, trims[0])
+			}
+			if !exists(t, filepath.Join(target, "release", "deps", "libbig.rlib")) || !exists(t, filepath.Join(target, ".rustc_info.json")) {
+				t.Fatal("untagged directory trimmed")
+			}
+		})
+	}
+}
+
+// A target directory or profile replaced after validation, while the process
+// scan runs, is not trimmed: the trim fails and neither the replacement nor
+// the validated directory loses anything.
+func TestCargoTargetTrimRefusesDirectoryReplacedAfterValidation(t *testing.T) {
+	for _, swapped := range []string{"target", "profile"} {
+		t.Run(swapped, func(t *testing.T) {
+			x, target, trim := cargoTargetFixture(t)
+			backdate(t, target, 2*time.Hour)
+			// The process scan blocks reading this process's cmdline until
+			// the test has swapped the directory.
+			proc := filepath.Join(x.proc, "100")
+			writeFile(t, filepath.Join(proc, "environ"), "HOME=/nonexistent\x00")
+			if err := unix.Mkfifo(filepath.Join(proc, "cmdline"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for link, dest := range map[string]string{"cwd": "/", "exe": "/usr/bin/sleep"} {
+				if err := os.Symlink(dest, filepath.Join(proc, link)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			swap, fresh := target, filepath.Join(target, "release", "fresh-noncache-data")
+			if swapped == "profile" {
+				swap = filepath.Join(target, "release")
+			}
+			done := make(chan error, 1)
+			go func() { done <- replaceDuringScan(filepath.Join(proc, "cmdline"), swap, fresh) }()
+			trims, code := x.cycleTrims(t, trim)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if code == ExitOK || trims[0].Status != "failed" {
+				t.Fatalf("replaced %s trimmed: exit %d %+v", swapped, code, trims[0])
+			}
+			if !exists(t, fresh) {
+				t.Fatal("replacement's data removed")
+			}
+			validated := filepath.Join(swap+".validated", "release", "deps", "libbig.rlib")
+			if swapped == "profile" {
+				validated = filepath.Join(swap+".validated", "deps", "libbig.rlib")
+			}
+			if !exists(t, validated) {
+				t.Fatal("validated directory trimmed after it was moved aside")
+			}
+		})
+	}
+}
+
+// replaceDuringScan waits for a reader to open fifo, moves dir aside to
+// dir.validated, puts in its place an untagged directory with a release
+// profile lock and fresh, then releases the reader.
+func replaceDuringScan(fifo, dir, fresh string) error {
+	deadline := time.Now().Add(time.Minute)
+	fd, err := unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	for errors.Is(err, unix.ENXIO) && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		fd, err = unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	}
+	if err != nil {
+		return fmt.Errorf("process scan never read %s: %w", fifo, err)
+	}
+	defer unix.Close(fd)
+	if err := os.Rename(dir, dir+".validated"); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(fresh), 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(fresh), ".cargo-lock"), nil, 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(fresh, []byte("not cache"), 0o600); err != nil {
+		return err
+	}
+	_, err = unix.Write(fd, []byte("/usr/bin/sleep\x0060\x00"))
+	return err
 }

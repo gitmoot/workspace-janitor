@@ -642,6 +642,36 @@ prevention:
 	}
 }
 
+// cargo-target takes a canonical path and no binary, may be configured once
+// per target directory, and only it takes min_idle.
+func TestCargoTargetTrimFields(t *testing.T) {
+	paths := fixturePaths(t)
+	_, err := parse(t, paths, `prevention:
+  cache_trims:
+    - kind: cargo-target
+      path: relative/target
+      binary: /usr/bin/cargo
+      max_bytes: 0
+      min_idle: -1h
+    - kind: go-build
+      path: /root/.cache/go-build
+      binary: /usr/local/go/bin/go
+      max_bytes: 1
+      min_idle: 1h
+`)
+	if err == nil {
+		t.Fatal("invalid cargo-target trim accepted")
+	}
+	for _, field := range []string{"cache_trims[0].path", "cache_trims[0].binary", "cache_trims[0].max_bytes", "cache_trims[0].min_idle", "cache_trims[1].min_idle"} {
+		if !strings.Contains(err.Error(), field) {
+			t.Errorf("error %q does not identify %s", err, field)
+		}
+	}
+	if _, err := parse(t, paths, "prevention:\n  cache_trims:\n    - kind: cargo-target\n      path: /root/.cache/herdr-net-target\n      max_bytes: 4294967296\n    - kind: cargo-target\n      path: /root/.cache/other-target\n      max_bytes: 1\n      min_idle: 30m\n"); err != nil {
+		t.Fatalf("valid cargo-target trims rejected: %v", err)
+	}
+}
+
 // versioned_work needs a one-star base-name pattern and a keep count;
 // archive_only cannot be combined with report_only.
 func TestVersionedWorkAndArchiveOnlyValidation(t *testing.T) {
