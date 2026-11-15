@@ -210,16 +210,18 @@ func restoreCommand() *command {
 func statusCommand() *command {
 	return &command{
 		name:    "status",
-		usage:   "janitor status [flags]",
+		usage:   "janitor status [--capacity] [flags]",
 		summary: "Report resolved paths, policy source, and stored state",
 		long: "Shows which configuration, state, and cache directories this run uses,\n" +
-			"where the policy came from, and what the local database contains.",
+			"where the policy came from, and what the local database contains.\n" +
+			"--capacity reads only the stored capacity decision, for admission polling.",
 		register: func(fs *flag.FlagSet) func(ctx context.Context, e *env, args []string) error {
+			capacityOnly := fs.Bool("capacity", false, "report only the stored capacity decision; skip store summaries, model usage and inventory growth")
 			return func(ctx context.Context, e *env, args []string) error {
 				if len(args) > 0 {
 					return &usageError{msg: "status takes no arguments"}
 				}
-				return runStatus(ctx, e)
+				return runStatus(ctx, e, *capacityOnly)
 			}
 		},
 	}

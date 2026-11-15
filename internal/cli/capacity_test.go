@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/gitmoot/workspace-janitor/internal/store"
 )
 
 func TestCapacityPersistsHysteresisAcrossCLIInvocations(t *testing.T) {
@@ -130,6 +133,128 @@ func TestCapacityMissingSampleIsUnknown(t *testing.T) {
 	volume := report.Data.Capacity.Volumes[0]
 	if volume.State != "measurement_unknown" || !volume.Hold || volume.Available != nil {
 		t.Fatalf("missing measurement looks healthy: %s", out)
+	}
+}
+
+// statusData returns the data object of `janitor --format json status args`.
+func statusData(t *testing.T, f *fixture, args ...string) map[string]json.RawMessage {
+	t.Helper()
+	out, stderr, code := f.run(t, append([]string{"--format", "json", "status"}, args...)...)
+	if code != ExitOK {
+		t.Fatalf("status %v: %d %s %s", args, code, out, stderr)
+	}
+	var envelope struct {
+		Kind string                     `json:"kind"`
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Kind != "status" {
+		t.Fatalf("status %v: kind %q: %s", args, envelope.Kind, out)
+	}
+	return envelope.Data
+}
+
+func compactJSON(t *testing.T, raw json.RawMessage) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, raw); err != nil {
+		t.Fatalf("compact %s: %v", raw, err)
+	}
+	return buf.String()
+}
+
+// Admission consumers poll `status --capacity` under load: it must publish
+// exactly the full status's capacity decision while skipping the costly store
+// summaries, and the full status must keep them.
+func TestStatusCapacityOnlyMatchesFullStatus(t *testing.T) {
+	f := newFixture(t)
+	root := filepath.Join(f.home, "workspace")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	f.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  git: false\n  processes: false\n  services: false\nprevention:\n  min_free_percent: 0\n  targets:\n    - path: %s\n      target_free_bytes: 1\n      recovery_margin_bytes: 1\n", root, root))
+	if out, stderr, code := f.run(t, "cycle"); code != ExitOK {
+		t.Fatalf("cycle: %d %s %s", code, out, stderr)
+	}
+	full := statusData(t, f)
+	capacityOnly := statusData(t, f, "--capacity")
+	if len(full["capacity"]) == 0 || compactJSON(t, full["capacity"]) != compactJSON(t, capacityOnly["capacity"]) {
+		t.Fatalf("capacity differs:\nfull:     %s\ncapacity: %s", full["capacity"], capacityOnly["capacity"])
+	}
+	var sampled struct {
+		SampledAt string `json:"sampled_at"`
+	}
+	if err := json.Unmarshal(capacityOnly["capacity"], &sampled); err != nil || sampled.SampledAt == "" {
+		t.Fatalf("capacity-only status missed the stored sample: %s", capacityOnly["capacity"])
+	}
+	for _, key := range []string{"build", "contract_version", "paths", "policy"} {
+		if compactJSON(t, full[key]) != compactJSON(t, capacityOnly[key]) {
+			t.Errorf("%s differs:\nfull:     %s\ncapacity: %s", key, full[key], capacityOnly[key])
+		}
+	}
+	type storeFields struct {
+		Initialized bool            `json:"initialized"`
+		Stats       json.RawMessage `json:"stats"`
+		ModelUsage  json.RawMessage `json:"model_usage"`
+	}
+	var fullStore, capacityStore storeFields
+	if err := json.Unmarshal(full["store"], &fullStore); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(capacityOnly["store"], &capacityStore); err != nil {
+		t.Fatal(err)
+	}
+	if !fullStore.Initialized || fullStore.Stats == nil || fullStore.ModelUsage == nil || string(full["inventory_report"]) == "null" {
+		t.Errorf("full status lost its store summaries: %s inventory=%s", full["store"], full["inventory_report"])
+	}
+	if !capacityStore.Initialized || capacityStore.Stats != nil || capacityStore.ModelUsage != nil || string(capacityOnly["inventory_report"]) != "null" {
+		t.Errorf("capacity-only status read store summaries: %s inventory=%s", capacityOnly["store"], capacityOnly["inventory_report"])
+	}
+}
+
+// Without a readable database the capacity-only status gives the same
+// unknown answer as the full status and, being read-only, neither creates nor
+// migrates the database.
+func TestStatusCapacityOnlyUnknownWithoutReadableStore(t *testing.T) {
+	f := newFixture(t)
+	root := filepath.Join(f.home, "workspace")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	f.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  git: false\n  processes: false\n  services: false\nprevention:\n  min_free_percent: 0\n  targets:\n    - path: %s\n      target_free_bytes: 1\n      recovery_margin_bytes: 1\n", root, root))
+	dbPath := filepath.Join(f.home, ".local", "state", "workspace-janitor", "janitor.db")
+	unknown := compactJSON(t, statusData(t, f, "--capacity")["capacity"])
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("capacity-only status created the database: %v", err)
+	}
+	if full := compactJSON(t, statusData(t, f)["capacity"]); full != unknown {
+		t.Fatalf("uninitialized capacity differs:\nfull:     %s\ncapacity: %s", full, unknown)
+	}
+	var snapshot struct {
+		Volumes []struct {
+			State string `json:"state"`
+			Hold  bool   `json:"admission_hold"`
+		} `json:"volumes"`
+	}
+	if err := json.Unmarshal([]byte(unknown), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Volumes) != 1 || snapshot.Volumes[0].State != "measurement_unknown" || !snapshot.Volumes[0].Hold {
+		t.Fatalf("uninitialized capacity looks healthy: %s", unknown)
+	}
+	if out, stderr, code := f.run(t, "cycle"); code != ExitOK {
+		t.Fatalf("cycle: %d %s %s", code, out, stderr)
+	}
+	for _, version := range []int{store.SchemaVersion() - 1, store.SchemaVersion() + 1} {
+		setUserVersion(t, dbPath, version)
+		if got := compactJSON(t, statusData(t, f, "--capacity")["capacity"]); got != unknown {
+			t.Errorf("schema %d: capacity is not unknown:\ngot:  %s\nwant: %s", version, got, unknown)
+		}
+		if got := userVersion(t, dbPath); got != version {
+			t.Errorf("capacity-only status changed schema %d to %d", version, got)
+		}
 	}
 }
 
