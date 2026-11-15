@@ -237,11 +237,14 @@ func (v *sourceApprovalVerifier) publishedEvidence() []string {
 }
 
 // recordSecret reports a built-in secret name that is a published tracked
-// file. The worktree stays refused; the walk continues so that every such
-// leak in it is reported.
-func (v *sourceApprovalVerifier) recordSecret(relative string) {
+// file. The worktree stays refused, and so does any protected-name directory
+// holding it; the walk continues so that every such leak is reported.
+func (v *sourceApprovalVerifier) recordSecret(relative string, within *protectedSubtree) {
 	if v.secretRefusal == nil {
 		v.secretRefusal = &worktreePolicyRefusal{fmt.Sprintf("worktree descendant %q is a secret published in Git at %s; rotate it and remove it from the history", relative, v.state.Head)}
+	}
+	if within != nil {
+		within.holdsSecret = true
 	}
 	if len(v.publishedSecrets) < maxPublishedNameEvidence {
 		v.publishedSecrets = append(v.publishedSecrets, core.PublishedSecret{Repository: core.RepositoryLabel(v.state.Remote, v.origin), Path: relative, Head: v.state.Head})
@@ -265,20 +268,26 @@ func (v *sourceApprovalVerifier) fingerprint() (string, error) {
 }
 
 // protectedSubtree is a directory whose own name refuses unless every file
-// below it is a published tracked file.
+// below it is a published tracked file that is not a built-in secret.
 type protectedSubtree struct {
-	refusal error
-	matches []string
+	refusal     error
+	matches     []string
+	holdsSecret bool
 }
 
 // checkNames applies classification.evidence_names and protect.name_patterns
 // to one descendant. Explicit paths, report-only roots and preserving cache
 // rules are checked elsewhere and cannot be waived. A name-pattern match may
 // be approved by source_name_approvals; any remaining match refuses unless
-// protect.published_name_matches: allow resolves it: a published tracked
-// file is recorded and passes, a built-in secret name never passes, and a
-// matching directory is returned as a subtree the walk must prove.
-func (v *sourceApprovalVerifier) checkNames(parent *os.File, name, relative string, stat unix.Stat_t, indexed worktreeIndexEntry) (*protectedSubtree, error) {
+// protect.published_name_matches: allow resolves it.
+//
+// Under allow, the built-in secret screen also applies to every descendant,
+// matched or not: a built-in secret name never passes, and a published one
+// is reported. A published tracked file with a matching name is recorded and
+// passes; a matching directory is returned as a subtree the walk must prove.
+// Inside within, every file must be published. Each descendant's
+// publication is proven (and its bytes hashed) at most once.
+func (v *sourceApprovalVerifier) checkNames(parent *os.File, name, relative string, stat unix.Stat_t, indexed worktreeIndexEntry, within *protectedSubtree) (*protectedSubtree, error) {
 	if v.policy == nil {
 		return nil, nil
 	}
@@ -315,13 +324,30 @@ func (v *sourceApprovalVerifier) checkNames(parent *os.File, name, relative stri
 			matches = append(matches, fmt.Sprintf("pattern %q", pattern))
 		}
 	}
-	if refusal == nil || !v.policy.Protect.AllowsPublishedNameMatches() {
+	if !v.policy.Protect.AllowsPublishedNameMatches() {
 		return nil, refusal
 	}
-	secret := core.BuiltinSecretName(name, filepath.Join(v.origin, filepath.Dir(relative)))
-	if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
-		if secret {
+	dir := stat.Mode&unix.S_IFMT == unix.S_IFDIR
+	if core.BuiltinSecretName(name, filepath.Join(v.origin, filepath.Dir(relative))) {
+		if refusal == nil {
+			refusal = &worktreePolicyRefusal{fmt.Sprintf("worktree descendant %q matches the built-in secret screen", relative)}
+		}
+		if dir {
 			return nil, refusal
+		}
+		published, err := v.published(parent, name, relative, stat, indexed)
+		if err != nil {
+			return nil, err
+		}
+		if !published {
+			return nil, refusal
+		}
+		v.recordSecret(relative, within)
+		return nil, nil
+	}
+	if dir {
+		if refusal == nil {
+			return nil, nil
 		}
 		if ok, err := v.publishable(); err != nil {
 			return nil, err
@@ -330,15 +356,18 @@ func (v *sourceApprovalVerifier) checkNames(parent *os.File, name, relative stri
 		}
 		return &protectedSubtree{refusal: refusal, matches: matches}, nil
 	}
+	if refusal == nil && within == nil {
+		return nil, nil
+	}
 	published, err := v.published(parent, name, relative, stat, indexed)
 	switch {
 	case err != nil:
 		return nil, err
-	case !published:
+	case !published && refusal != nil:
 		return nil, refusal
-	case secret:
-		v.recordSecret(relative)
-	default:
+	case !published:
+		return nil, within.refusal
+	case refusal != nil:
 		v.recordPublished("file", relative, matches)
 	}
 	return nil, nil

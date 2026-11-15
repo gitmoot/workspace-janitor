@@ -115,8 +115,11 @@ func (w *walker) resolve(kind, path string) {
 }
 
 // screenName applies the secret-like name screen to member path, the child
-// name of dir observed as st. It reports whether path is a directory that
-// starts a subtree proof, which visit completes after walking it.
+// name of dir observed as st. The built-in secret screen is part of
+// secretLike, so it applies to every member whatever the policy patterns.
+// Each member's publication is proven (and its bytes hashed) at most once.
+// It reports whether path is a directory that starts a subtree proof, which
+// visit completes after walking it.
 func (w *walker) screenName(dir *os.File, name, parent, path string, st state) bool {
 	inside := w.subtree != ""
 	if !secretLike(name, parent, w.patterns) {
@@ -127,7 +130,9 @@ func (w *walker) screenName(dir *os.File, name, parent, path string, st state) b
 	}
 	builtin := core.BuiltinSecretName(name, parent)
 	published := w.published != nil && st.kind() == unix.S_IFREG && w.published.file(dir, name, path, st)
-	if inside && st.kind() != unix.S_IFDIR && !published {
+	if inside && (builtin || (st.kind() != unix.S_IFDIR && !published)) {
+		// A built-in secret, published or not, fails the enclosing
+		// directory's proof as well as refusing the tree.
 		w.subtreeFailed = true
 	}
 	switch {

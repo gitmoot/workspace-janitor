@@ -705,15 +705,18 @@ every other gate are unchanged.
 built-in secret screen (listed under [explicit workspace
 archives](#workspace-archives): `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`,
 `id_ed25519*`, `id_ecdsa*`, `id_dsa*`, `*.p12`, `*.pfx`, `credentials*.json`,
-...) is never resolved, published or not. When such a file is published
-tracked content, it is also reported as a leak to rotate and remove from the
-Git history: `published_secrets` entries with the repository (origin URL
-without user information, or the checkout path), the path inside it and the
-`HEAD` commit. They appear on the worktree's Git state, on an archive
-inspection (also alongside its refusal), on each `archive --categories` item,
-and in the refusal text. The worktree proof keeps walking after a published
-secret so that each one is reported (up to 32; up to 20 per archive
-inspection).
+...) is never resolved, published or not. With `allow`, the worktree proof
+applies this screen to every descendant, whether or not a
+`protect.name_patterns` or evidence name also matches (the archive screen
+always does). A matching directory holding such a file is therefore never
+resolved either. When such a file is published tracked content, it is also
+reported as a leak to rotate and remove from the Git history:
+`published_secrets` entries with the repository (origin URL without user
+information, or the checkout path), the path inside it and the `HEAD`
+commit. They appear on the worktree's Git state, on an archive inspection
+(also alongside its refusal), on each `archive --categories` item, and in
+the refusal text. The worktree proof keeps walking after a published secret
+so that each one is reported (up to 32; up to 20 per archive inspection).
 
 Loose files, scratch cleanup, session artifact batches and sensitive names
 outside a Git checkout are not affected by the setting.

@@ -211,7 +211,9 @@ func walkWorktreeContents(ctx context.Context, dir *os.File, relative, origin st
 			if uint64(stat.Dev) != device {
 				return errors.New("worktree contents cross a filesystem boundary")
 			}
-			subtree, err := verifier.checkNames(dir, name, rel, stat, tracked[rel])
+			// checkNames also proves, once, that a file inside a
+			// protected-name directory is published.
+			subtree, err := verifier.checkNames(dir, name, rel, stat, tracked[rel], within)
 			if err != nil {
 				return err
 			}
@@ -219,15 +221,6 @@ func walkWorktreeContents(ctx context.Context, dir *os.File, relative, origin st
 			case unix.S_IFREG, unix.S_IFLNK:
 				if stat.Mode&unix.S_IFMT == unix.S_IFREG && core.IsDatabasePath(rel) {
 					return errors.New("worktree descendant may be a live database")
-				}
-				if within != nil {
-					published, err := verifier.published(dir, name, rel, stat, tracked[rel])
-					if err != nil {
-						return err
-					}
-					if !published {
-						return within.refusal
-					}
 				}
 				indexed, known := tracked[rel]
 				if known {
@@ -263,7 +256,7 @@ func walkWorktreeContents(ctx context.Context, dir *os.File, relative, origin st
 					}
 					err = walkWorktreeContents(ctx, child, rel, origin, policy, tracked, device, mountID, depth+1, count, verifier, inner)
 				}
-				if err == nil && subtree != nil && within == nil {
+				if err == nil && subtree != nil && within == nil && !subtree.holdsSecret {
 					verifier.recordPublished("directory", rel, subtree.matches)
 				}
 				if err == nil {

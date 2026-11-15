@@ -223,3 +223,32 @@ func TestSecretScreenIgnoresReplaceRefsAndGrafts(t *testing.T) {
 		})
 	}
 }
+
+// A published built-in secret (auth.p12, not in the policy patterns) nested
+// in a protected-name directory refuses the tree, is reported, and the
+// directory is not recorded as resolved.
+func TestSecretScreenRefusesSecretNestedInProtectedDirectory(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is unavailable")
+	}
+	f := newFixture(t)
+	publishedFixture(t, f)
+	scope := publishedScope(t, f, "allow")
+	if _, err := inspectPublished(t, f, scope); err != nil {
+		t.Fatalf("Inspect refused the published tree: %v", err)
+	}
+	write(t, filepath.Join(f.source, "tokens", "nested", "auth.p12"), []byte("synthetic published fixture\n"), 0o600)
+	gitFixture(t, f.source, "add", "tokens/nested/auth.p12")
+	gitFixture(t, f.source, "commit", "-q", "-m", "publish a nested secret")
+	gitFixture(t, f.source, "push", "-q", "origin", "HEAD")
+	reported, err := inspectPublished(t, f, scope)
+	if err == nil || !strings.Contains(err.Error(), "tokens/nested/auth.p12") {
+		t.Fatalf("Inspect = %v, want tokens/nested/auth.p12 refused", err)
+	}
+	if len(reported.Secrets) != 1 || reported.Secrets[0]["path"] != "tokens/nested/auth.p12" {
+		t.Fatalf("nested published secret not reported: %+v", reported.Secrets)
+	}
+	if slices.ContainsFunc(reported.Matches, func(match string) bool { return strings.Contains(match, `directory "tokens"`) }) {
+		t.Fatalf("directory holding a published secret was reported as resolved: %+v", reported.Matches)
+	}
+}

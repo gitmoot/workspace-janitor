@@ -246,3 +246,30 @@ func TestPublicationIgnoresReplaceRefsAndGrafts(t *testing.T) {
 		})
 	}
 }
+
+// The built-in secret screen applies to every descendant, not only to names
+// the policy patterns match: a published auth.p12 (not in name_patterns)
+// nested in the protected tokens/ directory refuses the worktree, keeps the
+// directory from being resolved, and is reported.
+func TestPublishedSecretNestedInProtectedDirectoryRefused(t *testing.T) {
+	requireGit(t)
+	home, root := t.TempDir(), t.TempDir()
+	repo := publishedNamesRepo(t, home, root)
+	requirePublishedResolved(t, collectPublishedNames(t, root, publishedNamesPolicy(t, "allow"), repo))
+	mustWrite(t, filepath.Join(repo, "tokens", "nested", "auth.p12"), "synthetic published fixture\n")
+	git(t, home, repo, "add", "tokens/nested/auth.p12")
+	git(t, home, repo, "commit", "-m", "publish a nested secret")
+	git(t, home, repo, "push", "origin", "main")
+	head := git(t, home, repo, "rev-parse", "HEAD")
+	entry := collectPublishedNames(t, root, publishedNamesPolicy(t, "allow"), repo)
+	requireNameRefusal(t, entry, "tokens/nested/auth.p12")
+	secrets := publishedSecretsOf(t, entry.Git)
+	if len(secrets) != 1 || secrets[0]["path"] != "tokens/nested/auth.p12" || secrets[0]["head"] != head {
+		t.Fatalf("nested published secret not reported: %+v", secrets)
+	}
+	for _, evidence := range entry.Evidence {
+		if evidence.Signal == "worktree_published_name_match" && strings.Contains(evidence.Detail, `directory "tokens"`) {
+			t.Fatalf("directory holding a published secret was recorded as resolved: %+v", evidence)
+		}
+	}
+}
