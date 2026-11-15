@@ -111,6 +111,13 @@ type walker struct {
 	inv          inventory
 	secrets      []string
 	refusals     []string
+
+	// published, when set, lets a secret-like published tracked file pass
+	// the screen; resolved lists those files as evidence and resolvedCount
+	// counts them all.
+	published     *publishedTree
+	resolved      []string
+	resolvedCount int
 }
 
 func (w *walker) refuse(format string, args ...any) {
@@ -132,8 +139,9 @@ func (w *walker) add(m Member, st state) error {
 // scanTree records every member without following symlinks or crossing
 // mounts; a regular file root is its own only member. hash also hashes
 // regular files; screen applies the refusal screens, which apply to sources
-// and to local trees bound for expiry, not to restores.
-func scanTree(ctx context.Context, root *os.File, source string, patterns []string, limit int, hash, screen bool) (*walker, error) {
+// and to local trees bound for expiry, not to restores. published applies
+// protect.published_name_matches: allow to the secret-like name screen.
+func scanTree(ctx context.Context, root *os.File, source string, patterns []string, limit int, hash, screen, published bool) (*walker, error) {
 	rootState, err := fstate(root)
 	if err != nil {
 		return nil, err
@@ -143,6 +151,9 @@ func scanTree(ctx context.Context, root *os.File, source string, patterns []stri
 		return nil, errors.New("workspace archive source must be a directory or a regular file")
 	}
 	w := &walker{ctx: ctx, source: source, rootState: rootState, patterns: patterns, max: limit, hash: hash, screen: screen}
+	if published {
+		w.published = &publishedTree{ctx: ctx, source: source}
+	}
 	if screen {
 		if secretLike(filepath.Base(source), filepath.Dir(source), patterns) {
 			w.secrets = append(w.secrets, ".")
@@ -226,8 +237,16 @@ func (w *walker) visit(dir *os.File, rel, name string, depth int) error {
 		return nil
 	}
 	if w.screen {
-		if secretLike(name, filepath.Join(w.source, rel), w.patterns) && len(w.secrets) < maxReported {
-			w.secrets = append(w.secrets, path)
+		if secretLike(name, filepath.Join(w.source, rel), w.patterns) {
+			switch {
+			case w.published != nil && w.published.resolve(dir, name, path, st):
+				w.resolvedCount++
+				if len(w.resolved) < maxReported {
+					w.resolved = append(w.resolved, publishedMatch(path))
+				}
+			case len(w.secrets) < maxReported:
+				w.secrets = append(w.secrets, path)
+			}
 		}
 		if hasXattrs(unix.Llistxattr(fmt.Sprintf("%s/%s", descriptorPath(dir), name), nil)) {
 			w.refuse("%s: extended attributes are unsupported", path)
@@ -546,6 +565,15 @@ func (w *walker) err() error {
 		return fmt.Errorf("%s cannot be archived faithfully: %s", w.source, strings.Join(w.refusals, "; "))
 	}
 	return nil
+}
+
+// publishedEvidence lists the secret-like names resolved as published
+// tracked files, then how many more were resolved than are listed.
+func (w *walker) publishedEvidence() []string {
+	if more := w.resolvedCount - len(w.resolved); more > 0 {
+		return append(w.resolved, fmt.Sprintf("%d more protected-name match(es) on published tracked files", more))
+	}
+	return w.resolved
 }
 
 // unchanged is the extraction-equivalent comparison: every recorded member

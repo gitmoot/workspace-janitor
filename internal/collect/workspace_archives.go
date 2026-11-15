@@ -151,6 +151,9 @@ func collectWorkspaceArchives(ctx context.Context, opts *Options, entries []core
 					ref.Protection = ""
 					ref.WorkspaceArchive = binding
 					ref.Detail = "pinned archive manifest exactly matches the local tree"
+					if len(binding.PublishedNameMatches) > 0 {
+						ref.Detail += "; " + strings.Join(binding.PublishedNameMatches, "; ")
+					}
 				}
 			}
 			refs = append(refs, ref)

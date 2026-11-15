@@ -162,7 +162,7 @@ func collectGit(ctx context.Context, opts *Options, entries []core.Entry, now ti
 		}
 		report.Recorded++
 		if entry.Git != nil && !entry.Git.Bare && !entry.Git.Degraded && entry.Git.DirtyFiles == 0 {
-			if err := proveWorktreeContents(ctx, runner, entry.Path, opts, entry.Git, now); err != nil {
+			if published, err := proveWorktreeContents(ctx, runner, entry.Path, opts, entry.Git, now); err != nil {
 				var refusal *worktreePolicyRefusal
 				if errors.As(err, &refusal) {
 					entry.Git.ContentsProtection = refusal.Error()
@@ -178,6 +178,11 @@ func collectGit(ctx context.Context, opts *Options, entries []core.Entry, now ti
 				}
 			} else {
 				entry.Git.ContentsKnown = true
+				// protect.published_name_matches: allow resolved these
+				// matches; they are reported, never silently waived.
+				for _, detail := range published {
+					addEvidence(entry, core.Evidence{Source: core.SourceGit, Signal: "worktree_published_name_match", Detail: detail, ObservedAt: now})
+				}
 			}
 		}
 	}

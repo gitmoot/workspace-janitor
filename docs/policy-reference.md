@@ -89,7 +89,8 @@ root cannot bypass it.
 Every category safety check still applies to archive-only entries, including
 the in-tree secret screen (built-in names plus `protect.name_patterns`): a
 tree containing credential material is refused and stays in place, so it is
-never copied off-host.
+never copied off-host. The one exception is a published tracked file under
+[`protect.published_name_matches: allow`](#published-tracked-protected-names).
 
 Category kind `versioned_work` selects plain directories directly inside a
 root whose base name matches `match`, a pattern with exactly one `*`. The
@@ -575,8 +576,11 @@ into permission to delete the enclosing worktree. Rules for the worktree
 itself, its parents or its quarantine destination do not approve descendants.
 Overlapping preserving/bounded cache rules, report-only roots, protected paths
 and credential/evidence name patterns take precedence, including inside an
-otherwise approved cache. An ignored symlink, nested Git repository, gitlink,
-special file or filesystem crossing refuses cleanup.
+otherwise approved cache (a `protect.name_patterns` match on a published
+tracked file is resolved only as described in
+[Published tracked protected names](#published-tracked-protected-names)). An
+ignored symlink, nested Git repository, gitlink, special file or filesystem
+crossing refuses cleanup.
 The existing potentially-live database extension veto also applies to regular
 descendant files, even tracked files or files inside an approved cache.
 
@@ -609,7 +613,9 @@ revokes expiry permission. Restore remains available after a proof refusal.
 `source_name_approvals` is absent by default. A tracked, published file such as
 `credentials.go` can still match a protected name. Tracking, a source extension,
 or a secret scan never creates permission to remove it. Without an exact
-authorized review record, the name remains protected.
+authorized review record, the name remains protected, unless the operator has
+set `protect.published_name_matches: allow` (next section), which resolves
+such a match without a per-file record.
 
 This optional policy adjudicates **one protected-name match**, not the containing
 workspace's lifecycle or disposal permission. The operator must explicitly
@@ -652,6 +658,55 @@ rule but no file contents. It is not reported as broken Git metadata or a
 collector failure. Actual metadata, I/O and bounded-proof failures retain their
 existing fail-closed reporting.
 
+## Published tracked protected names
+
+`protect.published_name_matches` decides whether a `protect.name_patterns`
+match on a file whose content is already published still blocks whole-worktree
+quarantine and expiry and workspace archiving (explicit `workspace_archives`,
+and the `pushed_clones`, `merged_worktrees` and other
+`workspace_archive_categories` kinds). It is `refuse` by default (also when
+omitted): every match blocks, as before. With `allow`, a match is resolved,
+not waived silently, only when **all** of these hold for that file:
+
+- it is a regular file with exactly one link (no symlink, hard link, directory
+  or special file), at most 64 MiB;
+- the checkout's own index tracks it at stage 0 as an ordinary file (`100644`
+  or `100755`, agreeing with the file's executable bit);
+- its bytes, hashed as a Git blob while its identity, links, size and times
+  stay unchanged, equal the index blob;
+- that blob is the blob at the same path in `HEAD`;
+- `HEAD` is on a remote-tracking branch. The worktree proof reuses the Git
+  collector's publication measurement (nothing dirty, stashed, locked or
+  unpublished, and `HEAD` still the measured commit); the archive screen
+  requires the tree to be its repository's top level and
+  `git rev-list HEAD --not --remotes` to be empty. Nothing is fetched.
+
+Anything else keeps the refusal exactly as with `refuse`: an untracked or
+ignored file (for example a `.env` that is not in Git), a tracked file with
+local edits, a file whose blob is only in a local commit, a file in a nested
+repository, a matching directory, a file the bounded proof could not finish
+checking. `classification.evidence_names`, `protect.paths`, report-only
+roots, cache rules, the live-database veto and every other gate are unchanged.
+The setting applies to built-in secret names in the archive screen too, so a
+tracked, published `.env` no longer blocks archiving: its content is already
+on the remote. Loose files, scratch cleanup, session artifact batches and
+sensitive names outside a Git checkout are not affected.
+
+Each resolved match is recorded, never silent: the Git collector adds a
+`worktree_published_name_match` evidence entry ("protected-name match on
+published tracked file ...") to the worktree, an archive inspection lists them
+in `published_name_matches` (also on each `archive --categories` item), and an
+archive binding appends them to its detail. At most 32 (worktree) or 20
+(archive) files are named; the rest are counted. The setting is part of the
+policy digest, and quarantine, archiving and expiry recheck it under the
+current policy.
+
+```yaml
+protect:
+  # Owner decision: a protected name on a tracked, unmodified file whose
+  # commit is on a remote-tracking branch no longer blocks archiving.
+  published_name_matches: allow
+```
 
 ## Exact evidence exports
 
@@ -739,7 +794,8 @@ Creation refuses, leaving the source and destination untouched, when:
   `.netrc`, `.pgpass`, `.npmrc`, `.pypirc`, `credentials.json`,
   `service-account.json`, `token.json`, `*.pem`, `*.key`, `*.p12`, `*.pfx`,
   `*.kdbx`, `*.keystore`, `*.jks`; certifi's public `cacert.pem` is exempt) or
-  any `protect.name_patterns` entry matches;
+  any `protect.name_patterns` entry matches, except a published tracked file
+  under [`protect.published_name_matches: allow`](#published-tracked-protected-names);
 - a process has its working directory, root, executable or an open descriptor
   inside the path, or a process cannot be inspected (`collectors.proc_root`);
 - a gitdir file, `objects/info/alternates` file or symlink outside the path

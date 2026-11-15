@@ -93,6 +93,10 @@ type Scope struct {
 	// SensitiveNames are additional base-name patterns (filepath.Match)
 	// that keep an item local, normally policy protect.name_patterns.
 	SensitiveNames []string
+	// PublishedNameMatches lets a secret-like file that the tree's own
+	// repository tracks unmodified at a published HEAD pass the screen
+	// (policy protect.published_name_matches: allow).
+	PublishedNameMatches bool
 	// MaxEntries bounds the archived tree and each dependent walk; an
 	// exceeded bound refuses rather than archiving a partial view.
 	MaxEntries int
@@ -111,6 +115,9 @@ type Inspection struct {
 	LinkedWorktree bool              `json:"linked_worktree"`
 	MountSource    string            `json:"mount_source"`
 	FSType         string            `json:"fstype"`
+	// PublishedNameMatches lists secret-like names that passed the screen
+	// as published tracked files.
+	PublishedNameMatches []string `json:"published_name_matches,omitempty"`
 }
 
 // File names inside the archive directory; Create never replaces them.
@@ -144,7 +151,8 @@ func archiveRule(rule config.WorkspaceArchiveRule) config.WorkspaceArchiveRule {
 // entry bound.
 func PolicyScope(policy config.Policy, rule config.WorkspaceArchiveRule) Scope {
 	scope := Scope{ProcRoot: policy.Collectors.ProcRoot, SearchRoots: append([]string(nil), rule.DependentRoots...),
-		SensitiveNames: policy.Protect.NamePatterns, MaxEntries: policy.Limits.DeepSizeMaxEntries}
+		SensitiveNames: policy.Protect.NamePatterns, PublishedNameMatches: policy.Protect.AllowsPublishedNameMatches(),
+		MaxEntries: policy.Limits.DeepSizeMaxEntries}
 	if len(scope.SearchRoots) == 0 {
 		for _, root := range policy.Roots {
 			scope.SearchRoots = append(scope.SearchRoots, root.Path)

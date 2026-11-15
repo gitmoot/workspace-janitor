@@ -77,7 +77,7 @@ func Bind(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope, lo
 	defer local.Close()
 	// One member beyond the manifest is already a difference, so the
 	// manifest's own size bounds the walk.
-	walk, err := scanTree(ctx, local, localPath, scope.SensitiveNames, len(m.Members), full, true)
+	walk, err := scanTree(ctx, local, localPath, scope.SensitiveNames, len(m.Members), full, true, scope.PublishedNameMatches)
 	if err != nil {
 		return nil, fmt.Errorf("local tree cannot be matched to its archive; local changes would be lost: %w", err)
 	}
@@ -134,6 +134,7 @@ func Bind(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope, lo
 	binding := &core.WorkspaceArchiveBinding{
 		Manifest: rule.Archive.Manifest, ManifestSHA256: rule.Archive.ManifestSHA256,
 		MemberCount: len(m.Members), CreatedAt: m.CreatedAt.UTC(), CompanionSuffix: rule.CompanionSuffix(),
+		PublishedNameMatches: walk.publishedEvidence(),
 	}
 	// The companion is part of the bound unit: a different one is a
 	// different fingerprint.

@@ -57,6 +57,10 @@ type categoryArchiveItem struct {
 	// CleanupID is the receipt a batch's quarantine will journal its files
 	// under: `janitor restore <CleanupID>` restores them.
 	CleanupID string `json:"cleanup_id,omitempty"`
+
+	// PublishedNameMatches lists protected-name matches the archive
+	// inspection resolved as published tracked files.
+	PublishedNameMatches []string `json:"published_name_matches,omitempty"`
 }
 
 type categoryArchiveReport struct {
@@ -752,6 +756,7 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			rule := categoryRule(category, name, item.Path, owner, release)
 			scope := workspacearchive.BindingScope(ctx, policy, rule, policy.Collectors.ProcRoot, &dependents)
 			inspection, err := workspacearchive.Inspect(ctx, rule, scope)
+			item.PublishedNameMatches = inspection.PublishedNameMatches
 			switch {
 			case err != nil:
 				item.Reasons = []string{"archive inspection refused: " + err.Error()}

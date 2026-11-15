@@ -31,6 +31,12 @@ protect:
     - /srv/data
   name_patterns:
     - "*.backup"
+  # refuse (default): a name_patterns match blocks whole-worktree cleanup and
+  # workspace archiving even on a tracked file whose commit is pushed. allow:
+  # such a match on a tracked, unmodified file at a published HEAD is recorded
+  # as evidence instead; untracked, ignored, modified or unpushed matches
+  # still block. Set allow only on the owner's decision.
+  # published_name_matches: allow
 
 retention:
   # How long quarantined items are kept: none, 3d, 7d, 30d, 90d, or permanent.

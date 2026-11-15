@@ -23,4 +23,9 @@ type WorkspaceArchiveBinding struct {
 	// CompanionID is the bound companion's identity, zero when the archive
 	// recorded it absent (it must then stay absent).
 	CompanionID FilesystemID `json:"companion_id,omitzero"`
+	// PublishedNameMatches reports secret-like names in the local tree that
+	// passed the screen as published tracked files
+	// (protect.published_name_matches: allow). Evidence only: it is not part
+	// of the fingerprint, and the tree digest already binds those files.
+	PublishedNameMatches []string `json:"published_name_matches,omitempty"`
 }

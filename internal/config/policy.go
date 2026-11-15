@@ -81,6 +81,24 @@ type Root struct {
 type Protect struct {
 	Paths        []string `yaml:"paths" json:"paths"`
 	NamePatterns []string `yaml:"name_patterns" json:"name_patterns"`
+	// PublishedNameMatches decides whether a name_patterns match on a file
+	// that Git tracks, unmodified, at a published HEAD still blocks
+	// whole-worktree quarantine and workspace archiving. Empty or "refuse"
+	// (the default) blocks; "allow" records the match as evidence instead.
+	// Untracked, ignored, modified or unpublished matches always block.
+	PublishedNameMatches string `yaml:"published_name_matches,omitempty" json:"published_name_matches,omitempty"`
+}
+
+// Values of protect.published_name_matches.
+const (
+	PublishedNameMatchesRefuse = "refuse"
+	PublishedNameMatchesAllow  = "allow"
+)
+
+// AllowsPublishedNameMatches reports whether a protected-name match on a
+// tracked, unmodified, published file is resolved rather than blocking.
+func (p Protect) AllowsPublishedNameMatches() bool {
+	return p.PublishedNameMatches == PublishedNameMatchesAllow
 }
 
 // RetentionPolicy configures quarantine retention.
@@ -901,6 +919,11 @@ func (p *Policy) Validate() core.FieldErrors {
 		if _, err := filepath.Match(pattern, "probe"); err != nil {
 			errs.Add(fmt.Sprintf("protect.name_patterns[%d]", i), "invalid pattern %q: %v", pattern, err)
 		}
+	}
+	switch p.Protect.PublishedNameMatches {
+	case "", PublishedNameMatchesRefuse, PublishedNameMatchesAllow:
+	default:
+		errs.Add("protect.published_name_matches", "must be %q or %q, got %q", PublishedNameMatchesRefuse, PublishedNameMatchesAllow, p.Protect.PublishedNameMatches)
 	}
 	if !p.Retention.Default.Valid() {
 		errs.Add("retention.default", "unknown retention %q (allowed: %s)", string(p.Retention.Default), joinRetentions())

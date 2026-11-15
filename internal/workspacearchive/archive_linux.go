@@ -39,6 +39,8 @@ type inspected struct {
 	parent              *os.File
 	tarRoot             string
 	companion           *companion
+	// published lists secret-like names resolved as published tracked files.
+	published []string
 }
 
 func (in *inspected) close() {
@@ -90,7 +92,7 @@ func Inspect(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope)
 	}
 	defer in.close()
 	members, content := in.totals()
-	return Inspection{Source: in.sourceState.id, Members: members, ContentBytes: content, LinkedWorktree: in.inv.worktreeAdmin != "", MountSource: in.mountSource, FSType: in.fstype}, nil
+	return Inspection{Source: in.sourceState.id, Members: members, ContentBytes: content, LinkedWorktree: in.inv.worktreeAdmin != "", MountSource: in.mountSource, FSType: in.fstype, PublishedNameMatches: in.published}, nil
 }
 
 func inspect(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope) (*inspected, error) {
@@ -129,14 +131,14 @@ func inspect(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope)
 	if in.source, _, err = openEntry(in.parent, rule.Path, true); err != nil {
 		return nil, fmt.Errorf("workspace: %w", err)
 	}
-	walk, err := scanTree(ctx, in.source, rule.Path, scope.SensitiveNames, scope.limit(), false, true)
+	walk, err := scanTree(ctx, in.source, rule.Path, scope.SensitiveNames, scope.limit(), false, true, scope.PublishedNameMatches)
 	if err != nil {
 		return nil, err
 	}
 	if err = walk.err(); err != nil {
 		return nil, err
 	}
-	in.sourceState, in.inv = walk.rootState, walk.inv
+	in.sourceState, in.inv, in.published = walk.rootState, walk.inv, walk.publishedEvidence()
 	in.tarRoot = unitRoot(rule, in.inv.members[0])
 	if in.sourceState.id == in.rootSt.id {
 		return nil, errors.New("archive directory and workspace are the same directory")
@@ -956,7 +958,7 @@ func extractFile(dir *os.File, name string, m Member, content io.Reader) error {
 // re-reads the restored companion, if any, and compares both with the
 // manifest.
 func verifyRestored(ctx context.Context, root, companion *os.File, destination string, m Manifest) error {
-	walk, err := scanTree(ctx, root, destination, nil, len(m.Members), true, false)
+	walk, err := scanTree(ctx, root, destination, nil, len(m.Members), true, false, false)
 	if err != nil {
 		return err
 	}
