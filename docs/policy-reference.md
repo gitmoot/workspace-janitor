@@ -232,10 +232,16 @@ At most one trim per kind and path is accepted.
     lock while removing, so a build that starts meanwhile waits on cargo's
     own lock.
 
-  Removal never follows a symlink (a link is removed, never its target) and
-  never crosses into another filesystem: an entry on another device, or a
-  mount below one, is not removed and fails the trim, as does any other
-  removal error.
+  The target and its profile directories are opened once, when validated,
+  and locking and removal go only through those open directories. Holding
+  the locks, before removing anything, the trim checks that `path` (opened
+  again without following symlinks) and each profile name still are the
+  validated directories and that `CACHEDIR.TAG` is still cargo's; a
+  directory replaced or moved meanwhile fails the trim and nothing is
+  removed. Removal never follows a symlink (a link is removed, never its
+  target) and never crosses into another filesystem: an entry on another
+  device, or a mount below one, is not removed and fails the trim, as does
+  any other removal error.
 
   ```yaml
   - kind: cargo-target

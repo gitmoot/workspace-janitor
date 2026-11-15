@@ -66,6 +66,27 @@ func RemoveAnchored(ctx context.Context, path string, expected core.FilesystemID
 	return deleteAnchoredAt(path, expected, ctimeNS)
 }
 
+// OpenDirNoSymlinks opens the directory at an absolute canonical path for
+// reading, refusing a symlink in any component. The caller closes it.
+func OpenDirNoSymlinks(path string) (int, error) {
+	return openExistingDirNoSymlinks(path)
+}
+
+// RemoveAt removes the entry name of the directory open as dir: a file,
+// symlink (never its target) or directory tree. Every child is resolved
+// through descriptors anchored at dir, never by path, never follows a
+// symlink and never crosses out of device; a mount found anywhere in the
+// tree refuses the removal before anything is removed.
+func RemoveAt(ctx context.Context, dir int, name string, device uint64) error {
+	if err := verifyAt(ctx, dir, name, device); err != nil {
+		return err
+	}
+	if err := removeAt(dir, name, device); err != nil {
+		return err
+	}
+	return unix.Fsync(dir)
+}
+
 // verifyDeletionTree checks mount boundaries before mutation. It uses the
 // same no-follow descriptor traversal as removeAt but retains no inode map
 // and no directory-sized listing in memory.

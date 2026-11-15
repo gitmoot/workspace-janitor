@@ -4,6 +4,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -852,4 +853,81 @@ func TestCargoTargetTrimRefusesUntaggedDirectory(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A target directory or profile replaced after validation, while the process
+// scan runs, is not trimmed: the trim fails and neither the replacement nor
+// the validated directory loses anything.
+func TestCargoTargetTrimRefusesDirectoryReplacedAfterValidation(t *testing.T) {
+	for _, swapped := range []string{"target", "profile"} {
+		t.Run(swapped, func(t *testing.T) {
+			x, target, trim := cargoTargetFixture(t)
+			backdate(t, target, 2*time.Hour)
+			// The process scan blocks reading this process's cmdline until
+			// the test has swapped the directory.
+			proc := filepath.Join(x.proc, "100")
+			writeFile(t, filepath.Join(proc, "environ"), "HOME=/nonexistent\x00")
+			if err := unix.Mkfifo(filepath.Join(proc, "cmdline"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for link, dest := range map[string]string{"cwd": "/", "exe": "/usr/bin/sleep"} {
+				if err := os.Symlink(dest, filepath.Join(proc, link)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			swap, fresh := target, filepath.Join(target, "release", "fresh-noncache-data")
+			if swapped == "profile" {
+				swap = filepath.Join(target, "release")
+			}
+			done := make(chan error, 1)
+			go func() { done <- replaceDuringScan(filepath.Join(proc, "cmdline"), swap, fresh) }()
+			trims, code := x.cycleTrims(t, trim)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if code == ExitOK || trims[0].Status != "failed" {
+				t.Fatalf("replaced %s trimmed: exit %d %+v", swapped, code, trims[0])
+			}
+			if !exists(t, fresh) {
+				t.Fatal("replacement's data removed")
+			}
+			validated := filepath.Join(swap+".validated", "release", "deps", "libbig.rlib")
+			if swapped == "profile" {
+				validated = filepath.Join(swap+".validated", "deps", "libbig.rlib")
+			}
+			if !exists(t, validated) {
+				t.Fatal("validated directory trimmed after it was moved aside")
+			}
+		})
+	}
+}
+
+// replaceDuringScan waits for a reader to open fifo, moves dir aside to
+// dir.validated, puts in its place an untagged directory with a release
+// profile lock and fresh, then releases the reader.
+func replaceDuringScan(fifo, dir, fresh string) error {
+	deadline := time.Now().Add(time.Minute)
+	fd, err := unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	for errors.Is(err, unix.ENXIO) && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		fd, err = unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	}
+	if err != nil {
+		return fmt.Errorf("process scan never read %s: %w", fifo, err)
+	}
+	defer unix.Close(fd)
+	if err := os.Rename(dir, dir+".validated"); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(fresh), 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(fresh), ".cargo-lock"), nil, 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(fresh, []byte("not cache"), 0o600); err != nil {
+		return err
+	}
+	_, err = unix.Write(fd, []byte("/usr/bin/sleep\x0060\x00"))
+	return err
 }

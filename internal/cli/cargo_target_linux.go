@@ -8,11 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
-	"syscall"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/action"
@@ -40,27 +38,27 @@ var cargoLockFiles = []string{".cargo-lock", ".cargo-build-lock", ".cargo-artifa
 // trim is skipped as in use while anything in the top two levels changed
 // within min_idle, while a process may use the directory (cargoTargetUser),
 // or while any cargo lock is held; it holds every lock while removing.
-// Removal never follows a symlink and never crosses into another filesystem.
+//
+// The target and its profile directories are opened once, when validated;
+// locking and removal go through those descriptors only. Under the locks,
+// before removing anything, the path must still name the validated target
+// and profiles and the tag must still be cargo's, else the trim fails and
+// removes nothing. Removal never follows a symlink and never crosses into
+// another filesystem.
 func trimCargoTarget(ctx context.Context, procRoot string, trim config.CacheTrim, report cacheTrimReport) cacheTrimReport {
 	fail := func(err error) cacheTrimReport {
 		report.Status, report.Error = cacheTrimFailed, err.Error()
 		return report
 	}
-	info, err := os.Lstat(trim.Path)
-	if errors.Is(err, fs.ErrNotExist) {
+	target, err := openCargoTarget(trim.Path)
+	if errors.Is(err, unix.ENOENT) {
 		report.Status = cacheTrimNotFound
 		return report
 	}
 	if err != nil {
 		return fail(err)
 	}
-	if !info.IsDir() {
-		return fail(fmt.Errorf("%s is not a directory", trim.Path))
-	}
-	device := uint64(info.Sys().(*syscall.Stat_t).Dev)
-	if err := cargoTargetTagged(trim.Path); err != nil {
-		return fail(err)
-	}
+	defer target.close()
 	size, err := allocatedBytes(ctx, trim.Path)
 	if err != nil {
 		return fail(fmt.Errorf("measure: %w", err))
@@ -70,11 +68,10 @@ func trimCargoTarget(ctx context.Context, procRoot string, trim config.CacheTrim
 		report.Status = cacheUnderBound
 		return report
 	}
-	profiles, err := cargoProfiles(trim.Path, device)
-	if err != nil {
+	if err := target.findProfiles(); err != nil {
 		return fail(err)
 	}
-	recent, err := cargoTargetChange(trim.Path, profiles, time.Now().Add(-trim.MinIdle.Duration()))
+	recent, err := target.changedSince(time.Now().Add(-trim.MinIdle.Duration()))
 	if err != nil {
 		return fail(err)
 	}
@@ -86,14 +83,17 @@ func trimCargoTarget(ctx context.Context, procRoot string, trim config.CacheTrim
 		report.Status, report.ActiveUsers = cacheInUse, users
 		return report
 	}
-	release, held := lockCargoProfiles(trim.Path, profiles)
+	release, held := target.lock()
 	defer release()
 	if len(held) != 0 {
 		report.Status, report.ActiveUsers = cacheInUse, held
 		return report
 	}
+	if err := target.verify(); err != nil {
+		return fail(err)
+	}
 	report.FreeBefore = freeBytes(trimFilesystem(trim))
-	removeErr := removeCargoOutputs(ctx, trim.Path, device, profiles)
+	removeErr := target.removeOutputs(ctx)
 	report.FreeAfter = freeBytes(trimFilesystem(trim))
 	if after, err := allocatedBytes(ctx, trim.Path); err == nil {
 		reclaimed := max(size-after, 0)
@@ -106,11 +106,54 @@ func trimCargoTarget(ctx context.Context, procRoot string, trim config.CacheTrim
 	return report
 }
 
-// cargoTargetTagged checks that dir holds the CACHEDIR.TAG cargo writes, a
+// cargoTarget is a validated cargo target directory held open with its
+// profile directories.
+type cargoTarget struct {
+	path     string
+	fd       int
+	id       core.FilesystemID
+	profiles []cargoProfile
+}
+
+type cargoProfile struct {
+	name string
+	fd   int
+	id   core.FilesystemID
+}
+
+// openCargoTarget opens path, refusing a symlink in any component, and
+// checks it holds cargo's CACHEDIR.TAG.
+func openCargoTarget(path string) (*cargoTarget, error) {
+	fd, err := action.OpenDirNoSymlinks(path)
+	if err != nil {
+		return nil, err
+	}
+	target := &cargoTarget{path: path, fd: fd}
+	id, err := fdIdentity(fd)
+	if err != nil {
+		target.close()
+		return nil, err
+	}
+	target.id = id
+	if err := target.tagged(); err != nil {
+		target.close()
+		return nil, err
+	}
+	return target, nil
+}
+
+func (t *cargoTarget) close() {
+	for _, profile := range t.profiles {
+		unix.Close(profile.fd)
+	}
+	unix.Close(t.fd)
+}
+
+// tagged checks that the target holds the CACHEDIR.TAG cargo writes, a
 // regular file starting with the cache directory tag signature.
-func cargoTargetTagged(dir string) error {
-	refuse := fmt.Errorf("%s has no cargo CACHEDIR.TAG; not a cargo target directory, refused", dir)
-	fd, err := unix.Open(filepath.Join(dir, "CACHEDIR.TAG"), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+func (t *cargoTarget) tagged() error {
+	refuse := fmt.Errorf("%s has no cargo CACHEDIR.TAG; not a cargo target directory, refused", t.path)
+	fd, err := unix.Openat(t.fd, "CACHEDIR.TAG", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ELOOP) {
 		return refuse
 	}
@@ -129,75 +172,71 @@ func cargoTargetTagged(dir string) error {
 	return nil
 }
 
-// cargoProfiles lists the profile directories of target: top-level real
-// directories holding a regular .cargo-lock. A profile directory on another
-// filesystem is an error.
-func cargoProfiles(target string, device uint64) ([]string, error) {
-	entries, err := os.ReadDir(target)
+// findProfiles opens the profile directories: top-level real directories
+// holding a regular .cargo-lock. One on another filesystem is an error.
+func (t *cargoTarget) findProfiles() error {
+	names, err := dirNames(t.fd)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var profiles []string
-	for _, entry := range entries {
-		if !entry.IsDir() {
+	for _, name := range names {
+		fd, err := unix.Openat(t.fd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOENT) {
 			continue
-		}
-		lock, err := os.Lstat(filepath.Join(target, entry.Name(), ".cargo-lock"))
-		if errors.Is(err, fs.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if !lock.Mode().IsRegular() {
-			continue
-		}
-		info, err := os.Lstat(filepath.Join(target, entry.Name()))
-		if err != nil {
-			return nil, err
-		}
-		if uint64(info.Sys().(*syscall.Stat_t).Dev) != device {
-			return nil, fmt.Errorf("%s is on another filesystem; refused", filepath.Join(target, entry.Name()))
-		}
-		profiles = append(profiles, entry.Name())
-	}
-	return profiles, nil
-}
-
-// cargoTargetChange names the newest entry modified after cutoff among
-// target, its entries and each profile directory's entries, or "" when
-// nothing there changed since. Symlinks are not followed.
-func cargoTargetChange(target string, profiles []string, cutoff time.Time) (string, error) {
-	dirs := []string{target}
-	for _, profile := range profiles {
-		dirs = append(dirs, filepath.Join(target, profile))
-	}
-	var newest time.Time
-	var newestPath string
-	consider := func(path string) error {
-		info, err := os.Lstat(path)
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
 		}
 		if err != nil {
 			return err
 		}
-		if info.ModTime().After(newest) {
-			newest, newestPath = info.ModTime(), path
+		var lock unix.Stat_t
+		err = unix.Fstatat(fd, ".cargo-lock", &lock, unix.AT_SYMLINK_NOFOLLOW)
+		if errors.Is(err, unix.ENOENT) || (err == nil && lock.Mode&unix.S_IFMT != unix.S_IFREG) {
+			unix.Close(fd)
+			continue
 		}
-		return nil
+		id, idErr := fdIdentity(fd)
+		if err == nil {
+			err = idErr
+		}
+		if err == nil && id.Device != t.id.Device {
+			err = fmt.Errorf("%s is on another filesystem; refused", filepath.Join(t.path, name))
+		}
+		if err != nil {
+			unix.Close(fd)
+			return err
+		}
+		t.profiles = append(t.profiles, cargoProfile{name: name, fd: fd, id: id})
 	}
-	if err := consider(target); err != nil {
+	return nil
+}
+
+// changedSince names the newest entry modified after cutoff among the
+// target, its entries and each profile directory's entries, or "" when
+// nothing there changed since. Symlinks are not followed.
+func (t *cargoTarget) changedSince(cutoff time.Time) (string, error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(t.fd, &st); err != nil {
 		return "", err
 	}
-	for _, dir := range dirs {
-		entries, err := os.ReadDir(dir)
+	newest, newestPath := time.Unix(st.Mtim.Unix()), t.path
+	dirs := map[string]int{t.path: t.fd}
+	for _, profile := range t.profiles {
+		dirs[filepath.Join(t.path, profile.name)] = profile.fd
+	}
+	for dir, fd := range dirs {
+		names, err := dirNames(fd)
 		if err != nil {
 			return "", err
 		}
-		for _, entry := range entries {
-			if err := consider(filepath.Join(dir, entry.Name())); err != nil {
+		for _, name := range names {
+			err := unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW)
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			if err != nil {
 				return "", err
+			}
+			if mtime := time.Unix(st.Mtim.Unix()); mtime.After(newest) {
+				newest, newestPath = mtime, filepath.Join(dir, name)
 			}
 		}
 	}
@@ -207,11 +246,12 @@ func cargoTargetChange(target string, profiles []string, cutoff time.Time) (stri
 	return fmt.Sprintf("%s modified %s, within min_idle", newestPath, newest.UTC().Format(time.RFC3339)), nil
 }
 
-// lockCargoProfiles takes, without waiting, an exclusive flock on every
-// cargo lock file present in each profile directory. held lists each lock it
-// could not take: one a build holds, or one it could not open or lock, which
-// counts as held. release drops every lock taken.
-func lockCargoProfiles(target string, profiles []string) (release func(), held []string) {
+// lock takes, without waiting, an exclusive flock on every cargo lock file
+// present in each profile directory, opened through the profile's
+// descriptor. held lists each lock it could not take: one a build holds, or
+// one it could not open or lock, which counts as held. release drops every
+// lock taken.
+func (t *cargoTarget) lock() (release func(), held []string) {
 	var files []*os.File
 	release = func() {
 		for _, file := range files {
@@ -219,10 +259,10 @@ func lockCargoProfiles(target string, profiles []string) (release func(), held [
 			file.Close()
 		}
 	}
-	for _, profile := range profiles {
+	for _, profile := range t.profiles {
 		for _, name := range cargoLockFiles {
-			path := filepath.Join(target, profile, name)
-			fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+			path := filepath.Join(t.path, profile.name, name)
+			fd, err := unix.Openat(profile.fd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 			if errors.Is(err, unix.ENOENT) && name != ".cargo-lock" {
 				continue
 			}
@@ -251,54 +291,87 @@ func lockCargoProfiles(target string, profiles []string) (release func(), held [
 	return release, held
 }
 
-// removeCargoOutputs removes every entry of each profile directory except
-// cargo's lock files, every entry of tmp (when it is a real directory), and
-// .rustc_info.json. It carries on past a failed entry and returns every
-// failure.
-func removeCargoOutputs(ctx context.Context, target string, device uint64, profiles []string) error {
+// verify checks, just before removal, that the path still names the
+// validated target, each profile name still the validated profile, and that
+// the target still holds cargo's tag.
+func (t *cargoTarget) verify() error {
+	changed := fmt.Errorf("%s changed since it was validated; nothing removed", t.path)
+	fd, err := action.OpenDirNoSymlinks(t.path)
+	if err != nil {
+		return fmt.Errorf("%w: %v", changed, err)
+	}
+	defer unix.Close(fd)
+	if id, err := fdIdentity(fd); err != nil || id != t.id {
+		return changed
+	}
+	for _, profile := range t.profiles {
+		var st unix.Stat_t
+		if err := unix.Fstatat(fd, profile.name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
+			(core.FilesystemID{Device: uint64(st.Dev), Inode: st.Ino}) != profile.id {
+			return changed
+		}
+	}
+	if err := t.tagged(); err != nil {
+		return fmt.Errorf("%w: %v", changed, err)
+	}
+	return nil
+}
+
+// removeOutputs removes, anchored at the validated descriptors, every entry
+// of each profile directory except cargo's lock files, every entry of tmp
+// (when it is a real directory), and .rustc_info.json. It carries on past a
+// failed entry and returns every failure.
+func (t *cargoTarget) removeOutputs(ctx context.Context) error {
 	var errs []error
-	contents := func(dir string, keep []string) {
-		entries, err := os.ReadDir(dir)
+	remove := func(dir int, path, name string) {
+		if err := action.RemoveAt(ctx, dir, name, t.id.Device); err != nil && !errors.Is(err, unix.ENOENT) {
+			errs = append(errs, fmt.Errorf("remove %s: %w", filepath.Join(path, name), err))
+		}
+	}
+	contents := func(dir int, path string, keep []string) {
+		names, err := dirNames(dir)
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("list %s: %w", path, err))
 			return
 		}
-		for _, entry := range entries {
-			if !slices.Contains(keep, entry.Name()) {
-				errs = append(errs, removeCargoEntry(ctx, filepath.Join(dir, entry.Name()), device))
+		for _, name := range names {
+			if !slices.Contains(keep, name) {
+				remove(dir, path, name)
 			}
 		}
 	}
-	for _, profile := range profiles {
-		contents(filepath.Join(target, profile), cargoLockFiles)
+	for _, profile := range t.profiles {
+		contents(profile.fd, filepath.Join(t.path, profile.name), cargoLockFiles)
 	}
-	tmp := filepath.Join(target, "tmp")
-	if info, err := os.Lstat(tmp); err == nil && info.IsDir() {
-		contents(tmp, nil)
-	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		errs = append(errs, err)
+	tmp, err := unix.Openat(t.fd, "tmp", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	switch {
+	case err == nil:
+		contents(tmp, filepath.Join(t.path, "tmp"), nil)
+		unix.Close(tmp)
+	case errors.Is(err, unix.ENOENT), errors.Is(err, unix.ENOTDIR), errors.Is(err, unix.ELOOP):
+	default:
+		errs = append(errs, fmt.Errorf("open %s: %w", filepath.Join(t.path, "tmp"), err))
 	}
-	errs = append(errs, removeCargoEntry(ctx, filepath.Join(target, ".rustc_info.json"), device))
+	remove(t.fd, t.path, ".rustc_info.json")
 	return errors.Join(errs...)
 }
 
-// removeCargoEntry removes one file, symlink (never its target) or
-// directory tree at path, refusing one on another filesystem than device or
-// with a mount below it.
-func removeCargoEntry(ctx context.Context, path string, device uint64) error {
-	info, err := os.Lstat(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
+// dirNames lists the directory open as fd through a fresh descriptor, so fd
+// itself keeps no read offset.
+func dirNames(fd int) ([]string, error) {
+	dup, err := unix.Openat(fd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	st := info.Sys().(*syscall.Stat_t)
-	if uint64(st.Dev) != device {
-		return fmt.Errorf("%s is on another filesystem; not removed", path)
+	file := os.NewFile(uintptr(dup), ".")
+	defer file.Close()
+	return file.Readdirnames(-1)
+}
+
+func fdIdentity(fd int) (core.FilesystemID, error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return core.FilesystemID{}, err
 	}
-	if err := action.RemoveAnchored(ctx, path, core.FilesystemID{Device: device, Inode: st.Ino}, st.Ctim.Sec*1e9+st.Ctim.Nsec); err != nil {
-		return fmt.Errorf("remove %s: %w", path, err)
-	}
-	return nil
+	return core.FilesystemID{Device: uint64(st.Dev), Inode: st.Ino}, nil
 }
