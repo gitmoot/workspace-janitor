@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/workspace-janitor/internal/core"
 	"golang.org/x/sys/unix"
 )
 
@@ -34,11 +35,14 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 }
 
 // runGit runs one fixed local subcommand. Inherited GIT_* settings, hooks,
-// credential helpers and user/system config are discarded; nothing contacts a
-// remote. extra, when set, is visible to Git as /proc/self/fd/3.
+// credential helpers and user/system config are discarded, and replace refs,
+// grafts and the commit-graph cannot redirect object lookups
+// (core.GitIsolationArgs, core.GitIsolationEnv); nothing contacts a remote.
+// extra, when set, is visible to Git as /proc/self/fd/3.
 func runGit(ctx context.Context, dir string, stdout io.Writer, extra *os.File, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir, "--no-optional-locks"}, args...)...)
-	cmd.Env = []string{
+	global := append([]string{"-C", dir, "--no-optional-locks"}, core.GitIsolationArgs()...)
+	cmd := exec.CommandContext(ctx, "git", append(global, args...)...)
+	cmd.Env = append([]string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=/nonexistent",
 		"GIT_CONFIG_NOSYSTEM=1",
@@ -46,7 +50,7 @@ func runGit(ctx context.Context, dir string, stdout io.Writer, extra *os.File, a
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS=true",
 		"LC_ALL=C",
-	}
+	}, core.GitIsolationEnv()...)
 	cmd.WaitDelay = time.Second
 	var out, stderr boundedBuffer
 	cmd.Stdout, cmd.Stderr = &out, &stderr

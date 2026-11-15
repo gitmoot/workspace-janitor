@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -188,6 +189,33 @@ func TestParsePolicyKeepsBuiltinProtections(t *testing.T) {
 	}
 	if !contains(policy.Protect.NamePatterns, "*.tar") || !contains(policy.Protect.NamePatterns, "*.pem") {
 		t.Errorf("name patterns = %v, want both declared and built-in entries", policy.Protect.NamePatterns)
+	}
+}
+
+// protect.published_name_matches accepts only its documented values, and an
+// omitted value stays omitted (refuse).
+func TestParsePolicyPublishedNameMatches(t *testing.T) {
+	paths := fixturePaths(t)
+	for _, value := range []string{"", "refuse", "allow"} {
+		document := "roots:\n  - path: /repos\n"
+		if value != "" {
+			document += "protect:\n  published_name_matches: " + value + "\n"
+		}
+		policy, err := parse(t, paths, document)
+		if err != nil {
+			t.Fatalf("%q: ParsePolicy: %v", value, err)
+		}
+		data, err := json.Marshal(policy.Protect)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Contains(string(data), `"published_name_matches"`); got != (value != "") ||
+			(value != "" && !strings.Contains(string(data), `"published_name_matches":"`+value+`"`)) {
+			t.Errorf("%q: effective protect = %s", value, data)
+		}
+	}
+	if _, err := parse(t, paths, "roots:\n  - path: /repos\nprotect:\n  published_name_matches: yes\n"); err == nil || !strings.Contains(err.Error(), "protect.published_name_matches") {
+		t.Fatalf("an unknown published_name_matches value was accepted: %v", err)
 	}
 }
 

@@ -40,6 +40,9 @@ type categoryFixture struct {
 	limits string
 	agents []collect.AgentSource
 	files  map[string][]byte
+
+	// protect holds extra lines under protect:, each indented two spaces.
+	protect string
 }
 
 func newCategoryFixture(t *testing.T) *categoryFixture {
@@ -75,7 +78,7 @@ func (x *categoryFixture) write(t *testing.T) {
     max_depth: 1
 protect:
   paths: [%s]
-collectors:
+%scollectors:
   git: true
   processes: true
   services: true
@@ -92,7 +95,7 @@ prevention:
 %slimits:
   command_timeout: 30s
 %sworkspace_archive_categories:
-%s%s%s%s`, x.work, x.archive, x.proc, x.services, x.prevention, x.limits,
+%s%s%s%s`, x.work, x.archive, x.protect, x.proc, x.services, x.prevention, x.limits,
 		category("scratch", "root_scratch"), category("merged", "merged_worktrees"), category("clones", "pushed_clones"), x.extra))
 }
 
@@ -264,6 +267,11 @@ func (x *categoryFixture) preserved(t *testing.T, root string) {
 
 func (x *categoryFixture) receipt(t *testing.T) core.CleanupItem {
 	t.Helper()
+	return x.receiptAt(t, x.source)
+}
+
+func (x *categoryFixture) receiptAt(t *testing.T, source string) core.CleanupItem {
+	t.Helper()
 	db, err := store.OpenExisting(context.Background(), x.paths(t).DatabaseFile)
 	if err != nil {
 		t.Fatal(err)
@@ -273,14 +281,14 @@ func (x *categoryFixture) receipt(t *testing.T) core.CleanupItem {
 	err = db.Read(context.Background(), func(tx *store.Tx) error {
 		items, err := tx.CleanupItems(context.Background(), "")
 		for _, item := range items {
-			if item.Source == x.source {
+			if item.Source == source {
 				found = item
 			}
 		}
 		return err
 	})
 	if err != nil || found.CleanupID == "" {
-		t.Fatalf("quarantine receipt for %s absent: %v", x.source, err)
+		t.Fatalf("quarantine receipt for %s absent: %v", source, err)
 	}
 	return found
 }
@@ -289,16 +297,21 @@ func (x *categoryFixture) receipt(t *testing.T) core.CleanupItem {
 // moves it.
 func (x *categoryFixture) quarantine(t *testing.T) core.CleanupItem {
 	t.Helper()
-	plan, action := x.action(t, x.source)
+	return x.quarantineAt(t, x.source)
+}
+
+func (x *categoryFixture) quarantineAt(t *testing.T, source string) core.CleanupItem {
+	t.Helper()
+	plan, action := x.action(t, source)
 	if action.Kind != core.ActionQuarantine {
 		t.Fatalf("category-archived item not proposed for quarantine: %+v", action)
 	}
 	x.data(t, "plan", "--plan", plan.ID, "--approve", action.ID, "--no-jev")
 	x.data(t, "apply", "--quarantine", "--action", action.ID, "--dry-run=false", "--confirm")
-	if _, err := os.Lstat(x.source); !os.IsNotExist(err) {
+	if _, err := os.Lstat(source); !os.IsNotExist(err) {
 		t.Fatalf("quarantine left the source in place: %v", err)
 	}
-	return x.receipt(t)
+	return x.receiptAt(t, source)
 }
 
 // recordBackdated archives the released directory exactly as a category run

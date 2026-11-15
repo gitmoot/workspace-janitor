@@ -25,8 +25,10 @@ const (
 
 // proveWorktreeContents proves ignored files disposable, not merely Git-clean.
 // Policy paths retain the receipt's original identity after quarantine. No
-// policy conclusion is reused by mutation-time recollection.
-func proveWorktreeContents(ctx context.Context, runner gitRunner, path string, opts *Options, state *core.GitState, now time.Time) error {
+// policy conclusion is reused by mutation-time recollection. On success it
+// returns evidence of each protected-name match resolved as a published
+// tracked file.
+func proveWorktreeContents(ctx context.Context, runner gitRunner, path string, opts *Options, state *core.GitState, now time.Time) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, runner.timeout)
 	defer cancel()
 	origin := path
@@ -34,68 +36,78 @@ func proveWorktreeContents(ctx context.Context, runner gitRunner, path string, o
 		origin = source
 	}
 	if !core.IsCanonicalPath(origin) {
-		return errors.New("worktree policy origin is not canonical")
+		return nil, errors.New("worktree policy origin is not canonical")
 	}
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("worktree contents cannot be opened: %w", err)
+		return nil, fmt.Errorf("worktree contents cannot be opened: %w", err)
 	}
 	root := os.NewFile(uintptr(fd), path)
 	defer root.Close()
 	var initial unix.Stat_t
 	if err := unix.Fstat(fd, &initial); err != nil {
-		return err
+		return nil, err
 	}
 	mountID, err := worktreeMountID(fd, "")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Index modes expose gitlinks even when their directories are empty or
 	// absent. Git paths are NUL-delimited, never split on whitespace/newlines.
 	index, err := runner.runOutput(ctx, path, worktreeMaxGitBytes, "ls-files", "--stage", "-z")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	tracked := make(map[string]worktreeIndexEntry)
 	records := 0
 	for index != "" {
 		record, rest, ok := strings.Cut(index, "\x00")
 		if !ok {
-			return errors.New("incomplete Git index listing")
+			return nil, errors.New("incomplete Git index listing")
 		}
 		index = rest
 		metadata, name, ok := strings.Cut(record, "\t")
 		if !ok || !validWorktreeRelative(name) {
-			return errors.New("invalid Git index path")
+			return nil, errors.New("invalid Git index path")
 		}
 		mode, objectStage, ok := strings.Cut(metadata, " ")
 		blob, stage, complete := strings.Cut(objectStage, " ")
 		if !ok || !complete || stage != "0" || (mode != "100644" && mode != "100755" && mode != "120000") {
-			return errors.New("nested Git or unsupported index mode prevents whole-worktree cleanup")
+			return nil, errors.New("nested Git or unsupported index mode prevents whole-worktree cleanup")
 		}
 		records++
 		if records > worktreeMaxEntries {
-			return errors.New("worktree index entry bound exceeded")
+			return nil, errors.New("worktree index entry bound exceeded")
 		}
 		tracked[name] = worktreeIndexEntry{mode: mode, blob: blob}
 	}
 	count := 0
 	verifier := sourceApprovalVerifier{ctx: ctx, runner: runner, path: path, origin: origin, policy: opts.WorktreePolicy, state: state, now: now}
-	if err := walkWorktreeContents(ctx, root, "", origin, opts.WorktreePolicy, tracked, uint64(initial.Dev), mountID, 0, &count, &verifier); err != nil {
-		return fmt.Errorf("worktree contents unproven: %w", err)
+	err = walkWorktreeContents(ctx, root, "", origin, opts.WorktreePolicy, tracked, uint64(initial.Dev), mountID, 0, &count, &verifier, nil)
+	// Published secrets are reported even when the walk then stops on
+	// another refusal; each one refuses the worktree on its own.
+	state.PublishedSecrets = verifier.publishedSecrets
+	if err == nil {
+		err = verifier.secretRefusal
+	}
+	if err != nil {
+		return nil, fmt.Errorf("worktree contents unproven: %w", err)
 	}
 	var current unix.Stat_t
 	if err := unix.Lstat(path, &current); err != nil {
-		return err
+		return nil, err
 	}
 	if !sameWorktreeDirectory(initial, current) {
-		return errors.New("worktree identity changed during contents proof")
+		return nil, errors.New("worktree identity changed during contents proof")
 	}
 	state.SourceApprovalFingerprint, err = verifier.fingerprint()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return verifier.publishedEvidence(), nil
 }
 
 func validWorktreeRelative(path string) bool {
@@ -147,7 +159,11 @@ func worktreePolicyVeto(path string, policy *config.Policy) error {
 	return nil
 }
 
-func walkWorktreeContents(ctx context.Context, dir *os.File, relative, origin string, policy *config.Policy, tracked map[string]worktreeIndexEntry, device, mountID uint64, depth int, count *int, verifier *sourceApprovalVerifier) error {
+// walkWorktreeContents proves one directory's descendants. within, when set,
+// is the protected-name directory this one lies in: every file below it must
+// then be a published tracked file, with no symlinks or untracked content,
+// or the walk refuses with that directory's own refusal.
+func walkWorktreeContents(ctx context.Context, dir *os.File, relative, origin string, policy *config.Policy, tracked map[string]worktreeIndexEntry, device, mountID uint64, depth int, count *int, verifier *sourceApprovalVerifier, within *protectedSubtree) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -195,7 +211,10 @@ func walkWorktreeContents(ctx context.Context, dir *os.File, relative, origin st
 			if uint64(stat.Dev) != device {
 				return errors.New("worktree contents cross a filesystem boundary")
 			}
-			if err := verifier.checkNames(dir, name, rel, stat, tracked[rel]); err != nil {
+			// checkNames also proves, once, that a file inside a
+			// protected-name directory is published.
+			subtree, err := verifier.checkNames(dir, name, rel, stat, tracked[rel], within)
+			if err != nil {
 				return err
 			}
 			switch stat.Mode & unix.S_IFMT {
@@ -231,7 +250,14 @@ func walkWorktreeContents(ctx context.Context, dir *os.File, relative, origin st
 					err = errors.New("worktree descendant identity changed")
 				}
 				if err == nil {
-					err = walkWorktreeContents(ctx, child, rel, origin, policy, tracked, device, mountID, depth+1, count, verifier)
+					inner := within
+					if inner == nil {
+						inner = subtree
+					}
+					err = walkWorktreeContents(ctx, child, rel, origin, policy, tracked, device, mountID, depth+1, count, verifier, inner)
+				}
+				if err == nil && subtree != nil && within == nil && !subtree.holdsSecret {
+					verifier.recordPublished("directory", rel, subtree.matches)
 				}
 				if err == nil {
 					var current unix.Stat_t

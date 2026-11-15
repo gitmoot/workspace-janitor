@@ -57,6 +57,14 @@ type categoryArchiveItem struct {
 	// CleanupID is the receipt a batch's quarantine will journal its files
 	// under: `janitor restore <CleanupID>` restores them.
 	CleanupID string `json:"cleanup_id,omitempty"`
+
+	// PublishedNameMatches lists protected-name matches the archive
+	// inspection resolved as published tracked files.
+	PublishedNameMatches []string `json:"published_name_matches,omitempty"`
+	// PublishedSecrets lists built-in secret names found tracked and
+	// published in Git (by the Git collector or the archive inspection):
+	// leaks to rotate and remove from Git. They keep the item refused.
+	PublishedSecrets []core.PublishedSecret `json:"published_secrets,omitempty"`
 }
 
 type categoryArchiveReport struct {
@@ -619,6 +627,9 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			entry = unitEntry(entry, companion)
 		}
 		item := categoryArchiveItem{Path: entry.Path, Status: categoryRefused, SizeBytes: entry.SizeBytes, SizeKnown: entry.SizeIsDeep && !entry.SizeIsLowerBound}
+		if entry.Git != nil {
+			item.PublishedSecrets = entry.Git.PublishedSecrets
+		}
 		if companion != nil {
 			item.Companion = companion.Path
 		}
@@ -752,6 +763,10 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			rule := categoryRule(category, name, item.Path, owner, release)
 			scope := workspacearchive.BindingScope(ctx, policy, rule, policy.Collectors.ProcRoot, &dependents)
 			inspection, err := workspacearchive.Inspect(ctx, rule, scope)
+			item.PublishedNameMatches = inspection.PublishedNameMatches
+			if len(inspection.PublishedSecrets) > 0 {
+				item.PublishedSecrets = inspection.PublishedSecrets
+			}
 			switch {
 			case err != nil:
 				item.Reasons = []string{"archive inspection refused: " + err.Error()}

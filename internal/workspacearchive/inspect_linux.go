@@ -34,43 +34,11 @@ const (
 	maxReported = 20
 )
 
-// Built-in screen ported from the proven manual mover. Policy
-// protect.name_patterns are applied in addition, verbatim.
-var (
-	secretNames    = []string{".env", "id_rsa", "id_ed25519", ".netrc", ".pgpass", ".npmrc", ".pypirc", "credentials.json", "service-account.json", "token.json"}
-	secretSuffixes = []string{".pem", ".key", ".p12", ".pfx", ".kdbx", ".keystore", ".jks"}
-	secretExamples = []string{".env.example", ".env.sample", ".env.template"}
-)
-
-func builtinSecret(name, parent string) bool {
-	low := strings.ToLower(name)
-	for _, example := range secretExamples {
-		if low == example {
-			return false
-		}
-	}
-	// certifi's cacert.pem is the public Mozilla CA bundle, not a secret.
-	if low == "cacert.pem" && filepath.Base(parent) == "certifi" {
-		return false
-	}
-	for _, exact := range secretNames {
-		if low == exact {
-			return true
-		}
-	}
-	if strings.HasPrefix(low, ".env.") || strings.HasPrefix(low, "id_rsa") || strings.HasPrefix(low, "id_ed25519") {
-		return true
-	}
-	for _, suffix := range secretSuffixes {
-		if strings.HasSuffix(low, suffix) {
-			return true
-		}
-	}
-	return false
-}
-
+// The built-in screen (core.BuiltinSecretName) is ported from the proven
+// manual mover. Policy protect.name_patterns are applied in addition,
+// verbatim.
 func secretLike(name, parent string, patterns []string) bool {
-	if builtinSecret(name, parent) {
+	if core.BuiltinSecretName(name, parent) {
 		return true
 	}
 	// Policy patterns match case-insensitively, like the built-in screen:
@@ -111,12 +79,80 @@ type walker struct {
 	inv          inventory
 	secrets      []string
 	refusals     []string
+
+	// published, when set, resolves secret-like names that are published
+	// tracked files (protect.published_name_matches: allow); resolved lists
+	// them as evidence and resolvedCount counts them all. publishedSecrets
+	// are built-in secret names found published: they still refuse.
+	published        *publishedTree
+	resolved         []string
+	resolvedCount    int
+	publishedSecrets []core.PublishedSecret
+	// subtree is the secret-like directory being proven: every file below
+	// it must be a published tracked file. subtreeFailed records that one
+	// was not.
+	subtree       string
+	subtreeFailed bool
 }
 
 func (w *walker) refuse(format string, args ...any) {
 	if len(w.refusals) < maxReported {
 		w.refusals = append(w.refusals, fmt.Sprintf(format, args...))
 	}
+}
+
+func (w *walker) secret(path string) {
+	if len(w.secrets) < maxReported {
+		w.secrets = append(w.secrets, path)
+	}
+}
+
+func (w *walker) resolve(kind, path string) {
+	w.resolvedCount++
+	if len(w.resolved) < maxReported {
+		w.resolved = append(w.resolved, publishedMatch(kind, path))
+	}
+}
+
+// screenName applies the secret-like name screen to member path, the child
+// name of dir observed as st. The built-in secret screen is part of
+// secretLike, so it applies to every member whatever the policy patterns.
+// Each member's publication is proven (and its bytes hashed) at most once.
+// It reports whether path is a directory that starts a subtree proof, which
+// visit completes after walking it.
+func (w *walker) screenName(dir *os.File, name, parent, path string, st state) bool {
+	inside := w.subtree != ""
+	if !secretLike(name, parent, w.patterns) {
+		if inside && st.kind() != unix.S_IFDIR && !w.published.file(dir, name, path, st) {
+			w.subtreeFailed = true
+		}
+		return false
+	}
+	builtin := core.BuiltinSecretName(name, parent)
+	published := w.published != nil && st.kind() == unix.S_IFREG && w.published.file(dir, name, path, st)
+	if inside && (builtin || (st.kind() != unix.S_IFDIR && !published)) {
+		// A built-in secret, published or not, fails the enclosing
+		// directory's proof as well as refusing the tree.
+		w.subtreeFailed = true
+	}
+	switch {
+	case builtin:
+		// A published secret is a leak to rotate, never archived quietly.
+		w.secret(path)
+		if published && len(w.publishedSecrets) < maxReported {
+			w.publishedSecrets = append(w.publishedSecrets, w.published.secret(path))
+		}
+	case published:
+		w.resolve("file", path)
+	case st.kind() == unix.S_IFDIR && inside:
+		// The enclosing subtree proof covers this directory too.
+	case st.kind() == unix.S_IFDIR && w.published != nil && w.published.load():
+		w.subtree, w.subtreeFailed = path, false
+		return true
+	default:
+		w.secret(path)
+	}
+	return false
 }
 
 func (w *walker) add(m Member, st state) error {
@@ -132,8 +168,9 @@ func (w *walker) add(m Member, st state) error {
 // scanTree records every member without following symlinks or crossing
 // mounts; a regular file root is its own only member. hash also hashes
 // regular files; screen applies the refusal screens, which apply to sources
-// and to local trees bound for expiry, not to restores.
-func scanTree(ctx context.Context, root *os.File, source string, patterns []string, limit int, hash, screen bool) (*walker, error) {
+// and to local trees bound for expiry, not to restores. published applies
+// protect.published_name_matches: allow to the secret-like name screen.
+func scanTree(ctx context.Context, root *os.File, source string, patterns []string, limit int, hash, screen, published bool) (*walker, error) {
 	rootState, err := fstate(root)
 	if err != nil {
 		return nil, err
@@ -143,6 +180,9 @@ func scanTree(ctx context.Context, root *os.File, source string, patterns []stri
 		return nil, errors.New("workspace archive source must be a directory or a regular file")
 	}
 	w := &walker{ctx: ctx, source: source, rootState: rootState, patterns: patterns, max: limit, hash: hash, screen: screen}
+	if published {
+		w.published = &publishedTree{ctx: ctx, source: source}
+	}
 	if screen {
 		if secretLike(filepath.Base(source), filepath.Dir(source), patterns) {
 			w.secrets = append(w.secrets, ".")
@@ -225,10 +265,9 @@ func (w *walker) visit(dir *os.File, rel, name string, depth int) error {
 		w.refuse("%s: crosses a mount boundary inside the tree", path)
 		return nil
 	}
+	subtree := false
 	if w.screen {
-		if secretLike(name, filepath.Join(w.source, rel), w.patterns) && len(w.secrets) < maxReported {
-			w.secrets = append(w.secrets, path)
-		}
+		subtree = w.screenName(dir, name, filepath.Join(w.source, rel), path, st)
 		if hasXattrs(unix.Llistxattr(fmt.Sprintf("%s/%s", descriptorPath(dir), name), nil)) {
 			w.refuse("%s: extended attributes are unsupported", path)
 		}
@@ -250,6 +289,16 @@ func (w *walker) visit(dir *os.File, rel, name string, depth int) error {
 		}
 		if err == nil {
 			err = w.walk(child, path, depth+1)
+		}
+		if err == nil && subtree {
+			// A secret-like directory passes only if every file below it is
+			// a published tracked file.
+			if w.subtreeFailed {
+				w.secret(path)
+			} else {
+				w.resolve("directory", path)
+			}
+			w.subtree, w.subtreeFailed = "", false
 		}
 		child.Close()
 		if err != nil {
@@ -540,12 +589,21 @@ func alternateTargets(content, objectsDir string) []string {
 
 func (w *walker) err() error {
 	if len(w.secrets) > 0 {
-		return fmt.Errorf("secret-like files keep %s local: %s", w.source, strings.Join(w.secrets, ", "))
+		return &secretRefusal{source: w.source, secrets: w.secrets, published: w.publishedSecrets}
 	}
 	if len(w.refusals) > 0 {
 		return fmt.Errorf("%s cannot be archived faithfully: %s", w.source, strings.Join(w.refusals, "; "))
 	}
 	return nil
+}
+
+// publishedEvidence lists the secret-like names resolved as published
+// tracked files, then how many more were resolved than are listed.
+func (w *walker) publishedEvidence() []string {
+	if more := w.resolvedCount - len(w.resolved); more > 0 {
+		return append(w.resolved, fmt.Sprintf("%d more protected-name match(es) on published tracked files", more))
+	}
+	return w.resolved
 }
 
 // unchanged is the extraction-equivalent comparison: every recorded member
