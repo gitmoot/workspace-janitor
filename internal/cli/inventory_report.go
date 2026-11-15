@@ -77,6 +77,7 @@ type inventoryBudget struct {
 
 type inventoryReport struct {
 	Growth               inventoryGrowth         `json:"growth"`
+	NewEntries           *newEntriesReport       `json:"new_entries,omitempty"`
 	Budgets              []inventoryBudget       `json:"store_budgets"`
 	Unresolved           []string                `json:"unresolved_decisions"`
 	Activities           []core.CapacityActivity `json:"activities"`
@@ -263,6 +264,7 @@ func buildInventoryReport(ctx context.Context, tx *store.Tx, policy config.Polic
 		}
 		growth.OmittedChanges = changed - len(growth.Changes)
 	}
+	report.NewEntries = buildNewEntries(ctx, policy, pair, growth)
 	for _, rule := range policy.Caches {
 		row := inventoryBudget{Path: rule.Path, Owner: inventoryOwner(rule.Path, policy), Approval: rule.Recovery.Approval, Kind: "cache", ApparentBytes: observedSize(current[rule.Path]), Retention: rule.Retention, Reasons: []string{"fresh producer and safety preflight still required"}}
 		if rule.MaxBytes > 0 {

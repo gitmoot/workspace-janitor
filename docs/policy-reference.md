@@ -8,7 +8,7 @@ The policy defaults to `<config-dir>/policy.yaml`; `--policy` overrides `JANITOR
 
 | Section | Meaning |
 | --- | --- |
-| `roots` | Discovery paths, `max_depth`, symlink and filesystem traversal, `report_only` (no mutations under that root). With `cross_filesystem: false`, a mount point inside a root is listed but neither the metadata walk nor deep sizing enters it; its deep size is reported as unknown, never as a measured total: `size_is_lower_bound: true` with an `unknown:deep_size_partial` observation, and `size_bytes` is 0 only because nothing behind the boundary was counted. Do not use a mounted archive or network share as part of a local root. |
+| `roots` | Discovery paths, `max_depth`, symlink and filesystem traversal, `report_only` (no mutations under that root), `report_new_entries` (report new direct children; see [New root entries](#new-root-entries)). With `cross_filesystem: false`, a mount point inside a root is listed but neither the metadata walk nor deep sizing enters it; its deep size is reported as unknown, never as a measured total: `size_is_lower_bound: true` with an `unknown:deep_size_partial` observation, and `size_bytes` is 0 only because nothing behind the boundary was counted. Do not use a mounted archive or network share as part of a local root. |
 | `protect` | Additive protected paths and basename patterns; built-in credential names, Gitmoot home, state and effective quarantine remain protected. |
 | `retention` | Default quarantine period (`none`, `3d`, `7d`, `30d`, `90d`, `permanent`), quarantine directory, and separate deletion opt-in. `archived` (same values; unset follows `default`) is the quarantine period of items whose receipt records a verified archive of their content, so they stay restorable from it: a released workspace or category item whose quarantined snapshot carries a workspace archive binding (manifest and SHA-256), or an `omp_session_artifacts` file whose receipt names its verified batch. `none` expires them at the next expiry. It is measured from the move and the current value applies at every expiry, so changing it also shortens or extends the hold of items already in quarantine. It never relaxes expiry: the archive is re-bound or re-verified, and in-use, keep, `local_retention`/`local_expiry_enabled` and safety checks still apply. `janitor apply --expire` lists items due only because of it under `archived_retention_due`. |
 | `prevention` | Deep-scan interval, disk alert thresholds/cooldown, per-filesystem capacity targets, and opt-in automatic quarantine and expiry; a policy never installs a timer. |
@@ -367,6 +367,7 @@ directly. Reporting never approves cleanup or releases a job-admission hold.
 | Report field | Meaning and limits |
 | --- | --- |
 | `growth` | Apparent-size changes between matching deep observations, with scan IDs, timestamps, staleness and per-path reasons for unknown values. At most 64 changed/unknown rows; omitted rows are counted. |
+| `new_entries` | Present only when a root sets `report_new_entries: true`; see [New root entries](#new-root-entries). |
 | `store_budgets` | Declared logical-size thresholds, allocated prune caps, export-file caps, retention, owners and approval gaps. These have different units/scopes and must not be added or substituted for each other. |
 | `activities` | Recent quarantine, expiry, official prune, verified archive/restore and recovery-decision outcomes. Fresh completions and replayed receipts have separate counts. |
 | `unresolved_decisions` | Missing owners, approvals and other declared-policy decisions. Existing recovery reports and activity `skipped` rows identify why actions stopped and who owns each decision. |
@@ -401,6 +402,60 @@ up to eight skipped-path/owner/reason rows and count omissions. This reporting
 bound does not delete authoritative audit records or shrink the SQLite file.
 Schema 10 adds reporting metadata; old observations without a recorded scope
 cannot establish growth.
+
+### New root entries
+
+```yaml
+roots:
+  - path: /root
+    max_depth: 1
+    report_new_entries: true
+```
+
+`report_new_entries` on a root adds `inventory_report.new_entries` to
+`status`, `history` and the daily `cycle` JSON, and a `new root entries:`
+block to their text output. It lists the root's direct children that the
+latest deep scan saw and its comparable predecessor did not, so an operator
+can see what was newly put at the top of a shared directory and by whom.
+It is a flag on the root rather than a separate list of paths because the
+entries come from that root's own inventory: it cannot name a path no scan
+observes, the root path is already validated as canonical, and it cannot drift
+from `roots`. Like `owners`, it is information only and is excluded from the
+plan's policy digest; it never moves, deletes or messages anything.
+
+The baseline is the growth comparison's: `status` is the `growth` status, and
+anything other than `compared` (`no_comparable_baseline`,
+`configured_scope_mismatch`, ...) lists nothing rather than every child as
+new. `previous_discovery_incomplete` also lists nothing: a path a bounded or
+failed walk did not see is unobserved, not absent. Comparison is by path, so a
+child replaced under the same name is not new. Up to 100 entries are listed,
+sorted by path; `total` and `omitted_entries` count the rest. Until the next
+deep scan, later reports repeat the same pair.
+
+| Entry field | Meaning |
+| --- | --- |
+| `type` | `dir`, `file`, `symlink`, `repo`, `worktree` (linked Git worktree) or `special`. `repo`/`worktree` need the Git collector. |
+| `created_at`, `created_at_source` | Birth time (`birth`) where the filesystem records one, else inode change time (`ctime`, which later changes also move); `replaced_since_scan` or `unavailable` leave it null. |
+| `apparent_bytes`, `size_is_lower_bound` | Deep apparent size when measured; null when unknown. |
+| `attributions` | Best-effort evidence of who made or uses the entry, each with its `source`. None proves the creator. |
+
+Attribution sources, all read-only:
+
+- `policy_owner`: the decision owner a cache rule, evidence export or
+  `owners` entry names, exactly as in [Decision owners](#decision-owners).
+- `gitmoot_ledger`: the role Gitmoot's ledger names for jobs/tasks whose
+  `worktree_path` is exactly the entry (`tasks.disposal_escalation_role`,
+  `jobs.dispatched_by`); `contested` or `unknown` when it names several or none.
+- `linked_worktree`: the main repository of a linked Git worktree.
+- `omp_session_process` / `process_cwd`: a live process (from
+  `collectors.proc_root`, only with `collectors.processes: true`) whose
+  working directory is the entry or inside it at report time. An OMP process
+  started with `--resume=<session.jsonl>` is named by its session directory;
+  any other by its command name. At most eight per entry.
+- `none` with value `unknown`: no source names anyone.
+
+`attribution` states, per source, what could be read. An unavailable Gitmoot
+ledger or process table attributes nothing; that is never read as "nobody".
 
 ### Scan history retention
 

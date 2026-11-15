@@ -23,6 +23,10 @@ roots:
     cross_filesystem: false
     # report_only keeps a root in the inventory but bars any mutating action.
     report_only: false
+    # report_new_entries lists, in status and the daily cycle report, direct
+    # children absent from the previous comparable deep scan, with
+    # best-effort creator attribution. Information only; nothing is moved.
+    report_new_entries: false
 
 # Protections are additive: these entries are added to the built-in ones
 # (credential directories and secret-shaped filenames), never replace them.

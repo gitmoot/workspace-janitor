@@ -75,6 +75,11 @@ type Root struct {
 	// owner-approved archive category archive a direct child with a verified
 	// copy, then quarantine and expire exactly that archived tree.
 	ArchiveOnly bool `yaml:"archive_only" json:"archive_only"`
+	// ReportNewEntries lists, in the inventory report, the root's direct
+	// children that are absent from the comparable previous deep scan, with
+	// best-effort creator attribution. It is information only, like owners:
+	// it cannot move a decision, so the plan's policy digest leaves it out.
+	ReportNewEntries bool `yaml:"report_new_entries" json:"report_new_entries,omitempty"`
 }
 
 // Protect lists paths and name patterns that may never be mutated.
