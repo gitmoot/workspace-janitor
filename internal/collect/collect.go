@@ -494,15 +494,15 @@ func runBounded(
 }
 
 // runBoundedFor is runBounded with an explicit timeout, which the report
-// names as what.
-func runBoundedFor(
+// names as what, for a collector of any observation type.
+func runBoundedFor[T any](
 	ctx context.Context,
 	opts *Options,
 	name string,
 	timeout time.Duration,
 	what string,
-	gather func(context.Context, *Options) ([]Reference, core.CollectorReport),
-) ([]Reference, core.CollectorReport) {
+	gather func(context.Context, *Options) ([]T, core.CollectorReport),
+) ([]T, core.CollectorReport) {
 	deadline := nowFunc().Add(timeout)
 	collectorCtx, cancel := context.WithDeadline(ctx, deadline)
 	// The caller may impose an earlier deadline than this collector's own.
@@ -517,7 +517,7 @@ func runBoundedFor(
 	defer cancel()
 
 	type outcome struct {
-		refs   []Reference
+		refs   []T
 		report core.CollectorReport
 	}
 	// Buffered so a collector that publishes after the caller has moved on

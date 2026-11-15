@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -446,10 +447,21 @@ func EvidenceDigest(entries []core.Entry) string {
 func PolicyDigest(policy config.Policy) string {
 	// The effective policy is marshalled in full: any field that can move
 	// a decision is part of it, and hashing the whole document means a new
-	// field cannot be forgotten here. The one exception is owners: a
-	// decision owner is information that cannot move a decision, so
-	// naming one neither changes a plan's identity nor voids its approvals.
+	// field cannot be forgotten here. The exceptions are owners and
+	// roots[].report_new_entries: both are reporting information that
+	// cannot move a decision, so setting one neither changes a plan's
+	// identity nor voids its approvals.
 	policy.Owners = nil
+	for i := range policy.Roots {
+		if policy.Roots[i].ReportNewEntries {
+			// Copy before clearing: the caller shares the backing array.
+			policy.Roots = slices.Clone(policy.Roots)
+			for j := range policy.Roots {
+				policy.Roots[j].ReportNewEntries = false
+			}
+			break
+		}
+	}
 	encoded, err := core.MarshalJSON(policy)
 	if err != nil {
 		// Marshalling a validated policy cannot fail; if it somehow did, a

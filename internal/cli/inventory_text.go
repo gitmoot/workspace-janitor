@@ -41,6 +41,28 @@ func appendInventoryFields(fields []output.Field, report *inventoryReport) []out
 		}
 		fields = append(fields, output.Field{Key: change.Path + ":", Value: value + "; owner=" + change.Owner})
 	}
+	if entries := report.NewEntries; entries != nil {
+		fields = append(fields, output.Field{Key: "new root entries:", Value: fmt.Sprintf("%s roots=%s scan=%s previous=%s total=%d omitted=%d", entries.Status, strings.Join(entries.Roots, ","), entries.ScanID, entries.PreviousScanID, entries.Total, entries.OmittedEntries)})
+		for i := range entries.Entries {
+			entry := &entries.Entries[i]
+			created := "unknown"
+			if entry.CreatedAt != nil {
+				created = entry.CreatedAt.Format(time.RFC3339)
+			}
+			size := inventoryInt(entry.ApparentBytes)
+			if entry.SizeIsLowerBound {
+				size = ">=" + size
+			}
+			attributions := make([]string, 0, len(entry.Attributions))
+			for _, attribution := range entry.Attributions {
+				attributions = append(attributions, attribution.Source+"="+attribution.Value)
+			}
+			fields = append(fields, output.Field{Key: "new " + entry.Path + ":", Value: fmt.Sprintf("type=%s created=%s (%s) apparent_bytes=%s; attribution %s", entry.Type, created, entry.CreatedAtSource, size, strings.Join(attributions, ", "))})
+		}
+		for _, note := range entries.Attribution {
+			fields = append(fields, output.Field{Key: "new entry attribution:", Value: note})
+		}
+	}
 	for i := range report.Budgets {
 		budget := &report.Budgets[i]
 		fields = append(fields, output.Field{Key: "store " + budget.Path + ":", Value: fmt.Sprintf("owner=%s observed_apparent=%s logical_threshold=%s allocated_prune_cap=%s export_file_cap=%s retention=%s; %s", budget.Owner, inventoryInt(budget.ApparentBytes), inventoryInt(budget.LogicalThreshold), inventoryInt(budget.AllocatedPruneCap), inventoryInt(budget.ExportFileCap), budget.Retention, strings.Join(budget.Reasons, "; "))})
