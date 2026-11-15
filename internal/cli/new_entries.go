@@ -3,10 +3,8 @@ package cli
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -89,6 +87,12 @@ func buildNewEntries(ctx context.Context, policy config.Policy, pair store.Inven
 	if report.Status != "compared" {
 		return report
 	}
+	// With no deep scan the comparison falls back to metadata-only scans,
+	// which run often: a child would be new against minutes-old state.
+	if !pair.Deep {
+		report.Status = "no_comparable_deep_baseline"
+		return report
+	}
 	report.ScanID, report.PreviousScanID = pair.Current.ID, pair.Previous.ID
 	// An absent path in a bounded or failed walk is unobserved, not new.
 	if !completeDiscovery(*pair.Previous) {
@@ -159,7 +163,7 @@ func buildNewEntries(ctx context.Context, policy config.Policy, pair store.Inven
 	if !policy.Collectors.Processes {
 		report.Attribution = append(report.Attribution, "processes: process collector disabled")
 	} else {
-		report.Attribution = append(report.Attribution, attributeNewEntryProcesses(policy.Collectors.ProcRoot, index, report.Entries))
+		report.Attribution = append(report.Attribution, attributeNewEntryProcesses(ctx, policy, paths, index, report.Entries))
 	}
 	for i := range report.Entries {
 		if len(report.Entries[i].Attributions) == 0 {
@@ -185,75 +189,37 @@ func newEntryType(entry *core.Entry) string {
 }
 
 // attributeNewEntryProcesses adds, to each entry holding a live process's
-// working directory, that process's OMP session directory (from a
-// --resume=<session.jsonl> argument) or else its command name. It returns
-// what it could inspect.
-func attributeNewEntryProcesses(procRoot string, index map[string]int, entries []newRootEntry) string {
-	dirents, err := os.ReadDir(procRoot)
-	if err != nil {
-		return fmt.Sprintf("processes: %s is unavailable: %v", procRoot, err)
-	}
-	inspected, unreadable := 0, 0
-	for _, dirent := range dirents {
-		pid := dirent.Name()
-		if _, err := strconv.Atoi(pid); err != nil {
-			continue
-		}
-		procDir := filepath.Join(procRoot, pid)
-		cwd, err := os.Readlink(filepath.Join(procDir, "cwd"))
-		if processGone(err) {
-			continue
-		}
-		if err != nil {
-			unreadable++
-			continue
-		}
-		inspected++
-		at, ok := enclosingEntry(index, cwd)
+// working directory, that process's OMP session directory or else its
+// command name. It runs under the process collector's bounds and returns
+// what it could inspect; a bounded or late observation is incomplete.
+func attributeNewEntryProcesses(ctx context.Context, policy config.Policy, paths []string, index map[string]int, entries []newRootEntry) string {
+	opts := collect.Options{Processes: true, ProcRoot: policy.Collectors.ProcRoot, Limits: collectLimits(policy, scanOptions{})}
+	processes, observed := collect.ProcessWorkdirs(ctx, opts, paths)
+	for _, process := range processes {
+		at, ok := enclosingEntry(index, process.Cwd)
 		if !ok {
 			continue
 		}
-		attribution := newEntryAttribution{Source: newEntryByProcess, Detail: "pid " + pid + " cwd " + cwd}
-		if raw, err := os.ReadFile(filepath.Join(procDir, "cmdline")); err == nil {
-			if session := ompSessionDir(strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")); session != "" {
-				attribution.Source, attribution.Value = newEntryByOMPSession, session
-			}
-		}
-		if attribution.Value == "" {
-			comm, err := os.ReadFile(filepath.Join(procDir, "comm"))
-			attribution.Value = strings.TrimSpace(string(comm))
-			if err != nil || attribution.Value == "" {
-				attribution.Value = config.UnknownOwner
-			}
+		attribution := newEntryAttribution{Source: newEntryByProcess, Value: process.Name, Detail: "pid " + process.PID + " cwd " + process.Cwd}
+		if process.OMPSession != "" {
+			attribution.Source, attribution.Value = newEntryByOMPSession, process.OMPSession
 		}
 		row := &entries[at]
-		processes, duplicate := 0, false
+		count, duplicate := 0, false
 		for _, other := range row.Attributions {
 			if other.Source == newEntryByOMPSession || other.Source == newEntryByProcess {
-				processes++
+				count++
 				duplicate = duplicate || (other.Source == attribution.Source && other.Value == attribution.Value)
 			}
 		}
-		if !duplicate && processes < newEntryProcessLimit {
+		if !duplicate && count < newEntryProcessLimit {
 			row.Attributions = append(row.Attributions, attribution)
 		}
 	}
-	return fmt.Sprintf("processes: inspected %d live working directories under %s at report time; %d unreadable", inspected, procRoot, unreadable)
-}
-
-// ompSessionDir is the session directory name of an OMP process resumed from
-// a session file, or "" when argv resumes none.
-func ompSessionDir(argv []string) string {
-	for i, arg := range argv {
-		session, ok := strings.CutPrefix(arg, "--resume=")
-		if !ok && arg == "--resume" && i+1 < len(argv) {
-			session, ok = argv[i+1], true
-		}
-		if ok && filepath.IsAbs(session) && strings.HasSuffix(session, ".jsonl") {
-			return filepath.Base(filepath.Dir(session))
-		}
+	if observed.Status != core.CollectorRan {
+		return fmt.Sprintf("processes: incomplete (%s): %s", observed.Status, observed.Detail)
 	}
-	return ""
+	return "processes: live working directories at report time; " + observed.Detail
 }
 
 // enclosingEntry is the index of the entry that is path or its nearest

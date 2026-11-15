@@ -426,7 +426,10 @@ plan's policy digest; it never moves, deletes or messages anything.
 The baseline is the growth comparison's: `status` is the `growth` status, and
 anything other than `compared` (`no_comparable_baseline`,
 `configured_scope_mismatch`, ...) lists nothing rather than every child as
-new. `previous_discovery_incomplete` also lists nothing: a path a bounded or
+new. The comparison must also be between deep scans: when none exists, growth
+falls back to frequent metadata-only scans, and the report says
+`no_comparable_deep_baseline` instead of listing anything.
+`previous_discovery_incomplete` also lists nothing: a path a bounded or
 failed walk did not see is unobserved, not absent. Comparison is by path, so a
 child replaced under the same name is not new. Up to 100 entries are listed,
 sorted by path; `total` and `omitted_entries` count the rest. Until the next
@@ -449,9 +452,15 @@ Attribution sources, all read-only:
 - `linked_worktree`: the main repository of a linked Git worktree.
 - `omp_session_process` / `process_cwd`: a live process (from
   `collectors.proc_root`, only with `collectors.processes: true`) whose
-  working directory is the entry or inside it at report time. An OMP process
-  started with `--resume=<session.jsonl>` is named by its session directory;
-  any other by its command name. At most eight per entry.
+  working directory is the entry or inside it at report time. A process
+  whose executable or `argv[0]` is named `omp` and that was started with
+  `--resume=<session.jsonl>` is named by its session directory; any other by
+  its command name, whatever its arguments. At most eight per entry. The
+  process table is read under the process collector's bounds
+  (`limits.max_dir_entries` processes, `limits.command_timeout`); a command
+  line is read without blocking and at most 64 KiB. When a bound is hit the
+  `attribution` line says `incomplete`, and a timed-out read attributes no
+  process at all.
 - `none` with value `unknown`: no source names anyone.
 
 `attribution` states, per source, what could be read. An unavailable Gitmoot
