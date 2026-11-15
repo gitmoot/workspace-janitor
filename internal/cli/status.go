@@ -46,7 +46,12 @@ type statusReport struct {
 	Inventory       *inventoryReport       `json:"inventory_report"`
 }
 
-func runStatus(ctx context.Context, e *env) error {
+// runStatus reports paths, policy, stored state and the capacity decision.
+// With capacityOnly it reads nothing but the stored capacity decision: no
+// store summaries, model usage or inventory growth, and the policy file
+// without the state-derived category archive rules, which the decision does
+// not depend on. Admission consumers poll this under load.
+func runStatus(ctx context.Context, e *env, capacityOnly bool) error {
 	format, err := e.format()
 	if err != nil {
 		return err
@@ -55,7 +60,12 @@ func runStatus(ctx context.Context, e *env) error {
 	if err != nil {
 		return err
 	}
-	policy, err := e.loadPolicy(ctx)
+	var policy config.Policy
+	if capacityOnly {
+		policy, err = e.loadFilePolicy()
+	} else {
+		policy, err = e.loadPolicy(ctx)
+	}
 	if err != nil {
 		return err
 	}
@@ -78,58 +88,98 @@ func runStatus(ctx context.Context, e *env) error {
 		},
 	}
 
-	db, err := store.OpenExisting(ctx, paths.DatabaseFile)
-	switch {
-	case errors.Is(err, store.ErrNotInitialized):
-		// Reporting must never create state as a side effect.
-	case err != nil:
+	if capacityOnly {
+		if err := readStatusCapacity(ctx, &report, policy); err != nil {
+			return err
+		}
+	} else if err := readStatusStore(ctx, &report, policy); err != nil {
 		return err
-	default:
-		defer db.Close()
-		stats, err := db.Stats(ctx)
-		if err != nil {
-			return err
-		}
-		var usage store.UsageTotals
-		if err := db.Read(ctx, func(tx *store.Tx) error {
-			var err error
-			usage, err = tx.UsageTotals(ctx)
-			return err
-		}); err != nil {
-			return err
-		}
-		report.Store.Initialized = true
-		report.Store.Stats = &stats
-		report.Store.ModelUsage = &usage
-		if stats.SchemaVersion == store.SchemaVersion() {
-			if err := db.Read(ctx, func(tx *store.Tx) error {
-				inventory, err := buildInventoryReport(ctx, tx, policy, time.Now().UTC())
-				report.Inventory = &inventory
-				return err
-			}); err != nil {
-				return err
-			}
-		}
-		if len(policy.Prevention.Targets) > 0 && stats.SchemaVersion == store.SchemaVersion() {
-			var snapshot core.CapacitySnapshot
-			if err := db.Read(ctx, func(tx *store.Tx) error {
-				var err error
-				snapshot, err = tx.CapacitySnapshot(ctx)
-				return err
-			}); err != nil {
-				return err
-			}
-			if snapshot.PolicyHash == capacityPolicyHash(policy) {
-				snapshot = snapshot.Expire(time.Now().UTC())
-				report.Capacity = &snapshot
-			}
-		}
 	}
 
 	if format == output.FormatJSON {
 		return output.WriteJSON(e.stdout, "status", report)
 	}
 	return writeStatusText(e, report)
+}
+
+// readStatusStore fills the full status from the database, leaving report
+// untouched when none exists: reporting must never create state.
+func readStatusStore(ctx context.Context, report *statusReport, policy config.Policy) error {
+	db, err := store.OpenExisting(ctx, report.Store.DatabaseFile)
+	switch {
+	case errors.Is(err, store.ErrNotInitialized):
+		return nil
+	case err != nil:
+		return err
+	}
+	defer db.Close()
+	stats, err := db.Stats(ctx)
+	if err != nil {
+		return err
+	}
+	var usage store.UsageTotals
+	if err := db.Read(ctx, func(tx *store.Tx) error {
+		var err error
+		usage, err = tx.UsageTotals(ctx)
+		return err
+	}); err != nil {
+		return err
+	}
+	report.Store.Initialized = true
+	report.Store.Stats = &stats
+	report.Store.ModelUsage = &usage
+	if stats.SchemaVersion != store.SchemaVersion() {
+		return nil
+	}
+	if err := db.Read(ctx, func(tx *store.Tx) error {
+		inventory, err := buildInventoryReport(ctx, tx, policy, time.Now().UTC())
+		report.Inventory = &inventory
+		return err
+	}); err != nil {
+		return err
+	}
+	return readStoredCapacity(ctx, db, report, policy)
+}
+
+// readStatusCapacity fills only the capacity decision. It opens the database
+// read-only, so it never migrates, takes no write lock and does not
+// checkpoint on close; a missing database or a schema this build cannot read
+// leaves the unknown-capacity answer in place.
+func readStatusCapacity(ctx context.Context, report *statusReport, policy config.Policy) error {
+	db, err := store.OpenReadOnly(ctx, report.Store.DatabaseFile)
+	switch {
+	case errors.Is(err, store.ErrNotInitialized):
+		return nil
+	case errors.Is(err, store.ErrSchemaMismatch):
+		report.Store.Initialized = true
+		return nil
+	case err != nil:
+		return err
+	}
+	defer db.Close()
+	report.Store.Initialized = true
+	return readStoredCapacity(ctx, db, report, policy)
+}
+
+// readStoredCapacity replaces the unknown capacity with the stored snapshot
+// when that snapshot was sampled under the current capacity policy.
+func readStoredCapacity(ctx context.Context, db *store.Store, report *statusReport, policy config.Policy) error {
+	if len(policy.Prevention.Targets) == 0 {
+		return nil
+	}
+	var snapshot core.CapacitySnapshot
+	if err := db.Read(ctx, func(tx *store.Tx) error {
+		var err error
+		snapshot, err = tx.CapacitySnapshot(ctx)
+		return err
+	}); err != nil {
+		return err
+	}
+	if snapshot.PolicyHash == capacityPolicyHash(policy) {
+		snapshot = snapshot.Expire(time.Now().UTC())
+		report.Capacity = &snapshot
+	}
+	return nil
 }
 
 func writeStatusText(e *env, report statusReport) error {
@@ -148,9 +198,13 @@ func writeStatusText(e *env, report statusReport) error {
 	}
 	fields = appendInventoryFields(fields, report.Inventory)
 	if report.Store.Stats == nil {
+		state := "not initialized; run \"janitor doctor\""
+		if report.Store.Initialized {
+			state = "summary not read with --capacity"
+		}
 		fields = append(fields, output.Field{
 			Key:   "store:",
-			Value: fmt.Sprintf("%s (not initialized; run \"janitor doctor\")", report.Store.DatabaseFile),
+			Value: fmt.Sprintf("%s (%s)", report.Store.DatabaseFile, state),
 		})
 		return output.WriteFields(e.stdout, fields)
 	}

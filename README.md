@@ -176,6 +176,7 @@ and needs no C toolchain.
 janitor --help
 janitor doctor                 # create directories, open the store, report checks
 janitor status                 # resolved paths, policy source, stored state
+janitor status --capacity      # only the stored capacity decision, for admission polling
 janitor policy check           # validate the policy, print the effective policy
 janitor scan                   # inventory the configured roots
 janitor scan /repos --deep-size    # one root, with bounded recursive sizes
@@ -395,7 +396,9 @@ Only configured inventory roots are measured.
 Optional `prevention.targets` adds persisted per-filesystem pressure state;
 see [capacity target fields](docs/policy-reference.md#capacity-targets). `scan`,
 `cycle`, and the watcher's independent timer share a bounded sample and durable
-hysteresis. `janitor --format json status` exposes `data.capacity` without sampling.
+hysteresis. `janitor --format json status` exposes `data.capacity` without sampling;
+`status --capacity` returns the same `data.capacity` without the store summaries,
+model usage, or inventory growth, for pollers that must answer under load.
 Missing, stale, failed, or policy-mismatched observations are unknown and hold
 admission rather than reporting health. This contract is advisory: it does not
 yet pause jobs, authorize cleanup, or replace the independent dispatch disk guard.

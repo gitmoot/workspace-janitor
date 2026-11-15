@@ -58,6 +58,12 @@ report healthy capacity. Unknown byte values are JSON `null`, never zero.
 `valid_until`, `policy_hash`, and `volumes`; each volume includes its device/root
 identity, thresholds, state, `admission_hold`, and reason. Status is read-only;
 missing data or a changed policy returns unknown until a fresh sample exists.
+Admission pollers should run `janitor --format json status --capacity`: the
+same `status` envelope and the same `data.capacity`, with `build`,
+`contract_version`, `paths`, and `policy`, but no `store.stats`,
+`store.model_usage`, or `inventory_report` (null). It opens the database
+read-only and reads one row, so it neither migrates nor waits on a writer; a
+missing database or a schema this build does not expect returns unknown.
 `cycle`, stored `scan`, and watcher reports also include the snapshot. This is
 an advisory contract, not deletion authority or an enforced job admission gate.
 Archive/restore allocations separately retain a decimal 10 GB destination
