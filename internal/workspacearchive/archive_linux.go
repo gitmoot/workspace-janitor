@@ -88,6 +88,11 @@ func (s Scope) limit() int {
 func Inspect(ctx context.Context, rule config.WorkspaceArchiveRule, scope Scope) (Inspection, error) {
 	in, err := inspect(ctx, rule, scope)
 	if err != nil {
+		// A secret refusal still reports the secrets published in Git.
+		var refusal *secretRefusal
+		if errors.As(err, &refusal) {
+			return Inspection{PublishedSecrets: refusal.published}, err
+		}
 		return Inspection{}, err
 	}
 	defer in.close()

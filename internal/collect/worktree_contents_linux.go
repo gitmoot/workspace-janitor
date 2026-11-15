@@ -83,7 +83,14 @@ func proveWorktreeContents(ctx context.Context, runner gitRunner, path string, o
 	}
 	count := 0
 	verifier := sourceApprovalVerifier{ctx: ctx, runner: runner, path: path, origin: origin, policy: opts.WorktreePolicy, state: state, now: now}
-	if err := walkWorktreeContents(ctx, root, "", origin, opts.WorktreePolicy, tracked, uint64(initial.Dev), mountID, 0, &count, &verifier); err != nil {
+	err = walkWorktreeContents(ctx, root, "", origin, opts.WorktreePolicy, tracked, uint64(initial.Dev), mountID, 0, &count, &verifier, nil)
+	// Published secrets are reported even when the walk then stops on
+	// another refusal; each one refuses the worktree on its own.
+	state.PublishedSecrets = verifier.publishedSecrets
+	if err == nil {
+		err = verifier.secretRefusal
+	}
+	if err != nil {
 		return nil, fmt.Errorf("worktree contents unproven: %w", err)
 	}
 	var current unix.Stat_t
@@ -152,7 +159,11 @@ func worktreePolicyVeto(path string, policy *config.Policy) error {
 	return nil
 }
 
-func walkWorktreeContents(ctx context.Context, dir *os.File, relative, origin string, policy *config.Policy, tracked map[string]worktreeIndexEntry, device, mountID uint64, depth int, count *int, verifier *sourceApprovalVerifier) error {
+// walkWorktreeContents proves one directory's descendants. within, when set,
+// is the protected-name directory this one lies in: every file below it must
+// then be a published tracked file, with no symlinks or untracked content,
+// or the walk refuses with that directory's own refusal.
+func walkWorktreeContents(ctx context.Context, dir *os.File, relative, origin string, policy *config.Policy, tracked map[string]worktreeIndexEntry, device, mountID uint64, depth int, count *int, verifier *sourceApprovalVerifier, within *protectedSubtree) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -200,13 +211,23 @@ func walkWorktreeContents(ctx context.Context, dir *os.File, relative, origin st
 			if uint64(stat.Dev) != device {
 				return errors.New("worktree contents cross a filesystem boundary")
 			}
-			if err := verifier.checkNames(dir, name, rel, stat, tracked[rel]); err != nil {
+			subtree, err := verifier.checkNames(dir, name, rel, stat, tracked[rel])
+			if err != nil {
 				return err
 			}
 			switch stat.Mode & unix.S_IFMT {
 			case unix.S_IFREG, unix.S_IFLNK:
 				if stat.Mode&unix.S_IFMT == unix.S_IFREG && core.IsDatabasePath(rel) {
 					return errors.New("worktree descendant may be a live database")
+				}
+				if within != nil {
+					published, err := verifier.published(dir, name, rel, stat, tracked[rel])
+					if err != nil {
+						return err
+					}
+					if !published {
+						return within.refusal
+					}
 				}
 				indexed, known := tracked[rel]
 				if known {
@@ -236,7 +257,14 @@ func walkWorktreeContents(ctx context.Context, dir *os.File, relative, origin st
 					err = errors.New("worktree descendant identity changed")
 				}
 				if err == nil {
-					err = walkWorktreeContents(ctx, child, rel, origin, policy, tracked, device, mountID, depth+1, count, verifier)
+					inner := within
+					if inner == nil {
+						inner = subtree
+					}
+					err = walkWorktreeContents(ctx, child, rel, origin, policy, tracked, device, mountID, depth+1, count, verifier, inner)
+				}
+				if err == nil && subtree != nil && within == nil {
+					verifier.recordPublished("directory", rel, subtree.matches)
 				}
 				if err == nil {
 					var current unix.Stat_t

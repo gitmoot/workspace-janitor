@@ -165,6 +165,10 @@ type GitState struct {
 	ContentsKnown bool `json:"contents_known,omitempty"`
 	// ContentsProtection is an observed policy refusal, not broken Git metadata.
 	ContentsProtection string `json:"contents_protection,omitempty"`
+	// PublishedSecrets are built-in secret names the contents proof found
+	// tracked, unmodified, at the published HEAD
+	// (protect.published_name_matches: allow). Each still refuses.
+	PublishedSecrets []PublishedSecret `json:"published_secrets,omitempty"`
 	// SourceApprovalFingerprint binds any used source exception to its complete
 	// current approval policy. Changes invalidate quarantine/expiry snapshots.
 	SourceApprovalFingerprint string `json:"source_approval_fingerprint,omitempty"`

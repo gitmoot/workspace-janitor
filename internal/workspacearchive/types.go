@@ -118,6 +118,10 @@ type Inspection struct {
 	// PublishedNameMatches lists secret-like names that passed the screen
 	// as published tracked files.
 	PublishedNameMatches []string `json:"published_name_matches,omitempty"`
+	// PublishedSecrets lists built-in secret names found tracked,
+	// unmodified, at a published HEAD: leaks to rotate and remove from Git.
+	// They refuse the archive; Inspect returns them with that refusal.
+	PublishedSecrets []core.PublishedSecret `json:"published_secrets,omitempty"`
 }
 
 // File names inside the archive directory; Create never replaces them.

@@ -31,11 +31,14 @@ protect:
     - /srv/data
   name_patterns:
     - "*.backup"
-  # refuse (default): a name_patterns match blocks whole-worktree cleanup and
-  # workspace archiving even on a tracked file whose commit is pushed. allow:
-  # such a match on a tracked, unmodified file at a published HEAD is recorded
-  # as evidence instead; untracked, ignored, modified or unpushed matches
-  # still block. Set allow only on the owner's decision.
+  # refuse (default): a name_patterns or evidence-name match blocks
+  # whole-worktree cleanup and workspace archiving even on tracked content
+  # whose commit is pushed. allow: such a match on a tracked, unmodified file
+  # (or a directory of only such files) at a published HEAD is recorded as
+  # evidence instead; untracked, ignored, modified or unpushed matches still
+  # block, and built-in secret names (.env, *.pem, id_rsa, ...) always block
+  # and are reported as published_secrets when pushed. Set allow only on the
+  # owner's decision.
   # published_name_matches: allow
 
 retention:

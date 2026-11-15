@@ -33,6 +33,7 @@ var gitReadOnlyVerbs = map[string]struct{}{
 	"config":       {},
 	"worktree":     {},
 	"ls-files":     {},
+	"ls-tree":      {},
 	"for-each-ref": {},
 	"log":          {},
 }
@@ -69,14 +70,15 @@ func (g gitRunner) runOutput(ctx context.Context, dir string, limit int, args ..
 	ctx, cancel := context.WithTimeout(ctx, g.timeout)
 	defer cancel()
 
-	// Git's -c options override repository config even on versions that do
-	// not support GIT_CONFIG_COUNT. Status must never run an fsmonitor hook.
-	commandArgs := make([]string, 0, len(args)+5)
-	commandArgs = append(commandArgs, "--no-replace-objects", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+	// Replace refs, grafts and the commit-graph must not redirect object or
+	// parent lookups; status must never run an fsmonitor hook.
+	isolation := core.GitIsolationArgs()
+	commandArgs := make([]string, 0, len(isolation)+len(args))
+	commandArgs = append(commandArgs, isolation...)
 	commandArgs = append(commandArgs, args...)
 	cmd := exec.CommandContext(ctx, g.binary, commandArgs...)
 	cmd.Dir = dir
-	cmd.Env = []string{
+	cmd.Env = append([]string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + dir,
 		"GIT_TERMINAL_PROMPT=0",
@@ -85,7 +87,7 @@ func (g gitRunner) runOutput(ctx context.Context, dir string, limit int, args ..
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"LC_ALL=C",
-	}
+	}, core.GitIsolationEnv()...)
 	var stdout, stderr limitedGitOutput
 	stdout.limit, stderr.limit = limit, limit
 	stdout.cancel, stderr.cancel = cancel, cancel
