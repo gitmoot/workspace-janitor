@@ -120,6 +120,10 @@ prevention:
   #     path: ~/.local/share/pnpm/store/v11  # as `pnpm store path` prints
   #     binary: /usr/local/bin/pnpm
   #     max_bytes: 2147483648
+  #   - kind: cargo-target         # what `cargo clean` removes; runs no command
+  #     path: /root/.cache/herdr-net-target  # a CARGO_TARGET_DIR with cargo's CACHEDIR.TAG
+  #     max_bytes: 4294967296      # 4 GiB
+  #     min_idle: 1h               # default: untouched for this long
   # cache_trim_interval: 15m
 
 # Where entries of a class are supposed to live. A primary project found

@@ -117,11 +117,12 @@ deletion authority; configure it only with the owner's approval.
 
 | Field | Meaning |
 | --- | --- |
-| `kind` | `go-build`, `docker-builder`, `docker-images`, `go-mod` or `pnpm-store`; nothing else is accepted. |
-| `path` | `go-build`, `go-mod`, `pnpm-store` only: the absolute shared cache directory. The Docker kinds take no path. |
-| `binary` | Absolute path of the official `go`, `docker` or `pnpm` executable. For `go-mod` and `pnpm-store` it may not lie inside `path`. |
+| `kind` | `go-build`, `docker-builder`, `docker-images`, `go-mod`, `pnpm-store` or `cargo-target`; nothing else is accepted. |
+| `path` | `go-build`, `go-mod`, `pnpm-store`, `cargo-target` only: the absolute shared cache (or cargo target) directory. The Docker kinds take no path. |
+| `binary` | Absolute path of the official `go`, `docker` or `pnpm` executable. For `go-mod` and `pnpm-store` it may not lie inside `path`. `cargo-target` runs no command and takes no binary. |
 | `max_bytes` | Positive bound. Optional for `docker-images` (see below). |
 | `min_age` | `docker-images` only, required: a whole number of hours, at least `24h`. |
+| `min_idle` | `cargo-target` only, optional (default and `0`: `1h`): the trim waits until nothing in the target directory's top two levels changed for this long. |
 | `keep` | `docker-images` only, optional: up to 64 `repo:tag` glob patterns (Go `path.Match` syntax: `*`, `?`, `[...]`; `*` does not cross `/`), for example `phobos-workspace-mcp:*`. An image with any tag matching a pattern is never removed. Patterns and tags are compared in Docker's short form (`nginx:1.27`, not `docker.io/library/nginx:1.27`); a pattern needs a non-empty repository and tag part and no digest. |
 
 At most one trim per kind and path is accepted.
@@ -208,6 +209,40 @@ At most one trim per kind and path is accepted.
   `pnpm store path --store-dir <path>` names `path` itself and fails
   otherwise. pnpm runs with the binary's directory first on `PATH`, so an
   nvm-, npm- or corepack-installed pnpm finds the `node` beside it.
+- `cargo-target`: keeps a regenerable cargo build target directory (one
+  shared through `CARGO_TARGET_DIR`, for example) within `max_bytes`. It
+  runs no command (`cargo clean` needs the source tree); when the
+  directory's allocated size exceeds `max_bytes` it removes what `cargo
+  clean` would: the contents of each profile directory (every top-level
+  directory holding a `.cargo-lock`, such as `debug` and `release`), the
+  contents of `tmp`, and `.rustc_info.json`. It keeps the directory itself,
+  its `CACHEDIR.TAG` and cargo's lock files (`.cargo-lock`,
+  `.cargo-build-lock`, `.cargo-artifact-lock`). Other top-level entries
+  (`doc`, per-target-triple directories) are not touched. A directory
+  without cargo's `CACHEDIR.TAG` (a regular file starting `Signature:
+  8a477f597d28d172789f06886806bc55`) is refused and reported as `failed`.
+  The trim is postponed (`skipped_in_use`, naming the reason in
+  `active_users`) when:
+  - anything among the directory, its entries and each profile directory's
+    entries was modified within `min_idle`;
+  - a process may use it (see below);
+  - any cargo lock file in a profile directory is held: the trim takes an
+    exclusive, non-blocking `flock` on each, and one held by a build (or
+    that cannot be opened or locked) postpones it. The trim holds every
+    lock while removing, so a build that starts meanwhile waits on cargo's
+    own lock.
+
+  Removal never follows a symlink (a link is removed, never its target) and
+  never crosses into another filesystem: an entry on another device, or a
+  mount below one, is not removed and fails the trim, as does any other
+  removal error.
+
+  ```yaml
+  - kind: cargo-target
+    path: /root/.cache/herdr-net-target
+    max_bytes: 4294967296  # 4 GiB
+    min_idle: 1h           # the default
+  ```
 
 Trims with a `path` report `size_before_bytes`, `size_after_bytes` (the
 allocated size) and `reclaimed_bytes`.
@@ -232,10 +267,17 @@ one) or a handle under the store postpones `pnpm-store`. An image build
 (`docker build`, `docker buildx build`, `bake`, `buildctl build`) postpones
 the Docker build cache prune; an image build or pull (`docker pull`,
 `docker image pull`, `docker compose pull`, `docker-compose pull`) postpones
-the image removal. A postponed trim is reported as `skipped_in_use` and
-retried next cycle; it is not an error. A process that cannot be inspected
-counts as a user. A trim command that fails is reported and makes the cycle
-exit non-zero. Results appear as `cache_trims` in the cycle report.
+the image removal. Any process postpones `cargo-target` whose
+`CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` (in its environment, even a
+shell that only exports it) or `--target-dir` argument names `path`
+(relative to its working directory), whose working directory, executable or
+any open handle lies inside `path`, or that is `cargo`, `rustc`,
+`clippy-driver` or `rustdoc` working at or below the parent of a `path`
+named `target` (cargo's default `<workspace>/target`). A postponed trim is
+reported as `skipped_in_use` and retried next cycle; it is not an error. A
+process that cannot be inspected counts as a user. A trim command that
+fails is reported and makes the cycle exit non-zero. Results appear as
+`cache_trims` in the cycle report.
 
 No trim may target an archive_only root. Validation checks the path, or for
 the Docker kinds Docker's default data root `/var/lib/docker` (and for

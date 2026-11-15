@@ -416,7 +416,11 @@ const (
 	CacheTrimDockerImages  = "docker-images"
 	CacheTrimGoMod         = "go-mod"
 	CacheTrimPnpmStore     = "pnpm-store"
+	CacheTrimCargoTarget   = "cargo-target"
 )
+
+// DefaultCargoTargetIdle is a cargo-target trim's min_idle when unset.
+const DefaultCargoTargetIdle = time.Hour
 
 // MinDockerImageAge is the youngest min_age a docker-images trim accepts.
 const MinDockerImageAge = 24 * time.Hour
@@ -439,6 +443,11 @@ const MaxDockerImageKeep = 64
 // go-mod runs `go clean -modcache` for Path, and pnpm-store runs `pnpm store
 // prune` for Path, when its allocated size exceeds MaxBytes and no process
 // using it runs.
+// cargo-target runs no command: when the target directory's allocated size
+// exceeds MaxBytes, no process uses it, no cargo build holds its locks and
+// nothing in it changed within MinIdle, it removes what `cargo clean` would
+// (each profile directory's contents, tmp's contents, .rustc_info.json) but
+// keeps the directory, its CACHEDIR.TAG and cargo's lock files.
 type CacheTrim struct {
 	Kind     string `yaml:"kind" json:"kind"`
 	Path     string `yaml:"path,omitempty" json:"path,omitempty"`
@@ -449,6 +458,9 @@ type CacheTrim struct {
 	// Keep is docker-images only: repo:tag glob patterns (path.Match
 	// syntax, in Docker's short form) of images never removed.
 	Keep []string `yaml:"keep,omitempty" json:"keep,omitempty"`
+	// MinIdle is cargo-target only: the target directory is trimmed only
+	// when nothing in its top two levels changed for this long.
+	MinIdle Duration `yaml:"min_idle,omitempty" json:"min_idle,omitempty"`
 }
 
 // CapacityTarget names an inventory root whose filesystem needs headroom.
@@ -744,6 +756,13 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 		if p.Prevention.CacheTrims[i].Path != "" {
 			p.Prevention.CacheTrims[i].Path = expand(fmt.Sprintf("prevention.cache_trims[%d].path", i), p.Prevention.CacheTrims[i].Path)
 		}
+		if p.Prevention.CacheTrims[i].Kind == CacheTrimCargoTarget {
+			// cargo-target runs no command, so it has no binary to expand.
+			if p.Prevention.CacheTrims[i].MinIdle == 0 {
+				p.Prevention.CacheTrims[i].MinIdle = Duration(DefaultCargoTargetIdle)
+			}
+			continue
+		}
 		p.Prevention.CacheTrims[i].Binary = expand(fmt.Sprintf("prevention.cache_trims[%d].binary", i), p.Prevention.CacheTrims[i].Binary)
 	}
 	if p.Collectors.ProcRoot != "" {
@@ -1009,8 +1028,18 @@ func (p *Policy) Validate() core.FieldErrors {
 				errs.Add(field+".path", "docker-images takes no path; Docker owns its image store")
 			}
 			targets = append(targets, ContainerdDataRoot)
+		case CacheTrimCargoTarget:
+			if !core.IsCanonicalPath(trim.Path) || trim.Path == "/" {
+				errs.Add(field+".path", "cargo-target requires the absolute target directory")
+			}
+			if trim.Binary != "" {
+				errs.Add(field+".binary", "cargo-target takes no binary; it runs no command")
+			}
+			if trim.MinIdle < 0 {
+				errs.Add(field+".min_idle", "must not be negative")
+			}
 		default:
-			errs.Add(field+".kind", "must be go-build, docker-builder, docker-images, go-mod or pnpm-store")
+			errs.Add(field+".kind", "must be go-build, docker-builder, docker-images, go-mod, pnpm-store or cargo-target")
 		}
 		for _, target := range targets {
 			for _, root := range p.Roots {
@@ -1023,8 +1052,13 @@ func (p *Policy) Validate() core.FieldErrors {
 			errs.Add(field, "duplicates an earlier cache trim")
 		}
 		trimKinds[trim.Kind+"\x00"+trim.Path] = true
-		if !core.IsCanonicalPath(trim.Binary) {
-			errs.Add(field+".binary", "must be an absolute executable path")
+		if trim.Kind != CacheTrimCargoTarget {
+			if !core.IsCanonicalPath(trim.Binary) {
+				errs.Add(field+".binary", "must be an absolute executable path")
+			}
+			if trim.MinIdle != 0 {
+				errs.Add(field+".min_idle", "only cargo-target takes min_idle")
+			}
 		}
 		if trim.Kind == CacheTrimDockerImages {
 			// max_bytes is optional: zero trims on every run.
