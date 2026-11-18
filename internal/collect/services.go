@@ -795,7 +795,7 @@ func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, 
 		// directory above its first run-dependent component, only when
 		// that prefix provably contains it (see stagehandPrefixes.check).
 		if !core.PathWithin(ref.Path, runsDir) {
-			prefix, why := prefixes.check(ref.Path)
+			prefix, why := prefixes.check(ref.rawPath, ref.Path)
 			if why != "" {
 				noteUnreadable(report, fmt.Sprintf("%s builds a path outside its run directory: %s (%s)", label, ref.Path, why))
 				continue
@@ -835,11 +835,18 @@ func newStagehandPrefixes(ctx context.Context, opts *Options) *stagehandPrefixes
 // everything the janitor manages). Containment must also be proven on
 // disk: the run-dependent component may name any entry below the prefix,
 // so a symlink on the prefix path or anywhere below it could send the
-// real target elsewhere. An existing prefix must resolve to itself and a
+// real target elsewhere. path must be spelled clean in the spec (raw): a
+// ".." after a symlink resolves through the symlink's target, not
+// lexically. An existing prefix must resolve to itself and a
 // bounded walk must find no symlink below it. A prefix that does not exist
 // yet redirects nothing: its nearest existing ancestor must resolve to
 // itself and must not be an inventory root or an ancestor of one.
-func (s *stagehandPrefixes) check(path string) (string, string) {
+func (s *stagehandPrefixes) check(raw, path string) (string, string) {
+	if raw != path {
+		// filepath.Clean folds "x/.." lexically, but the kernel follows x
+		// first: a symlink at x sends the real path elsewhere.
+		return "", "it is not spelled as a clean path (" + raw + ")"
+	}
 	if s == nil {
 		return "", "its containment cannot be checked"
 	}
@@ -1035,7 +1042,7 @@ func specPathReferences(spec, signal, detail string, runtime map[string]string, 
 	var currentKey string
 	addOne := func(path string) {
 		if p := filepath.Clean(path); filepath.IsAbs(p) && p != "/" {
-			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail, specKey: currentKey})
+			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail, specKey: currentKey, rawPath: path})
 		}
 	}
 	// add applies the shell's pathname expansions to one candidate: braces,

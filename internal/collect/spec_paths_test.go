@@ -359,6 +359,10 @@ func TestStagehandRunPathOutsideRunsFailsClosedWithoutContainment(t *testing.T) 
 			links: map[string]string{"per-run/7": "real-results"}},
 		"symlinked ancestor of a missing prefix": {path: "alias/results/d-$STAGEHAND_RUN_ID.json", dirs: []string{"real"},
 			links: map[string]string{"alias": "real"}},
+		// Lexically alias/../results is <root>/results, which exists and
+		// holds no symlink; the kernel writes to actual-parent/results.
+		"dot-dot after a symlink": {path: "alias/../results/decisions-$STAGEHAND_RUN_ID.json", dirs: []string{"actual-parent/child", "results"},
+			links: map[string]string{"alias": "actual-parent/child"}},
 		"walk past the entry budget": {path: "x/results/d-$STAGEHAND_RUN_ID.json", dirs: []string{"x/results/a", "x/results/b"}, limit: 1},
 	}
 	for name, tc := range cases {
