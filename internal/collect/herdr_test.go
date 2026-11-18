@@ -112,11 +112,21 @@ func TestHerdrFailureLeavesEverySessionUnknown(t *testing.T) {
 		"error document":   `echo '{"id":"cli:agent:list","error":{"code":"server_not_running","message":"no herdr server"}}'; exit 1`,
 		"exit status":      `echo boom >&2; exit 3`,
 		"not JSON":         `echo 'agents: none'`,
-		"trailing data":    `echo '{"id":"x","result":{"agents":[]}} {}'`,
-		"no agent list":    `echo '{"id":"x","result":{}}'`,
-		"relative session": `echo '{"id":"x","result":{"agents":[{"agent":"omp","agent_session":{"kind":"path","value":"-proj/a.jsonl"}}]}}'`,
-		"output bound":     `exec /usr/bin/head -c 5000000 /dev/zero`,
-		"timeout":          `exec /bin/sleep 30`,
+		"trailing data":    `echo '{"id":"cli:agent:list","result":{"type":"agent_list","agents":[]}} {}'`,
+		"no agent list":    `echo '{"id":"cli:agent:list","result":{"type":"agent_list"}}'`,
+		"relative session": `echo '{"id":"cli:agent:list","result":{"type":"agent_list","agents":[{"agent":"omp","agent_session":{"kind":"path","value":"-proj/a.jsonl"}}]}}'`,
+		// Review of #222: a wrong result type with a null record decoded
+		// into a skipped zero agent and reported "ran, no sessions".
+		"unexpected result":   `echo '{"result":{"type":"unexpected_result","agents":[null]}}'`,
+		"wrong id":            `echo '{"id":"cli:pane:list","result":{"type":"agent_list","agents":[]}}'`,
+		"wrong result type":   `echo '{"id":"cli:agent:list","result":{"type":"pane_list","agents":[]}}'`,
+		"null agent":          `echo '{"id":"cli:agent:list","result":{"type":"agent_list","agents":[null]}}'`,
+		"agent not an object": `echo '{"id":"cli:agent:list","result":{"type":"agent_list","agents":["omp"]}}'`,
+		"ill-typed session":   `echo '{"id":"cli:agent:list","result":{"type":"agent_list","agents":[{"agent":"omp","agent_session":{"kind":"path","value":5}}]}}'`,
+		"session not object":  `echo '{"id":"cli:agent:list","result":{"type":"agent_list","agents":[{"agent":"omp","agent_session":"x.jsonl"}]}}'`,
+		"session no value":    `echo '{"id":"cli:agent:list","result":{"type":"agent_list","agents":[{"agent":"omp","agent_session":{"kind":"path"}}]}}'`,
+		"output bound":        `exec /usr/bin/head -c 5000000 /dev/zero`,
+		"timeout":             `exec /bin/sleep 30`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			x := newHerdrFixture(t, script)
@@ -182,4 +192,57 @@ func TestHerdrRunsWithAMinimalEnvironment(t *testing.T) {
 	if env := string(data); strings.Contains(env, "sk-secret") || !strings.Contains(env, "HERDR_SOCKET_PATH=/run/herdr.sock") {
 		t.Fatalf("herdr environment:\n%s", env)
 	}
+}
+
+// Review of #222: session_roots may name a symlinked alias of the store
+// the inventory observes by its real path. Both spellings are one identity:
+// herdr runs, the referenced session is protected on the real path whether
+// herdr names it by the alias or the real path, and a failing herdr leaves
+// the real-path entries unknown.
+func TestHerdrAliasedSessionRootIsOneIdentity(t *testing.T) {
+	aliased := func(t *testing.T, x herdrFixture) Options {
+		alias := filepath.Join(t.TempDir(), "alias")
+		mustSymlink(t, filepath.Dir(filepath.Dir(filepath.Dir(x.sessions))), alias)
+		opts := x.options(5 * time.Second)
+		opts.Herdr.SessionRoots = []string{filepath.Join(alias, ".omp", "agent", "sessions")}
+		opts.Herdr.ResolveRoots(nil)
+		return opts
+	}
+	for name, viaAlias := range map[string]bool{"named by real path": false, "named by alias": true} {
+		t.Run(name, func(t *testing.T) {
+			x := newHerdrFixture(t, "")
+			opts := aliased(t, x)
+			named := filepath.Join(x.project, herdrStemA+".jsonl")
+			if viaAlias {
+				named = filepath.Join(opts.Herdr.SessionRoots[0], "-proj", herdrStemA+".jsonl")
+			}
+			if err := os.WriteFile(x.binary, []byte("#!/bin/sh\n"+answerScript(t, named)+"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			result := run(t, opts)
+			if report := reportFor(t, result, CollectorHerdr); report.Status != core.CollectorRan || report.Visited != 1 {
+				t.Fatalf("herdr report under an aliased root = %+v", report)
+			}
+			for _, path := range []string{filepath.Join(x.project, herdrStemA), named} {
+				if !strings.HasPrefix(path, x.sessions) {
+					continue
+				}
+				if protectionReason(entryFor(t, result, path), core.ProtectLiveAgentSession) == "" {
+					t.Errorf("%s not protected under an aliased root", path)
+				}
+			}
+			if entry := entryFor(t, result, filepath.Join(x.project, herdrStemA)); protectionReason(entry, core.ProtectLiveAgentSession) == "" {
+				t.Errorf("session folder on the real path not protected: %+v", entry.Protections)
+			}
+		})
+	}
+	t.Run("herdr failing", func(t *testing.T) {
+		x := newHerdrFixture(t, "exit 1")
+		result := run(t, aliased(t, x))
+		for _, entry := range result.Entries {
+			if protectionReason(entry, core.ProtectCollectorFailure) == "" {
+				t.Errorf("%s not unknown under a failing herdr and an aliased root", entry.Path)
+			}
+		}
+	})
 }

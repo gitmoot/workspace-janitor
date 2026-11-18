@@ -728,6 +728,7 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 	// candidate of this run instead of one bounded walk per candidate. Built
 	// only when there is a candidate.
 	var dependents *workspacearchive.DependentIndex
+	herdr := newHerdrRecheck(policy)
 	order := make([]string, 0, len(policy.WorkspaceArchiveCategories)+1)
 	for _, category := range policy.WorkspaceArchiveCategories {
 		order = append(order, category.Name)
@@ -769,6 +770,18 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 					return releaseStillEffective(ctx, paths, reply)
 				}
 			}
+			if category.Kind == config.CategoryOMPSessions {
+				// Herdr is asked again before the copy and before
+				// publication: a queued session can wait behind earlier
+				// copies long after the run's observation.
+				base := preflight
+				preflight = func() error {
+					if err := base(); err != nil {
+						return err
+					}
+					return herdr.check(ctx, path)
+				}
+			}
 			rule := categoryRule(category, name, item.Path, owner, release)
 			scope := workspacearchive.BindingScope(ctx, policy, rule, policy.Collectors.ProcRoot, &dependents)
 			inspection, err := workspacearchive.Inspect(ctx, rule, scope)
@@ -791,8 +804,20 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 				item.Status, item.Name = categoryWouldArchive, name
 				continue
 			}
-			binding, err := createCategoryArchive(ctx, db, paths, category, rule, scope, report.RunID, preflight)
-			if err != nil {
+			binding, err := func() (*workspacearchive.Binding, error) {
+				if category.Kind == config.CategoryOMPSessions {
+					if err := herdr.check(ctx, path); err != nil {
+						return nil, err
+					}
+				}
+				return createCategoryArchive(ctx, db, paths, category, rule, scope, report.RunID, preflight)
+			}()
+			var live *liveSessionRefusal
+			switch {
+			case errors.As(err, &live):
+				item.Reasons = []string{live.Error() + "; original retained"}
+				continue
+			case err != nil:
 				item.Status, item.Reasons = categoryFailed, []string{err.Error()}
 				failures = append(failures, fmt.Errorf("%s: %w", item.Path, err))
 				continue
@@ -864,6 +889,55 @@ func createCategoryArchive(ctx context.Context, db *store.Store, paths config.Pa
 		return nil, err
 	}
 	return binding, nil
+}
+
+// herdrRecheckReuse is how long one herdr answer serves the archive
+// preflights of a run; any older answer is replaced by a fresh one. Tests
+// set it to zero to ask herdr at every check.
+var herdrRecheckReuse = 2 * time.Second
+
+// herdrRecheck asks herdr afresh at an omp_sessions archive's preflights
+// (before the copy and before publication), reusing one answer for at most
+// herdrRecheckReuse. Nil (herdr not configured) checks nothing.
+type herdrRecheck struct {
+	cfg     *config.HerdrCollector
+	timeout time.Duration
+	last    *collect.HerdrSessions
+}
+
+func newHerdrRecheck(policy config.Policy) *herdrRecheck {
+	if policy.Collectors.Herdr == nil {
+		return nil
+	}
+	return &herdrRecheck{cfg: policy.Collectors.Herdr, timeout: policy.Limits.CommandTimeout.Duration()}
+}
+
+// liveSessionRefusal is a session a live herdr agent resumes, found at an
+// archive preflight: a refusal, never a failure.
+type liveSessionRefusal struct{ reason string }
+
+func (r *liveSessionRefusal) Error() string {
+	return string(core.ProtectLiveAgentSession) + ": " + r.reason
+}
+
+// check returns a *liveSessionRefusal when a live herdr agent resumes the
+// unit at path, and a plain error (a failure) when herdr gave no answer.
+func (h *herdrRecheck) check(ctx context.Context, path string) error {
+	if h == nil || !h.cfg.Covers(path) {
+		return nil
+	}
+	if h.last == nil || time.Since(h.last.At) >= herdrRecheckReuse {
+		sessions, err := collect.ListHerdrSessions(ctx, h.cfg, h.timeout)
+		if err != nil {
+			h.last = nil
+			return fmt.Errorf("herdr agent sessions are unknown, so %s is not archived: %w", path, err)
+		}
+		h.last = sessions
+	}
+	if live := h.last.Unit(path); live != "" {
+		return &liveSessionRefusal{reason: live}
+	}
+	return nil
 }
 
 // newestMember is the latest modification time among archived members, the

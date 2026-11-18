@@ -1289,18 +1289,27 @@ every collection that reaches into a session root runs
 `<binary> agent list --json` once: no shell, a minimal environment (`HOME`,
 `PATH`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, `HERDR_SOCKET_PATH`), in its own
 process group, within `limits.command_timeout` and a 4 MiB output bound. Each
-agent whose `agent_session` has `kind: path` names a transcript; the path is
-cleaned and mapped onto the configured roots (resolving symlinks of the
-session's directory and of the root). Sessions of other machines and `kind:
-id` sessions (Claude) name no file here and are ignored.
+agent whose `agent_session` has `kind: path` names a transcript. Each session
+root is resolved at load to one identity: its configured spelling, the path
+its symlinks resolve to, and every OMP category root that resolves to the
+same store; two `session_roots` naming one store are refused. A session path
+(also with its directory's symlinks resolved) under any spelling is
+protected under every spelling, so an entry observed by the real path or by
+an alias meets it. Sessions of other machines and `kind: id` sessions
+(Claude) name no file here and are ignored.
 
 A referenced `<project>/<stem>.jsonl` protects its session unit: the
 transcript and its session folder `<project>/<stem>` as a whole, as the
 blocking protection `live_agent_session` naming the agent and its pane. It
 refuses `omp_sessions` archiving, the quarantine move and expiry of the unit
-and of its transcript (a refusal, not a failure). Restores never replace an
-existing path (`RENAME_NOREPLACE`), so a transcript an agent recreated
-meanwhile is never overwritten; such a restore is refused.
+and of its transcript (a refusal, not a failure). The category run asks
+herdr again before each session's copy and before its archive is published
+(one answer serves for at most 2 seconds); a session that became live while
+it waited in the queue is refused, and herdr failing there fails the item.
+Quarantine and expiry ask herdr afresh in each item's revalidation. Restores
+never replace an existing path (`RENAME_NOREPLACE`), so a session folder or
+transcript an agent recreated meanwhile is never overwritten; such a restore
+is refused and the unit stays in quarantine.
 
 The boundary is the unit, not the files inside it (decided with this guard,
 2026-11-18):
@@ -1311,8 +1320,11 @@ seats requires. It never selects the transcript itself, which lies beside
 the folder, nor the folder as a whole, and it does not run or depend on herdr.
 
 Herdr configured but failing, timing out, printing more than the bound or
-printing anything but its agent list (its error document included) leaves
-every entry under the session roots unknown (`collector_failure`): no
+printing anything but a well-formed agent list (its error document, any `id`
+other than `cli:agent:list`, a `result.type` other than `agent_list`, a null
+or ill-typed agent record, an `agent_session` without a string kind and
+value) leaves every entry under the session roots unknown
+(`collector_failure`): no
 `omp_sessions` unit is archived, moved or expired, and the run reports a
 failure, not a refusal (`janitor cycle` exits non-zero). A collection that
 does not reach into a session root does not run herdr, and a herdr failure

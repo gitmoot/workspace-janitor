@@ -32,13 +32,23 @@ const herdrSessionLog = ".jsonl"
 // it) reaches the command.
 var herdrEnv = []string{"HOME", "PATH", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "HERDR_SOCKET_PATH"}
 
-// listHerdrSessions runs "<binary> agent list --json" once, without a
-// shell, within timeout and maxHerdrOutput, and maps every OMP session under
-// the session roots a live agent resumes, by its canonical transcript path
-// ("<root>/<project>/<stem>.jsonl"), to the agents that name it. An error
-// means herdr gave no complete answer: it failed, timed out, printed too
-// much or printed something that is not its agent list.
-func listHerdrSessions(ctx context.Context, cfg *config.HerdrCollector, timeout time.Duration) (map[string]string, error) {
+// HerdrSessions is one complete herdr answer: every OMP session under the
+// session roots that a live agent resumes, by its transcript path
+// ("<root>/<project>/<stem>.jsonl") under every spelling of its root, with
+// the agents that name it.
+type HerdrSessions struct {
+	// At is when herdr answered.
+	At       time.Time
+	sessions map[string]string
+	// distinct holds each live session once, under its configured root.
+	distinct map[string]bool
+}
+
+// ListHerdrSessions runs "<binary> agent list --json" once, without a
+// shell, within timeout and maxHerdrOutput. An error means herdr gave no
+// complete answer: it failed, timed out, printed too much or printed
+// something that is not a well-formed agent list.
+func ListHerdrSessions(ctx context.Context, cfg *config.HerdrCollector, timeout time.Duration) (*HerdrSessions, error) {
 	data, err := runHerdr(ctx, cfg.Binary, timeout)
 	if err != nil {
 		return nil, err
@@ -47,9 +57,10 @@ func listHerdrSessions(ctx context.Context, cfg *config.HerdrCollector, timeout 
 	if err != nil {
 		return nil, err
 	}
-	sessions := map[string]string{}
+	out := &HerdrSessions{At: nowFunc(), sessions: map[string]string{}, distinct: map[string]bool{}}
+	forms := cfg.RootForms()
 	for _, agent := range agents {
-		session := agent.Session
+		session := agent.session
 		if session == nil || session.Kind != "path" {
 			// An "id" session (Claude) names no file.
 			continue
@@ -57,37 +68,59 @@ func listHerdrSessions(ctx context.Context, cfg *config.HerdrCollector, timeout 
 		if !filepath.IsAbs(session.Value) {
 			return nil, fmt.Errorf("herdr agent %s names a non-absolute session path %q", agent.label(), session.Value)
 		}
-		for _, path := range canonicalSession(cfg.SessionRoots, session.Value) {
-			sessions[path] = appendDetail(sessions[path], agent.label())
+		paths := canonicalSession(forms, session.Value)
+		for _, path := range paths {
+			out.sessions[path] = appendDetail(out.sessions[path], agent.label())
+		}
+		if len(paths) != 0 {
+			out.distinct[paths[0]] = true
 		}
 	}
-	return sessions, nil
+	return out, nil
 }
 
-// canonicalSession maps a herdr session path onto the session roots:
-// cleaned, and with its directory's symlinks resolved, under a root as
-// configured or as it resolves. Paths outside every root (another machine's
+// Len is the number of distinct live sessions.
+func (h *HerdrSessions) Len() int { return len(h.distinct) }
+
+// Unit is why a live agent keeps the OMP session unit at path (its session
+// folder "<stem>" or its transcript "<stem>.jsonl"), or "" when none does.
+func (h *HerdrSessions) Unit(path string) string {
+	transcript := path
+	if !strings.HasSuffix(transcript, herdrSessionLog) {
+		transcript += herdrSessionLog
+	}
+	if agents, ok := h.sessions[transcript]; ok {
+		return liveSessionDetail(transcript, agents)
+	}
+	return ""
+}
+
+// canonicalSession maps a herdr session path onto the session roots: the
+// path cleaned, and with its directory's symlinks resolved, is matched
+// against every spelling of each root, and the session is named under every
+// spelling of the root it matched, so an entry observed through any of them
+// meets its reference. Paths outside every root (another machine's
 // sessions) are dropped.
-func canonicalSession(roots []string, value string) []string {
+func canonicalSession(roots [][]string, value string) []string {
 	candidates := []string{filepath.Clean(value)}
 	if dir, err := filepath.EvalSymlinks(filepath.Dir(candidates[0])); err == nil {
 		candidates = append(candidates, filepath.Join(dir, filepath.Base(candidates[0])))
 	}
 	var out []string
-	for _, root := range roots {
-		forms := []string{root}
-		if real, err := filepath.EvalSymlinks(root); err == nil && real != root {
-			forms = append(forms, real)
-		}
+	for _, forms := range roots {
 		for _, form := range forms {
 			for _, candidate := range candidates {
-				rel, err := filepath.Rel(form, candidate)
-				if err != nil || !core.PathWithin(candidate, form) {
+				if !core.PathWithin(candidate, form) {
 					continue
 				}
-				path := filepath.Join(root, rel)
-				if !slices.Contains(out, path) {
-					out = append(out, path)
+				rel, err := filepath.Rel(form, candidate)
+				if err != nil {
+					continue
+				}
+				for _, spelling := range forms {
+					if path := filepath.Join(spelling, rel); !slices.Contains(out, path) {
+						out = append(out, path)
+					}
 				}
 			}
 		}
@@ -100,15 +133,15 @@ func canonicalSession(roots []string, value string) []string {
 // collected entries only; omp_session_artifacts, which moves old single
 // files out of live seats by an earlier owner decision (2026-11-09), selects
 // and moves files under its own guards and never consults them.
-func herdrReferences(sessions map[string]string) []Reference {
-	transcripts := make([]string, 0, len(sessions))
-	for transcript := range sessions {
+func herdrReferences(sessions *HerdrSessions) []Reference {
+	transcripts := make([]string, 0, len(sessions.sessions))
+	for transcript := range sessions.sessions {
 		transcripts = append(transcripts, transcript)
 	}
 	sort.Strings(transcripts)
 	var refs []Reference
 	for _, transcript := range transcripts {
-		detail := liveSessionDetail(transcript, sessions[transcript])
+		detail := liveSessionDetail(transcript, sessions.sessions[transcript])
 		refs = append(refs, Reference{Path: transcript, Source: core.SourceJob, Protection: core.ProtectLiveAgentSession,
 			Signal: "herdr_agent_session", Detail: detail})
 		if stem, ok := strings.CutSuffix(transcript, herdrSessionLog); ok {
@@ -123,15 +156,26 @@ func liveSessionDetail(transcript string, agents string) string {
 	return fmt.Sprintf("live herdr agent %s resumes OMP session %s", agents, filepath.Base(transcript))
 }
 
+// herdrAgentListID and herdrAgentListType identify the one document
+// "herdr agent list --json" answers with.
+const (
+	herdrAgentListID   = "cli:agent:list"
+	herdrAgentListType = "agent_list"
+)
+
+// herdrSession is a well-formed agent_session: a kind and a value.
+type herdrSession struct {
+	Kind  string `json:"kind"`
+	Value string `json:"value"`
+}
+
 // herdrAgent is the part of one "herdr agent list" entry the guard reads.
 type herdrAgent struct {
-	Agent   string `json:"agent"`
-	Name    string `json:"name"`
-	PaneID  string `json:"pane_id"`
-	Session *struct {
-		Kind  string `json:"kind"`
-		Value string `json:"value"`
-	} `json:"agent_session"`
+	Agent   string          `json:"agent"`
+	Name    string          `json:"name"`
+	PaneID  string          `json:"pane_id"`
+	Session json.RawMessage `json:"agent_session"`
+	session *herdrSession
 }
 
 func (a herdrAgent) label() string {
@@ -142,12 +186,25 @@ func (a herdrAgent) label() string {
 	return fmt.Sprintf("%q (%s, pane %s)", a.Name, a.Agent, pane)
 }
 
-// parseHerdrAgents decodes exactly one agent-list document. An error
-// document, a missing agent list or trailing data is no answer.
+// isObject reports whether raw is a JSON object (not null, an array or a
+// scalar).
+func isObject(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) != 0 && trimmed[0] == '{'
+}
+
+// parseHerdrAgents decodes exactly one agent-list document: id
+// cli:agent:list, result.type agent_list, result.agents an array of agent
+// objects, each with an agent name and, when it has a session, an
+// agent_session object with a kind and a value. An error document, any
+// other id or result type, a null or ill-typed record, a malformed session,
+// or trailing data is no answer.
 func parseHerdrAgents(data []byte) ([]herdrAgent, error) {
 	var doc struct {
+		ID     string `json:"id"`
 		Result *struct {
-			Agents *[]herdrAgent `json:"agents"`
+			Type   string             `json:"type"`
+			Agents *[]json.RawMessage `json:"agents"`
 		} `json:"result"`
 		Error *struct {
 			Code    string `json:"code"`
@@ -156,7 +213,7 @@ func parseHerdrAgents(data []byte) ([]herdrAgent, error) {
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(&doc); err != nil {
-		return nil, fmt.Errorf("herdr agent list is not JSON: %w", err)
+		return nil, fmt.Errorf("herdr agent list is not a well-formed JSON document: %w", err)
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return nil, errors.New("herdr agent list has trailing data after its JSON document")
@@ -164,10 +221,43 @@ func parseHerdrAgents(data []byte) ([]herdrAgent, error) {
 	if doc.Error != nil {
 		return nil, fmt.Errorf("herdr agent list failed: %s: %s", doc.Error.Code, doc.Error.Message)
 	}
-	if doc.Result == nil || doc.Result.Agents == nil {
+	switch {
+	case doc.ID != herdrAgentListID:
+		return nil, fmt.Errorf("herdr answered %q, not %s", doc.ID, herdrAgentListID)
+	case doc.Result == nil || doc.Result.Agents == nil:
 		return nil, errors.New("herdr agent list has no result.agents")
+	case doc.Result.Type != herdrAgentListType:
+		return nil, fmt.Errorf("herdr agent list result type is %q, not %s", doc.Result.Type, herdrAgentListType)
 	}
-	return *doc.Result.Agents, nil
+	agents := make([]herdrAgent, 0, len(*doc.Result.Agents))
+	for i, raw := range *doc.Result.Agents {
+		var agent herdrAgent
+		if !isObject(raw) {
+			return nil, fmt.Errorf("herdr agent list entry %d is not an agent object: %s", i, bytes.TrimSpace(raw))
+		}
+		if err := json.Unmarshal(raw, &agent); err != nil {
+			return nil, fmt.Errorf("herdr agent list entry %d is malformed: %w", i, err)
+		}
+		if agent.Agent == "" {
+			return nil, fmt.Errorf("herdr agent list entry %d names no agent", i)
+		}
+		// An absent or null agent_session is an agent with no session.
+		if trimmed := bytes.TrimSpace(agent.Session); len(trimmed) != 0 && !bytes.Equal(trimmed, []byte("null")) {
+			var session herdrSession
+			if !isObject(trimmed) {
+				return nil, fmt.Errorf("herdr agent %s has a malformed agent_session: %s", agent.label(), trimmed)
+			}
+			if err := json.Unmarshal(trimmed, &session); err != nil {
+				return nil, fmt.Errorf("herdr agent %s has a malformed agent_session: %w", agent.label(), err)
+			}
+			if session.Kind == "" || session.Value == "" {
+				return nil, fmt.Errorf("herdr agent %s has an agent_session without kind or value", agent.label())
+			}
+			agent.session = &session
+		}
+		agents = append(agents, agent)
+	}
+	return agents, nil
 }
 
 // runHerdr runs the agent list under timeout, in its own process group, with
@@ -221,13 +311,13 @@ func gatherHerdrReferences(ctx context.Context, opts *Options, needed bool) ([]R
 		report.Status, report.Detail = core.CollectorSkipped, "no observed path lies in a herdr session root"
 		return nil, report
 	}
-	sessions, err := listHerdrSessions(ctx, opts.Herdr, opts.Limits.CommandTimeout)
+	sessions, err := ListHerdrSessions(ctx, opts.Herdr, opts.Limits.CommandTimeout)
 	if err != nil {
 		report.Status, report.Unknowns, report.Detail = core.CollectorFailed, 1, err.Error()
 		return nil, report
 	}
-	report.Visited = len(sessions)
-	report.Detail = fmt.Sprintf("live herdr agents resume %d OMP session(s) under %s", len(sessions), strings.Join(opts.Herdr.SessionRoots, ", "))
+	report.Visited = sessions.Len()
+	report.Detail = fmt.Sprintf("live herdr agents resume %d OMP session(s) under %s", sessions.Len(), strings.Join(opts.Herdr.SessionRoots, ", "))
 	return herdrReferences(sessions), report
 }
 

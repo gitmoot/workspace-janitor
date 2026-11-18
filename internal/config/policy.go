@@ -268,15 +268,64 @@ type HerdrCollector struct {
 	// SessionRoots are the OMP session stores (".../.omp/agent/sessions")
 	// the guard covers.
 	SessionRoots []string `yaml:"session_roots" json:"session_roots"`
+	// forms holds, per session root, every spelling of that store this
+	// policy uses (ResolveRoots): the root, its symlink-resolved path, and
+	// each OMP category root that resolves to the same store. Nil until
+	// resolved, when only the configured roots are known.
+	forms [][]string
 }
 
-// Covers reports whether path is, or lies in, one of the session roots. A
-// nil collector covers nothing.
+// ResolveRoots records every spelling of each session root: itself, the
+// path its symlinks resolve to, and each of aliases (the policy's OMP
+// category roots) that resolves to the same store. Coverage and herdr
+// references then use one identity, whichever spelling an inventory or
+// category observation reaches a session by. A root that cannot be
+// resolved (absent) keeps its configured spelling alone.
+func (h *HerdrCollector) ResolveRoots(aliases []string) {
+	resolve := func(path string) string {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			return resolved
+		}
+		return path
+	}
+	h.forms = make([][]string, len(h.SessionRoots))
+	for i, root := range h.SessionRoots {
+		store := resolve(root)
+		forms := []string{root}
+		for _, form := range append([]string{store}, aliases...) {
+			if !slices.Contains(forms, form) && resolve(form) == store {
+				forms = append(forms, form)
+			}
+		}
+		h.forms[i] = forms
+	}
+}
+
+// RootForms returns every known spelling of each session root, in
+// SessionRoots order; the first spelling is the configured root.
+func (h *HerdrCollector) RootForms() [][]string {
+	if h.forms != nil {
+		return h.forms
+	}
+	out := make([][]string, len(h.SessionRoots))
+	for i, root := range h.SessionRoots {
+		out[i] = []string{root}
+	}
+	return out
+}
+
+// Covers reports whether path is, or lies in, any spelling of a session
+// root. A nil collector covers nothing.
 func (h *HerdrCollector) Covers(path string) bool {
 	if h == nil {
 		return false
 	}
-	return slices.ContainsFunc(h.SessionRoots, func(root string) bool { return core.PathWithin(path, root) })
+	for _, forms := range h.RootForms() {
+		if slices.ContainsFunc(forms, func(root string) bool { return core.PathWithin(path, root) }) {
+			return true
+		}
+	}
+	return false
 }
 
 // CanonicalRoot declares where entries of a class are supposed to live.
@@ -928,6 +977,13 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 		for i := range herdr.SessionRoots {
 			herdr.SessionRoots[i] = expand(fmt.Sprintf("collectors.herdr.session_roots[%d]", i), herdr.SessionRoots[i])
 		}
+		var aliases []string
+		for _, category := range p.WorkspaceArchiveCategories {
+			if category.Kind == CategoryOMPSessions || category.Kind == CategoryOMPSessionArtifacts {
+				aliases = append(aliases, category.Roots...)
+			}
+		}
+		herdr.ResolveRoots(aliases)
 	}
 	for i := range p.Collectors.SystemdDirs {
 		p.Collectors.SystemdDirs[i] = expand(fmt.Sprintf("collectors.systemd_dirs[%d]", i), p.Collectors.SystemdDirs[i])
@@ -1450,13 +1506,17 @@ func (p *Policy) Validate() core.FieldErrors {
 		if len(herdr.SessionRoots) == 0 {
 			errs.Add("collectors.herdr.session_roots", "must name at least one OMP session store")
 		}
+		forms := herdr.RootForms()
 		for i, root := range herdr.SessionRoots {
 			field := fmt.Sprintf("collectors.herdr.session_roots[%d]", i)
+			sameStore := func(earlier []string) bool {
+				return slices.ContainsFunc(forms[i], func(form string) bool { return slices.Contains(earlier, form) })
+			}
 			switch {
 			case !CategoryOMPSessions.StateRootShape(root):
 				errs.Add(field, "must be an absolute OMP session store such as /root/.omp/agent/sessions, got %q", root)
-			case slices.Contains(herdr.SessionRoots[:i], root):
-				errs.Add(field, "duplicates %q", root)
+			case slices.ContainsFunc(forms[:i], sameStore):
+				errs.Add(field, "duplicates %q, or names the same store through a symlink", root)
 			}
 		}
 	}

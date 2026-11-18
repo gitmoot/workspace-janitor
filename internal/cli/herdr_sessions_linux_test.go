@@ -4,6 +4,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
+	"github.com/gitmoot/workspace-janitor/internal/store"
 )
 
 // fakeHerdr installs an executable herdr stand-in that prints whatever the
@@ -241,6 +243,133 @@ func TestHerdrSessionArtifactsStillMoveButNeverTheTranscript(t *testing.T) {
 			}
 			if _, err := os.Stat(session); err != nil {
 				t.Fatalf("session folder moved: %v", err)
+			}
+		})
+	}
+}
+
+// herdrScript installs a herdr stand-in running body and configures
+// collectors.herdr with it over root.
+func herdrScript(t *testing.T, x *stateStoreFixture, root, body string) {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "herdr")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\n[ \"$*\" = 'agent list --json' ] || exit 64\n"+body+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	x.collectors = fmt.Sprintf("  herdr:\n    binary: %s\n    session_roots: [%s]\n", binary, root)
+	x.writeStores(t, "")
+}
+
+// Review of #222: session_roots may name a symlinked alias of the store
+// that inventory and omp_sessions observe by its real path. Herdr still
+// runs, the referenced session is refused, and a failing herdr still fails
+// every session unit.
+func TestHerdrAliasedSessionRootStillGuards(t *testing.T) {
+	setup := func(t *testing.T, answer string) (*stateStoreFixture, string) {
+		x := newStateStoreFixture(t)
+		alias := filepath.Join(t.TempDir(), "alias")
+		if err := os.Symlink(x.home, alias); err != nil {
+			t.Fatal(err)
+		}
+		root := filepath.Join(alias, ".omp", "agent", "sessions")
+		file := filepath.Join(t.TempDir(), "answer.json")
+		herdrScript(t, x, root, "exec /bin/cat "+file)
+		session := x.session(t, "-proj", sessionA, categoryIdleAge)
+		if answer == "" {
+			answer = herdrAgentList(filepath.Join(root, "-proj", sessionA+".jsonl"))
+		}
+		writeHerdrAnswer(t, file, answer)
+		return x, session
+	}
+	t.Run("live session", func(t *testing.T) {
+		x, session := setup(t, "")
+		report := x.categories(t, false)
+		item := categoryItem(t, report, session)
+		if item.Status != categoryRefused || !strings.Contains(strings.Join(item.Reasons, ";"), "live_agent_session") || report.Failed != 0 {
+			t.Fatalf("session named through an aliased root not refused as live: %+v (report %+v)", item, report)
+		}
+	})
+	t.Run("herdr failing", func(t *testing.T) {
+		x, session := setup(t, herdrNotRunning)
+		item := categoryItem(t, failingCategories(t, x), session)
+		if item.Status != categoryFailed || !strings.Contains(strings.Join(item.Reasons, ";"), "herdr") {
+			t.Fatalf("session under an aliased root and a failing herdr not failed: %+v", item)
+		}
+	})
+}
+
+// Review of #222: a session can wait in the archive queue behind earlier
+// copies, so herdr is asked again before the copy and again before the
+// archive is published. A session that became live meanwhile is refused
+// (not failed) and nothing is recorded for it.
+func TestHerdrIsAskedAgainBeforeCopyAndPublication(t *testing.T) {
+	// herdr call 1 is the run's observation; 2 the check before the copy;
+	// 3 Create's preflight before the copy; 4 its preflight before
+	// publication.
+	for name, liveFrom := range map[string]int{"before the copy": 2, "before publication": 4} {
+		t.Run(name, func(t *testing.T) {
+			reuse := herdrRecheckReuse
+			herdrRecheckReuse = 0
+			t.Cleanup(func() { herdrRecheckReuse = reuse })
+			x := newStateStoreFixture(t)
+			dir := t.TempDir()
+			session := x.session(t, "-proj", sessionA, categoryIdleAge)
+			writeHerdrAnswer(t, filepath.Join(dir, "idle.json"), herdrAgentList())
+			writeHerdrAnswer(t, filepath.Join(dir, "live.json"), herdrAgentList(session+".jsonl"))
+			herdrScript(t, x, x.sessions, fmt.Sprintf(`n=$(/bin/cat %[1]s/count 2>/dev/null || echo 0); n=$((n+1)); echo $n > %[1]s/count
+if [ $n -ge %[2]d ]; then exec /bin/cat %[1]s/live.json; fi
+exec /bin/cat %[1]s/idle.json`, dir, liveFrom))
+
+			report := x.categories(t, false)
+			item := categoryItem(t, report, session)
+			if item.Status != categoryRefused || !strings.Contains(strings.Join(item.Reasons, ";"), "live_agent_session") || report.Failed != 0 {
+				t.Fatalf("session that became live %s not refused: %+v (report %+v)", name, item, report)
+			}
+			records, err := store.ReadCategoryArchives(context.Background(), x.paths(t).DatabaseFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, record := range records {
+				if record.Path == session {
+					t.Fatalf("archive of a live session recorded: %+v", record)
+				}
+			}
+		})
+	}
+}
+
+// A restore never replaces a session path that exists again: the
+// recreated folder or transcript is left as it is, and the quarantined unit
+// stays in quarantine.
+func TestRestoreNeverOverwritesARecreatedSession(t *testing.T) {
+	for name, recreate := range map[string]func(session string) string{
+		"session folder": func(session string) string { return filepath.Join(session, "new.log") },
+		"transcript":     func(session string) string { return session + ".jsonl" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			x := newStateStoreFixture(t)
+			session := x.session(t, "-proj", sessionA, categoryIdleAge)
+			if item := categoryItem(t, x.categories(t, false), session); item.Status != categoryArchived {
+				t.Fatalf("idle session not archived: %+v", item)
+			}
+			receipt := x.quarantineUnit(t, session)
+			path := recreate(session)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("written by a live agent\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, code := x.run(t, "restore", "--confirm", receipt.CleanupID); code == ExitOK {
+				t.Fatal("restore over a recreated session path succeeded")
+			}
+			if data, err := os.ReadFile(path); err != nil || string(data) != "written by a live agent\n" {
+				t.Fatalf("recreated %s overwritten: %q %v", filepath.Base(path), data, err)
+			}
+			for _, moved := range []string{receipt.Destination, receipt.Destination + ".jsonl"} {
+				if _, err := os.Lstat(moved); err != nil {
+					t.Fatalf("quarantined %s left quarantine: %v", filepath.Base(moved), err)
+				}
 			}
 		})
 	}

@@ -761,3 +761,34 @@ func TestParsePolicyValidatesHerdrCollector(t *testing.T) {
 		}
 	}
 }
+
+// Review of #222: a symlinked alias of a session store resolves at load to
+// the store it names, so it covers the real path, and two roots naming one
+// store are refused.
+func TestParsePolicyResolvesHerdrSessionRootAliases(t *testing.T) {
+	paths := fixturePaths(t)
+	store := filepath.Join(paths.Home, ".omp", "agent", "sessions")
+	if err := os.MkdirAll(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(paths.Home, alias); err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(alias, ".omp", "agent", "sessions")
+	policy, err := parse(t, paths, "roots:\n  - path: /repos\ncollectors:\n  herdr:\n    binary: /bin/herdr\n    session_roots: ["+aliasRoot+"]\n")
+	if err != nil {
+		t.Fatalf("aliased session root refused: %v", err)
+	}
+	resolved, err := filepath.EvalSymlinks(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := policy.Collectors.Herdr; !h.Covers(filepath.Join(resolved, "-proj", "s.jsonl")) || !h.Covers(filepath.Join(aliasRoot, "-proj")) {
+		t.Fatalf("aliased root does not cover both spellings: %+v", h.RootForms())
+	}
+	_, err = parse(t, paths, "roots:\n  - path: /repos\ncollectors:\n  herdr:\n    binary: /bin/herdr\n    session_roots: ["+aliasRoot+", "+resolved+"]\n")
+	if err == nil || !strings.Contains(err.Error(), "collectors.herdr.session_roots[1]") {
+		t.Fatalf("two spellings of one store not refused: %v", err)
+	}
+}
