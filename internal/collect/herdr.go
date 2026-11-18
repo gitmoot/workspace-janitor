@@ -143,12 +143,13 @@ func (v herdrView) covers(opts *Options, path string) bool {
 
 // herdrReferences are the protections of every live session unit: its
 // transcript and its session folder with everything in it, spelled through
-// each directory the collection observes that holds them, so entries and
-// the engine's checks of an original path meet them in whatever spelling
-// they use. They bind collected entries only; omp_session_artifacts, which
-// moves old single files out of live seats by an earlier owner decision
-// (2026-11-09), selects and moves files under its own guards and never
-// consults them.
+// each directory the collection observes that holds them, and, for an
+// observed directory that is the session folder or lies inside it, that
+// whole directory. Entries and the engine's checks of an original path
+// meet them in whatever spelling they use. They bind collected entries
+// only; omp_session_artifacts, which moves old single files out of live
+// seats by an earlier owner decision (2026-11-09), selects and moves files
+// under its own guards and never consults them.
 func herdrReferences(sessions *HerdrSessions, view herdrView) []Reference {
 	transcripts := make([]string, 0, len(sessions.sessions))
 	for transcript := range sessions.sessions {
@@ -167,20 +168,36 @@ func herdrReferences(sessions *HerdrSessions, view herdrView) []Reference {
 		stem, _ := strings.CutSuffix(transcript, herdrSessionLog)
 		for _, dir := range spellings {
 			real := view.dirs[dir]
-			rel, err := filepath.Rel(real, transcript)
-			if err != nil || !core.PathWithin(transcript, real) {
-				continue
-			}
-			path := filepath.Join(dir, rel)
-			if seen[path] {
-				continue
-			}
-			seen[path] = true
-			refs = append(refs, Reference{Path: path, Source: core.SourceJob, Protection: core.ProtectLiveAgentSession,
-				Signal: "herdr_agent_session", Detail: detail})
-			if stem != transcript {
-				refs = append(refs, Reference{Path: strings.TrimSuffix(path, herdrSessionLog), Source: core.SourceJob,
-					Protection: core.ProtectLiveAgentSession, Signal: "herdr_agent_session", Detail: detail, Subtree: true})
+			switch {
+			case core.PathWithin(transcript, real):
+				// The directory holds the unit: reference the transcript and
+				// the session folder as it spells them.
+				rel, err := filepath.Rel(real, transcript)
+				if err != nil {
+					continue
+				}
+				path := filepath.Join(dir, rel)
+				if seen[path] {
+					continue
+				}
+				seen[path] = true
+				refs = append(refs, Reference{Path: path, Source: core.SourceJob, Protection: core.ProtectLiveAgentSession,
+					Signal: "herdr_agent_session", Detail: detail})
+				if stem != transcript {
+					refs = append(refs, Reference{Path: strings.TrimSuffix(path, herdrSessionLog), Source: core.SourceJob,
+						Protection: core.ProtectLiveAgentSession, Signal: "herdr_agent_session", Detail: detail, Subtree: true})
+				}
+			case stem != transcript && core.PathWithin(real, stem):
+				// The directory is the session folder or lies inside it (a
+				// scan rooted there, or a revalidation of a file in it):
+				// its transcript is a sibling outside it, so the folder's
+				// protection is projected onto the directory itself.
+				if seen[dir] {
+					continue
+				}
+				seen[dir] = true
+				refs = append(refs, Reference{Path: dir, Source: core.SourceJob, Protection: core.ProtectLiveAgentSession,
+					Signal: "herdr_agent_session", Detail: detail, Subtree: true})
 			}
 		}
 	}

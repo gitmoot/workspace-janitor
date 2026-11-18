@@ -314,3 +314,72 @@ func TestHerdrInventoryAliasOfTheStoreIsOneIdentity(t *testing.T) {
 		})
 	}
 }
+
+// Review round 3 of #222: a collection rooted at a live session folder, or
+// at a directory inside it, never sees the transcript beside the folder,
+// yet every entry it observes is part of the live unit. The same holds for
+// the engine's revalidation of one file, which observes only the file's
+// parent directory. An unreferenced session's folder stays unprotected.
+func TestHerdrProtectsCollectionsInsideALiveSessionFolder(t *testing.T) {
+	x := newHerdrFixture(t, "")
+	live := filepath.Join(x.project, herdrStemA)
+	mustWrite(t, filepath.Join(live, "nested", "child.log"), "child\n")
+	mustWrite(t, filepath.Join(x.project, herdrStemB, "nested", "child.log"), "child\n")
+	if err := os.WriteFile(x.binary, []byte("#!/bin/sh\n"+answerScript(t, live+".jsonl")+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, root := range map[string]RootSpec{
+		"rooted at the session folder":         {Path: live, MaxDepth: 2},
+		"rooted at a directory inside it":      {Path: filepath.Join(live, "nested"), MaxDepth: 1},
+		"revalidating a file inside a session": {Path: filepath.Join(live, "nested"), MaxDepth: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := x.options(5 * time.Second)
+			opts.Roots = []RootSpec{root}
+			result := run(t, opts)
+			if len(result.Entries) == 0 {
+				t.Fatal("nothing observed")
+			}
+			for _, entry := range result.Entries {
+				if reason := protectionReason(entry, core.ProtectLiveAgentSession); !strings.Contains(reason, herdrStemA+".jsonl") {
+					t.Errorf("%s inside the live session not protected: %+v", entry.Path, entry.Protections)
+				}
+			}
+			// The engine's original-path check (action.originalReferences)
+			// matches a Subtree reference that contains the source.
+			source := filepath.Join(live, "nested", "child.log")
+			held := false
+			for _, ref := range result.References {
+				held = held || ref.Protection == core.ProtectLiveAgentSession && (core.PathWithin(ref.Path, source) || ref.Subtree && core.PathWithin(source, ref.Path))
+			}
+			if !held {
+				t.Errorf("no live-session reference holds %s: %+v", source, result.References)
+			}
+		})
+	}
+	t.Run("an unreferenced session folder", func(t *testing.T) {
+		opts := x.options(5 * time.Second)
+		opts.Roots = []RootSpec{{Path: filepath.Join(x.project, herdrStemB), MaxDepth: 2}}
+		for _, entry := range run(t, opts).Entries {
+			if len(entry.Protections) != 0 {
+				t.Errorf("%s of an unreferenced session protected: %+v", entry.Path, entry.Protections)
+			}
+		}
+	})
+	t.Run("an ancestor reaching the store only through a symlink", func(t *testing.T) {
+		// A real directory holding a symlink to the agent directory above
+		// the store; the walk never descends a symlink, so the collection
+		// reaches the store as a root spelled through it.
+		ancestor := t.TempDir()
+		mustSymlink(t, filepath.Dir(x.sessions), filepath.Join(ancestor, "agent"))
+		opts := x.options(5 * time.Second)
+		opts.Roots = []RootSpec{{Path: filepath.Join(ancestor, "agent", "sessions"), MaxDepth: 4}}
+		result := run(t, opts)
+		through := filepath.Join(ancestor, "agent", "sessions", "-proj", herdrStemA)
+		for _, path := range []string{through, through + ".jsonl", filepath.Join(through, "nested", "child.log")} {
+			if protectionReason(entryFor(t, result, path), core.ProtectLiveAgentSession) == "" {
+				t.Errorf("%s not protected through an ancestor alias", path)
+			}
+		}
+	})
+}

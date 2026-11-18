@@ -417,3 +417,32 @@ func TestHerdrInventoryAliasScanStillGuards(t *testing.T) {
 		})
 	}
 }
+
+// Review round 3 of #222: a scan rooted at a live session folder, or at a
+// directory inside it, protects every entry it observes, though the
+// transcript beside the folder is outside both roots.
+func TestHerdrScanInsideALiveSessionFolderStillGuards(t *testing.T) {
+	x := newStateStoreFixture(t)
+	file := filepath.Join(t.TempDir(), "answer.json")
+	herdrScript(t, x, x.sessions, "exec /bin/cat "+file)
+	session := x.session(t, "-proj", sessionA, categoryIdleAge)
+	writeHerdrAnswer(t, file, herdrAgentList(session+".jsonl"))
+	raw, err := os.ReadFile(x.paths(t).PolicyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, strings.Replace(string(raw), "roots:\n", "roots:\n  - path: "+session+"\n    max_depth: 2\n  - path: "+filepath.Join(session, "sub")+"\n    max_depth: 1\n", 1))
+	x.data(t, "scan")
+	x.data(t, "plan", "--no-jev")
+	for _, path := range []string{filepath.Join(session, "0.bash.log"), filepath.Join(session, "sub"), filepath.Join(session, "sub", "1.read.log")} {
+		var verdict core.Verdict
+		field(t, x.data(t, "explain", path), "safety_verdict", &verdict)
+		found := false
+		for _, protection := range verdict.Protections {
+			found = found || protection.Kind == core.ProtectLiveAgentSession
+		}
+		if !found || verdict.Allows(core.ActionQuarantine) {
+			t.Errorf("%s inside a live session not held by live_agent_session: %+v", path, verdict.Protections)
+		}
+	}
+}

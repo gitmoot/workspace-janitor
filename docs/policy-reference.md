@@ -1299,8 +1299,11 @@ symlink never moves what it points to. This holds for every collection
 root, entry and herdr session path, so an inventory root, a category root or
 herdr reaching the store through any symlinked alias (at the store, above it
 or at a project directory) is covered. A live session is protected as each
-observed directory that holds it spells it, so entries and the expiry check
-of an original path meet it under whatever spelling they use. Sessions of
+observed directory that holds it spells it, and an observed directory that
+is the live session folder or lies inside it (a scan rooted there, the
+revalidation of one file in it) is protected whole, though the transcript
+beside the folder is outside it. Entries and the expiry check of an
+original path meet the protection under whatever spelling they use. Sessions of
 other machines and `kind: id` sessions (Claude) name no file here and are
 ignored.
 
