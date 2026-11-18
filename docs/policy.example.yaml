@@ -426,6 +426,15 @@ collectors:
   # Stagehand state directory: $STAGEHAND_WORK in a spec is a run's work
   # directory under <dir>/runs, protected as a whole.
   stagehand_state_dir: /var/lib/stagehand
+  # Optional: ask herdr ("<binary> agent list --json", no shell, within
+  # limits.command_timeout) which OMP sessions live agents resume. Such a
+  # session's transcript and its folder (as a whole) are never archived by
+  # omp_sessions, quarantined or expired; herdr failing leaves every
+  # omp_sessions unit under session_roots unknown, and the run fails.
+  # herdr:
+  #   binary: /root/.local/bin/herdr
+  #   session_roots:
+  #     - /root/.omp/agent/sessions
 
 # Destination checks of the safety engine. Nothing here disables a core
 # invariant: the protections themselves are not configurable.

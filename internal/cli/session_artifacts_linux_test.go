@@ -79,7 +79,7 @@ protect:
   systemd_dirs: [%s]
   cron_paths: []
   pm2_dumps: []
-retention:
+%sretention:
   default: %s
 %s  delete_enabled: true
 prevention:
@@ -98,7 +98,7 @@ gitmoot:
     local_retention: %s
     archive:
       directory: %s
-%s`, x.sessions, x.archive, x.protect, x.proc, x.services, retention(x.defaultRetention), archived, x.prevention, x.gitmoot, filepath.Join(x.gitmoot, "gitmoot.db"), x.extra, sessions, x.sessions,
+%s`, x.sessions, x.archive, x.protect, x.proc, x.services, x.collectors, retention(x.defaultRetention), archived, x.prevention, x.gitmoot, filepath.Join(x.gitmoot, "gitmoot.db"), x.extra, sessions, x.sessions,
 		retention(x.retention), x.archive, x.category))
 }
 
