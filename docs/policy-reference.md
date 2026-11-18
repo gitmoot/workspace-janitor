@@ -1322,7 +1322,15 @@ and of its transcript (a refusal, not a failure). The category run asks
 herdr again before each session's copy and before its archive is published;
 a session that became live while it waited in the queue is refused, and
 herdr failing there fails the item.
-Quarantine and expiry ask herdr afresh in each item's revalidation. Restores
+Quarantine and expiry ask herdr afresh in each item's revalidation. Expiry
+also asks herdr by the receipt's recorded original path, since that pathname
+is gone once quarantined and no collection observes it: a receipt whose
+original lay in a session store, or was a real directory holding one, is
+refused while a session under it is live and fails while herdr cannot
+answer. A sessions root that is a symlink into a moved directory keeps its
+identity (the dangling link is followed). The same rule (in a store, or a
+real directory holding one) decides when a herdr failure fails a category
+item rather than refusing it. Restores
 never replace an existing path (`RENAME_NOREPLACE`), so a session folder or
 transcript an agent recreated meanwhile is never overwritten; such a restore
 is refused and the unit stays in quarantine.
