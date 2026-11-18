@@ -345,6 +345,9 @@ func TestStagehandRunPathOutsideRunsFailsClosedWithoutContainment(t *testing.T) 
 		dirs  []string
 		links map[string]string
 		path  string // below the inventory root
+		// cmd, when set, is the whole spec line: @ stands for the
+		// inventory root, and ~ for its parent (HOME).
+		cmd   string
 		roots func(root string) []string
 		limit int
 	}{
@@ -363,6 +366,13 @@ func TestStagehandRunPathOutsideRunsFailsClosedWithoutContainment(t *testing.T) 
 		// holds no symlink; the kernel writes to actual-parent/results.
 		"dot-dot after a symlink": {path: "alias/../results/decisions-$STAGEHAND_RUN_ID.json", dirs: []string{"actual-parent/child", "results"},
 			links: map[string]string{"alias": "actual-parent/child"}},
+		// The same through a leading ~, a variable's value, and a "."
+		// component: each is cleaned away before the path is checked.
+		"tilde, dot-dot after a symlink": {cmd: "cmd: /bin/cp a ~/inventory/alias/../results/decisions-$STAGEHAND_RUN_ID.json\n",
+			dirs: []string{"actual-parent/child", "results"}, links: map[string]string{"alias": "actual-parent/child"}},
+		"variable value with dot-dot": {cmd: "cmd: D=@/alias/.. /bin/cp a \"$D/results/decisions-$STAGEHAND_RUN_ID.json\"\n",
+			dirs: []string{"actual-parent/child", "results"}, links: map[string]string{"alias": "actual-parent/child"}},
+		"tilde, dot component":       {cmd: "cmd: /bin/cp a ~/./inventory/results/decisions-$STAGEHAND_RUN_ID.json\n", dirs: []string{"results"}},
 		"walk past the entry budget": {path: "x/results/d-$STAGEHAND_RUN_ID.json", dirs: []string{"x/results/a", "x/results/b"}, limit: 1},
 	}
 	for name, tc := range cases {
@@ -376,7 +386,12 @@ func TestStagehandRunPathOutsideRunsFailsClosedWithoutContainment(t *testing.T) 
 			if tc.roots != nil {
 				roots = tc.roots(root)
 			}
-			opts := writeStagehandSpec(t, "cmd: /bin/cp a \""+path+"\"\n", roots)
+			spec := "cmd: /bin/cp a \"" + path + "\"\n"
+			if tc.cmd != "" {
+				t.Setenv("HOME", filepath.Dir(root))
+				spec = strings.ReplaceAll(tc.cmd, "@", root)
+			}
+			opts := writeStagehandSpec(t, spec, roots)
 			if tc.limit > 0 {
 				opts.Limits.DeepSizeMaxEntries = tc.limit
 			}

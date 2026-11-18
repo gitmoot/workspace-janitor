@@ -795,7 +795,7 @@ func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, 
 		// directory above its first run-dependent component, only when
 		// that prefix provably contains it (see stagehandPrefixes.check).
 		if !core.PathWithin(ref.Path, runsDir) {
-			prefix, why := prefixes.check(ref.rawPath, ref.Path)
+			prefix, why := prefixes.check(ref.unclean, ref.Path)
 			if why != "" {
 				noteUnreadable(report, fmt.Sprintf("%s builds a path outside its run directory: %s (%s)", label, ref.Path, why))
 				continue
@@ -835,17 +835,18 @@ func newStagehandPrefixes(ctx context.Context, opts *Options) *stagehandPrefixes
 // everything the janitor manages). Containment must also be proven on
 // disk: the run-dependent component may name any entry below the prefix,
 // so a symlink on the prefix path or anywhere below it could send the
-// real target elsewhere. path must be spelled clean in the spec (raw): a
-// ".." after a symlink resolves through the symlink's target, not
+// real target elsewhere. A path that is unclean (spelled with a "." or ".."
+// component before or during expansion, or not clean once expanded) fails:
+// a ".." after a symlink resolves through the symlink's target, not
 // lexically. An existing prefix must resolve to itself and a
 // bounded walk must find no symlink below it. A prefix that does not exist
 // yet redirects nothing: its nearest existing ancestor must resolve to
 // itself and must not be an inventory root or an ancestor of one.
-func (s *stagehandPrefixes) check(raw, path string) (string, string) {
-	if raw != path {
+func (s *stagehandPrefixes) check(unclean bool, path string) (string, string) {
+	if unclean {
 		// filepath.Clean folds "x/.." lexically, but the kernel follows x
 		// first: a symlink at x sends the real path elsewhere.
-		return "", "it is not spelled as a clean path (" + raw + ")"
+		return "", "it is not spelled as a clean path"
 	}
 	if s == nil {
 		return "", "its containment cannot be checked"
@@ -1040,9 +1041,14 @@ func specPathReferences(spec, signal, detail string, runtime map[string]string, 
 	var refs []Reference
 	var unresolved []string
 	var currentKey string
+	// currentDotted marks every path of the word being considered whose
+	// spelling, before any expansion or in a substituted value, has a "."
+	// or ".." component.
+	var currentDotted bool
 	addOne := func(path string) {
 		if p := filepath.Clean(path); filepath.IsAbs(p) && p != "/" {
-			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail, specKey: currentKey, rawPath: path})
+			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail, specKey: currentKey,
+				unclean: currentDotted || path != p})
 		}
 	}
 	// add applies the shell's pathname expansions to one candidate: braces,
@@ -1059,7 +1065,9 @@ func specPathReferences(spec, signal, detail string, runtime map[string]string, 
 		}
 	}
 	consider := func(word string) {
-		for _, expanded := range expandWord(word, vars) {
+		expansions, dotted := expandWord(word, vars)
+		currentDotted = dotted || hasDotComponent(word)
+		for _, expanded := range expansions {
 			// An expansion still present may hold any value, including "..",
 			// so no part of the word bounds where it points: unresolved.
 			if unresolvedExpansion.MatchString(expanded) {
@@ -1163,7 +1171,12 @@ func expandPathname(word string) ([]string, bool) {
 			if !filepath.IsAbs(home) {
 				return nil, false
 			}
-			w = filepath.Join(home, rest)
+			// Concatenated, not joined: filepath.Join would clean away a
+			// ".." that the containment check must see.
+			w = home
+			if rest != "" {
+				w += "/" + rest
+			}
 		}
 		if !filepath.IsAbs(w) {
 			continue
@@ -1241,9 +1254,12 @@ func expandBraces(word string, limit int) ([]string, bool) {
 // candidates, set or not. An unknown expansion, a variable recorded with too
 // many values (nil in vars), or a word whose expansions would exceed 16 is
 // returned unexpanded, for the caller to treat as unresolved: candidates are
-// never silently dropped.
-func expandWord(word string, vars map[string][]string) []string {
+// never silently dropped. Values are substituted by plain concatenation;
+// dotted reports whether any substituted value has a "." or ".."
+// component.
+func expandWord(word string, vars map[string][]string) ([]string, bool) {
 	const maxResults = 16
+	dotted := false
 	results := []string{word}
 	for round := 0; round < 4; round++ {
 		changed := false
@@ -1262,7 +1278,7 @@ func expandWord(word string, vars map[string][]string) []string {
 			}
 			known, recorded := vars[name]
 			if recorded && known == nil {
-				return []string{word}
+				return []string{word}, dotted
 			}
 			// A written fallback is always a candidate as well: POSIX uses it
 			// when NAME is unset and, for :- and :=, when NAME is empty, and
@@ -1278,10 +1294,11 @@ func expandWord(word string, vars map[string][]string) []string {
 				continue
 			}
 			if len(next)+len(values) > maxResults {
-				return []string{word}
+				return []string{word}, dotted
 			}
 			changed = true
 			for _, value := range values {
+				dotted = dotted || hasDotComponent(value)
 				next = append(next, current[:loc[0]]+value+current[loc[1]:])
 			}
 		}
@@ -1290,7 +1307,20 @@ func expandWord(word string, vars map[string][]string) []string {
 			break
 		}
 	}
-	return results
+	return results, dotted
+}
+
+// hasDotComponent reports whether s, split on "/", has a "." or ".."
+// component. filepath.Clean folds those lexically, but the kernel resolves
+// ".." through a symlink's target, so a cleaned path no longer says where
+// such a path points.
+func hasDotComponent(s string) bool {
+	for _, part := range strings.Split(s, "/") {
+		if part == "." || part == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // commandKeys name spec fields whose values are shell commands.
