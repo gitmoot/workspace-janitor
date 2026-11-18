@@ -385,6 +385,29 @@ func (e *Engine) receiptPolicy() safety.Policy {
 	return policy
 }
 
+// liveSessionFootprint holds a receipt to herdr by its original footprint,
+// not by inventory: once quarantined, its original pathname is gone, so no
+// collection of the original's parent observes it or runs herdr. When the
+// recorded original path could move a live session (config.HerdrCollector
+// .Reaches: it lies in a session store, or was a real directory holding
+// one), herdr is asked; a live session there refuses (live_agent_session),
+// and herdr not answering is a failure, not a refusal. Session artifacts
+// are exempt (owner decision, 2026-11-09).
+func (e *Engine) liveSessionFootprint(ctx context.Context, item core.CleanupItem) error {
+	cfg := e.Collect.Herdr
+	if !cfg.Reaches(item.Source, item.Entry.Kind == core.EntryKindDirectory) {
+		return nil
+	}
+	sessions, err := collect.ListHerdrSessions(ctx, cfg, e.Collect.Limits.CommandTimeout)
+	if err != nil {
+		return fmt.Errorf("herdr agent sessions are unknown, so %s is not expired: %w", item.Source, err)
+	}
+	if live := sessions.Holds(item.Source); live != "" {
+		return refused("%s: %s", core.ProtectLiveAgentSession, live)
+	}
+	return nil
+}
+
 // eligibleLeftoverCompanion holds a bound companion that an interrupted
 // expiry left behind its deleted primary to the expiry guards again before
 // removeLeftoverCompanion deletes it. Its identity alone is not enough: an
@@ -412,6 +435,11 @@ func (e *Engine) eligibleLeftoverCompanion(ctx context.Context, item core.Cleanu
 	}
 	if !identityMatches(info, id) {
 		return nil
+	}
+	// Only a leftover that is still there is held to herdr: a deletion that
+	// already removed both settles without it.
+	if err := e.liveSessionFootprint(ctx, item); err != nil {
+		return err
 	}
 	if err := e.originalReferences(ctx, source); err != nil {
 		return err

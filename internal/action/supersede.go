@@ -32,6 +32,9 @@ func (e *Engine) expiryEligible(ctx context.Context, item core.CleanupItem) (*id
 	if _, ok := ArtifactBatch(item); ok {
 		return nil, e.artifactEligible(ctx, item)
 	}
+	if err := e.liveSessionFootprint(ctx, item); err != nil {
+		return nil, err
+	}
 	proof := e.identicalOriginal(ctx, item)
 	if proof == nil {
 		return nil, e.Eligible(ctx, item)

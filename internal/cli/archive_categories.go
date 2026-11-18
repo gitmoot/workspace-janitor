@@ -648,7 +648,7 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			continue
 		}
 		item.Category, item.Kind = category.Name, string(category.Kind)
-		if herdrGap != nil && policy.Collectors.Herdr.Covers(entry.Path) {
+		if herdrGap != nil && policy.Collectors.Herdr.Reaches(entry.Path, entry.Kind == core.EntryKindDirectory) {
 			item.Status, item.Reasons = categoryFailed, []string{herdrGap.Error()}
 			failures = append(failures, fmt.Errorf("%s: %w", item.Path, herdrGap))
 			report.Items = append(report.Items, item)
@@ -770,17 +770,16 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 					return releaseStillEffective(ctx, paths, reply)
 				}
 			}
-			if category.Kind == config.CategoryOMPSessions {
-				// Herdr is asked again before the copy and before
-				// publication: a queued session can wait behind earlier
-				// copies long after the run's observation.
-				base := preflight
-				preflight = func() error {
-					if err := base(); err != nil {
-						return err
-					}
-					return herdr.check(ctx, path)
+			// Herdr is asked again before the copy and before publication
+			// for an item that could move a session (a session unit, or a
+			// directory holding a store): a queued item can wait behind
+			// earlier copies long after the run's observation.
+			withHerdr := preflight
+			preflight = func() error {
+				if err := withHerdr(); err != nil {
+					return err
 				}
+				return herdr.check(ctx, path)
 			}
 			rule := categoryRule(category, name, item.Path, owner, release)
 			scope := workspacearchive.BindingScope(ctx, policy, rule, policy.Collectors.ProcRoot, &dependents)
@@ -908,17 +907,22 @@ func (r *liveSessionRefusal) Error() string {
 	return string(core.ProtectLiveAgentSession) + ": " + r.reason
 }
 
-// check returns a *liveSessionRefusal when a live herdr agent resumes the
-// unit at path, and a plain error (a failure) when herdr gave no answer.
+// check returns a *liveSessionRefusal when a live herdr agent resumes a
+// session that archiving path would cover (config.HerdrCollector.Reaches),
+// and a plain error (a failure) when herdr gave no answer.
 func (h *herdrRecheck) check(ctx context.Context, path string) error {
-	if h == nil || !h.cfg.Covers(path) {
+	if h == nil {
+		return nil
+	}
+	info, err := os.Lstat(path)
+	if !h.cfg.Reaches(path, err == nil && info.IsDir()) {
 		return nil
 	}
 	sessions, err := collect.ListHerdrSessions(ctx, h.cfg, h.timeout)
 	if err != nil {
 		return fmt.Errorf("herdr agent sessions are unknown, so %s is not archived: %w", path, err)
 	}
-	if live := sessions.Unit(path); live != "" {
+	if live := sessions.Holds(path); live != "" {
 		return &liveSessionRefusal{reason: live}
 	}
 	return nil

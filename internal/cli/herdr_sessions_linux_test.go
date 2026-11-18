@@ -449,3 +449,177 @@ func TestHerdrScanInsideALiveSessionFolderStillGuards(t *testing.T) {
 		}
 	}
 }
+
+// Review of #223: a shallow scan whose root holds the session store (here
+// the ".omp" directory, seeing "agent" at depth one) runs herdr and keeps
+// that directory: protected while a session is live, unknown when herdr
+// fails, so it is never planned for quarantine.
+func TestHerdrShallowScanOfAStoreAncestorStillGuards(t *testing.T) {
+	for name, answer := range map[string]string{"live session": "", "herdr failing": herdrNotRunning} {
+		t.Run(name, func(t *testing.T) {
+			x := newStateStoreFixture(t)
+			file := filepath.Join(t.TempDir(), "answer.json")
+			herdrScript(t, x, x.sessions, "exec /bin/cat "+file)
+			session := x.session(t, "-proj", sessionA, categoryIdleAge)
+			if answer == "" {
+				answer = herdrAgentList(session + ".jsonl")
+			}
+			writeHerdrAnswer(t, file, answer)
+			omp := filepath.Dir(filepath.Dir(x.sessions))
+			raw, err := os.ReadFile(x.paths(t).PolicyFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			x.writePolicy(t, strings.Replace(string(raw), "roots:\n", "roots:\n  - path: "+omp+"\n    max_depth: 1\n", 1))
+			want := core.ProtectLiveAgentSession
+			if answer == herdrNotRunning {
+				want = core.ProtectCollectorFailure
+			}
+			x.data(t, "scan")
+			x.data(t, "plan", "--no-jev")
+			var verdict core.Verdict
+			field(t, x.data(t, "explain", filepath.Join(omp, "agent")), "safety_verdict", &verdict)
+			found := false
+			for _, protection := range verdict.Protections {
+				found = found || protection.Kind == want
+			}
+			if !found || verdict.Allows(core.ActionQuarantine) {
+				t.Errorf("store ancestor %s lacks %s: %+v", filepath.Join(omp, "agent"), want, verdict.Protections)
+			}
+		})
+	}
+}
+
+// Review of #226, P1: a directory holding a session store, quarantined
+// while no session was live, is held at expiry by its original footprint,
+// though its original pathname is gone and no inventory observes it: a
+// session herdr now names under it refuses, and herdr failing fails.
+func TestHerdrExpiryOfAStoreAncestorChecksItsOriginalFootprint(t *testing.T) {
+	for name, live := range map[string]bool{"live session": true, "herdr failing": false} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			root := filepath.Join(f.home, "inventory")
+			build := filepath.Join(root, "build")
+			sessions := filepath.Join(build, ".omp", "agent", "sessions")
+			transcript := filepath.Join(sessions, "-proj", sessionA+".jsonl")
+			proc := filepath.Join(f.home, "empty-proc")
+			units := filepath.Join(f.home, "systemd")
+			for _, dir := range []string{filepath.Join(sessions, "-proj", sessionA), proc, units} {
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(transcript, []byte(strings.Repeat("x", 5120)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			answer := filepath.Join(t.TempDir(), "answer.json")
+			writeHerdrAnswer(t, answer, herdrAgentList())
+			binary := filepath.Join(t.TempDir(), "herdr")
+			if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec /bin/cat "+answer+"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: true\n  proc_root: "+proc+
+				"\n  systemd_dirs:\n    - "+units+"\n  cron_paths: []\n  pm2_dumps: []\n  herdr:\n    binary: "+binary+"\n    session_roots: ["+sessions+"]\n"+
+				"caches:\n  - name: build\n    path: "+build+"\n    action: quarantine\n    retention: none\nretention:\n  delete_enabled: true\nprevention:\n  min_free_percent: 0\n")
+			if _, stderr, code := f.run(t, "scan"); code != ExitOK {
+				t.Fatalf("scan: %s", stderr)
+			}
+			out, stderr, code := f.run(t, "--format", "json", "plan", "--no-jev")
+			var doc struct {
+				Data struct {
+					Plan core.Plan `json:"plan"`
+				} `json:"data"`
+			}
+			if code != ExitOK || json.Unmarshal([]byte(out), &doc) != nil {
+				t.Fatalf("plan: %d %s %s", code, stderr, out)
+			}
+			var chosen core.Action
+			for _, candidate := range doc.Data.Plan.Actions {
+				if candidate.Path == build {
+					chosen = candidate
+				}
+			}
+			if chosen.Kind != core.ActionQuarantine {
+				t.Fatalf("build directory not proposed for quarantine while no session is live: %+v", chosen)
+			}
+			if _, stderr, code := f.run(t, "plan", "--plan", doc.Data.Plan.ID, "--approve", chosen.ID, "--no-jev"); code != ExitOK {
+				t.Fatalf("approve: %s", stderr)
+			}
+			if _, stderr, code := f.run(t, "apply", "--quarantine", "--action", chosen.ID, "--confirm", "--dry-run=false"); code != ExitOK {
+				t.Fatalf("quarantine: %s", stderr)
+			}
+			if _, err := os.Lstat(build); !os.IsNotExist(err) {
+				t.Fatalf("build not quarantined: %v", err)
+			}
+			if live {
+				writeHerdrAnswer(t, answer, herdrAgentList(transcript))
+			} else {
+				writeHerdrAnswer(t, answer, herdrNotRunning)
+			}
+			out, stderr, code = f.run(t, "--format", "json", "apply", "--expire", "--dry-run=false", "--confirm")
+			var expired struct {
+				Data cleanupReport `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(out), &expired); err != nil {
+				t.Fatalf("expiry output: %v\n%s\n%s", err, out, stderr)
+			}
+			got := expired.Data
+			switch {
+			case code == ExitOK:
+				t.Fatalf("expiry of a store ancestor succeeded: %+v", got)
+			case live && (len(got.Errors) != 0 || len(got.Refused) != 1 || !strings.Contains(got.Refused[0], "live_agent_session")):
+				t.Fatalf("expiry with a live session under the original not refused as live_agent_session: %+v", got)
+			case !live && (len(got.Refused) != 0 || len(got.Errors) != 1 || !strings.Contains(got.Errors[0], "herdr")):
+				t.Fatalf("expiry under a failing herdr not a failure: %+v", got)
+			}
+			for _, item := range got.Items {
+				if item.State == core.CleanupDeleted {
+					t.Fatalf("store ancestor deleted: %+v", item)
+				}
+			}
+		})
+	}
+}
+
+// Review of #226, P2: a root_scratch candidate holding a session store
+// (reached through a symlinked sessions root) under a failing herdr is a
+// failure of the category run, not a refusal.
+func TestHerdrFailureOnAStoreAncestorCandidateIsAFailure(t *testing.T) {
+	x := newCategoryFixture(t)
+	candidate := filepath.Join(x.work, "scratch-build")
+	store := filepath.Join(candidate, "sessions")
+	if err := os.MkdirAll(filepath.Join(store, "-proj", sessionA), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	backdate(t, candidate, categoryIdleAge)
+	root := filepath.Join(x.home, ".omp", "agent", "sessions")
+	if err := os.MkdirAll(filepath.Dir(root), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(store, root); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(t.TempDir(), "herdr")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\necho '"+herdrNotRunning+"'\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(x.paths(t).PolicyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, strings.Replace(string(raw), "collectors:\n", "collectors:\n  herdr:\n    binary: "+binary+"\n    session_roots: ["+root+"]\n", 1))
+	out, stderr, code := x.runAgents(t, "--format", "json", "archive", "--categories", "--dry-run=false", "--confirm")
+	if code == ExitOK {
+		t.Fatalf("category run under a failing herdr succeeded: %s", out)
+	}
+	var doc struct {
+		Data categoryArchiveReport `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("%v\n%s\n%s", err, out, stderr)
+	}
+	item := categoryItem(t, doc.Data, candidate)
+	if item.Status != categoryFailed || !strings.Contains(strings.Join(item.Reasons, ";"), "herdr") {
+		t.Fatalf("store ancestor candidate under a failing herdr not failed: %+v", item)
+	}
+}

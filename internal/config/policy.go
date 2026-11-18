@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"net"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"slices"
@@ -268,32 +269,44 @@ type HerdrCollector struct {
 	// SessionRoots are the OMP session stores (".../.omp/agent/sessions")
 	// the guard covers.
 	SessionRoots []string `yaml:"session_roots" json:"session_roots"`
-	// stores holds the store each session root resolves to (ResolveRoots).
-	stores []string
+	// stores holds the store each session root resolves to (ResolveRoots);
+	// unknown is set when one could not be resolved to a single identity.
+	stores   []string
+	unknown  bool
+	resolved bool
 }
 
 // ResolveRoots records the store of each session root: the path all its
 // symlinks resolve to (of its deepest existing ancestor while it is
 // absent). Coverage and herdr references compare resolved paths, so a
 // session is one identity whichever spelling (an inventory root, a category
-// root, herdr's own path) reaches it.
+// root, herdr's own path) reaches it. A root that cannot be resolved to one
+// identity (ResolvePath) makes every path reach a store, so herdr must
+// answer before anything moves.
 func (h *HerdrCollector) ResolveRoots() {
-	h.stores = make([]string, len(h.SessionRoots))
+	h.stores, h.unknown, h.resolved = make([]string, len(h.SessionRoots)), false, true
 	for i, root := range h.SessionRoots {
-		h.stores[i] = RealPath(root)
+		real, ok := ResolvePath(root)
+		h.stores[i], h.unknown = real, h.unknown || !ok
 	}
 }
 
-// Stores returns the resolved store of each session root, in SessionRoots
-// order. A collector built outside policy loading resolves them on each
-// call.
-func (h *HerdrCollector) Stores() []string {
-	if h.stores != nil {
-		return h.stores
+// resolution returns the resolved stores and whether any is unknown. A
+// collector built outside policy loading resolves them on each call.
+func (h *HerdrCollector) resolution() ([]string, bool) {
+	if h.resolved {
+		return h.stores, h.unknown
 	}
 	resolved := *h
 	resolved.ResolveRoots()
-	return resolved.stores
+	return resolved.stores, resolved.unknown
+}
+
+// Stores returns the resolved store of each session root, in SessionRoots
+// order.
+func (h *HerdrCollector) Stores() []string {
+	stores, _ := h.resolution()
+	return stores
 }
 
 // CoversReal reports whether real, a resolved path, is or lies in a
@@ -302,27 +315,90 @@ func (h *HerdrCollector) CoversReal(real string) bool {
 	return slices.ContainsFunc(h.Stores(), func(store string) bool { return core.PathWithin(real, store) })
 }
 
-// Covers reports whether moving path could move part of a session store:
-// path, with its directory's symlinks resolved (RealParent), lies in a
-// store. A nil collector covers nothing.
-func (h *HerdrCollector) Covers(path string) bool {
-	return h != nil && h.CoversReal(RealParent(path))
+// Reaches is the one rule for whether moving path could move a live
+// session, so herdr must answer first: path lies in a session store, or it
+// is a real directory (realDir; a symlink moves only itself) that holds
+// one. Path need not exist (an expired receipt's original pathname). A nil
+// collector reaches nothing.
+func (h *HerdrCollector) Reaches(path string, realDir bool) bool {
+	return h != nil && h.ReachesReal(RealParent(path), realDir)
 }
 
-// RealPath resolves every symlink of path; for a path that does not exist,
-// those of its deepest existing ancestor, the rest appended as spelled.
+// ReachesReal is Reaches for real, a path already resolved (RealParent).
+// With a store of unknown identity every path reaches one (fail closed).
+func (h *HerdrCollector) ReachesReal(real string, realDir bool) bool {
+	stores, unknown := h.resolution()
+	return unknown || h.CoversReal(real) || realDir && slices.ContainsFunc(stores, func(store string) bool {
+		return store != real && core.PathWithin(store, real)
+	})
+}
+
+// maxRealPathLinks bounds how many symlinks ResolvePath follows.
+const maxRealPathLinks = 40
+
+// RealPath is ResolvePath without its certainty: path as spelled when it
+// cannot be resolved.
 func RealPath(path string) string {
+	real, _ := ResolvePath(path)
+	return real
+}
+
+// ResolvePath resolves every symlink of path the way the kernel would,
+// component by component: a symlink's target is read against the already
+// resolved directory holding it, and ".." steps out of that resolved
+// directory, never out of a spelled one. A dangling symlink (a session
+// store whose target was moved into quarantine) is followed to where it
+// points, so the store keeps its identity while its target is absent; from
+// the first absent component on, the rest is appended as spelled. ok is
+// false when that reading is not the filesystem's: ".." after an absent
+// component, a non-directory inside the path, an unreadable component, or
+// more than maxRealPathLinks links; real is then path as spelled.
+func ResolvePath(path string) (real string, ok bool) {
 	path = filepath.Clean(path)
-	var rest []string
-	for dir := path; ; dir = filepath.Dir(dir) {
-		if real, err := filepath.EvalSymlinks(dir); err == nil {
-			return filepath.Join(append([]string{real}, rest...)...)
-		}
-		if parent := filepath.Dir(dir); parent == dir {
-			return path
-		}
-		rest = append([]string{filepath.Base(dir)}, rest...)
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return real, true
 	}
+	if !filepath.IsAbs(path) {
+		return path, false
+	}
+	pending := strings.Split(path, string(filepath.Separator))
+	resolved, links := string(filepath.Separator), maxRealPathLinks
+	for len(pending) > 0 {
+		name := pending[0]
+		pending = pending[1:]
+		switch name {
+		case "", ".":
+			continue
+		case "..":
+			resolved = filepath.Dir(resolved)
+			continue
+		}
+		next := filepath.Join(resolved, name)
+		info, err := os.Lstat(next)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			if slices.Contains(pending, "..") {
+				return path, false
+			}
+			return filepath.Join(append([]string{next}, pending...)...), true
+		case err != nil:
+			return path, false
+		case info.Mode()&fs.ModeSymlink != 0:
+			target, err := os.Readlink(next)
+			if links--; err != nil || links < 0 {
+				return path, false
+			}
+			if filepath.IsAbs(target) {
+				resolved = string(filepath.Separator)
+			}
+			pending = append(strings.Split(target, string(filepath.Separator)), pending...)
+		case !info.IsDir() && len(pending) > 0:
+			return path, false
+		default:
+			resolved = next
+		}
+	}
+	return resolved, true
 }
 
 // RealParent is path with its directory resolved (RealPath) and its own
