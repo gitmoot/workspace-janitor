@@ -213,9 +213,10 @@ prevention:
 	}
 }
 
-// A capacity sample below the warning target runs notify_command once with
-// the warning as its last argument: on the transition into warning, not on
-// every sample that stays below it.
+// A capacity sample below prevention.notify_below_bytes runs notify_command
+// once with the warning as its last argument: on the transition below it,
+// not on every sample that stays below it. The threshold is informational:
+// a volume above its own warning target stays target_recovered, no hold.
 func TestCapacityWarningNotifiesOncePerTransition(t *testing.T) {
 	x := newTrimFixture(t)
 	log := filepath.Join(x.home, "notified.log")
@@ -236,9 +237,10 @@ prevention:
   capacity_interval: 1s
   targets:
     - path: %[1]s
-      target_free_bytes: 9000000000000000000
+      target_free_bytes: 1
       reserve_free_bytes: 0
   notify_command: [%s, jarvis]
+  notify_below_bytes: 9000000000000000000
   notify_timeout: 1s
 `, x.root, notify))
 	lines, stop := startWatch(t, x)
@@ -248,15 +250,27 @@ prevention:
 		select {
 		case line := <-lines:
 			var report struct {
-				Reason   string          `json:"reason"`
-				Capacity json.RawMessage `json:"capacity"`
+				Reason   string `json:"reason"`
+				Capacity *struct {
+					Volumes []struct {
+						State         string `json:"state"`
+						AdmissionHold bool   `json:"admission_hold"`
+					} `json:"volumes"`
+				} `json:"capacity"`
 			}
 			if err := json.Unmarshal(line, &report); err != nil {
 				t.Fatal(err)
 			}
-			if report.Reason == "capacity" && len(report.Capacity) != 0 {
-				samples++
+			if report.Reason != "capacity" || report.Capacity == nil {
+				continue
 			}
+			for _, volume := range report.Capacity.Volumes {
+				// An unmeasured sample is unknown whatever the policy says.
+				if volume.State != "measurement_unknown" && (volume.State != "target_recovered" || volume.AdmissionHold) {
+					t.Fatalf("the notify threshold changed capacity state: %s", line)
+				}
+			}
+			samples++
 		case <-deadline:
 			t.Fatalf("only %d capacity samples", samples)
 		}
@@ -267,7 +281,50 @@ prevention:
 		t.Fatalf("notify_command never ran: %v", err)
 	}
 	calls := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(calls) != 1 || !strings.HasPrefix(calls[0], "jarvis|workspace-janitor on ") || !strings.Contains(calls[0], "below the 9000000000.0 GB warning") {
-		t.Fatalf("notify_command calls over %d samples below the target: %q", samples, calls)
+	if len(calls) != 1 || !strings.HasPrefix(calls[0], "jarvis|workspace-janitor on ") || !strings.Contains(calls[0], "below 9000000000.0 GB (warning target 0.0 GB") {
+		t.Fatalf("notify_command calls over %d samples below the threshold: %q", samples, calls)
+	}
+}
+
+// The notification settings are not part of the capacity contract Gitmoot
+// reads: the policy hash and every volume's state, hold, target, reserve,
+// recovery bytes and reason are identical with and without them.
+func TestNotifyThresholdLeavesCapacityContractUnchanged(t *testing.T) {
+	x := newTrimFixture(t)
+	notify := filepath.Join(x.home, "notify")
+	writeFile(t, notify, "#!/bin/sh\n")
+	base := fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\nprevention:\n  min_free_percent: 0\n  targets:\n    - path: %[1]s\n      target_free_bytes: 20000000000\n      reserve_free_bytes: 10000000000\n", x.root)
+	sample := func(document string) (string, string) {
+		t.Helper()
+		x.writePolicy(t, document)
+		e := &env{opts: &globalOpts{format: "json"}, stdout: io.Discard, stderr: io.Discard, lookup: config.MapLookup(x.env)}
+		paths, err := e.resolvePaths()
+		if err != nil {
+			t.Fatal(err)
+		}
+		policy, err := e.loadPolicy(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, code := x.run(t, "scan"); code != ExitOK {
+			t.Fatal("scan failed")
+		}
+		snapshot, err := sampleCapacity(context.Background(), policy, paths, time.Now().UTC(), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range snapshot.Volumes {
+			snapshot.Volumes[i].AvailableBytes, snapshot.Volumes[i].TotalBytes = nil, nil
+		}
+		volumes, err := json.Marshal(snapshot.Volumes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return snapshot.PolicyHash, string(volumes)
+	}
+	hash, volumes := sample(base)
+	notifyHash, notifyVolumes := sample(base + "  notify_command: [" + notify + ", jarvis]\n  notify_below_bytes: 40000000000\n  notify_cooldown: 1h\n  notify_timeout: 30s\n")
+	if hash != notifyHash || volumes != notifyVolumes {
+		t.Fatalf("notify settings changed the capacity contract:\nwithout %s %s\nwith    %s %s", hash, volumes, notifyHash, notifyVolumes)
 	}
 }

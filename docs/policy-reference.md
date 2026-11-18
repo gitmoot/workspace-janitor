@@ -373,29 +373,36 @@ trims and size-bounded cache rules above, and nothing else.
 ## Capacity warning notification
 
 `prevention.notify_command` (empty by default) is run when the watcher's
-capacity sample first finds a target volume below its `target_free_bytes`
-warning target, with one message appended as its last argument, for
-example:
+capacity sample first finds a target volume with fewer than
+`prevention.notify_below_bytes` available, with one message appended as its
+last argument, for example:
 
 ```yaml
 prevention:
   notify_command: [/usr/bin/env, GITMOOT_ORG_ROLE=workspace-janitor, /root/.local/bin/gitmoot, message, send, jarvis]
+  notify_below_bytes: 40000000000   # decimal 40 GB
   notify_cooldown: 6h
   notify_timeout: 30s
 ```
 
-It is edge-triggered: one run per transition into the warning, not one per
-sample. `notify_cooldown` (default `6h`, accepted `1m` through `168h`) is
-the least time between two runs, so free space hovering at the target does
-not repeat the warning; a failed run is retried, while the warning lasts,
-once the cooldown has passed. `notify_timeout` (default `30s`) bounds a run
-and may not exceed `capacity_interval`, since the sampler runs it between
-samples. The command's first element must be an absolute path; it runs
-with the watcher's environment in `/`. It requires `prevention.targets`.
-Its state is kept in `capacity-notify.json` in the state directory, so a
-restarted watcher does not warn again. Each run is reported as reason
-`capacity_notify`. The notification fields are not part of the capacity
-`policy_hash` that admission pollers pin; changing `targets` still is.
+`notify_below_bytes` is informational only. It is its own threshold, not a
+capacity target: it changes no `capacity.volumes` state, admission hold or
+reason, and it is not part of the capacity `policy_hash` that admission
+pollers such as Gitmoot pin. Raising it never moves work elsewhere or
+changes admission; `target_free_bytes` and `reserve_free_bytes` keep that
+role. `notify_command` and `notify_below_bytes` require each other.
+
+It is edge-triggered: one run per transition below the threshold, not one
+per sample. `notify_cooldown` (default `6h`, accepted `1m` through `168h`)
+is the least time between two runs, so free space hovering at the
+threshold does not repeat the warning; a failed run is retried, while space
+stays below, once the cooldown has passed. `notify_timeout` (default `30s`)
+bounds a run and may not exceed `capacity_interval`, since the sampler runs
+it between samples. The command's first element must be an absolute path;
+it runs with the watcher's environment in `/`. It requires
+`prevention.targets`, whose capacity sample it reads. Its state is kept in
+`capacity-notify.json` in the state directory, so a restarted watcher does
+not warn again. Each run is reported as reason `capacity_notify`.
 
 ## Bounded cache recovery
 

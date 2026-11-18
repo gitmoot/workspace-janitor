@@ -340,9 +340,13 @@ type Prevention struct {
 	// threshold, instead of waiting for the daily cycle.
 	LowDisk LowDiskPolicy `yaml:"low_disk" json:"low_disk"`
 	// NotifyCommand, when set, is run with one message appended as its last
-	// argument when the watcher's capacity sample first finds a volume below
-	// its warning target (target_free_bytes). Empty disables it.
+	// argument when the watcher's capacity sample first finds a target
+	// volume with fewer than NotifyBelowBytes available. Empty disables it.
 	NotifyCommand []string `yaml:"notify_command,omitempty" json:"notify_command,omitempty"`
+	// NotifyBelowBytes is the notification threshold. It is informational
+	// only: it is not a capacity target, changes no capacity state or
+	// admission hold, and is not part of the capacity policy hash.
+	NotifyBelowBytes int64 `yaml:"notify_below_bytes,omitempty" json:"notify_below_bytes,omitempty"`
 	// NotifyCooldown is the least time between two notify_command runs,
 	// so free space hovering at the target cannot repeat the warning.
 	NotifyCooldown Duration `yaml:"notify_cooldown" json:"notify_cooldown"`
@@ -1149,7 +1153,10 @@ func (p *Policy) Validate() core.FieldErrors {
 			errs.Add("prevention.notify_command", "must start with an absolute executable path")
 		}
 		if len(p.Prevention.Targets) == 0 {
-			errs.Add("prevention.notify_command", "requires prevention.targets: it reports their warning target")
+			errs.Add("prevention.notify_command", "requires prevention.targets: their capacity sample is what it checks")
+		}
+		if p.Prevention.NotifyBelowBytes <= 0 {
+			errs.Add("prevention.notify_below_bytes", "must be positive with notify_command")
 		}
 		if timeout := p.Prevention.NotifyTimeout.Duration(); timeout < time.Second || timeout > p.Prevention.CapacityInterval.Duration() {
 			// The sampler runs the command between samples; a longer run
@@ -1159,6 +1166,9 @@ func (p *Policy) Validate() core.FieldErrors {
 		if p.Prevention.NotifyCooldown.Duration() < time.Minute || p.Prevention.NotifyCooldown.Duration() > 7*24*time.Hour {
 			errs.Add("prevention.notify_cooldown", "must be between 1m and 168h")
 		}
+	}
+	if p.Prevention.NotifyBelowBytes != 0 && len(p.Prevention.NotifyCommand) == 0 {
+		errs.Add("prevention.notify_below_bytes", "requires notify_command")
 	}
 	trimKinds := map[string]bool{}
 	for i, trim := range p.Prevention.CacheTrims {

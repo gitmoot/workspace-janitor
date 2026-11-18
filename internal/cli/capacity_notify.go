@@ -34,13 +34,15 @@ type capacityNotifyVolume struct {
 const capacityNotifyStateFile = "capacity-notify.json"
 
 // notifyCapacityWarning runs prevention.notify_command once when a volume
-// of snapshot is first measured below its warning target (target_free_bytes)
-// after being at or above it: edge-triggered, not on every sample. Within
-// notify_cooldown of the last attempt it waits, so space hovering at the
-// target cannot repeat the warning; a failed attempt is retried, while the
-// warning lasts, once the cooldown has passed. A volume that could not be
-// measured changes nothing. The state persists in the state directory, so a
-// restarted watcher does not warn again. It returns nil when nothing ran.
+// of snapshot is first measured with fewer than notify_below_bytes available
+// after having at least that much: edge-triggered, not on every sample. It
+// only reads the sample: the threshold is not a capacity target and changes
+// no capacity state or admission hold. Within notify_cooldown of the last
+// attempt it waits, so space hovering at the threshold cannot repeat the
+// warning; a failed attempt is retried, while space stays below, once the
+// cooldown has passed. A volume that could not be measured changes nothing.
+// The state persists in the state directory, so a restarted watcher does
+// not warn again. It returns nil when nothing ran.
 func notifyCapacityWarning(ctx context.Context, paths config.Paths, policy config.Policy, snapshot *core.CapacitySnapshot, now time.Time) (*capacityNotifyReport, error) {
 	statePath := filepath.Join(paths.StateDir, capacityNotifyStateFile)
 	state := map[string]capacityNotifyVolume{}
@@ -56,7 +58,7 @@ func notifyCapacityWarning(ctx context.Context, paths config.Paths, policy confi
 		}
 		previous := state[volume.Key]
 		current := previous
-		current.Warning = *volume.AvailableBytes < volume.TargetBytes
+		current.Warning = *volume.AvailableBytes < uint64(policy.Prevention.NotifyBelowBytes)
 		if !current.Warning {
 			current.Notified = false
 		} else if !current.Notified && !now.Before(current.LastAttempt.Add(cooldown)) {
@@ -88,7 +90,7 @@ func notifyCapacityWarning(ctx context.Context, paths config.Paths, policy confi
 // runCapacityNotify runs the notify command, bounded by notify_timeout,
 // with the warning message as its last argument.
 func runCapacityNotify(ctx context.Context, policy config.Policy, volumes []core.CapacityState) *capacityNotifyReport {
-	message := capacityWarningMessage(volumes)
+	message := capacityWarningMessage(uint64(policy.Prevention.NotifyBelowBytes), volumes)
 	command := policy.Prevention.NotifyCommand
 	report := &capacityNotifyReport{Command: command, Message: message}
 	runCtx, cancel := context.WithTimeout(ctx, policy.Prevention.NotifyTimeout.Duration())
@@ -103,17 +105,18 @@ func runCapacityNotify(ctx context.Context, policy config.Policy, volumes []core
 	return report
 }
 
-// capacityWarningMessage names each volume below its warning target, in
-// decimal GB as the owner's thresholds are written.
-func capacityWarningMessage(volumes []core.CapacityState) string {
+// capacityWarningMessage names each volume below the notify threshold, with
+// its capacity warning target and reserve, in decimal GB as the owner's
+// thresholds are written.
+func capacityWarningMessage(below uint64, volumes []core.CapacityState) string {
 	host, _ := os.Hostname()
 	gb := func(bytes uint64) string { return fmt.Sprintf("%.1f GB", float64(bytes)/1e9) }
 	parts := make([]string, 0, len(volumes))
 	for _, volume := range volumes {
 		roots := append([]string(nil), volume.Roots...)
 		sort.Strings(roots)
-		parts = append(parts, fmt.Sprintf("%s has %s free, below the %s warning (blocking below %s)",
-			strings.Join(roots, ", "), gb(*volume.AvailableBytes), gb(volume.TargetBytes), gb(volume.ReserveBytes)))
+		parts = append(parts, fmt.Sprintf("%s has %s free, below %s (warning target %s, blocking below %s)",
+			strings.Join(roots, ", "), gb(*volume.AvailableBytes), gb(below), gb(volume.TargetBytes), gb(volume.ReserveBytes)))
 	}
 	return fmt.Sprintf("workspace-janitor on %s: low disk space: %s", host, strings.Join(parts, "; "))
 }

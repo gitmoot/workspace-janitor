@@ -95,9 +95,12 @@ prevention:
   #     target_free_bytes: 53687091200
   #     reserve_free_bytes: 10737418240
   #     recovery_margin_bytes: 2147483648
-  # Run on the first sample below a target's target_free_bytes (edge-
-  # triggered, at most once per notify_cooldown), message as last argument.
+  # Informational notification: run on the first sample with fewer than
+  # notify_below_bytes free (edge-triggered, at most once per
+  # notify_cooldown), message as last argument. Not a capacity target: no
+  # capacity state, admission hold or policy_hash changes with it.
   # notify_command: [/usr/bin/env, GITMOOT_ORG_ROLE=workspace-janitor, /root/.local/bin/gitmoot, message, send, jarvis]
+  # notify_below_bytes: 40000000000
   # notify_cooldown: 6h
   # notify_timeout: 30s          # at most capacity_interval
   # Below min_free_bytes on path's filesystem the watcher runs, at most once
