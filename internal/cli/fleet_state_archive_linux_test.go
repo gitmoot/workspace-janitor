@@ -694,7 +694,7 @@ func TestStagehandSpecKeepsItsFoldersLocal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  stagehand_dirs: ["+specs+"]\n", 1))
+	x.writePolicy(t, x.setStagehand(string(raw), "["+specs+"]", ""))
 	report := x.categories(t, true)
 	for _, path := range []string{script, work, envs, prompts} {
 		if item := x.item(t, report, path); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
@@ -712,6 +712,59 @@ func TestStagehandSpecKeepsItsFoldersLocal(t *testing.T) {
 	for _, collector := range scan.Collectors {
 		if collector.Name == "services" && collector.Status == core.CollectorRan {
 			t.Fatalf("an unparseable stagehand spec left services complete: %+v", collector)
+		}
+	}
+}
+
+// A stagehand stage that copies its result out of the run directory into a
+// file named by the run id (docs-reference's collect stage) keeps the
+// directory it writes into and leaves services complete, so unrelated
+// folders still archive. A run-dependent path whose static prefix is an
+// inventory root still blocks every removal.
+func TestStagehandRunIDPathOutsideRunsKeepsItsDirectory(t *testing.T) {
+	x := newFleetStateFixture(t)
+	results := filepath.Join(x.state, "results")
+	free := filepath.Join(x.state, "unrelated")
+	for _, path := range []string{results, free} {
+		x.folder(t, path, 20*24*time.Hour, map[string]string{"f": "x"})
+	}
+	specs := filepath.Join(x.home, "stagehand", "pipelines")
+	if err := os.MkdirAll(specs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	spec := fmt.Sprintf("stages:\n  - id: collect\n    needs: [research]\n    cmd: >-\n      /bin/cp \"$STAGEHAND_WORK/decisions.json\"\n      \"%s/decisions-$STAGEHAND_RUN_ID.json\"\n    timeout: 1m\n", results)
+	if err := os.WriteFile(filepath.Join(specs, "docs-reference.yaml"), []byte(spec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	x.policy(t)
+	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
+	raw, err := os.ReadFile(policyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, x.setStagehand(string(raw), "["+specs+"]", filepath.Join(x.home, "stagehand-state")))
+	report := x.categories(t, true)
+	if item := x.item(t, report, results); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
+		t.Fatalf("%s receives stagehand results but was not kept: %+v", results, item)
+	}
+	if item := x.item(t, report, free); item.Status != "would_archive" {
+		t.Fatalf("an unreferenced folder was blocked: %+v", item)
+	}
+	var scan core.Scan
+	field(t, x.data(t, "scan"), "scan", &scan)
+	for _, collector := range scan.Collectors {
+		if collector.Name == "services" && collector.Status != core.CollectorRan {
+			t.Fatalf("services not complete: %+v", collector)
+		}
+	}
+	broad := fmt.Sprintf("stages:\n  - cmd: /bin/cp a \"%s/decisions-$STAGEHAND_RUN_ID.json\"\n", x.state)
+	if err := os.WriteFile(filepath.Join(specs, "broad.yaml"), []byte(broad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	field(t, x.data(t, "scan"), "scan", &scan)
+	for _, collector := range scan.Collectors {
+		if collector.Name == "services" && collector.Status == core.CollectorRan {
+			t.Fatalf("a run-dependent path directly in an inventory root left services complete: %+v", collector)
 		}
 	}
 }
@@ -825,7 +878,7 @@ func TestStagehandDatabasePipelineKeepsItsFoldersLocal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  stagehand_dirs: []\n  stagehand_state_dir: "+state+"\n", 1))
+	x.writePolicy(t, x.setStagehand(string(raw), "[]", state))
 	report := x.categories(t, true)
 	for _, path := range []string{source, used, prompts} {
 		if item := x.item(t, report, path); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
@@ -853,7 +906,7 @@ func TestRelativeStagehandStateDirIsRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  stagehand_state_dir: stagehand state\n", 1))
+	x.writePolicy(t, x.setStagehand(string(raw), "", "stagehand state"))
 	_, stderr, code := x.run(t, "scan")
 	if code == ExitOK || !strings.Contains(stderr, "stagehand_state_dir") {
 		t.Fatalf("relative stagehand_state_dir accepted: exit=%d %s", code, stderr)

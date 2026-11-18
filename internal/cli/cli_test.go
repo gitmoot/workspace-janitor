@@ -29,6 +29,10 @@ func newFixture(t *testing.T) *fixture {
 	return &fixture{home: home, env: map[string]string{config.EnvHome: home}}
 }
 
+// writePolicy writes the fixture's policy. Unless the document names them,
+// the stagehand spec directory and state directory point into the fixture
+// home: the defaults (/etc/stagehand/pipelines, /var/lib/stagehand) would
+// make every services collector depend on the host's real pipelines.
 func (f *fixture) writePolicy(t *testing.T, document string) string {
 	t.Helper()
 	dir := filepath.Join(f.home, ".config", config.AppName)
@@ -36,10 +40,48 @@ func (f *fixture) writePolicy(t *testing.T, document string) string {
 		t.Fatalf("mkdir: %v", err)
 	}
 	path := filepath.Join(dir, "policy.yaml")
-	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(f.isolateStagehand(document)), 0o600); err != nil {
 		t.Fatalf("write policy: %v", err)
 	}
 	return path
+}
+
+// noStagehandDirs and noStagehandState are the fixture's isolated stagehand
+// locations; neither exists, so stagehand contributes no references.
+func (f *fixture) noStagehandDirs() string  { return filepath.Join(f.home, "no-stagehand", "pipelines") }
+func (f *fixture) noStagehandState() string { return filepath.Join(f.home, "no-stagehand", "state") }
+
+func (f *fixture) isolateStagehand(document string) string {
+	var add string
+	if !strings.Contains(document, "stagehand_dirs:") {
+		add += "  stagehand_dirs: [" + f.noStagehandDirs() + "]\n"
+	}
+	if !strings.Contains(document, "stagehand_state_dir:") {
+		add += "  stagehand_state_dir: " + f.noStagehandState() + "\n"
+	}
+	if add == "" {
+		return document
+	}
+	switch {
+	case strings.HasPrefix(document, "collectors:\n"):
+		return "collectors:\n" + add + strings.TrimPrefix(document, "collectors:\n")
+	case strings.Contains(document, "\ncollectors:\n"):
+		return strings.Replace(document, "\ncollectors:\n", "\ncollectors:\n"+add, 1)
+	default:
+		return "collectors:\n" + add + document
+	}
+}
+
+// setStagehand replaces the isolated stagehand locations in a document
+// written by writePolicy. dirs and state are YAML values; empty keeps one.
+func (f *fixture) setStagehand(document, dirs, state string) string {
+	if dirs != "" {
+		document = strings.Replace(document, "  stagehand_dirs: ["+f.noStagehandDirs()+"]\n", "  stagehand_dirs: "+dirs+"\n", 1)
+	}
+	if state != "" {
+		document = strings.Replace(document, "  stagehand_state_dir: "+f.noStagehandState()+"\n", "  stagehand_state_dir: "+state+"\n", 1)
+	}
+	return document
 }
 
 func (f *fixture) run(t *testing.T, args ...string) (stdout, stderr string, code ExitCode) {
