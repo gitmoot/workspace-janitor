@@ -360,6 +360,9 @@ func (t *cargoTarget) verify() error {
 			(core.FilesystemID{Device: uint64(st.Dev), Inode: st.Ino}) != profile.id {
 			return changed
 		}
+		if err := unix.Fstatat(profile.fd, ".cargo-lock", &st, unix.AT_SYMLINK_NOFOLLOW); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {
+			return fmt.Errorf("%w: %s no longer holds a regular .cargo-lock", changed, filepath.Join(t.path, profile.name))
+		}
 	}
 	if err := t.identify(); err != nil {
 		return fmt.Errorf("%w: %v", changed, err)
