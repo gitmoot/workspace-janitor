@@ -737,3 +737,58 @@ workspace_archive_categories:
 		}
 	}
 }
+
+// collectors.herdr needs an absolute binary and exact OMP session stores;
+// "~" expands, and the parsed policy carries both.
+func TestParsePolicyValidatesHerdrCollector(t *testing.T) {
+	paths := fixturePaths(t)
+	policy, err := parse(t, paths, "roots:\n  - path: /repos\ncollectors:\n  herdr:\n    binary: /root/.local/bin/herdr\n    session_roots: [~/.omp/agent/sessions]\n")
+	if err != nil {
+		t.Fatalf("valid herdr collector refused: %v", err)
+	}
+	if h := policy.Collectors.Herdr; h == nil || h.Binary != "/root/.local/bin/herdr" || len(h.SessionRoots) != 1 || h.SessionRoots[0] != filepath.Join(paths.Home, ".omp", "agent", "sessions") {
+		t.Fatalf("herdr collector = %+v", policy.Collectors.Herdr)
+	}
+	for document, field := range map[string]string{
+		"    binary: herdr\n    session_roots: [/root/.omp/agent/sessions]\n":                                 "collectors.herdr.binary",
+		"    binary: /bin/herdr\n    session_roots: []\n":                                                     "collectors.herdr.session_roots",
+		"    binary: /bin/herdr\n    session_roots: [/root/.omp/agent]\n":                                     "collectors.herdr.session_roots[0]",
+		"    binary: /bin/herdr\n    session_roots: [/root/.omp/agent/sessions, /root/.omp/agent/sessions]\n": "collectors.herdr.session_roots[1]",
+	} {
+		_, err := parse(t, paths, "roots:\n  - path: /repos\ncollectors:\n  herdr:\n"+document)
+		if err == nil || !strings.Contains(err.Error(), field) {
+			t.Errorf("%q: want an error for %s, got %v", document, field, err)
+		}
+	}
+}
+
+// Review of #222: a symlinked alias of a session store resolves at load to
+// the store it names, so it covers the real path, and two roots naming one
+// store are refused.
+func TestParsePolicyResolvesHerdrSessionRootAliases(t *testing.T) {
+	paths := fixturePaths(t)
+	store := filepath.Join(paths.Home, ".omp", "agent", "sessions")
+	if err := os.MkdirAll(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(paths.Home, alias); err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(alias, ".omp", "agent", "sessions")
+	policy, err := parse(t, paths, "roots:\n  - path: /repos\ncollectors:\n  herdr:\n    binary: /bin/herdr\n    session_roots: ["+aliasRoot+"]\n")
+	if err != nil {
+		t.Fatalf("aliased session root refused: %v", err)
+	}
+	resolved, err := filepath.EvalSymlinks(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := policy.Collectors.Herdr; !h.Covers(filepath.Join(resolved, "-proj", "s.jsonl")) || !h.Covers(filepath.Join(aliasRoot, "-proj")) {
+		t.Fatalf("aliased root does not cover both spellings: %+v", h.SessionRoots)
+	}
+	_, err = parse(t, paths, "roots:\n  - path: /repos\ncollectors:\n  herdr:\n    binary: /bin/herdr\n    session_roots: ["+aliasRoot+", "+resolved+"]\n")
+	if err == nil || !strings.Contains(err.Error(), "collectors.herdr.session_roots[1]") {
+		t.Fatalf("two spellings of one store not refused: %v", err)
+	}
+}

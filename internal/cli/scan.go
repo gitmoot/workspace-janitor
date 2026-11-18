@@ -168,6 +168,7 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 			ConfigFiles: policy.Collectors.ConfigFiles, GitmootPipelines: policy.Gitmoot.Database, StagehandDirs: policy.Collectors.StagehandDirs, StagehandStateDir: policy.Collectors.StagehandStateDir,
 		},
 		AgentSources: e.agentSources,
+		Herdr:        policy.Collectors.Herdr,
 		Prior:        prior,
 		PriorScanID:  priorID,
 	})

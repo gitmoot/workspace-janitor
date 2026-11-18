@@ -16,7 +16,7 @@ The policy defaults to `<config-dir>/policy.yaml`; `--policy` overrides `JANITOR
 | `owners` | Decision owner role of arbitrary paths, for reports and `explain` only. Never approves, releases, protects or unprotects anything. See [decision owners](#decision-owners). |
 | `caches` | Exact declared cache roots; `action` is `keep`, `quarantine`, `delete_candidate`, or `investigate`. Omitted action means `investigate`; TTL/size bounds need complete evidence for directories. Dedicated irreversible prune has further restrictions. |
 | `jev` | Disabled by default; model, endpoint, key **environment variable name**, request bounds, thresholds, caching and redaction. See [privacy](privacy.md). |
-| `collectors`, `limits`, `safety` | Explicit collector sources, bounded work/timeouts, and destination headroom. `allow_cross_filesystem_quarantine` does not enable a copy path: the Linux action engine still refuses cross-filesystem quarantine. `limits.archive_verify_timeout` (default `30m`, at most `24h`) bounds each full workspace archive verification on its own; see [workspace archive local expiry](#workspace-archive-local-expiry). |
+| `collectors`, `limits`, `safety` | Explicit collector sources, bounded work/timeouts, and destination headroom. `allow_cross_filesystem_quarantine` does not enable a copy path: the Linux action engine still refuses cross-filesystem quarantine. `limits.archive_verify_timeout` (default `30m`, at most `24h`) bounds each full workspace archive verification on its own; see [workspace archive local expiry](#workspace-archive-local-expiry). `collectors.herdr` (off by default) protects OMP sessions live herdr agents resume; see [live herdr agent sessions](#live-herdr-agent-sessions). |
 
 Safety is a first-precedence veto. Protected paths/canonical roots precede explicit cache rules, then built-in classification and investigate fallback. Within a tier, safer action wins, independently of YAML order. No policy field waives a core protection or enables generic direct deletion. `follow_symlinks` changes discovery, not symlink-containment safety. `delete_candidate` needs an exact cache rule and, for official pruning, a dedicated owned/idle cache plus an approved action, configured absolute supported executable, and a distinct confirmed `apply --prune` call. `retention.delete_enabled` alone never expires an item; a confirmed expiry also needs elapsed retention and fresh complete checks.
 
@@ -1260,6 +1260,8 @@ state-store unit is kept while any of these hold:
   session's path or its session id (the text after the last `_` of the
   session name). A herdr pane or session that runs an agent on that session
   carries one of these.
+- for `omp_sessions`: `collectors.herdr` is set and a live herdr agent
+  resumes the session (see [live herdr agent sessions](#live-herdr-agent-sessions))
 - a `workspace_archive_keep` or `protect.paths` entry covers the unit or its
   transcript
 - anything in it was written within `idle`
@@ -1270,6 +1272,74 @@ the run. The checks run at selection, before and after the copy, and again at
 the quarantine move and at expiry, for both the original and quarantined
 paths. The category run observes the sessions root one project directory at a
 time; a listing above `limits.max_dir_entries` refuses the run.
+
+##### Live herdr agent sessions
+
+Long-lived herdr seats resume old session files, so idle time and process
+mentions alone do not prove a session is free (owner, 2026-11-18). With
+
+```yaml
+collectors:
+  herdr:
+    binary: /root/.local/bin/herdr
+    session_roots: [/root/.omp/agent/sessions]
+```
+
+every collection that reaches into a session store runs
+`<binary> agent list --json` once: no shell, a minimal environment (`HOME`,
+`PATH`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, `HERDR_SOCKET_PATH`), in its own
+process group, within `limits.command_timeout` and a 4 MiB output bound. Each
+agent whose `agent_session` has `kind: path` names a transcript.
+
+Paths are compared by identity, not spelling. Each session root resolves at
+load to its store (all symlinks resolved); two `session_roots` naming one
+store (or one inside another) are refused. A path lies in a store when its
+directory, symlinks resolved, does; its own name is kept, since moving a
+symlink never moves what it points to. This holds for every collection
+root, entry and herdr session path, so an inventory root, a category root or
+herdr reaching the store through any symlinked alias (at the store, above it
+or at a project directory) is covered. A live session is protected as each
+observed directory that holds it spells it, and an observed directory that
+is the live session folder or lies inside it (a scan rooted there, the
+revalidation of one file in it) is protected whole, though the transcript
+beside the folder is outside it. Entries and the expiry check of an
+original path meet the protection under whatever spelling they use. Sessions of
+other machines and `kind: id` sessions (Claude) name no file here and are
+ignored.
+
+A referenced `<project>/<stem>.jsonl` protects its session unit: the
+transcript and its session folder `<project>/<stem>` as a whole, as the
+blocking protection `live_agent_session` naming the agent and its pane. It
+refuses `omp_sessions` archiving, the quarantine move and expiry of the unit
+and of its transcript (a refusal, not a failure). The category run asks
+herdr again before each session's copy and before its archive is published;
+a session that became live while it waited in the queue is refused, and
+herdr failing there fails the item.
+Quarantine and expiry ask herdr afresh in each item's revalidation. Restores
+never replace an existing path (`RENAME_NOREPLACE`), so a session folder or
+transcript an agent recreated meanwhile is never overwritten; such a restore
+is refused and the unit stays in quarantine.
+
+The boundary is the unit, not the files inside it (decided with this guard,
+2026-11-18):
+`omp_session_artifacts` keeps moving old single files out of a live seat's
+session folder, under its own guards (open files, process use, per-file
+`idle`, verified batches), as the earlier owner decision for exactly these
+seats requires. It never selects the transcript itself, which lies beside
+the folder, nor the folder as a whole, and it does not run or depend on herdr.
+
+Herdr configured but failing, timing out, printing more than the bound or
+printing anything but a well-formed agent list (its error document, any `id`
+other than `cli:agent:list`, a `result.type` other than `agent_list`, a null
+or ill-typed agent record, an `agent_session` without a string kind and
+value) leaves every entry under the session roots unknown
+(`collector_failure`): no
+`omp_sessions` unit is archived, moved or expired, and the run reports a
+failure, not a refusal (`janitor cycle` exits non-zero). A collection that
+does not reach into a session root does not run herdr, and a herdr failure
+does not hold it. `binary` must be an absolute path; each `session_roots`
+entry must be an exact `.../.omp/agent/sessions` store. Without
+`collectors.herdr` nothing changes.
 
 ##### OMP session artifacts
 

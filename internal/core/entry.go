@@ -81,8 +81,12 @@ func (s EvidenceSource) Valid() bool { return validEnum(s, evidenceSources) }
 type ProtectionKind string
 
 const (
-	ProtectActiveProcess      ProtectionKind = "active_process"
-	ProtectRegisteredAgent    ProtectionKind = "registered_agent"
+	ProtectActiveProcess   ProtectionKind = "active_process"
+	ProtectRegisteredAgent ProtectionKind = "registered_agent"
+	// ProtectLiveAgentSession marks an OMP session (its transcript and
+	// session folder) that a live herdr agent resumes: never archived,
+	// quarantined or expired (owner, 2026-11-18).
+	ProtectLiveAgentSession   ProtectionKind = "live_agent_session"
 	ProtectOwningJob          ProtectionKind = "owning_job"
 	ProtectDirtyRepository    ProtectionKind = "dirty_repository"
 	ProtectStashedWork        ProtectionKind = "stashed_work"
@@ -106,7 +110,7 @@ const (
 )
 
 var protectionKinds = []ProtectionKind{
-	ProtectActiveProcess, ProtectRegisteredAgent, ProtectOwningJob, ProtectDirtyRepository,
+	ProtectActiveProcess, ProtectRegisteredAgent, ProtectLiveAgentSession, ProtectOwningJob, ProtectDirtyRepository,
 	ProtectStashedWork, ProtectUnpublishedCommits, ProtectBrokenGitMetadata, ProtectLockHeld,
 	ProtectServiceReference, ProtectSensitiveContent, ProtectLiveDatabase, ProtectDurableEvidence,
 	ProtectSymlinkEscape, ProtectIdentityChanged, ProtectInsufficientSpace, ProtectCrossFilesystem,
