@@ -641,8 +641,8 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 	// Stagehand sets $STAGEHAND_WORK to <state>/runs/<run id>/work and
 	// $STAGEHAND_RUN_ID to that run id, an integer it assigns. A placeholder
 	// stands for it;
-	// references through it are folded into <state>/runs, unless the spec
-	// itself climbs out of that directory with a literal "..".
+	// references through it are folded into <state>/runs. One outside that
+	// directory protects its static prefix (see stagehandStaticPrefix).
 	var runtime map[string]string
 	var runsDir string
 	if state := opts.ServiceSources.StagehandStateDir; filepath.IsAbs(state) {
@@ -676,7 +676,7 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 				continue
 			}
 			report.Visited++
-			refs = append(refs, stagehandSpecRefs(content, "used by stagehand pipeline "+file, runtime, runsDir, dir, file, report)...)
+			refs = append(refs, stagehandSpecRefs(content, "used by stagehand pipeline "+file, runtime, runsDir, dir, file, opts.ServiceSources.InventoryRoots, report)...)
 		}
 	}
 	refs = append(refs, gatherStagehandDatabase(ctx, opts, report, runtime, runsDir)...)
@@ -732,7 +732,7 @@ func gatherStagehandDatabase(ctx context.Context, opts *Options, report *core.Co
 		} else if source != "" {
 			noteUnreadable(report, fmt.Sprintf("stagehand pipeline %s has a relative source_dir %q", name, source))
 		}
-		refs = append(refs, stagehandSpecRefs(spec, detail, runtime, runsDir, source, "stagehand pipeline "+name, report)...)
+		refs = append(refs, stagehandSpecRefs(spec, detail, runtime, runsDir, source, "stagehand pipeline "+name, opts.ServiceSources.InventoryRoots, report)...)
 	}
 	if err := rows.Err(); err != nil {
 		noteUnreadable(report, fmt.Sprintf("could not read stagehand pipelines: %v", err))
@@ -749,7 +749,7 @@ var stagehandFileKeys = map[string]bool{"prompt_file": true, "env_file": true, "
 // file field (prompt_file, env_file, ...) is resolved against source, the
 // directory stagehand resolves it against; without an absolute source it is
 // unresolved. label names the spec in unreadable notes.
-func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, source, label string, report *core.CollectorReport) []Reference {
+func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, source, label string, inventoryRoots []string, report *core.CollectorReport) []Reference {
 	var refs []Reference
 	var docs []any
 	decoder := yaml.NewDecoder(strings.NewReader(spec))
@@ -790,15 +790,56 @@ func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, 
 			continue
 		}
 		// filepath.Clean has already applied any literal "..": a path
-		// that left <state>/runs is reported, not folded.
+		// that left <state>/runs is protected by its static prefix, the
+		// directory above its first run-dependent component, unless that
+		// prefix is too broad to protect safely.
 		if !core.PathWithin(ref.Path, runsDir) {
-			noteUnreadable(report, fmt.Sprintf("%s builds a path outside its run directory: %s", label, ref.Path))
+			prefix, ok := stagehandStaticPrefix(ref.Path, inventoryRoots)
+			if !ok {
+				noteUnreadable(report, fmt.Sprintf("%s builds a path outside its run directory: %s", label, ref.Path))
+				continue
+			}
+			ref.Detail += fmt.Sprintf(" (%s writes run-dependent %s)", ref.specKey, ref.Path)
+			ref.Path, ref.Subtree = prefix, true
+			refs = append(refs, ref)
 			continue
 		}
 		ref.Path, ref.Subtree = runsDir, true
 		refs = append(refs, ref)
 	}
 	return refs
+}
+
+// stagehandStaticPrefix returns the directory above the first component of
+// path that holds the run placeholder. It refuses (false) a prefix that is
+// not absolute and clean, is a filesystem root, or is an inventory root or
+// an ancestor of one (or when no roots are known): protecting it would
+// protect, and so freeze, every entry the janitor manages.
+func stagehandStaticPrefix(path string, inventoryRoots []string) (string, bool) {
+	if !filepath.IsAbs(path) {
+		return "", false
+	}
+	parts := strings.Split(path, "/")
+	cut := -1
+	for i, part := range parts {
+		if strings.Contains(part, stagehandRunPlaceholder) || strings.ContainsAny(part, "$`") {
+			cut = i
+			break
+		}
+	}
+	if cut < 1 {
+		return "", false
+	}
+	prefix := strings.Join(parts[:cut], "/")
+	if prefix == "" || prefix != filepath.Clean(prefix) || prefix == "/" || len(inventoryRoots) == 0 {
+		return "", false
+	}
+	for _, root := range inventoryRoots {
+		if !filepath.IsAbs(root) || core.PathWithin(filepath.Clean(root), prefix) {
+			return "", false
+		}
+	}
+	return prefix, true
 }
 
 // specPathReferences parses a pipeline spec (YAML, every document) and
@@ -871,9 +912,10 @@ func specPathReferences(spec, signal, detail string, runtime map[string]string, 
 	})
 	var refs []Reference
 	var unresolved []string
+	var currentKey string
 	addOne := func(path string) {
 		if p := filepath.Clean(path); filepath.IsAbs(p) && p != "/" {
-			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail})
+			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail, specKey: currentKey})
 		}
 	}
 	// add applies the shell's pathname expansions to one candidate: braces,
@@ -918,6 +960,7 @@ func specPathReferences(spec, signal, detail string, runtime map[string]string, 
 	// (cwd: /a b). A command field is shell text: only its words count, or a
 	// whole command line would be read as one long path.
 	walkConfigKeyedStrings(docs, "", func(key, value string) {
+		currentKey = key
 		if literal[strings.ToLower(key)] {
 			return
 		}

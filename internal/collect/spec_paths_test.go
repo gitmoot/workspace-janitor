@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -242,6 +243,84 @@ func TestStagehandRunReferencesProtectRunsAndSurviveSpaces(t *testing.T) {
 	}
 }
 
+// writeStagehandSpec writes one spec into a fresh spec directory and returns
+// collector options reading it, with a fresh state directory.
+func writeStagehandSpec(t *testing.T, spec string, roots []string) *Options {
+	t.Helper()
+	specs := t.TempDir()
+	if err := os.WriteFile(filepath.Join(specs, "p.yaml"), []byte(spec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return &Options{Services: true, ServiceSources: ServiceSources{StagehandDirs: []string{specs}, StagehandStateDir: t.TempDir(), InventoryRoots: roots}}
+}
+
+// A stage that copies its result out of the run directory into a file
+// named by the run id protects the directory above that file as a subtree
+// instead of leaving the whole services collector partial.
+func TestStagehandRunPathOutsideRunsProtectsStaticPrefix(t *testing.T) {
+	cases := map[string]struct{ spec, prefix string }{
+		"cp into results": {
+			spec:   "stages:\n  - cmd: /bin/cp \"$STAGEHAND_WORK/decisions.json\" \"/root/x/results/decisions-$STAGEHAND_RUN_ID.json\"\n",
+			prefix: "/root/x/results",
+		},
+		// The collect stage of /etc/stagehand/pipelines/docs-reference.yaml.
+		"docs-reference": {
+			spec:   "stages:\n  - id: collect\n    needs: [research]\n    cmd: >-\n      /bin/cp \"$STAGEHAND_WORK/decisions.json\"\n      \"/root/fleet-tools/state/enyo-docs/tests-bc/results/decisions-$STAGEHAND_RUN_ID.json\"\n    timeout: 1m\n",
+			prefix: "/root/fleet-tools/state/enyo-docs/tests-bc/results",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			refs, report := gatherServiceReferences(context.Background(), writeStagehandSpec(t, tc.spec, []string{"/root"}))
+			if report.Status != core.CollectorRan || report.Unknowns != 0 {
+				t.Fatalf("services collector should run completely: %+v", report)
+			}
+			var prefix *Reference
+			for i := range refs {
+				if refs[i].Path == tc.prefix {
+					prefix = &refs[i]
+				}
+			}
+			if prefix == nil || !prefix.Subtree || !strings.Contains(prefix.Detail, "cmd") {
+				t.Fatalf("static prefix %s not protected as a subtree naming its key: %+v", tc.prefix, refs)
+			}
+			inside := core.Entry{Path: filepath.Join(tc.prefix, "decisions-7.json")}
+			unrelated := core.Entry{Path: filepath.Join(filepath.Dir(tc.prefix), "other")}
+			entries := []core.Entry{inside, unrelated}
+			attachReferences(entries, refs, time.Now())
+			if !entries[0].Protected() || !hasProtection(entries[0], core.ProtectServiceReference) {
+				t.Errorf("%s inside the results directory is not protected: %+v", entries[0].Path, entries[0])
+			}
+			if entries[1].Protected() {
+				t.Errorf("unrelated %s is protected: %+v", entries[1].Path, entries[1])
+			}
+		})
+	}
+}
+
+// A run-dependent path whose static prefix is an inventory root, an
+// ancestor of one, or a filesystem root cannot be protected without freezing
+// everything: the source stays unknown, as before.
+func TestStagehandRunPathOutsideRunsFailsClosedOnBroadPrefix(t *testing.T) {
+	cases := map[string]struct {
+		spec  string
+		roots []string
+	}{
+		"prefix is a root":      {"cmd: /bin/cp a \"/root/x/results/d-$STAGEHAND_RUN_ID.json\"\n", []string{"/root/x/results"}},
+		"prefix is an ancestor": {"cmd: /bin/cp a \"/root/x/results/d-$STAGEHAND_RUN_ID.json\"\n", []string{"/root/x/results/archive"}},
+		"filesystem root":       {"cmd: /bin/cp a \"/d-$STAGEHAND_RUN_ID.json\"\n", []string{"/root"}},
+		"no roots known":        {"cmd: /bin/cp a \"/root/x/results/d-$STAGEHAND_RUN_ID.json\"\n", nil},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			refs, report := gatherServiceReferences(context.Background(), writeStagehandSpec(t, tc.spec, tc.roots))
+			if report.Status == core.CollectorRan || report.Unknowns == 0 {
+				t.Fatalf("broad run-dependent prefix must leave services partial: %+v %+v", report, refs)
+			}
+		})
+	}
+}
+
 // Review of #170: the collector must not treat a relative state directory
 // as "no database" (policy validation also rejects one).
 func TestStagehandDatabaseRejectsRelativeStateDir(t *testing.T) {
@@ -258,7 +337,7 @@ func TestStagehandDatabaseRejectsRelativeStateDir(t *testing.T) {
 func TestStagehandFileFieldsAreLiteral(t *testing.T) {
 	report := &core.CollectorReport{Status: core.CollectorRan}
 	spec := "stages:\n  - prompt_file: ../data/f$HOME\n  - env_file: ~x/e`y\n  - prompt_file: /abs/p$X.md\n"
-	refs := stagehandSpecRefs(spec, "d", nil, "/runs", "/work/source", "spec", report)
+	refs := stagehandSpecRefs(spec, "d", nil, "/runs", "/work/source", "spec", nil, report)
 	want := map[string]bool{"/work/data/f$HOME": false, "/work/source/~x/e`y": false, "/abs/p$X.md": false}
 	for _, ref := range refs {
 		if _, ok := want[ref.Path]; ok {
@@ -278,7 +357,7 @@ func TestStagehandFileFieldsAreLiteral(t *testing.T) {
 func TestStagehandLiteralFileFieldsDoNotMarkPartial(t *testing.T) {
 	report := &core.CollectorReport{Status: core.CollectorRan}
 	spec := "stages:\n  - prompt_file: ../data/f$UNSET\n  - env_file: ../data/f`literal`\n"
-	refs := stagehandSpecRefs(spec, "d", nil, "/runs", "/work/source", "spec", report)
+	refs := stagehandSpecRefs(spec, "d", nil, "/runs", "/work/source", "spec", nil, report)
 	if report.Status != core.CollectorRan || report.Unknowns != 0 {
 		t.Fatalf("literal file fields marked the source partial: %+v", report)
 	}
