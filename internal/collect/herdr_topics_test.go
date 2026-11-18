@@ -91,7 +91,7 @@ func TestHerdrTopicSessionsProtectEveryListedTopic(t *testing.T) {
 // A malformed topic_sessions is no answer: herdr fails and every session
 // entry is unknown. Absent and null mean no topics.
 func TestHerdrMalformedTopicSessionsFailClosed(t *testing.T) {
-	tooMany := make([]string, maxHerdrTopics+1)
+	tooMany := make([]string, 1001) // past the 1000-per-agent cap
 	for i := range tooMany {
 		tooMany[i] = "/s/-proj/t.jsonl"
 	}
