@@ -46,6 +46,8 @@ type watchReport struct {
 	Capacity        *core.CapacitySnapshot `json:"capacity,omitempty"`
 	CacheTrims      []cacheTrimReport      `json:"cache_trims,omitempty"`
 	ScratchCleanup  []scratchRunReport     `json:"scratch_cleanup,omitempty"`
+	LowDisk         *lowDiskReport         `json:"low_disk,omitempty"`
+	Notify          *capacityNotifyReport  `json:"notify,omitempty"`
 	Error           string                 `json:"error,omitempty"`
 }
 
@@ -184,6 +186,25 @@ func watchLoop(ctx context.Context, e *env, paths config.Paths, policy config.Po
 			<-sweeping
 			if sweepErr != nil && (err == nil || errors.Is(err, context.Canceled)) {
 				err = sweepErr
+			}
+		}()
+	}
+	if policy.Prevention.LowDisk.Enabled() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		lowDisk := make(chan struct{})
+		var lowDiskErr error
+		go func(ctx context.Context) {
+			defer close(lowDisk)
+			if lowDiskErr = lowDiskLoop(ctx, e, paths, policy); lowDiskErr != nil {
+				cancel()
+			}
+		}(ctx)
+		defer func() {
+			cancel()
+			<-lowDisk
+			if lowDiskErr != nil && (err == nil || errors.Is(err, context.Canceled)) {
+				err = lowDiskErr
 			}
 		}()
 	}
@@ -403,10 +424,20 @@ func sampleCapacityLoop(ctx context.Context, e *env, paths config.Paths, policy 
 		capacity *core.CapacitySnapshot
 		err      error
 	}
+	// The notifier runs beside the sampler: publication never waits on it.
+	publish := func(*core.CapacitySnapshot, time.Time) {}
+	var notifyFailed <-chan error
+	if len(policy.Prevention.NotifyCommand) != 0 {
+		var stopNotify func()
+		publish, notifyFailed, stopNotify = startCapacityNotifier(ctx, e, paths, policy)
+		defer stopNotify()
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case err := <-notifyFailed:
+			return err
 		case <-timer.C:
 		}
 		now := time.Now().UTC()
@@ -434,7 +465,14 @@ func sampleCapacityLoop(ctx context.Context, e *env, paths config.Paths, policy 
 				return err
 			}
 			if result.capacity != nil {
-				validUntil = result.capacity.ValidUntil
+				// An unknown sample (this attempt's time preceded a sample
+				// another writer, such as the startup scan, stored first)
+				// has no validity window; keep the current one rather than
+				// declaring the published sample stale at once.
+				if result.capacity.ValidUntil.After(validUntil) {
+					validUntil = result.capacity.ValidUntil
+				}
+				publish(result.capacity, now)
 			}
 		} else if !time.Now().Before(validUntil) {
 			staleErr := fmt.Errorf("capacity sample stale since %s: %w", validUntil.UTC().Format(time.RFC3339), result.err)
@@ -516,16 +554,9 @@ func emitDeferredWatch(e *env, due time.Time) error {
 
 func reconcileWatch(ctx context.Context, e *env, paths config.Paths, policy config.Policy,
 	reason string, changed map[string]bool, overflow bool, deferred uint64) error {
-	quiet := *e
-	quiet.stdout = io.Discard
-	// Category archive pins live in Janitor's state and change between
-	// cycles; the policy file itself is still read once per watcher.
-	if e.filePolicy != nil && e.filePolicy.HasArchiveCategories() {
-		refreshed, err := withCategoryArchives(ctx, paths, *e.filePolicy)
-		if err != nil {
-			return err
-		}
-		quiet.policy = &refreshed
+	quiet, err := watchEnv(ctx, e, paths)
+	if err != nil {
+		return err
 	}
 	// Background inventory is local and rules-only; neither planning nor
 	// Jev nor an action engine is invoked by this path.
@@ -536,7 +567,7 @@ func reconcileWatch(ctx context.Context, e *env, paths config.Paths, policy conf
 	if err != nil {
 		return err
 	}
-	err = runScan(ctx, &quiet, nil, scanOptions{noDeepSize: true, recordScanID: &scanID})
+	err = runScan(ctx, quiet, nil, scanOptions{noDeepSize: true, recordScanID: &scanID})
 	unlockScan()
 	if err != nil {
 		return err

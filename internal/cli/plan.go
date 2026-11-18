@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,12 +30,16 @@ type planOptions struct {
 	// approveQuarantine approves every quarantine action that overlaps no
 	// other quarantine action; the scheduled cycle uses it.
 	approveQuarantine bool
-	approver          string
-	note              string
-	noPersist         bool
-	noJev             bool
-	jevDryRun         bool
-	jevDebug          bool
+	// quarantineCacheRules, when set, limits approveQuarantine to the
+	// actions one of these cache rules (by name) decided: the low-disk
+	// trigger's size-bounded rules.
+	quarantineCacheRules []string
+	approver             string
+	note                 string
+	noPersist            bool
+	noJev                bool
+	jevDryRun            bool
+	jevDebug             bool
 }
 
 // planReport is the `plan` result contract.
@@ -331,7 +336,7 @@ func applyApprovals(ctx context.Context, db *store.Store, built core.Plan, opts 
 // approving a "keep" would mean nothing.
 func selectedActions(built core.Plan, opts planOptions) ([]core.Action, error) {
 	if opts.approveQuarantine {
-		return quarantineActions(built), nil
+		return quarantineActions(built, opts.quarantineCacheRules), nil
 	}
 	if !opts.approveAll && strings.TrimSpace(opts.approve) == "" {
 		return nil, nil
@@ -380,7 +385,9 @@ func selectedActions(built core.Plan, opts planOptions) ([]core.Action, error) {
 // quarantineActions selects the plan's quarantine actions, leaving out any
 // that overlaps another: apply refuses an overlapping batch as a whole, and
 // which of two nested paths should move is not a decision to make silently.
-func quarantineActions(built core.Plan) []core.Action {
+// With cacheRules set, it keeps only the actions one of those cache rules
+// (by name) decided.
+func quarantineActions(built core.Plan, cacheRules []string) []core.Action {
 	var candidates []core.Action
 	for _, action := range built.Actions {
 		if action.Kind == core.ActionQuarantine {
@@ -396,9 +403,10 @@ func quarantineActions(built core.Plan) []core.Action {
 				break
 			}
 		}
-		if !overlaps {
-			out = append(out, a)
+		if overlaps || (cacheRules != nil && !slices.ContainsFunc(cacheRules, func(name string) bool { return slices.Contains(a.Rules, plan.CacheRuleID(name)) })) {
+			continue
 		}
+		out = append(out, a)
 	}
 	return out
 }

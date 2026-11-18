@@ -81,7 +81,12 @@ prevention:
   history:
     keep_recent: 12
     keep_days: 14
-  # Read-only capacity sampling; empty targets disables it.
+  # Capacity sampling; empty targets disables it. target_free_bytes is the
+  # warning (no admission hold with zero recovery margin), reserve_free_bytes
+  # the blocking floor. Owner 2026-11-18 (amending directive 377778, which
+  # deleted nothing because of capacity): low capacity may trigger the
+  # rebuildable-cache trims and size-bounded cache rules (low_disk below),
+  # and nothing else.
   capacity_interval: 1m
   targets: []
   # Example desired headroom, NOT a claim that 50 GiB is available:
@@ -90,6 +95,23 @@ prevention:
   #     target_free_bytes: 53687091200
   #     reserve_free_bytes: 10737418240
   #     recovery_margin_bytes: 2147483648
+  # Informational notification: run on the first sample with fewer than
+  # notify_below_bytes free (edge-triggered, at most once per
+  # notify_cooldown), message as last argument. Not a capacity target: no
+  # capacity state, admission hold or policy_hash changes with it.
+  # notify_command: [/usr/bin/env, GITMOOT_ORG_ROLE=workspace-janitor, /root/.local/bin/gitmoot, message, send, jarvis]
+  # notify_below_bytes: 40000000000
+  # notify_cooldown: 6h
+  # notify_timeout: 30s          # kills its process group after this
+  # Below min_free_bytes on path's filesystem the watcher runs, at most once
+  # per min_interval and never during a cycle or apply, the cache_trims (not
+  # docker-images) and the caches rules with action quarantine, max_bytes and
+  # no ttl (quarantine, then expiry of those receipts). Nothing else.
+  # low_disk:
+  #   path: /
+  #   min_free_bytes: 20000000000
+  #   check_interval: 1m
+  #   min_interval: 30m
   # Separate opt-in; also requires exact owner-approved dedicated cache rules.
   recovery:
     enabled: false
@@ -137,6 +159,9 @@ prevention:
   #     path: /root/.cache/herdr-net-target  # a CARGO_TARGET_DIR with cargo's CACHEDIR.TAG
   #     max_bytes: 4294967296      # 4 GiB
   #     min_idle: 1h               # default: untouched for this long
+  #   - kind: cargo-target         # every cargo target matching, each bounded
+  #     path_glob: /root/.cache/*-target  # tagged, or a profile dir with .cargo-lock
+  #     max_bytes: 4294967296
   # cache_trim_interval: 15m
 
 # Where entries of a class are supposed to live. A primary project found

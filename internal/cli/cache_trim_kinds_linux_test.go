@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -830,15 +832,18 @@ func TestCargoTargetTrimWaitsForBuilds(t *testing.T) {
 	}
 }
 
-// A directory without cargo's CACHEDIR.TAG is not a cargo target directory:
-// the trim fails and removes nothing.
+// A directory with neither cargo's CACHEDIR.TAG nor cargo's layout, or with
+// another tool's CACHEDIR.TAG, is not a cargo target directory: the trim
+// fails and removes nothing.
 func TestCargoTargetTrimRefusesUntaggedDirectory(t *testing.T) {
 	for name, tag := range map[string]string{"missing": "", "foreign": "# not a cache directory tag\n"} {
 		t.Run(name, func(t *testing.T) {
 			x, target, trim := cargoTargetFixture(t)
 			if tag == "" {
-				if err := os.Remove(filepath.Join(target, "CACHEDIR.TAG")); err != nil {
-					t.Fatal(err)
+				for _, proof := range []string{"CACHEDIR.TAG", "release/.cargo-lock"} {
+					if err := os.Remove(filepath.Join(target, proof)); err != nil {
+						t.Fatal(err)
+					}
 				}
 			} else {
 				writeFile(t, filepath.Join(target, "CACHEDIR.TAG"), tag)
@@ -852,6 +857,65 @@ func TestCargoTargetTrimRefusesUntaggedDirectory(t *testing.T) {
 				t.Fatal("untagged directory trimmed")
 			}
 		})
+	}
+}
+
+// A cargo-target path_glob bounds every cargo target directly in its parent
+// without listing each (owner 2026-11-18): a new herdr-*-target, tagged or
+// with only cargo's layout (cargo writes no tag into a pre-created
+// CARGO_TARGET_DIR), is trimmed; one a live process builds into is skipped;
+// a matching directory that is not a cargo target is left alone.
+func TestCargoTargetGlobTrimsDiscoveredTargets(t *testing.T) {
+	x := newTrimFixture(t)
+	cache := filepath.Join(x.home, "cache")
+	makeTarget := func(name string, tagged bool) string {
+		target := filepath.Join(cache, name)
+		if tagged {
+			writeFile(t, filepath.Join(target, "CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n")
+		}
+		writeFile(t, filepath.Join(target, "release", ".cargo-lock"), "")
+		writeFile(t, filepath.Join(target, "release", "deps", "libbig.rlib"), string(make([]byte, 1<<20)))
+		return target
+	}
+	tagged := makeTarget("herdr-new-target", true)
+	untagged := makeTarget("herdr-untagged-target", false)
+	busy := makeTarget("herdr-busy-target", true)
+	notes := filepath.Join(cache, "notes-target")
+	writeFile(t, filepath.Join(notes, "keep.bin"), string(make([]byte, 1<<20)))
+	backdate(t, cache, 2*time.Hour)
+	x.processEnv(t, "100", []string{"HOME=" + x.home, "CARGO_TARGET_DIR=" + busy}, "/bin/bash")
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n    - kind: cargo-target\n      path_glob: %s\n      max_bytes: 65536\n",
+		x.root, x.proc, filepath.Join(cache, "*-target")))
+	out, stderr, code := x.run(t, "cycle")
+	var report struct {
+		CacheTrims []struct {
+			kindResult
+			Path string `json:"path"`
+		} `json:"cache_trims"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil || code != ExitOK {
+		t.Fatalf("cycle: exit %d %s %s", code, out, stderr)
+	}
+	status := map[string]string{}
+	for _, trim := range report.CacheTrims {
+		status[trim.Path] = trim.Status
+	}
+	want := map[string]string{tagged: "trimmed", untagged: "trimmed", busy: "skipped_in_use", notes: "not_cargo_target"}
+	if len(status) != len(want) {
+		t.Fatalf("glob trims = %v, want %v", status, want)
+	}
+	for path, wantStatus := range want {
+		if status[path] != wantStatus {
+			t.Errorf("%s: status %q, want %q", path, status[path], wantStatus)
+		}
+	}
+	for _, trimmed := range []string{tagged, untagged} {
+		if exists(t, filepath.Join(trimmed, "release", "deps")) || !exists(t, filepath.Join(trimmed, "release", ".cargo-lock")) {
+			t.Errorf("%s not trimmed as cargo clean would", trimmed)
+		}
+	}
+	if !exists(t, filepath.Join(busy, "release", "deps", "libbig.rlib")) || !exists(t, filepath.Join(notes, "keep.bin")) {
+		t.Fatal("a target in use or a non-cargo directory lost content")
 	}
 }
 
@@ -930,4 +994,158 @@ func replaceDuringScan(fifo, dir, fresh string) error {
 	}
 	_, err = unix.Write(fd, []byte("/usr/bin/sleep\x0060\x00"))
 	return err
+}
+
+// A directory a cargo-target path_glob discovered, then replaced by a
+// symlink before its turn, is never followed: its trim fails, and the
+// symlink's destination (a cargo target outside the glob's directory) and
+// the moved-aside directory keep their data.
+func TestCargoTargetGlobRefusesMatchReplacedBySymlink(t *testing.T) {
+	x := newTrimFixture(t)
+	cache := filepath.Join(x.home, "cache")
+	first, second := filepath.Join(cache, "a-target"), filepath.Join(cache, "b-target")
+	outside := filepath.Join(x.home, "outside-target")
+	for _, dir := range []string{first, second, outside} {
+		writeFile(t, filepath.Join(dir, "CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n")
+		writeFile(t, filepath.Join(dir, "release", ".cargo-lock"), "")
+		writeFile(t, filepath.Join(dir, "release", "deps", "libbig.rlib"), string(make([]byte, 1<<20)))
+		backdate(t, dir, 2*time.Hour)
+	}
+	// The first target's process scan blocks reading this cmdline until the
+	// test has replaced the second, already discovered, target.
+	proc := filepath.Join(x.proc, "100")
+	writeFile(t, filepath.Join(proc, "environ"), "HOME=/nonexistent\x00")
+	if err := unix.Mkfifo(filepath.Join(proc, "cmdline"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for link, dest := range map[string]string{"cwd": "/", "exe": "/usr/bin/sleep"} {
+		if err := os.Symlink(dest, filepath.Join(proc, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- symlinkDuringScan(filepath.Join(proc, "cmdline"), second, outside) }()
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n    - kind: cargo-target\n      path_glob: %s\n      max_bytes: 65536\n",
+		x.root, x.proc, filepath.Join(cache, "*-target")))
+	out, stderr, code := x.run(t, "cycle")
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	var report struct {
+		CacheTrims []struct {
+			kindResult
+			Path string `json:"path"`
+		} `json:"cache_trims"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("cycle report: %v %s %s", err, out, stderr)
+	}
+	status := map[string]string{}
+	for _, trim := range report.CacheTrims {
+		status[trim.Path] = trim.Status
+	}
+	if code == ExitOK || status[first] != "trimmed" || status[second] != "failed" {
+		t.Fatalf("replaced glob match not refused: exit %d %v", code, status)
+	}
+	for _, kept := range []string{filepath.Join(outside, "release", "deps", "libbig.rlib"), filepath.Join(second+".discovered", "release", "deps", "libbig.rlib")} {
+		if !exists(t, kept) {
+			t.Fatalf("%s was removed through the replaced match", kept)
+		}
+	}
+}
+
+// symlinkDuringScan waits for a process scan to read fifo, then moves dir
+// aside and puts a symlink to dest in its place, gives later scans a
+// regular cmdline, and releases the waiting scan.
+func symlinkDuringScan(fifo, dir, dest string) error {
+	deadline := time.Now().Add(time.Minute)
+	fd, err := unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	for errors.Is(err, unix.ENXIO) && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		fd, err = unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	}
+	if err != nil {
+		return fmt.Errorf("process scan never read %s: %w", fifo, err)
+	}
+	defer unix.Close(fd)
+	if err := os.Rename(dir, dir+".discovered"); err != nil {
+		return err
+	}
+	if err := os.Symlink(dest, dir); err != nil {
+		return err
+	}
+	cmdline := []byte("/usr/bin/sleep\x0060\x00")
+	if err := os.WriteFile(fifo+".next", cmdline, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(fifo+".next", fifo); err != nil {
+		return err
+	}
+	_, err = unix.Write(fd, cmdline)
+	return err
+}
+
+// asNonRoot runs the calling test again in a child process inside a new user
+// namespace whose only user, 1000, is this host's root: files the test
+// creates belong to it, but it has no capability to bypass their modes, so
+// a mode-000 directory really cannot be opened. It returns false in that
+// child (or when already unprivileged), where the test goes on; in the
+// parent it returns true once the child has passed.
+func asNonRoot(t *testing.T) bool {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		return false
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1", "-test.v")
+	cmd.Env = os.Environ()
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags:  syscall.CLONE_NEWUSER,
+		UidMappings: []syscall.SysProcIDMap{{ContainerID: 1000, HostID: 0, Size: 1}},
+		GidMappings: []syscall.SysProcIDMap{{ContainerID: 1000, HostID: 0, Size: 1}},
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "--- PASS: "+t.Name()) {
+		t.Fatalf("as a non-root user: %v\n%s", err, out)
+	}
+	return true
+}
+
+// One directory a cargo-target path_glob matched that cannot be opened is
+// reported as failed on its own; its healthy sibling is still trimmed.
+func TestCargoTargetGlobKeepsHealthyMatchesWhenOneCannotBeOpened(t *testing.T) {
+	if asNonRoot(t) {
+		return
+	}
+	x := newTrimFixture(t)
+	cache := filepath.Join(x.home, "cache")
+	healthy, locked := filepath.Join(cache, "a-target"), filepath.Join(cache, "b-target")
+	for _, dir := range []string{healthy, locked} {
+		writeFile(t, filepath.Join(dir, "CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n")
+		writeFile(t, filepath.Join(dir, "release", ".cargo-lock"), "")
+		writeFile(t, filepath.Join(dir, "release", "deps", "libbig.rlib"), string(make([]byte, 1<<20)))
+		backdate(t, dir, 2*time.Hour)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(locked, 0o700)
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n    - kind: cargo-target\n      path_glob: %s\n      max_bytes: 65536\n",
+		x.root, x.proc, filepath.Join(cache, "*-target")))
+	out, stderr, code := x.run(t, "cycle")
+	var report struct {
+		CacheTrims []struct {
+			kindResult
+			Path string `json:"path"`
+		} `json:"cache_trims"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("cycle report: %v %s %s", err, out, stderr)
+	}
+	status := map[string]string{}
+	for _, trim := range report.CacheTrims {
+		status[trim.Path] = trim.Status
+	}
+	if code == ExitOK || status[healthy] != "trimmed" || status[locked] != "failed" {
+		t.Fatalf("one unopenable match changed its sibling's trim: exit %d %v %s", code, status, out)
+	}
 }

@@ -73,6 +73,26 @@ func lockScan(ctx context.Context, stateDir string) (func(), error) {
 	}
 }
 
+// tryLockScan takes the scan lock without waiting. held is false, with no
+// error, when a cycle or a watcher scan holds it.
+func tryLockScan(stateDir string) (unlock func(), held bool, err error) {
+	if err := config.EnsureDir(stateDir); err != nil {
+		return nil, false, err
+	}
+	fd, file, err := openLockFile(filepath.Join(stateDir, "scan.lock"), "scan lock")
+	if err != nil {
+		return nil, false, err
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("scan lock: %w", err)
+	}
+	return func() { _ = syscall.Flock(fd, syscall.LOCK_UN); _ = file.Close() }, true, nil
+}
+
 // tryLockTrim serializes standing cache trims between the daily cycle and
 // the watcher. It never waits: a trim already running elsewhere makes this
 // one a no-op, reported as skipped.

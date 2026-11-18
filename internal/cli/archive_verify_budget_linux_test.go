@@ -264,7 +264,9 @@ func TestCycleDefersAnExpiryWhoseArchiveVerificationRunsOutOfBudget(t *testing.T
 	x.preserved(t, receipts[0].Destination)
 }
 
-// Guard: a genuine mismatch is still refused as one, never deferred.
+// Guard: a genuine mismatch is still refused as one, never deferred. The
+// refusal leaves the item in place and is listed in the cycle's refusals;
+// on its own it does not fail the cycle.
 func TestCycleStillRefusesAChangedArchive(t *testing.T) {
 	x := newVerifyBudgetFixture(t, "")
 	var tarPath string
@@ -293,7 +295,7 @@ func TestCycleStillRefusesAChangedArchive(t *testing.T) {
 	}
 	f.Close()
 	_, output, code := x.cycle(t)
-	if code == ExitOK || !strings.Contains(output, "does not bind the local tree") || strings.Contains(output, "verification deferred") {
+	if code != ExitOK || !strings.Contains(output, `"refusals"`) || !strings.Contains(output, "does not bind the local tree") || strings.Contains(output, "verification deferred") {
 		t.Fatalf("changed archive not refused as a mismatch: exit=%d %s", code, output)
 	}
 	x.preserved(t, x.source)

@@ -158,7 +158,7 @@ func proposals(entry core.Entry, class Classification, policy config.Policy, ver
 		}
 		kind, reason := boundedCacheAction(entry, rule)
 		out = append(out, Proposal{
-			Rule: "policy.cache:" + rule.Name, Tier: TierExplicit, Kind: kind,
+			Rule: CacheRuleID(rule.Name), Tier: TierExplicit, Kind: kind,
 			Retention: rule.Retention, Specificity: len(rule.Path),
 			Reason: fmt.Sprintf("cache rule %q covers %s; %s", rule.Name, rule.Path, reason),
 		})
@@ -215,6 +215,10 @@ func proposals(entry core.Entry, class Classification, policy config.Policy, ver
 	})
 	return out
 }
+
+// CacheRuleID is the rule identity a plan action records when the cache
+// rule named name decided it.
+func CacheRuleID(name string) string { return "policy.cache:" + name }
 
 // boundedCacheAction uses only inventory evidence and the scan observation
 // time, never the planner's wall clock. Zero bounds preserve legacy rules.

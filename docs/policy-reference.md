@@ -127,13 +127,14 @@ deletion authority; configure it only with the owner's approval.
 | --- | --- |
 | `kind` | `go-build`, `docker-builder`, `docker-images`, `go-mod`, `pnpm-store` or `cargo-target`; nothing else is accepted. |
 | `path` | `go-build`, `go-mod`, `pnpm-store`, `cargo-target` only: the absolute shared cache (or cargo target) directory. The Docker kinds take no path. |
+| `path_glob` | `cargo-target` only, instead of `path`: an absolute path whose last element is a Go `filepath.Match` pattern under a literal directory other than `/`, for example `/root/.cache/*-target`. Every cargo target directory directly in that directory whose name matches is trimmed as if listed with `path`, each under `max_bytes` and `min_idle`. |
 | `binary` | Absolute path of the official `go`, `docker` or `pnpm` executable. For `go-mod` and `pnpm-store` it may not lie inside `path`. `cargo-target` runs no command and takes no binary. |
 | `max_bytes` | Positive bound. Optional for `docker-images` (see below). |
 | `min_age` | `docker-images` only, required: a whole number of hours, at least `24h`. |
 | `min_idle` | `cargo-target` only, optional (default and `0`: `1h`): the trim waits until nothing in the target directory's top two levels changed for this long. |
 | `keep` | `docker-images` only, optional: up to 64 `repo:tag` glob patterns (Go `path.Match` syntax: `*`, `?`, `[...]`; `*` does not cross `/`), for example `phobos-workspace-mcp:*`. An image with any tag matching a pattern is never removed. Patterns and tags are compared in Docker's short form (`nginx:1.27`, not `docker.io/library/nginx:1.27`); a pattern needs a non-empty repository and tag part and no digest. |
 
-At most one trim per kind and path is accepted.
+At most one trim per kind and path (or path_glob) is accepted.
 
 - `go-build`: when the cache's allocated size exceeds `max_bytes`, runs
   `go clean -cache` with that exact `GOCACHE`, `GOTOOLCHAIN=local`,
@@ -226,9 +227,34 @@ At most one trim per kind and path is accepted.
   contents of `tmp`, and `.rustc_info.json`. It keeps the directory itself,
   its `CACHEDIR.TAG` and cargo's lock files (`.cargo-lock`,
   `.cargo-build-lock`, `.cargo-artifact-lock`). Other top-level entries
-  (`doc`, per-target-triple directories) are not touched. A directory
-  without cargo's `CACHEDIR.TAG` (a regular file starting `Signature:
-  8a477f597d28d172789f06886806bc55`) is refused and reported as `failed`.
+  (`doc`, per-target-triple directories) are not touched. The directory
+  must be a cargo target directory: it holds cargo's `CACHEDIR.TAG` (a
+  regular file starting `Signature: 8a477f597d28d172789f06886806bc55`),
+  or, with no `CACHEDIR.TAG` at all, at least one profile directory (any
+  real top-level directory holding a regular `.cargo-lock`, so custom
+  profiles count as well as `debug` and `release`). Cargo writes the tag only into a target
+  directory it creates itself, so a `CARGO_TARGET_DIR` that existed before
+  the first build has none; the profile lock is the layout cargo always
+  builds. A `CACHEDIR.TAG` of another tool, or a directory with neither, is
+  refused and reported as `failed`.
+
+  With `path_glob`, the glob's parent directory is opened once (only its
+  own configured path is resolved) and each real directory directly in it
+  whose name matches is opened through that descriptor without following
+  symlinks and its identity recorded. Its trim opens the path again without
+  following symlinks and refuses it (`failed`) when it is no longer that
+  directory: a match replaced by a symlink or by another directory is never
+  followed or trimmed. Whether a match is a cargo target is checked when its
+  trim opens it: one that is not is left alone and reported as
+  `not_cargo_target`, not as a failure; every other one is trimmed with
+  every guard below, and reported under its own `path` with the
+  `path_glob` that found it. A directory a `cargo-target` trim names by
+  `path` is left to that trim. New target directories (another
+  `herdr-*-target`) are covered without a policy change. A match that
+  cannot be opened is reported as `failed` on its own; its siblings are
+  still trimmed. Only a parent that cannot be opened or listed fails the
+  whole glob.
+
   The trim is postponed (`skipped_in_use`, naming the reason in
   `active_users`) when:
   - anything among the directory, its entries and each profile directory's
@@ -244,8 +270,11 @@ At most one trim per kind and path is accepted.
   and locking and removal go only through those open directories. Holding
   the locks, before removing anything, the trim checks that `path` (opened
   again without following symlinks) and each profile name still are the
-  validated directories and that `CACHEDIR.TAG` is still cargo's; a
-  directory replaced or moved meanwhile fails the trim and nothing is
+  validated directories, that each profile still holds a regular
+  `.cargo-lock` (a held lock does not stop an unlink), and that it is still
+  a cargo target directory; a
+  directory replaced or moved meanwhile, or one that lost its lock file,
+  fails the trim and nothing is
   removed. Removal never follows a symlink (a link is removed, never its
   target) and never crosses into another filesystem: an entry on another
   device, or a mount below one, is not removed and fails the trim, as does
@@ -256,6 +285,9 @@ At most one trim per kind and path is accepted.
     path: /root/.cache/herdr-net-target
     max_bytes: 4294967296  # 4 GiB
     min_idle: 1h           # the default
+  - kind: cargo-target
+    path_glob: /root/.cache/*-target  # every cargo target there
+    max_bytes: 4294967296             # 4 GiB each
   ```
 
 Trims with a `path` report `size_before_bytes`, `size_after_bytes` (the
@@ -305,6 +337,91 @@ parsed or whose `root` is not a non-empty absolute path string.
 
 Do not also configure a `caches` quarantine rule for a cache that has a
 trim: the quarantine is refused whenever a build writes the cache.
+
+## Low-disk trigger
+
+`prevention.low_disk` runs the rebuildable-cache cleanup from the watcher as
+soon as free space drops below a threshold, instead of waiting for the daily
+cycle. It is off by default (no `path`).
+
+| Field | Meaning |
+| --- | --- |
+| `path` | Absolute path on the filesystem to watch, for example `/`. |
+| `min_free_bytes` | Positive threshold: the trigger fires while the filesystem's available bytes are below it. Decimal 20 GB is `20000000000`. |
+| `check_interval` | How often the watcher measures it (default `1m`, accepted `1s` through `1h`). |
+| `min_interval` | Least time between two runs (default `30m`, accepted `1m` through `24h`). The last run time is kept in `low-disk.json` in the state directory, so a restarted watcher keeps the limit. |
+
+A run does exactly this, and nothing else:
+
+1. Every `prevention.cache_trims` entry except `docker-images` (images are
+   not a rebuildable cache), at its usual bound and with every usual guard.
+2. The size-bounded cache rules: each `caches` rule with `action:
+   quarantine`, a `max_bytes` bound and no `ttl`. With
+   `prevention.auto_quarantine` it runs a deep scan, plans it from rules
+   alone, approves only the quarantine actions those rules decided, and
+   moves them through the guarded apply (every revalidation: live process,
+   service, credential, Gitmoot and protected-path guards). With
+   `prevention.auto_expire` (and `retention.delete_enabled`) it then
+   expires the receipts that quarantine created, through the guarded
+   expiry. A rule with `retention: none` therefore frees its bytes in the
+   same run, as in the daily cycle; a rule with a longer retention is only
+   quarantined (the daily cycle expires it when its retention ends).
+
+No workspace archive, archive category, other quarantine or other expiry
+runs. Bounds are the rules' own: the trigger acts sooner, never deeper.
+
+A run needs the scan lock and the apply lock free; while a cycle, an
+apply or a watcher scan holds either, it is skipped
+(`skipped_cycle_running`, reported once) and retried at the next check,
+and it does not count against `min_interval`. The watcher reports each run
+as reason `low_disk` with `low_disk` (free bytes before and after, the
+rules applied, the quarantine and expiry reports and any `refusals`) and
+`cache_trims`. A run's failure is reported and never stops the watcher.
+
+This is the owner's 2026-11-18 change to directive 377778 ("deletes nothing
+because of capacity"): low capacity may now trigger the rebuildable-cache
+trims and size-bounded cache rules above, and nothing else.
+
+## Capacity warning notification
+
+`prevention.notify_command` (empty by default) is run when the watcher's
+capacity sample first finds a target volume with fewer than
+`prevention.notify_below_bytes` available, with one message appended as its
+last argument, for example:
+
+```yaml
+prevention:
+  notify_command: [/usr/bin/env, GITMOOT_ORG_ROLE=workspace-janitor, /root/.local/bin/gitmoot, message, send, jarvis]
+  notify_below_bytes: 40000000000   # decimal 40 GB
+  notify_cooldown: 6h
+  notify_timeout: 30s
+```
+
+`notify_below_bytes` is informational only. It is its own threshold, not a
+capacity target: it changes no `capacity.volumes` state, admission hold or
+reason, and it is not part of the capacity `policy_hash` that admission
+pollers such as Gitmoot pin. Raising it never moves work elsewhere or
+changes admission; `target_free_bytes` and `reserve_free_bytes` keep that
+role. `notify_command` and `notify_below_bytes` require each other.
+
+It is edge-triggered: one run per transition below the threshold, not one
+per sample. Every published sample updates the transition state at once,
+even while a run is in progress, so a recovery followed by a new fall below
+the threshold during a run is a new episode; only the runs themselves are
+coalesced. A successful run marks the episode it was for. `notify_cooldown`
+(default `6h`, accepted `1m` through `168h`, measured in sample time) is
+the least time between two runs, so free space hovering at the threshold
+does not repeat the warning; a failed run, or an episode that began during
+a run, is notified once the cooldown has passed. The notifier runs beside the
+capacity sampler and never delays publication. `notify_timeout` (default
+`30s`, accepted `1s` through `5m`) bounds a run: the command runs in its own
+process group, which is killed at the timeout and again once the command
+exits, and its output is drained for at most 2 seconds after that, so a
+child that keeps the output open cannot hold the notifier. The command's first element must be an absolute path;
+it runs with the watcher's environment in `/`. It requires
+`prevention.targets`, whose capacity sample it reads. Its state is kept in
+`capacity-notify.json` in the state directory, so a restarted watcher does
+not warn again. Each run is reported as reason `capacity_notify`.
 
 ## Bounded cache recovery
 

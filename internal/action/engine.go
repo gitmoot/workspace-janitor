@@ -124,15 +124,18 @@ func (e *Engine) preflightEntry(ctx context.Context, entry core.Entry, action co
 		return err
 	}
 	defer handle.Close()
+	var observeErr error
 	verdict := safety.Revalidate(ctx, safety.RevalidateInput{
 		Planned: entry, Action: action, Policy: e.Policy,
 		Now: e.now(), Handle: handle,
 		Recollect: func(ctx context.Context, path string) (core.Entry, error) {
-			return e.recollectWithSize(ctx, path, entry.SizeIsDeep)
+			fresh, err := e.recollectWithSize(ctx, path, entry.SizeIsDeep)
+			observeErr = err
+			return fresh, err
 		},
 	})
 	if !verdict.Allows(action.Kind) {
-		return fmt.Errorf("%s refused %s: %s", label, entry.Path, verdict.Detail())
+		return verdictError(observeErr, verdict, "%s refused %s: %s", label, entry.Path, verdict.Detail())
 	}
 	return nil
 }
@@ -153,12 +156,12 @@ func (e *Engine) Quarantine(ctx context.Context, item core.CleanupItem) (core.Cl
 		return item, err
 	}
 	defer handle.Close()
-	verdict, deferred := e.revalidatePrepared(ctx, item, handle)
-	if deferred != nil {
-		return e.deferPrepared(ctx, item, deferred)
+	verdict, observeErr := e.revalidatePrepared(ctx, item, handle)
+	if errors.Is(observeErr, collect.ErrArchiveVerifyDeferred) {
+		return e.deferPrepared(ctx, item, observeErr)
 	}
 	if !verdict.Allows(item.Action.Kind) {
-		return item, fmt.Errorf("revalidation refused %s: %s", item.Source, verdict.Detail())
+		return item, verdictError(observeErr, verdict, "revalidation refused %s: %s", item.Source, verdict.Detail())
 	}
 	if err := e.moveUnit(ctx, item, handle.Identity()); err != nil {
 		return item, err
@@ -198,23 +201,22 @@ func (e *Engine) QuarantineCheck(ctx context.Context, item core.CleanupItem) (co
 }
 
 // revalidatePrepared is the fresh complete safety verdict on a prepared item
-// opened through handle, immediately before its move, and the deferral, if
-// any, of its archive verification (collect.ErrArchiveVerifyDeferred).
+// opened through handle, immediately before its move, and the error, if
+// any, of its fresh observation: a deferral of its archive verification
+// (collect.ErrArchiveVerifyDeferred) or a collection that failed.
 func (e *Engine) revalidatePrepared(ctx context.Context, item core.CleanupItem, handle *safety.Handle) (core.Verdict, error) {
 	target := safety.ResolveTarget(filepath.Dir(item.Destination))
-	var deferred error
+	var observeErr error
 	verdict := safety.Revalidate(ctx, safety.RevalidateInput{
 		Planned: item.Entry, Action: item.Action, Policy: e.Policy,
 		Target: &target, Now: e.now(), Handle: handle,
 		Recollect: func(ctx context.Context, path string) (core.Entry, error) {
 			entry, err := e.recollectWithSize(ctx, path, item.Entry.SizeIsDeep)
-			if errors.Is(err, collect.ErrArchiveVerifyDeferred) {
-				deferred = err
-			}
+			observeErr = err
 			return entry, err
 		},
 	})
-	return verdict, deferred
+	return verdict, observeErr
 }
 
 // deferPrepared closes a prepared receipt whose revalidation ran out of its
@@ -290,12 +292,12 @@ func (e *Engine) revalidateCompanion(ctx context.Context, item core.CleanupItem,
 		return fmt.Errorf("companion revalidation refused %s: %w", path, err)
 	}
 	if fresh.Kind != core.EntryKindFile || fresh.FilesystemID != id {
-		return fmt.Errorf("companion revalidation refused %s: it is no longer the bound regular file", path)
+		return refused("companion revalidation refused %s: it is no longer the bound regular file", path)
 	}
 	target := safety.ResolveTarget(filepath.Dir(item.Destination))
 	verdict := safety.Evaluate(safety.Input{Entry: unitCompanion(fresh, item.Source), Policy: e.Policy, Target: &target, Now: e.now()})
 	if !verdict.Allows(item.Action.Kind) {
-		return fmt.Errorf("companion revalidation refused %s: %s", path, verdict.Detail())
+		return verdictError(nil, verdict, "companion revalidation refused %s: %s", path, verdict.Detail())
 	}
 	return nil
 }
@@ -431,12 +433,18 @@ func (e *Engine) Reconcile(ctx context.Context, item core.CleanupItem) (core.Cle
 }
 
 func (e *Engine) investigate(ctx context.Context, item core.CleanupItem, reason string) (core.CleanupItem, error) {
+	return e.investigateCause(ctx, item, errors.New(reason))
+}
+
+// investigateCause records item for investigation with cause as its reason.
+// The returned error wraps cause, so a Refusal stays one.
+func (e *Engine) investigateCause(ctx context.Context, item core.CleanupItem, cause error) (core.CleanupItem, error) {
 	before := item.State
-	item.State, item.UpdatedAt, item.Reason = core.CleanupInvestigate, e.now(), reason
+	item.State, item.UpdatedAt, item.Reason = core.CleanupInvestigate, e.now(), cause.Error()
 	if err := e.update(ctx, item, before); err != nil {
 		return item, err
 	}
-	return item, fmt.Errorf("%s: %s", item.ActionID, reason)
+	return item, fmt.Errorf("%s: %w", item.ActionID, cause)
 }
 
 // Restore never overwrites an occupied original path, including a symlink.

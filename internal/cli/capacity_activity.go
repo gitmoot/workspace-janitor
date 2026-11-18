@@ -52,7 +52,15 @@ func startCapacityActivity(ctx context.Context, db *store.Store, kind, receipt, 
 	return monitor, nil
 }
 
+// finish records the activity's outcome and returns operationErr joined
+// with any error recording it.
 func (m *activityMonitor) finish(ctx context.Context, operationErr error) error {
+	return errors.Join(operationErr, m.record(ctx, operationErr))
+}
+
+// record records the activity's outcome, failed with operationErr when it is
+// set, and returns only an error recording it.
+func (m *activityMonitor) record(ctx context.Context, operationErr error) error {
 	now := time.Now().UTC()
 	m.activity.FinishedAt = &now
 	m.activity.State = "completed"
@@ -95,8 +103,7 @@ func (m *activityMonitor) finish(ctx context.Context, operationErr error) error 
 		delta := *m.activity.StoreBeforeBytes - *m.activity.StoreAfterBytes
 		m.activity.StoreRemovedBytes = &delta
 	}
-	recordErr := m.db.Write(bounded, func(tx *store.Tx) error { return tx.RecordCapacityActivity(bounded, m.activity) })
-	return errors.Join(operationErr, recordErr)
+	return m.db.Write(bounded, func(tx *store.Tx) error { return tx.RecordCapacityActivity(bounded, m.activity) })
 }
 
 func recordRecoveryDecision(ctx context.Context, db *store.Store, report *recoveryReport, started time.Time, operationErr error) error {

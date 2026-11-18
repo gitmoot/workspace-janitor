@@ -137,6 +137,13 @@ type CacheRule struct {
 	Recovery       CacheRecovery `yaml:"recovery" json:"recovery"`
 }
 
+// SizeBounded reports whether the rule bounds a regenerable cache by size
+// alone: action quarantine, a max_bytes bound and no ttl. The low-disk
+// trigger runs only these rules.
+func (r CacheRule) SizeBounded() bool {
+	return r.Action == core.ActionQuarantine && r.MaxBytes > 0 && r.TTL == 0
+}
+
 // CacheRecovery is an owner's explicit scoped authority for automatic official
 // pruning. A failed/interrupted attempt requires a new approval before retry.
 type CacheRecovery struct {
@@ -328,10 +335,44 @@ type Prevention struct {
 	// CacheTrimInterval is how often the watcher re-checks the cache trims
 	// between daily cycles. Each check trims only a cache over its bound.
 	CacheTrimInterval Duration `yaml:"cache_trim_interval" json:"cache_trim_interval"`
-	// History bounds the stored scan history beyond the scans that live
-	// records pin.
+	// LowDisk runs the rebuildable-cache trims and size-bounded cache rules
+	// from the watcher as soon as free space on a volume drops below a
+	// threshold, instead of waiting for the daily cycle.
+	LowDisk LowDiskPolicy `yaml:"low_disk" json:"low_disk"`
+	// NotifyCommand, when set, is run with one message appended as its last
+	// argument when the watcher's capacity sample first finds a target
+	// volume with fewer than NotifyBelowBytes available. Empty disables it.
+	NotifyCommand []string `yaml:"notify_command,omitempty" json:"notify_command,omitempty"`
+	// NotifyBelowBytes is the notification threshold. It is informational
+	// only: it is not a capacity target, changes no capacity state or
+	// admission hold, and is not part of the capacity policy hash.
+	NotifyBelowBytes int64 `yaml:"notify_below_bytes,omitempty" json:"notify_below_bytes,omitempty"`
+	// NotifyCooldown is the least time between two notify_command runs,
+	// so free space hovering at the target cannot repeat the warning.
+	NotifyCooldown Duration `yaml:"notify_cooldown" json:"notify_cooldown"`
+	// NotifyTimeout bounds one notify_command run.
+	NotifyTimeout Duration `yaml:"notify_timeout" json:"notify_timeout"`
+	// History bounds the stored scan history beyond the scans live records
+	// pin.
 	History HistoryPolicy `yaml:"history" json:"history"`
 }
+
+// LowDiskPolicy is the watcher's low-disk trigger. While free space on the
+// filesystem holding Path is below MinFreeBytes, the watcher runs, at most
+// once per MinInterval and never while a cycle or apply holds its locks, the
+// standing cache trims (every kind but docker-images) and the size-bounded
+// cache rules (CacheRule.SizeBounded): their usual quarantine, and expiry of
+// the receipts that quarantine created. Nothing else: no archives, no other
+// quarantine, no other expiry. An empty Path disables it.
+type LowDiskPolicy struct {
+	Path          string   `yaml:"path" json:"path"`
+	MinFreeBytes  int64    `yaml:"min_free_bytes" json:"min_free_bytes"`
+	CheckInterval Duration `yaml:"check_interval" json:"check_interval"`
+	MinInterval   Duration `yaml:"min_interval" json:"min_interval"`
+}
+
+// Enabled reports whether the low-disk trigger is configured.
+func (l LowDiskPolicy) Enabled() bool { return l.Path != "" }
 
 // InArchiveOnlyRoot reports whether path is, or lies inside, any archive_only
 // root of policy. Protection follows this containment, never which root a
@@ -359,12 +400,53 @@ const DockerDataRoot = "/var/lib/docker"
 const ContainerdDataRoot = "/var/lib/containerd"
 
 // TrimTarget is the directory a standing cache trim acts on, as far as
-// policy alone can tell (Docker's default data root for the Docker kinds).
+// policy alone can tell (Docker's default data root for the Docker kinds,
+// the parent directory of a path_glob).
 func (t CacheTrim) TrimTarget() string {
 	if t.Kind == CacheTrimDockerBuilder || t.Kind == CacheTrimDockerImages {
 		return DockerDataRoot
 	}
+	if t.Path == "" && t.PathGlob != "" {
+		return filepath.Dir(t.PathGlob)
+	}
 	return t.Path
+}
+
+// GlobOverlaps reports whether a cargo-target path_glob trim could act at or
+// around root: the glob's parent lies inside root, or root lies inside a
+// directory the glob matches.
+func (t CacheTrim) GlobOverlaps(root string) bool {
+	parent := filepath.Dir(t.PathGlob)
+	if core.PathWithin(parent, root) {
+		return true
+	}
+	rel, err := filepath.Rel(parent, root)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return false
+	}
+	first, _, _ := strings.Cut(rel, string(filepath.Separator))
+	matched, _ := filepath.Match(filepath.Base(t.PathGlob), first)
+	return matched
+}
+
+// pathGlobProblem says why glob is not a usable cargo-target path_glob, or
+// "" when it is: an absolute clean path whose last element is a
+// filepath.Match pattern and whose parent directory is literal and not "/".
+func pathGlobProblem(glob string) string {
+	const meta = `*?[\`
+	parent, base := filepath.Dir(glob), filepath.Base(glob)
+	switch {
+	case !core.IsCanonicalPath(glob):
+		return "must be an absolute clean path"
+	case parent == "/" || strings.ContainsAny(parent, meta):
+		return "only its last element may be a pattern, under a literal directory other than /"
+	case !strings.ContainsAny(base, meta):
+		return "its last element must be a pattern; use path for one directory"
+	}
+	if _, err := filepath.Match(base, ""); err != nil {
+		return "is not a valid pattern: " + err.Error()
+	}
+	return ""
 }
 
 // dockerImagePatternProblem says why pattern is not a usable docker-images
@@ -470,10 +552,16 @@ const MaxDockerImageKeep = 64
 // exceeds MaxBytes, no process uses it, no cargo build holds its locks and
 // nothing in it changed within MinIdle, it removes what `cargo clean` would
 // (each profile directory's contents, tmp's contents, .rustc_info.json) but
-// keeps the directory, its CACHEDIR.TAG and cargo's lock files.
+// keeps the directory, its CACHEDIR.TAG and cargo's lock files. A directory
+// is a cargo target when it holds cargo's CACHEDIR.TAG or, without any
+// CACHEDIR.TAG, cargo's layout: a profile directory (any top-level directory)
+// holding a .cargo-lock. Instead of Path, a cargo-target trim may name PathGlob: every
+// direct child of its parent directory matching its last element that is a
+// cargo target is trimmed as if listed with Path, each under MaxBytes.
 type CacheTrim struct {
 	Kind     string `yaml:"kind" json:"kind"`
 	Path     string `yaml:"path,omitempty" json:"path,omitempty"`
+	PathGlob string `yaml:"path_glob,omitempty" json:"path_glob,omitempty"`
 	Binary   string `yaml:"binary" json:"binary"`
 	MaxBytes int64  `yaml:"max_bytes" json:"max_bytes"`
 	// MinAge is docker-images only: images younger than this are kept.
@@ -647,6 +735,9 @@ func DefaultPolicy(p Paths) Policy {
 			AlertInterval:     Duration(24 * time.Hour),
 			CapacityInterval:  Duration(time.Minute),
 			CacheTrimInterval: Duration(15 * time.Minute),
+			LowDisk:           LowDiskPolicy{CheckInterval: Duration(time.Minute), MinInterval: Duration(30 * time.Minute)},
+			NotifyCooldown:    Duration(6 * time.Hour),
+			NotifyTimeout:     Duration(30 * time.Second),
 			Recovery:          RecoveryPolicy{MaxStores: 1, MaxBytes: 1 << 30, Interval: Duration(24 * time.Hour), TimeBudget: Duration(time.Minute)},
 			History:           HistoryPolicy{KeepRecent: 12, KeepDays: 14},
 		},
@@ -711,6 +802,7 @@ func (p Policy) clone() Policy {
 		out.SourceNameApprovals = &approvals
 	}
 	out.Prevention.Targets = append([]CapacityTarget(nil), p.Prevention.Targets...)
+	out.Prevention.NotifyCommand = append([]string(nil), p.Prevention.NotifyCommand...)
 	out.Gitmoot = p.Gitmoot
 	out.Jev.RedactSegments = append([]string(nil), p.Jev.RedactSegments...)
 	out.Collectors.SystemdDirs = append([]string(nil), p.Collectors.SystemdDirs...)
@@ -745,6 +837,12 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	for i := range p.Prevention.Targets {
 		p.Prevention.Targets[i].Path = expand(fmt.Sprintf("prevention.targets[%d].path", i), p.Prevention.Targets[i].Path)
 	}
+	if p.Prevention.LowDisk.Path != "" {
+		p.Prevention.LowDisk.Path = expand("prevention.low_disk.path", p.Prevention.LowDisk.Path)
+	}
+	if len(p.Prevention.NotifyCommand) != 0 {
+		p.Prevention.NotifyCommand[0] = expand("prevention.notify_command[0]", p.Prevention.NotifyCommand[0])
+	}
 	for i := range p.Protect.Paths {
 		p.Protect.Paths[i] = expand(fmt.Sprintf("protect.paths[%d]", i), p.Protect.Paths[i])
 	}
@@ -778,6 +876,9 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 	for i := range p.Prevention.CacheTrims {
 		if p.Prevention.CacheTrims[i].Path != "" {
 			p.Prevention.CacheTrims[i].Path = expand(fmt.Sprintf("prevention.cache_trims[%d].path", i), p.Prevention.CacheTrims[i].Path)
+		}
+		if p.Prevention.CacheTrims[i].PathGlob != "" {
+			p.Prevention.CacheTrims[i].PathGlob = expand(fmt.Sprintf("prevention.cache_trims[%d].path_glob", i), p.Prevention.CacheTrims[i].PathGlob)
 		}
 		if p.Prevention.CacheTrims[i].Kind == CacheTrimCargoTarget {
 			// cargo-target runs no command, so it has no binary to expand.
@@ -1031,6 +1132,42 @@ func (p *Policy) Validate() core.FieldErrors {
 	if len(p.Prevention.Targets) > 64 {
 		errs.Add("prevention.targets", "at most 64 roots may have capacity targets")
 	}
+	if low := p.Prevention.LowDisk; low.Enabled() {
+		if !core.IsCanonicalPath(low.Path) {
+			errs.Add("prevention.low_disk.path", "must be an absolute clean path on the watched filesystem")
+		}
+		if low.MinFreeBytes <= 0 {
+			errs.Add("prevention.low_disk.min_free_bytes", "must be positive")
+		}
+		if low.CheckInterval.Duration() < time.Second || low.CheckInterval.Duration() > time.Hour {
+			errs.Add("prevention.low_disk.check_interval", "must be between 1s and 1h")
+		}
+		if low.MinInterval.Duration() < time.Minute || low.MinInterval.Duration() > 24*time.Hour {
+			errs.Add("prevention.low_disk.min_interval", "must be between 1m and 24h")
+		}
+	} else if low.MinFreeBytes != 0 {
+		errs.Add("prevention.low_disk.path", "is required with min_free_bytes")
+	}
+	if command := p.Prevention.NotifyCommand; len(command) != 0 {
+		if !core.IsCanonicalPath(command[0]) {
+			errs.Add("prevention.notify_command", "must start with an absolute executable path")
+		}
+		if len(p.Prevention.Targets) == 0 {
+			errs.Add("prevention.notify_command", "requires prevention.targets: their capacity sample is what it checks")
+		}
+		if p.Prevention.NotifyBelowBytes <= 0 {
+			errs.Add("prevention.notify_below_bytes", "must be positive with notify_command")
+		}
+		if timeout := p.Prevention.NotifyTimeout.Duration(); timeout < time.Second || timeout > 5*time.Minute {
+			errs.Add("prevention.notify_timeout", "must be between 1s and 5m")
+		}
+		if p.Prevention.NotifyCooldown.Duration() < time.Minute || p.Prevention.NotifyCooldown.Duration() > 7*24*time.Hour {
+			errs.Add("prevention.notify_cooldown", "must be between 1m and 168h")
+		}
+	}
+	if p.Prevention.NotifyBelowBytes != 0 && len(p.Prevention.NotifyCommand) == 0 {
+		errs.Add("prevention.notify_below_bytes", "requires notify_command")
+	}
 	trimKinds := map[string]bool{}
 	for i, trim := range p.Prevention.CacheTrims {
 		field := fmt.Sprintf("prevention.cache_trims[%d]", i)
@@ -1057,8 +1194,17 @@ func (p *Policy) Validate() core.FieldErrors {
 			}
 			targets = append(targets, ContainerdDataRoot)
 		case CacheTrimCargoTarget:
-			if !core.IsCanonicalPath(trim.Path) || trim.Path == "/" {
-				errs.Add(field+".path", "cargo-target requires the absolute target directory")
+			switch {
+			case trim.PathGlob != "" && trim.Path != "":
+				errs.Add(field+".path_glob", "takes no path; name one directory with path or several with path_glob")
+			case trim.PathGlob != "":
+				if reason := pathGlobProblem(trim.PathGlob); reason != "" {
+					errs.Add(field+".path_glob", "%s", reason)
+				}
+				// Checked against archive_only roots below by GlobOverlaps.
+				targets = nil
+			case !core.IsCanonicalPath(trim.Path) || trim.Path == "/":
+				errs.Add(field+".path", "cargo-target requires the absolute target directory or a path_glob")
 			}
 			if trim.Binary != "" {
 				errs.Add(field+".binary", "cargo-target takes no binary; it runs no command")
@@ -1069,6 +1215,14 @@ func (p *Policy) Validate() core.FieldErrors {
 		default:
 			errs.Add(field+".kind", "must be go-build, docker-builder, docker-images, go-mod, pnpm-store or cargo-target")
 		}
+		if trim.PathGlob != "" && trim.Kind != CacheTrimCargoTarget {
+			errs.Add(field+".path_glob", "only cargo-target takes path_glob")
+		}
+		for _, root := range p.Roots {
+			if root.ArchiveOnly && trim.Kind == CacheTrimCargoTarget && trim.PathGlob != "" && trim.GlobOverlaps(root.Path) {
+				errs.Add(field+".path_glob", "overlaps archive_only root %q; only an archive category may remove data there", root.Path)
+			}
+		}
 		for _, target := range targets {
 			for _, root := range p.Roots {
 				if root.ArchiveOnly && core.PathsOverlap(target, root.Path) {
@@ -1076,10 +1230,11 @@ func (p *Policy) Validate() core.FieldErrors {
 				}
 			}
 		}
-		if trimKinds[trim.Kind+"\x00"+trim.Path] {
+		key := trim.Kind + "\x00" + trim.Path + "\x00" + trim.PathGlob
+		if trimKinds[key] {
 			errs.Add(field, "duplicates an earlier cache trim")
 		}
-		trimKinds[trim.Kind+"\x00"+trim.Path] = true
+		trimKinds[key] = true
 		if trim.Kind != CacheTrimCargoTarget {
 			if !core.IsCanonicalPath(trim.Binary) {
 				errs.Add(field+".binary", "must be an absolute executable path")

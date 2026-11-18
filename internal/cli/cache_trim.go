@@ -37,7 +37,7 @@ func cacheTrimLoop(ctx context.Context, e *env, paths config.Paths, policy confi
 			return nil
 		case <-timer.C:
 		}
-		reports, err := runCacheTrims(ctx, policy, paths.StateDir)
+		reports, err := runCacheTrims(ctx, policy, policy.Prevention.CacheTrims, paths.StateDir)
 		// Report before honouring cancellation: an earlier trim in this run
 		// may already have deleted bytes.
 		report := watchReport{Reason: "cache_trim", CacheTrims: reports}
@@ -57,10 +57,11 @@ func cacheTrimLoop(ctx context.Context, e *env, paths config.Paths, policy confi
 }
 
 // acted reports whether any trim did or attempted something worth logging;
-// routine under-bound checks stay quiet.
+// routine under-bound checks, and directories a path_glob matched that are
+// not cargo targets, stay quiet.
 func acted(reports []cacheTrimReport) bool {
 	for _, r := range reports {
-		if r.Status != cacheUnderBound && r.Status != cacheTrimNotFound {
+		if r.Status != cacheUnderBound && r.Status != cacheTrimNotFound && r.Status != cacheTrimNotCargo {
 			return true
 		}
 	}
@@ -78,6 +79,9 @@ const (
 	cacheTrimFailed   = "failed"
 	cacheTrimNotFound = "absent"
 	cacheTrimBusy     = "skipped_trim_running"
+	// cacheTrimNotCargo is a directory a cargo-target path_glob matched
+	// that is not a cargo target directory; it is left alone.
+	cacheTrimNotCargo = "not_cargo_target"
 )
 
 // cacheTrimReport is one trim's outcome. For docker-images the sizes are the
@@ -86,6 +90,7 @@ const (
 type cacheTrimReport struct {
 	Kind        string   `json:"kind"`
 	Path        string   `json:"path,omitempty"`
+	PathGlob    string   `json:"path_glob,omitempty"`
 	MaxBytes    int64    `json:"max_bytes"`
 	Status      string   `json:"status"`
 	SizeBefore  *int64   `json:"size_before_bytes,omitempty"`
@@ -103,11 +108,12 @@ type cacheTrimReport struct {
 	Images             []dockerImageOutcome `json:"images,omitempty"`
 }
 
-// runCacheTrims applies every configured standing cache trim once. A cache in
-// live use is skipped, not an error; the next cycle retries it. Only a trim
-// command that fails is returned as an error.
-func runCacheTrims(ctx context.Context, policy config.Policy, stateDir string) ([]cacheTrimReport, error) {
-	if len(policy.Prevention.CacheTrims) == 0 {
+// runCacheTrims applies each of trims once. A cargo-target path_glob trim
+// applies to every cargo target directory it matches (cargoTargetGlob). A
+// cache in live use is skipped, not an error; the next run retries it. Only
+// a trim that fails is returned as an error.
+func runCacheTrims(ctx context.Context, policy config.Policy, trims []config.CacheTrim, stateDir string) ([]cacheTrimReport, error) {
+	if len(trims) == 0 {
 		return nil, nil
 	}
 	release, held, err := tryLockTrim(stateDir)
@@ -116,37 +122,99 @@ func runCacheTrims(ctx context.Context, policy config.Policy, stateDir string) (
 	}
 	if !held {
 		var reports []cacheTrimReport
-		for _, trim := range policy.Prevention.CacheTrims {
-			reports = append(reports, cacheTrimReport{Kind: trim.Kind, Path: trim.Path, MaxBytes: trim.MaxBytes, Status: cacheTrimBusy})
+		for _, trim := range trims {
+			reports = append(reports, cacheTrimReport{Kind: trim.Kind, Path: trim.Path, PathGlob: trim.PathGlob, MaxBytes: trim.MaxBytes, Status: cacheTrimBusy})
 		}
 		return reports, nil
 	}
 	defer release()
 	var reports []cacheTrimReport
 	var errs []error
-	for _, trim := range policy.Prevention.CacheTrims {
+	// run applies trim. A path_glob match (bound set) keeps the path it was
+	// discovered at, never a symlink resolution of it: its trim opens that
+	// path without following symlinks and refuses another directory there.
+	run := func(trim config.CacheTrim, bound core.FilesystemID) {
 		// Validation refuses a lexical overlap; this also resolves symlinks,
 		// and the provider then runs on the resolved path it checked.
 		written := trim.Path
-		if trim.Path != "" {
+		if trim.Path != "" && bound.Zero() {
 			if resolved, err := filepath.EvalSymlinks(trim.Path); err == nil {
 				trim.Path = resolved
 			}
 		}
 		if refusal := archiveOnlyTrimRefusal(ctx, &policy, trim); refusal != "" {
-			reports = append(reports, cacheTrimReport{Kind: trim.Kind, Path: written, MaxBytes: trim.MaxBytes,
+			reports = append(reports, cacheTrimReport{Kind: trim.Kind, Path: written, PathGlob: trim.PathGlob, MaxBytes: trim.MaxBytes,
 				Status: cacheTrimFailed, Error: refusal})
 			errs = append(errs, fmt.Errorf("cache trim %s %s: %s", trim.Kind, written, refusal))
-			continue
+			return
 		}
-		report := trimCache(ctx, policy.Collectors.ProcRoot, trim)
-		report.Path = written
+		var report cacheTrimReport
+		if bound.Zero() {
+			report = trimCache(ctx, policy.Collectors.ProcRoot, trim)
+		} else {
+			report = trimCargoTarget(ctx, policy.Collectors.ProcRoot, trim, bound,
+				cacheTrimReport{Kind: trim.Kind, Path: trim.Path, MaxBytes: trim.MaxBytes})
+		}
+		report.Path, report.PathGlob = written, trim.PathGlob
 		if report.Status == cacheTrimFailed {
 			errs = append(errs, fmt.Errorf("cache trim %s %s: %s", trim.Kind, trim.Path, report.Error))
 		}
 		reports = append(reports, report)
 	}
+	for _, trim := range trims {
+		if trim.PathGlob == "" {
+			run(trim, core.FilesystemID{})
+			continue
+		}
+		matches, err := cargoTargetGlob(trim.PathGlob, policy.Prevention.CacheTrims)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			reports = append(reports, cacheTrimReport{Kind: trim.Kind, PathGlob: trim.PathGlob, MaxBytes: trim.MaxBytes,
+				Status: cacheTrimFailed, Error: err.Error()})
+			errs = append(errs, fmt.Errorf("cache trim %s %s: %w", trim.Kind, trim.PathGlob, err))
+			continue
+		}
+		if len(matches) == 0 {
+			reports = append(reports, cacheTrimReport{Kind: trim.Kind, PathGlob: trim.PathGlob, MaxBytes: trim.MaxBytes, Status: cacheTrimNotFound})
+			continue
+		}
+		for _, match := range matches {
+			if match.err != nil {
+				// This match only; its healthy siblings are still trimmed.
+				reports = append(reports, cacheTrimReport{Kind: trim.Kind, Path: match.path, PathGlob: trim.PathGlob, MaxBytes: trim.MaxBytes,
+					Status: cacheTrimFailed, Error: match.err.Error()})
+				errs = append(errs, fmt.Errorf("cache trim %s %s: %w", trim.Kind, match.path, match.err))
+				continue
+			}
+			found := trim
+			found.Path = match.path
+			run(found, match.id)
+		}
+	}
 	return reports, errors.Join(errs...)
+}
+
+// cargoTargetGlob lists, in name order, the real directories directly in
+// glob's parent directory whose name matches glob's last element, each
+// with the identity it had when discovered (discoverCargoTargets), leaving
+// out any that a cargo-target trim names by path: that trim's own bound and
+// min_idle apply to it. Only the configured parent's own path is resolved;
+// no match is ever followed through a symlink. Whether each one is a cargo
+// target is decided when its trim opens it.
+func cargoTargetGlob(glob string, all []config.CacheTrim) ([]cargoMatch, error) {
+	parent, err := filepath.EvalSymlinks(filepath.Dir(glob))
+	if err != nil {
+		return nil, err
+	}
+	explicit := map[string]bool{}
+	for _, trim := range all {
+		if trim.Kind == config.CacheTrimCargoTarget && trim.Path != "" {
+			explicit[trim.Path] = true
+			if resolved, err := filepath.EvalSymlinks(trim.Path); err == nil {
+				explicit[resolved] = true
+			}
+		}
+	}
+	return discoverCargoTargets(parent, filepath.Base(glob), explicit)
 }
 
 func trimCache(ctx context.Context, procRoot string, trim config.CacheTrim) cacheTrimReport {
@@ -211,7 +279,7 @@ func trimCache(ctx context.Context, procRoot string, trim config.CacheTrim) cach
 	case config.CacheTrimDockerImages:
 		return trimDockerImages(ctx, procRoot, trim, report)
 	case config.CacheTrimCargoTarget:
-		return trimCargoTarget(ctx, procRoot, trim, report)
+		return trimCargoTarget(ctx, procRoot, trim, core.FilesystemID{}, report)
 	default:
 		return fail(fmt.Errorf("unsupported cache trim kind %q", trim.Kind))
 	}
