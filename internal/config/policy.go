@@ -268,64 +268,71 @@ type HerdrCollector struct {
 	// SessionRoots are the OMP session stores (".../.omp/agent/sessions")
 	// the guard covers.
 	SessionRoots []string `yaml:"session_roots" json:"session_roots"`
-	// forms holds, per session root, every spelling of that store this
-	// policy uses (ResolveRoots): the root, its symlink-resolved path, and
-	// each OMP category root that resolves to the same store. Nil until
-	// resolved.
-	forms [][]string
+	// stores holds the store each session root resolves to (ResolveRoots).
+	stores []string
 }
 
-// ResolveRoots records every spelling of each session root: itself, the
-// path its symlinks resolve to, and each of aliases (the policy's OMP
-// category roots) that resolves to the same store. Coverage and herdr
-// references then use one identity, whichever spelling an inventory or
-// category observation reaches a session by. A root that cannot be
-// resolved (absent) keeps its configured spelling alone.
-func (h *HerdrCollector) ResolveRoots(aliases []string) {
-	resolve := func(path string) string {
-		if resolved, err := filepath.EvalSymlinks(path); err == nil {
-			return resolved
-		}
-		return path
-	}
-	h.forms = make([][]string, len(h.SessionRoots))
+// ResolveRoots records the store of each session root: the path all its
+// symlinks resolve to (of its deepest existing ancestor while it is
+// absent). Coverage and herdr references compare resolved paths, so a
+// session is one identity whichever spelling (an inventory root, a category
+// root, herdr's own path) reaches it.
+func (h *HerdrCollector) ResolveRoots() {
+	h.stores = make([]string, len(h.SessionRoots))
 	for i, root := range h.SessionRoots {
-		store := resolve(root)
-		forms := []string{root}
-		for _, form := range append([]string{store}, aliases...) {
-			if !slices.Contains(forms, form) && resolve(form) == store {
-				forms = append(forms, form)
-			}
-		}
-		h.forms[i] = forms
+		h.stores[i] = RealPath(root)
 	}
 }
 
-// RootForms returns every known spelling of each session root, in
-// SessionRoots order; the first spelling is the configured root. A
-// collector built outside policy loading (never resolved) resolves its
-// roots' symlinks here, on each call.
-func (h *HerdrCollector) RootForms() [][]string {
-	if h.forms != nil {
-		return h.forms
+// Stores returns the resolved store of each session root, in SessionRoots
+// order. A collector built outside policy loading resolves them on each
+// call.
+func (h *HerdrCollector) Stores() []string {
+	if h.stores != nil {
+		return h.stores
 	}
 	resolved := *h
-	resolved.ResolveRoots(nil)
-	return resolved.forms
+	resolved.ResolveRoots()
+	return resolved.stores
 }
 
-// Covers reports whether path is, or lies in, any spelling of a session
-// root. A nil collector covers nothing.
+// CoversReal reports whether real, a resolved path, is or lies in a
+// session store.
+func (h *HerdrCollector) CoversReal(real string) bool {
+	return slices.ContainsFunc(h.Stores(), func(store string) bool { return core.PathWithin(real, store) })
+}
+
+// Covers reports whether moving path could move part of a session store:
+// path, with its directory's symlinks resolved (RealParent), lies in a
+// store. A nil collector covers nothing.
 func (h *HerdrCollector) Covers(path string) bool {
-	if h == nil {
-		return false
-	}
-	for _, forms := range h.RootForms() {
-		if slices.ContainsFunc(forms, func(root string) bool { return core.PathWithin(path, root) }) {
-			return true
+	return h != nil && h.CoversReal(RealParent(path))
+}
+
+// RealPath resolves every symlink of path; for a path that does not exist,
+// those of its deepest existing ancestor, the rest appended as spelled.
+func RealPath(path string) string {
+	path = filepath.Clean(path)
+	var rest []string
+	for dir := path; ; dir = filepath.Dir(dir) {
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(append([]string{real}, rest...)...)
 		}
+		if parent := filepath.Dir(dir); parent == dir {
+			return path
+		}
+		rest = append([]string{filepath.Base(dir)}, rest...)
 	}
-	return false
+}
+
+// RealParent is path with its directory resolved (RealPath) and its own
+// name kept: moving a symlink never moves what it points to.
+func RealParent(path string) string {
+	path = filepath.Clean(path)
+	if dir := filepath.Dir(path); dir != path {
+		return filepath.Join(RealPath(dir), filepath.Base(path))
+	}
+	return path
 }
 
 // CanonicalRoot declares where entries of a class are supposed to live.
@@ -977,13 +984,7 @@ func (p *Policy) normalize(paths Paths, defaults Policy) core.FieldErrors {
 		for i := range herdr.SessionRoots {
 			herdr.SessionRoots[i] = expand(fmt.Sprintf("collectors.herdr.session_roots[%d]", i), herdr.SessionRoots[i])
 		}
-		var aliases []string
-		for _, category := range p.WorkspaceArchiveCategories {
-			if category.Kind == CategoryOMPSessions || category.Kind == CategoryOMPSessionArtifacts {
-				aliases = append(aliases, category.Roots...)
-			}
-		}
-		herdr.ResolveRoots(aliases)
+		herdr.ResolveRoots()
 	}
 	for i := range p.Collectors.SystemdDirs {
 		p.Collectors.SystemdDirs[i] = expand(fmt.Sprintf("collectors.systemd_dirs[%d]", i), p.Collectors.SystemdDirs[i])
@@ -1506,17 +1507,14 @@ func (p *Policy) Validate() core.FieldErrors {
 		if len(herdr.SessionRoots) == 0 {
 			errs.Add("collectors.herdr.session_roots", "must name at least one OMP session store")
 		}
-		forms := herdr.RootForms()
+		stores := herdr.Stores()
 		for i, root := range herdr.SessionRoots {
 			field := fmt.Sprintf("collectors.herdr.session_roots[%d]", i)
-			sameStore := func(earlier []string) bool {
-				return slices.ContainsFunc(forms[i], func(form string) bool { return slices.Contains(earlier, form) })
-			}
 			switch {
 			case !CategoryOMPSessions.StateRootShape(root):
 				errs.Add(field, "must be an absolute OMP session store such as /root/.omp/agent/sessions, got %q", root)
-			case slices.ContainsFunc(forms[:i], sameStore):
-				errs.Add(field, "duplicates %q, or names the same store through a symlink", root)
+			case slices.ContainsFunc(stores[:i], func(store string) bool { return core.PathsOverlap(store, stores[i]) }):
+				errs.Add(field, "names the same store as an earlier root (or one inside it), possibly through a symlink: %q", root)
 			}
 		}
 	}

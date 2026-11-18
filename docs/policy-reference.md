@@ -1285,18 +1285,24 @@ collectors:
     session_roots: [/root/.omp/agent/sessions]
 ```
 
-every collection that reaches into a session root runs
+every collection that reaches into a session store runs
 `<binary> agent list --json` once: no shell, a minimal environment (`HOME`,
 `PATH`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, `HERDR_SOCKET_PATH`), in its own
 process group, within `limits.command_timeout` and a 4 MiB output bound. Each
-agent whose `agent_session` has `kind: path` names a transcript. Each session
-root is resolved at load to one identity: its configured spelling, the path
-its symlinks resolve to, and every OMP category root that resolves to the
-same store; two `session_roots` naming one store are refused. A session path
-(also with its directory's symlinks resolved) under any spelling is
-protected under every spelling, so an entry observed by the real path or by
-an alias meets it. Sessions of other machines and `kind: id` sessions
-(Claude) name no file here and are ignored.
+agent whose `agent_session` has `kind: path` names a transcript.
+
+Paths are compared by identity, not spelling. Each session root resolves at
+load to its store (all symlinks resolved); two `session_roots` naming one
+store (or one inside another) are refused. A path lies in a store when its
+directory, symlinks resolved, does; its own name is kept, since moving a
+symlink never moves what it points to. This holds for every collection
+root, entry and herdr session path, so an inventory root, a category root or
+herdr reaching the store through any symlinked alias (at the store, above it
+or at a project directory) is covered. A live session is protected as each
+observed directory that holds it spells it, so entries and the expiry check
+of an original path meet it under whatever spelling they use. Sessions of
+other machines and `kind: id` sessions (Claude) name no file here and are
+ignored.
 
 A referenced `<project>/<stem>.jsonl` protects its session unit: the
 transcript and its session folder `<project>/<stem>` as a whole, as the

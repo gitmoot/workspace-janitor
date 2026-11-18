@@ -370,3 +370,50 @@ func TestRestoreNeverOverwritesARecreatedSession(t *testing.T) {
 		})
 	}
 }
+
+// Review round 2 of #222, the reviewer's setup: session_roots names the
+// real store and an inventory root a symlinked alias of it (beside the real
+// root the category requires). The scan runs
+// herdr and protects the live folder and its transcript as the alias spells
+// them; a failing herdr leaves them unknown.
+func TestHerdrInventoryAliasScanStillGuards(t *testing.T) {
+	for name, answer := range map[string]string{"live session": "", "herdr failing": herdrNotRunning} {
+		t.Run(name, func(t *testing.T) {
+			x := newStateStoreFixture(t)
+			file := filepath.Join(t.TempDir(), "answer.json")
+			herdrScript(t, x, x.sessions, "exec /bin/cat "+file)
+			session := x.session(t, "-proj", sessionA, categoryIdleAge)
+			if answer == "" {
+				answer = herdrAgentList(session + ".jsonl")
+			}
+			writeHerdrAnswer(t, file, answer)
+			home := filepath.Join(t.TempDir(), "home")
+			if err := os.Symlink(x.home, home); err != nil {
+				t.Fatal(err)
+			}
+			alias := filepath.Join(home, ".omp", "agent", "sessions")
+			raw, err := os.ReadFile(x.paths(t).PolicyFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			x.writePolicy(t, strings.Replace(string(raw), "roots:\n", "roots:\n  - path: "+alias+"\n    max_depth: 2\n", 1))
+			want := "live_agent_session"
+			if answer == herdrNotRunning {
+				want = "collector_failure"
+			}
+			x.data(t, "scan")
+			x.data(t, "plan", "--no-jev")
+			for _, path := range []string{filepath.Join(alias, "-proj", sessionA), filepath.Join(alias, "-proj", sessionA+".jsonl")} {
+				var verdict core.Verdict
+				field(t, x.data(t, "explain", path), "safety_verdict", &verdict)
+				found := false
+				for _, protection := range verdict.Protections {
+					found = found || string(protection.Kind) == want
+				}
+				if !found {
+					t.Errorf("%s through the alias lacks %s: %+v", path, want, verdict.Protections)
+				}
+			}
+		})
+	}
+}

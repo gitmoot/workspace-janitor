@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -32,16 +31,12 @@ const herdrSessionLog = ".jsonl"
 // it) reaches the command.
 var herdrEnv = []string{"HOME", "PATH", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "HERDR_SOCKET_PATH"}
 
-// HerdrSessions is one complete herdr answer: every OMP session under the
-// session roots that a live agent resumes, by its transcript path
-// ("<root>/<project>/<stem>.jsonl") under every spelling of its root, with
-// the agents that name it.
+// HerdrSessions is one complete herdr answer: every OMP session in a
+// session store that a live agent resumes, by its resolved transcript path
+// ("<store>/<project>/<stem>.jsonl", config.RealParent), with the agents
+// that name it.
 type HerdrSessions struct {
-	// At is when herdr answered.
-	At       time.Time
 	sessions map[string]string
-	// distinct holds each live session once, under its configured root.
-	distinct map[string]bool
 }
 
 // ListHerdrSessions runs "<binary> agent list --json" once, without a
@@ -57,8 +52,7 @@ func ListHerdrSessions(ctx context.Context, cfg *config.HerdrCollector, timeout 
 	if err != nil {
 		return nil, err
 	}
-	out := &HerdrSessions{At: nowFunc(), sessions: map[string]string{}, distinct: map[string]bool{}}
-	forms := cfg.RootForms()
+	out := &HerdrSessions{sessions: map[string]string{}}
 	for _, agent := range agents {
 		session := agent.session
 		if session == nil || session.Kind != "path" {
@@ -68,24 +62,38 @@ func ListHerdrSessions(ctx context.Context, cfg *config.HerdrCollector, timeout 
 		if !filepath.IsAbs(session.Value) {
 			return nil, fmt.Errorf("herdr agent %s names a non-absolute session path %q", agent.label(), session.Value)
 		}
-		paths := canonicalSession(forms, session.Value)
-		for _, path := range paths {
+		if path, ok := storeSession(cfg, session.Value); ok {
 			out.sessions[path] = appendDetail(out.sessions[path], agent.label())
-		}
-		if len(paths) != 0 {
-			out.distinct[paths[0]] = true
 		}
 	}
 	return out, nil
 }
 
+// storeSession resolves a herdr session path to its identity in a session
+// store: its directory's symlinks resolved, or, spelled under a configured
+// root whose directory is absent, mapped onto that root's store. Paths in
+// no store (another machine's sessions) are dropped.
+func storeSession(cfg *config.HerdrCollector, value string) (string, bool) {
+	if real := config.RealParent(value); cfg.CoversReal(real) {
+		return real, true
+	}
+	value = filepath.Clean(value)
+	for i, root := range cfg.SessionRoots {
+		if rel, err := filepath.Rel(root, value); err == nil && core.PathWithin(value, root) {
+			return filepath.Join(cfg.Stores()[i], rel), true
+		}
+	}
+	return "", false
+}
+
 // Len is the number of distinct live sessions.
-func (h *HerdrSessions) Len() int { return len(h.distinct) }
+func (h *HerdrSessions) Len() int { return len(h.sessions) }
 
 // Unit is why a live agent keeps the OMP session unit at path (its session
-// folder "<stem>" or its transcript "<stem>.jsonl"), or "" when none does.
+// folder "<stem>" or its transcript "<stem>.jsonl", in any spelling), or ""
+// when none does.
 func (h *HerdrSessions) Unit(path string) string {
-	transcript := path
+	transcript := config.RealParent(path)
 	if !strings.HasSuffix(transcript, herdrSessionLog) {
 		transcript += herdrSessionLog
 	}
@@ -95,58 +103,85 @@ func (h *HerdrSessions) Unit(path string) string {
 	return ""
 }
 
-// canonicalSession maps a herdr session path onto the session roots: the
-// path cleaned, and with its directory's symlinks resolved, is matched
-// against every spelling of each root, and the session is named under every
-// spelling of the root it matched, so an entry observed through any of them
-// meets its reference. Paths outside every root (another machine's
-// sessions) are dropped.
-func canonicalSession(roots [][]string, value string) []string {
-	candidates := []string{filepath.Clean(value)}
-	if dir, err := filepath.EvalSymlinks(filepath.Dir(candidates[0])); err == nil {
-		candidates = append(candidates, filepath.Join(dir, filepath.Base(candidates[0])))
+// herdrView is how one collection reaches the session stores: each
+// directory it observes through (its roots and the directories holding its
+// entries), by its spelling, resolved; and whether any root or entry lies
+// in a store. It is computed once, before herdr runs.
+type herdrView struct {
+	dirs   map[string]string
+	needed bool
+}
+
+func newHerdrView(opts *Options, entries []core.Entry) herdrView {
+	view := herdrView{dirs: map[string]string{}}
+	if opts.Herdr == nil {
+		return view
 	}
-	var out []string
-	for _, forms := range roots {
-		for _, form := range forms {
-			for _, candidate := range candidates {
-				if !core.PathWithin(candidate, form) {
-					continue
-				}
-				rel, err := filepath.Rel(form, candidate)
-				if err != nil {
-					continue
-				}
-				for _, spelling := range forms {
-					if path := filepath.Join(spelling, rel); !slices.Contains(out, path) {
-						out = append(out, path)
-					}
-				}
-			}
+	resolve := func(dir string) string {
+		real, ok := view.dirs[dir]
+		if !ok {
+			real = config.RealPath(dir)
+			view.dirs[dir] = real
 		}
+		return real
 	}
-	return out
+	for _, root := range opts.Roots {
+		view.needed = opts.Herdr.CoversReal(resolve(root.Path)) || view.needed
+	}
+	for _, entry := range entries {
+		real := filepath.Join(resolve(filepath.Dir(entry.Path)), filepath.Base(entry.Path))
+		view.needed = opts.Herdr.CoversReal(real) || view.needed
+	}
+	return view
+}
+
+// covers reports whether entry path lies in a store, by identity.
+func (v herdrView) covers(opts *Options, path string) bool {
+	real, ok := v.dirs[filepath.Dir(path)]
+	return ok && opts.Herdr.CoversReal(filepath.Join(real, filepath.Base(path)))
 }
 
 // herdrReferences are the protections of every live session unit: its
-// transcript and its session folder with everything in it. They bind
-// collected entries only; omp_session_artifacts, which moves old single
-// files out of live seats by an earlier owner decision (2026-11-09), selects
-// and moves files under its own guards and never consults them.
-func herdrReferences(sessions *HerdrSessions) []Reference {
+// transcript and its session folder with everything in it, spelled through
+// each directory the collection observes that holds them, so entries and
+// the engine's checks of an original path meet them in whatever spelling
+// they use. They bind collected entries only; omp_session_artifacts, which
+// moves old single files out of live seats by an earlier owner decision
+// (2026-11-09), selects and moves files under its own guards and never
+// consults them.
+func herdrReferences(sessions *HerdrSessions, view herdrView) []Reference {
 	transcripts := make([]string, 0, len(sessions.sessions))
 	for transcript := range sessions.sessions {
 		transcripts = append(transcripts, transcript)
 	}
 	sort.Strings(transcripts)
+	spellings := make([]string, 0, len(view.dirs))
+	for dir := range view.dirs {
+		spellings = append(spellings, dir)
+	}
+	sort.Strings(spellings)
+	seen := map[string]bool{}
 	var refs []Reference
 	for _, transcript := range transcripts {
 		detail := liveSessionDetail(transcript, sessions.sessions[transcript])
-		refs = append(refs, Reference{Path: transcript, Source: core.SourceJob, Protection: core.ProtectLiveAgentSession,
-			Signal: "herdr_agent_session", Detail: detail})
-		if stem, ok := strings.CutSuffix(transcript, herdrSessionLog); ok {
-			refs = append(refs, Reference{Path: stem, Source: core.SourceJob, Protection: core.ProtectLiveAgentSession,
-				Signal: "herdr_agent_session", Detail: detail, Subtree: true})
+		stem, _ := strings.CutSuffix(transcript, herdrSessionLog)
+		for _, dir := range spellings {
+			real := view.dirs[dir]
+			rel, err := filepath.Rel(real, transcript)
+			if err != nil || !core.PathWithin(transcript, real) {
+				continue
+			}
+			path := filepath.Join(dir, rel)
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			refs = append(refs, Reference{Path: path, Source: core.SourceJob, Protection: core.ProtectLiveAgentSession,
+				Signal: "herdr_agent_session", Detail: detail})
+			if stem != transcript {
+				refs = append(refs, Reference{Path: strings.TrimSuffix(path, herdrSessionLog), Source: core.SourceJob,
+					Protection: core.ProtectLiveAgentSession, Signal: "herdr_agent_session", Detail: detail, Subtree: true})
+			}
 		}
 	}
 	return refs
@@ -299,16 +334,16 @@ func runHerdr(ctx context.Context, binary string, timeout time.Duration) ([]byte
 	return stdout.buffer.Bytes(), nil
 }
 
-// gatherHerdrReferences runs herdr once for a collection whose roots or
-// entries lie under a session root; otherwise it is skipped.
-func gatherHerdrReferences(ctx context.Context, opts *Options, needed bool) ([]Reference, core.CollectorReport) {
+// gatherHerdrReferences runs herdr once for a collection that reaches into
+// a session store (view.needed); otherwise it is skipped.
+func gatherHerdrReferences(ctx context.Context, opts *Options, view herdrView) ([]Reference, core.CollectorReport) {
 	report := core.CollectorReport{Name: CollectorHerdr, Status: core.CollectorRan}
 	switch {
 	case opts.Herdr == nil:
 		report.Status, report.Detail = core.CollectorSkipped, "herdr is not configured"
 		return nil, report
-	case !needed:
-		report.Status, report.Detail = core.CollectorSkipped, "no observed path lies in a herdr session root"
+	case !view.needed:
+		report.Status, report.Detail = core.CollectorSkipped, "no observed path lies in a herdr session store"
 		return nil, report
 	}
 	sessions, err := ListHerdrSessions(ctx, opts.Herdr, opts.Limits.CommandTimeout)
@@ -318,30 +353,17 @@ func gatherHerdrReferences(ctx context.Context, opts *Options, needed bool) ([]R
 	}
 	report.Visited = sessions.Len()
 	report.Detail = fmt.Sprintf("live herdr agents resume %d OMP session(s) under %s", sessions.Len(), strings.Join(opts.Herdr.SessionRoots, ", "))
-	return herdrReferences(sessions), report
-}
-
-// herdrNeeded reports whether a collection reaches into a session root:
-// through one of its roots (an engine recollection of a session's project
-// directory, whose session may be absent), or an observed entry. A
-// collection that only passes above one (a scan of /root) does not depend
-// on herdr, and a herdr failure must not hold it.
-func herdrNeeded(opts *Options, entries []core.Entry) bool {
-	if opts.Herdr == nil {
-		return false
-	}
-	return slices.ContainsFunc(opts.Roots, func(root RootSpec) bool { return opts.Herdr.Covers(root.Path) }) ||
-		slices.ContainsFunc(entries, func(entry core.Entry) bool { return opts.Herdr.Covers(entry.Path) })
+	return herdrReferences(sessions, view), report
 }
 
 // attachHerdrUnknowns fails closed: when herdr was needed but did not
-// answer, every entry in a session root is unknown.
-func attachHerdrUnknowns(entries []core.Entry, opts *Options, report *core.CollectorReport, now time.Time) {
+// answer, every entry in a session store, in any spelling, is unknown.
+func attachHerdrUnknowns(entries []core.Entry, opts *Options, view herdrView, report *core.CollectorReport, now time.Time) {
 	if report.Status == core.CollectorRan || report.Status == core.CollectorSkipped {
 		return
 	}
 	for i := range entries {
-		if opts.Herdr.Covers(entries[i].Path) {
+		if view.covers(opts, entries[i].Path) {
 			addUnknown(&entries[i], core.SourceJob, core.ProtectCollectorFailure, CollectorHerdr,
 				"herdr agent sessions are unknown: "+report.Detail, now)
 			report.Recorded++

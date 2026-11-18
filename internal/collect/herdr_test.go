@@ -245,3 +245,72 @@ func TestHerdrAliasedSessionRootIsOneIdentity(t *testing.T) {
 		}
 	})
 }
+
+// Review round 2 of #222: session_roots names the real store while the
+// inventory reaches it through a symlinked alias, at the store or above it.
+// Identity, not spelling, decides: herdr runs, the live transcript and its
+// folder are protected as the alias spells them (whether herdr names the
+// session by the real path or the alias), the other session is not, and a
+// failing herdr leaves every alias entry unknown.
+func TestHerdrInventoryAliasOfTheStoreIsOneIdentity(t *testing.T) {
+	// The alias is a symlink to the home holding the store; the inventory
+	// root is the store (depth 2) or its project directory (depth 1), as
+	// the alias spells them.
+	place := func(t *testing.T, x herdrFixture, depth int) (string, []RootSpec) {
+		home := filepath.Dir(filepath.Dir(filepath.Dir(x.sessions)))
+		alias := filepath.Join(t.TempDir(), "home")
+		mustSymlink(t, home, alias)
+		project := filepath.Join(alias, ".omp", "agent", "sessions", "-proj")
+		root := project
+		if depth == 2 {
+			root = filepath.Dir(project)
+		}
+		return project, []RootSpec{{Path: root, MaxDepth: depth}}
+	}
+	for where, depth := range map[string]int{"root at the store": 2, "root at the project": 1} {
+		for named, viaAlias := range map[string]bool{"herdr names the real path": false, "herdr names the alias": true} {
+			t.Run(where+"/"+named, func(t *testing.T) {
+				x := newHerdrFixture(t, "")
+				project, roots := place(t, x, depth)
+				value := filepath.Join(x.project, herdrStemA+".jsonl")
+				if viaAlias {
+					value = filepath.Join(project, herdrStemA+".jsonl")
+				}
+				if err := os.WriteFile(x.binary, []byte("#!/bin/sh\n"+answerScript(t, value)+"\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				opts := x.options(5 * time.Second)
+				opts.Roots = roots
+				result := run(t, opts)
+				if report := reportFor(t, result, CollectorHerdr); report.Status != core.CollectorRan || report.Visited != 1 {
+					t.Fatalf("herdr report for an aliased inventory root = %+v", report)
+				}
+				for _, path := range []string{filepath.Join(project, herdrStemA), filepath.Join(project, herdrStemA+".jsonl")} {
+					if protectionReason(entryFor(t, result, path), core.ProtectLiveAgentSession) == "" {
+						t.Errorf("%s not protected through the alias", path)
+					}
+				}
+				for _, path := range []string{filepath.Join(project, herdrStemB), filepath.Join(project, herdrStemB+".jsonl")} {
+					if entry := entryFor(t, result, path); len(entry.Protections) != 0 {
+						t.Errorf("unreferenced %s protected: %+v", path, entry.Protections)
+					}
+				}
+			})
+		}
+		t.Run(where+"/herdr failing", func(t *testing.T) {
+			x := newHerdrFixture(t, "exit 1")
+			_, roots := place(t, x, depth)
+			opts := x.options(5 * time.Second)
+			opts.Roots = roots
+			result := run(t, opts)
+			if report := reportFor(t, result, CollectorHerdr); report.Status != core.CollectorFailed || report.Recorded < 4 {
+				t.Fatalf("herdr report for an aliased inventory root = %+v", report)
+			}
+			for _, entry := range result.Entries {
+				if protectionReason(entry, core.ProtectCollectorFailure) == "" {
+					t.Errorf("%s not unknown under a failing herdr", entry.Path)
+				}
+			}
+		})
+	}
+}

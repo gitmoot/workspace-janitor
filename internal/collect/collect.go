@@ -300,16 +300,16 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		result.References = append(result.References, refs...)
 		result.Reports = append(result.Reports, report)
 	}
-	// Herdr runs once per collection that reaches a session root, after the
-	// filesystem pass decided whether one does. Unanswered, every entry
-	// under a session root is unknown.
-	needHerdr := herdrNeeded(&opts, entries)
+	// Herdr runs once per collection that reaches into a session store, by
+	// identity, after the filesystem pass decided whether one does.
+	// Unanswered, every entry in a store is unknown.
+	herdrView := newHerdrView(&opts, entries)
 	herdrRefs, herdrReport := runBounded(ctx, &opts, CollectorHerdr, func(ctx context.Context, opts *Options) ([]Reference, core.CollectorReport) {
-		return gatherHerdrReferences(ctx, opts, needHerdr)
+		return gatherHerdrReferences(ctx, opts, herdrView)
 	})
 	herdrReport.Recorded = attachReferences(entries, herdrRefs, now)
-	if needHerdr {
-		attachHerdrUnknowns(entries, &opts, &herdrReport, now)
+	if herdrView.needed {
+		attachHerdrUnknowns(entries, &opts, herdrView, &herdrReport, now)
 	}
 	result.References = append(result.References, herdrRefs...)
 	result.Reports = append(result.Reports, herdrReport)
