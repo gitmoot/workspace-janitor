@@ -1285,11 +1285,14 @@ collectors:
     session_roots: [/root/.omp/agent/sessions]
 ```
 
-every collection that reaches into a session store runs
+every collection that reaches into a session store, or observes a real
+directory holding one, runs
 `<binary> agent list --json` once: no shell, a minimal environment (`HOME`,
 `PATH`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, `HERDR_SOCKET_PATH`), in its own
 process group, within `limits.command_timeout` and a 4 MiB output bound. Each
-agent whose `agent_session` has `kind: path` names a transcript.
+agent whose `agent_session` has `kind: path` names a transcript; its value
+must be absolute and clean (`dir/link/../x` names another file once cleaned
+than the filesystem resolves, so an unclean value is malformed evidence).
 
 Paths are compared by identity, not spelling. Each session root resolves at
 load to its store (all symlinks resolved); two `session_roots` naming one
@@ -1303,9 +1306,13 @@ observed directory that holds it spells it, and an observed directory that
 is the live session folder or lies inside it (a scan rooted there, the
 revalidation of one file in it) is protected whole, though the transcript
 beside the folder is outside it. Entries and the expiry check of an
-original path meet the protection under whatever spelling they use. Sessions of
-other machines and `kind: id` sessions (Claude) name no file here and are
-ignored.
+original path meet the protection under whatever spelling they use. An
+observed real directory that holds a session store (`/root/.omp` in a
+shallow scan of `/root`, or the build directory a symlinked sessions root
+resolves into) is protected too while a session in it is live, since moving
+it moves every session inside; a directory holding only a symlink to the
+store is not. Sessions of other machines and `kind: id` sessions (Claude)
+name no file here and are ignored.
 
 A referenced `<project>/<stem>.jsonl` protects its session unit: the
 transcript and its session folder `<project>/<stem>` as a whole, as the
@@ -1332,11 +1339,13 @@ Herdr configured but failing, timing out, printing more than the bound or
 printing anything but a well-formed agent list (its error document, any `id`
 other than `cli:agent:list`, a `result.type` other than `agent_list`, a null
 or ill-typed agent record, an `agent_session` without a string kind and
-value) leaves every entry under the session roots unknown
+value, an unclean session path) leaves every entry under the session roots
+and every observed real directory holding one unknown
 (`collector_failure`): no
-`omp_sessions` unit is archived, moved or expired, and the run reports a
-failure, not a refusal (`janitor cycle` exits non-zero). A collection that
-does not reach into a session root does not run herdr, and a herdr failure
+`omp_sessions` unit, nor a directory holding a store, is archived, moved or
+expired, and the run reports a failure, not a refusal (`janitor cycle` exits
+non-zero). A collection that neither reaches into a session store nor
+observes a directory holding one does not run herdr, and a herdr failure
 does not hold it. `binary` must be an absolute path; each `session_roots`
 entry must be an exact `.../.omp/agent/sessions` store. Without
 `collectors.herdr` nothing changes.

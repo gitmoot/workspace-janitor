@@ -383,3 +383,95 @@ func TestHerdrProtectsCollectionsInsideALiveSessionFolder(t *testing.T) {
 		}
 	})
 }
+
+// Review of #223: "sessions/alias/../<stem>.jsonl" with alias a symlink to
+// "-proj/child" names "-proj/<stem>.jsonl" on the filesystem, but cleaning
+// it first names "sessions/<stem>.jsonl". An unclean session path is
+// malformed evidence: herdr fails, and every session entry is unknown.
+func TestHerdrUncleanSessionPathFailsClosed(t *testing.T) {
+	x := newHerdrFixture(t, "")
+	mustMkdir(t, filepath.Join(x.project, "child"))
+	mustSymlink(t, filepath.Join(x.project, "child"), filepath.Join(x.sessions, "alias"))
+	value := x.sessions + "/alias/../" + herdrStemA + ".jsonl"
+	if err := os.WriteFile(x.binary, []byte("#!/bin/sh\n"+answerScript(t, value)+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	result := run(t, x.options(5*time.Second))
+	if report := reportFor(t, result, CollectorHerdr); report.Status != core.CollectorFailed || !strings.Contains(report.Detail, "unclean") {
+		t.Fatalf("herdr report for an unclean session path = %+v", report)
+	}
+	for _, path := range []string{filepath.Join(x.project, herdrStemA), filepath.Join(x.project, herdrStemA+".jsonl")} {
+		if protectionReason(entryFor(t, result, path), core.ProtectCollectorFailure) == "" {
+			t.Errorf("%s not unknown after an unclean herdr session path", path)
+		}
+	}
+}
+
+// Review of #223: moving a real directory that holds a session store moves
+// every live session in it. A shallow collection that observes such a
+// directory runs herdr, protects it while a session is live, and leaves it
+// unknown when herdr fails. That holds for a store reached through a
+// symlink too (a sessions root pointing into a build directory), by
+// identity; the directory holding only the symlink is not an ancestor.
+func TestHerdrProtectsAnObservedAncestorOfAStore(t *testing.T) {
+	type setup struct {
+		opts     Options
+		ancestor string
+		other    string
+	}
+	shapes := map[string]func(t *testing.T, x herdrFixture) setup{
+		"directory containing the store": func(t *testing.T, x herdrFixture) setup {
+			omp := filepath.Dir(filepath.Dir(x.sessions))
+			mustWrite(t, filepath.Join(omp, "notes.txt"), "n\n")
+			opts := x.options(5 * time.Second)
+			opts.Roots = []RootSpec{{Path: omp, MaxDepth: 1}}
+			return setup{opts, filepath.Join(omp, "agent"), filepath.Join(omp, "notes.txt")}
+		},
+		"build directory the sessions root resolves into": func(t *testing.T, x herdrFixture) setup {
+			top := t.TempDir()
+			build := filepath.Join(top, "build")
+			mustMkdir(t, build)
+			if err := os.Rename(x.sessions, filepath.Join(build, "sessions")); err != nil {
+				t.Fatal(err)
+			}
+			mustSymlink(t, filepath.Join(build, "sessions"), x.sessions)
+			mustMkdir(t, filepath.Join(top, "unrelated"))
+			opts := x.options(5 * time.Second)
+			opts.Roots = []RootSpec{{Path: top, MaxDepth: 1}}
+			return setup{opts, build, filepath.Join(top, "unrelated")}
+		},
+	}
+	for name, shape := range shapes {
+		t.Run(name+"/live session", func(t *testing.T) {
+			x := newHerdrFixture(t, "")
+			if err := os.WriteFile(x.binary, []byte("#!/bin/sh\n"+answerScript(t, filepath.Join(x.project, herdrStemA+".jsonl"))+"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			s := shape(t, x)
+			result := run(t, s.opts)
+			if report := reportFor(t, result, CollectorHerdr); report.Status != core.CollectorRan {
+				t.Fatalf("herdr did not run for a collection observing a store ancestor: %+v", report)
+			}
+			if reason := protectionReason(entryFor(t, result, s.ancestor), core.ProtectLiveAgentSession); !strings.Contains(reason, herdrStemA+".jsonl") {
+				t.Errorf("ancestor %s of a live session not protected: %+v", s.ancestor, entryFor(t, result, s.ancestor).Protections)
+			}
+			if entry := entryFor(t, result, s.other); len(entry.Protections) != 0 {
+				t.Errorf("sibling %s protected: %+v", s.other, entry.Protections)
+			}
+		})
+		t.Run(name+"/herdr failing", func(t *testing.T) {
+			x := newHerdrFixture(t, "exit 1")
+			s := shape(t, x)
+			result := run(t, s.opts)
+			if report := reportFor(t, result, CollectorHerdr); report.Status != core.CollectorFailed {
+				t.Fatalf("herdr report = %+v", report)
+			}
+			if protectionReason(entryFor(t, result, s.ancestor), core.ProtectCollectorFailure) == "" {
+				t.Errorf("ancestor %s not unknown under a failing herdr", s.ancestor)
+			}
+			if entry := entryFor(t, result, s.other); len(entry.Protections) != 0 {
+				t.Errorf("sibling %s protected under a failing herdr: %+v", s.other, entry.Protections)
+			}
+		})
+	}
+}

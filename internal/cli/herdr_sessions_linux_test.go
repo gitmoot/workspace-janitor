@@ -449,3 +449,43 @@ func TestHerdrScanInsideALiveSessionFolderStillGuards(t *testing.T) {
 		}
 	}
 }
+
+// Review of #223: a shallow scan whose root holds the session store (here
+// the ".omp" directory, seeing "agent" at depth one) runs herdr and keeps
+// that directory: protected while a session is live, unknown when herdr
+// fails, so it is never planned for quarantine.
+func TestHerdrShallowScanOfAStoreAncestorStillGuards(t *testing.T) {
+	for name, answer := range map[string]string{"live session": "", "herdr failing": herdrNotRunning} {
+		t.Run(name, func(t *testing.T) {
+			x := newStateStoreFixture(t)
+			file := filepath.Join(t.TempDir(), "answer.json")
+			herdrScript(t, x, x.sessions, "exec /bin/cat "+file)
+			session := x.session(t, "-proj", sessionA, categoryIdleAge)
+			if answer == "" {
+				answer = herdrAgentList(session + ".jsonl")
+			}
+			writeHerdrAnswer(t, file, answer)
+			omp := filepath.Dir(filepath.Dir(x.sessions))
+			raw, err := os.ReadFile(x.paths(t).PolicyFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			x.writePolicy(t, strings.Replace(string(raw), "roots:\n", "roots:\n  - path: "+omp+"\n    max_depth: 1\n", 1))
+			want := core.ProtectLiveAgentSession
+			if answer == herdrNotRunning {
+				want = core.ProtectCollectorFailure
+			}
+			x.data(t, "scan")
+			x.data(t, "plan", "--no-jev")
+			var verdict core.Verdict
+			field(t, x.data(t, "explain", filepath.Join(omp, "agent")), "safety_verdict", &verdict)
+			found := false
+			for _, protection := range verdict.Protections {
+				found = found || protection.Kind == want
+			}
+			if !found || verdict.Allows(core.ActionQuarantine) {
+				t.Errorf("store ancestor %s lacks %s: %+v", filepath.Join(omp, "agent"), want, verdict.Protections)
+			}
+		})
+	}
+}

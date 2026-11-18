@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -62,6 +63,11 @@ func ListHerdrSessions(ctx context.Context, cfg *config.HerdrCollector, timeout 
 		if !filepath.IsAbs(session.Value) {
 			return nil, fmt.Errorf("herdr agent %s names a non-absolute session path %q", agent.label(), session.Value)
 		}
+		// Cleaning "dir/link/../x" lexically names another file than the
+		// filesystem resolves; an unclean path is malformed evidence.
+		if session.Value != filepath.Clean(session.Value) {
+			return nil, fmt.Errorf("herdr agent %s names an unclean session path %q", agent.label(), session.Value)
+		}
 		if path, ok := storeSession(cfg, session.Value); ok {
 			out.sessions[path] = appendDetail(out.sessions[path], agent.label())
 		}
@@ -105,15 +111,18 @@ func (h *HerdrSessions) Unit(path string) string {
 
 // herdrView is how one collection reaches the session stores: each
 // directory it observes through (its roots and the directories holding its
-// entries), by its spelling, resolved; and whether any root or entry lies
-// in a store. It is computed once, before herdr runs.
+// entries), by its spelling, resolved; the observed real directories that
+// hold a store (moving one moves every session in it); and whether any
+// root or entry lies in a store or holds one. It is computed once, before
+// herdr runs.
 type herdrView struct {
-	dirs   map[string]string
-	needed bool
+	dirs      map[string]string
+	ancestors map[string]bool
+	needed    bool
 }
 
 func newHerdrView(opts *Options, entries []core.Entry) herdrView {
-	view := herdrView{dirs: map[string]string{}}
+	view := herdrView{dirs: map[string]string{}, ancestors: map[string]bool{}}
 	if opts.Herdr == nil {
 		return view
 	}
@@ -131,6 +140,13 @@ func newHerdrView(opts *Options, entries []core.Entry) herdrView {
 	for _, entry := range entries {
 		real := filepath.Join(resolve(filepath.Dir(entry.Path)), filepath.Base(entry.Path))
 		view.needed = opts.Herdr.CoversReal(real) || view.needed
+		// A symlink entry moves only itself; a real directory moves the
+		// stores inside it.
+		if entry.Kind == core.EntryKindDirectory && slices.ContainsFunc(opts.Herdr.Stores(), func(store string) bool {
+			return store != real && core.PathWithin(store, real)
+		}) {
+			view.ancestors[entry.Path], view.needed = true, true
+		}
 	}
 	return view
 }
@@ -360,7 +376,7 @@ func gatherHerdrReferences(ctx context.Context, opts *Options, view herdrView) (
 		report.Status, report.Detail = core.CollectorSkipped, "herdr is not configured"
 		return nil, report
 	case !view.needed:
-		report.Status, report.Detail = core.CollectorSkipped, "no observed path lies in a herdr session store"
+		report.Status, report.Detail = core.CollectorSkipped, "no observed path lies in or holds a herdr session store"
 		return nil, report
 	}
 	sessions, err := ListHerdrSessions(ctx, opts.Herdr, opts.Limits.CommandTimeout)
@@ -374,13 +390,14 @@ func gatherHerdrReferences(ctx context.Context, opts *Options, view herdrView) (
 }
 
 // attachHerdrUnknowns fails closed: when herdr was needed but did not
-// answer, every entry in a session store, in any spelling, is unknown.
+// answer, every entry in a session store, in any spelling, and every
+// observed real directory holding one is unknown.
 func attachHerdrUnknowns(entries []core.Entry, opts *Options, view herdrView, report *core.CollectorReport, now time.Time) {
 	if report.Status == core.CollectorRan || report.Status == core.CollectorSkipped {
 		return
 	}
 	for i := range entries {
-		if view.covers(opts, entries[i].Path) {
+		if view.covers(opts, entries[i].Path) || view.ancestors[entries[i].Path] {
 			addUnknown(&entries[i], core.SourceJob, core.ProtectCollectorFailure, CollectorHerdr,
 				"herdr agent sessions are unknown: "+report.Detail, now)
 			report.Recorded++
