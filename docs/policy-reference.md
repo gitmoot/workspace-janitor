@@ -1293,6 +1293,15 @@ process group, within `limits.command_timeout` and a 4 MiB output bound. Each
 agent whose `agent_session` has `kind: path` names a transcript; its value
 must be absolute and clean (`dir/link/../x` names another file once cleaned
 than the filesystem resolves, so an unclean value is malformed evidence).
+An agent may also list `topic_sessions` (herdr with its `agent_topics`
+capability): every topic transcript the agent keeps, usually beside its
+`agent_session`. Each listed path is a live session exactly as the
+`agent_session` is (same identity mapping, transcript and session folder,
+and a `live_agent_session` reason naming the agent and saying it keeps the
+topic); paths in no session store are ignored. Absent or `null` means no
+topics. Anything else must be an array of at most 1000 strings, each
+absolute, clean and ending in `.jsonl`; any other value is malformed
+evidence and herdr fails closed.
 
 Paths are compared by identity, not spelling. Each session root resolves at
 load to its store (all symlinks resolved); two `session_roots` naming one
