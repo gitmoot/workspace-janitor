@@ -418,9 +418,10 @@ func TestHerdrInventoryAliasScanStillGuards(t *testing.T) {
 	}
 }
 
-// Review round 3 of #222: a scan rooted at a live session folder, or at a
-// directory inside it, protects every entry it observes, though the
-// transcript beside the folder is outside both roots.
+// Review round 3 of #222: a scan whose only roots are a live session folder
+// and a directory inside it protects every entry it observes, though the
+// transcript beside the folder is outside every root. (The categories go:
+// their roots would be inventory roots that hold the transcript.)
 func TestHerdrScanInsideALiveSessionFolderStillGuards(t *testing.T) {
 	x := newStateStoreFixture(t)
 	file := filepath.Join(t.TempDir(), "answer.json")
@@ -431,7 +432,9 @@ func TestHerdrScanInsideALiveSessionFolderStillGuards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	x.writePolicy(t, strings.Replace(string(raw), "roots:\n", "roots:\n  - path: "+session+"\n    max_depth: 2\n  - path: "+filepath.Join(session, "sub")+"\n    max_depth: 1\n", 1))
+	policy, _, _ := strings.Cut(string(raw), "workspace_archive_categories:")
+	_, rest, _ := strings.Cut(policy, "protect:")
+	x.writePolicy(t, "roots:\n  - path: "+session+"\n    max_depth: 2\n  - path: "+filepath.Join(session, "sub")+"\n    max_depth: 1\nprotect:"+rest)
 	x.data(t, "scan")
 	x.data(t, "plan", "--no-jev")
 	for _, path := range []string{filepath.Join(session, "0.bash.log"), filepath.Join(session, "sub"), filepath.Join(session, "sub", "1.read.log")} {
