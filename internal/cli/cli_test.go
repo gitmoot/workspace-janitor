@@ -21,6 +21,13 @@ import (
 type fixture struct {
 	home string
 	env  map[string]string
+	// stagehandDirs and stagehandState are the stagehand locations
+	// writePolicy adds to a document that names none. Nil and "" mean
+	// non-existent directories in the fixture home: the defaults
+	// (/etc/stagehand/pipelines, /var/lib/stagehand) would make every
+	// services collector depend on the host's real pipelines.
+	stagehandDirs  []string
+	stagehandState string
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -29,6 +36,8 @@ func newFixture(t *testing.T) *fixture {
 	return &fixture{home: home, env: map[string]string{config.EnvHome: home}}
 }
 
+// writePolicy writes the fixture's policy, with the fixture's stagehand
+// locations unless the document names its own.
 func (f *fixture) writePolicy(t *testing.T, document string) string {
 	t.Helper()
 	dir := filepath.Join(f.home, ".config", config.AppName)
@@ -36,10 +45,38 @@ func (f *fixture) writePolicy(t *testing.T, document string) string {
 		t.Fatalf("mkdir: %v", err)
 	}
 	path := filepath.Join(dir, "policy.yaml")
-	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(f.withStagehand(document)), 0o600); err != nil {
 		t.Fatalf("write policy: %v", err)
 	}
 	return path
+}
+
+func (f *fixture) withStagehand(document string) string {
+	dirs, state := f.stagehandDirs, f.stagehandState
+	if dirs == nil {
+		dirs = []string{filepath.Join(f.home, "no-stagehand", "pipelines")}
+	}
+	if state == "" {
+		state = filepath.Join(f.home, "no-stagehand", "state")
+	}
+	var add string
+	if !strings.Contains(document, "stagehand_dirs:") {
+		add += "  stagehand_dirs: [" + strings.Join(dirs, ", ") + "]\n"
+	}
+	if !strings.Contains(document, "stagehand_state_dir:") {
+		add += "  stagehand_state_dir: " + state + "\n"
+	}
+	if add == "" {
+		return document
+	}
+	switch {
+	case strings.HasPrefix(document, "collectors:\n"):
+		return "collectors:\n" + add + strings.TrimPrefix(document, "collectors:\n")
+	case strings.Contains(document, "\ncollectors:\n"):
+		return strings.Replace(document, "\ncollectors:\n", "\ncollectors:\n"+add, 1)
+	default:
+		return "collectors:\n" + add + document
+	}
 }
 
 func (f *fixture) run(t *testing.T, args ...string) (stdout, stderr string, code ExitCode) {

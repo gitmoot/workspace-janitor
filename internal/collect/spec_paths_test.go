@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -242,12 +243,196 @@ func TestStagehandRunReferencesProtectRunsAndSurviveSpaces(t *testing.T) {
 	}
 }
 
+// writeStagehandSpec writes one spec into a fresh spec directory and returns
+// collector options reading it, with a fresh state directory and the
+// default walk budgets.
+func writeStagehandSpec(t *testing.T, spec string, roots []string) *Options {
+	t.Helper()
+	specs := t.TempDir()
+	if err := os.WriteFile(filepath.Join(specs, "p.yaml"), []byte(spec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return &Options{Services: true, Limits: Limits{CommandTimeout: 10 * time.Second, DeepSizeMaxEntries: 1000, DeepSizeMaxDepth: 16},
+		ServiceSources: ServiceSources{StagehandDirs: []string{specs}, StagehandStateDir: t.TempDir(), InventoryRoots: roots}}
+}
+
+// stagehandTree makes an inventory root holding each directory and symlink
+// (name -> target, both relative to the root) and returns the root.
+func stagehandTree(t *testing.T, dirs []string, links map[string]string) string {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root = filepath.Join(root, "inventory")
+	for _, dir := range append([]string{"."}, dirs...) {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, target := range links {
+		if err := os.Symlink(filepath.Join(root, target), filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// docsReferenceSpec is the collect stage of
+// /etc/stagehand/pipelines/docs-reference.yaml, its results directory
+// (/root/fleet-tools/state/enyo-docs/tests-bc/results there) replaced by
+// results.
+func docsReferenceSpec(results string) string {
+	return "stages:\n  - id: collect\n    needs: [research]\n    cmd: >-\n      /bin/cp \"$STAGEHAND_WORK/decisions.json\"\n      \"" + results + "/decisions-$STAGEHAND_RUN_ID.json\"\n    timeout: 1m\n"
+}
+
+// A stage that copies its result out of the run directory into a file
+// named by the run id protects the directory above that file as a subtree,
+// when that directory provably holds every run's file, instead of leaving
+// the whole services collector partial.
+func TestStagehandRunPathOutsideRunsProtectsStaticPrefix(t *testing.T) {
+	cases := map[string]struct {
+		dirs []string
+		spec func(root string) string
+		rel  string
+	}{
+		"cp into results": {[]string{"x/results/old"}, func(root string) string {
+			return "stages:\n  - cmd: /bin/cp \"$STAGEHAND_WORK/decisions.json\" \"" + root + "/x/results/decisions-$STAGEHAND_RUN_ID.json\"\n"
+		}, "x/results"},
+		"docs-reference": {[]string{"enyo-docs/tests-bc/results"}, func(root string) string {
+			return docsReferenceSpec(root + "/enyo-docs/tests-bc/results")
+		}, "enyo-docs/tests-bc/results"},
+		"results not created yet": {[]string{"enyo-docs/tests-bc"}, func(root string) string {
+			return docsReferenceSpec(root + "/enyo-docs/tests-bc/results")
+		}, "enyo-docs/tests-bc/results"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := stagehandTree(t, tc.dirs, nil)
+			prefix := filepath.Join(root, tc.rel)
+			refs, report := gatherServiceReferences(context.Background(), writeStagehandSpec(t, tc.spec(root), []string{root}))
+			if report.Status != core.CollectorRan || report.Unknowns != 0 {
+				t.Fatalf("services collector should run completely: %+v", report)
+			}
+			var found *Reference
+			for i := range refs {
+				if refs[i].Path == prefix {
+					found = &refs[i]
+				}
+			}
+			if found == nil || !found.Subtree || !strings.Contains(found.Detail, "cmd") {
+				t.Fatalf("static prefix %s not protected as a subtree naming its key: %+v", prefix, refs)
+			}
+			entries := []core.Entry{{Path: filepath.Join(prefix, "decisions-7.json")}, {Path: filepath.Join(filepath.Dir(prefix), "other")}}
+			attachReferences(entries, refs, time.Now())
+			if !entries[0].Protected() || !hasProtection(entries[0], core.ProtectServiceReference) {
+				t.Errorf("%s inside the results directory is not protected: %+v", entries[0].Path, entries[0])
+			}
+			if entries[1].Protected() {
+				t.Errorf("unrelated %s is protected: %+v", entries[1].Path, entries[1])
+			}
+		})
+	}
+}
+
+// A run-dependent path whose static prefix cannot be shown to contain it
+// leaves the source unknown, as before: a prefix that is an inventory root,
+// an ancestor of one or a filesystem root (protecting it would freeze
+// everything), and any symlink on or below the prefix (the run-dependent
+// component may name it, and its target gets no protection).
+func TestStagehandRunPathOutsideRunsFailsClosedWithoutContainment(t *testing.T) {
+	cases := map[string]struct {
+		dirs  []string
+		links map[string]string
+		path  string // below the inventory root
+		// cmd, when set, is the whole spec line: @ stands for the
+		// inventory root, and ~ for its parent (HOME).
+		cmd   string
+		roots func(root string) []string
+		// scanned, when set, are this run's collection roots, and
+		// observed the policy's category roots.
+		scanned  func(root string) []string
+		observed func(root string) []string
+		limit    int
+	}{
+		"prefix is a root":              {path: "d-$STAGEHAND_RUN_ID.json", dirs: []string{"results"}},
+		"prefix is an ancestor":         {path: "x/d-$STAGEHAND_RUN_ID.json", dirs: []string{"x/results"}, roots: func(root string) []string { return []string{root + "/x/results"} }},
+		"filesystem root":               {path: "/d-$STAGEHAND_RUN_ID.json"},
+		"no roots known":                {path: "x/d-$STAGEHAND_RUN_ID.json", dirs: []string{"x"}, roots: func(string) []string { return nil }},
+		"missing, ancestor is the root": {path: "x/results/d-$STAGEHAND_RUN_ID.json"},
+		"symlinked prefix": {path: "alias-results/decisions-$STAGEHAND_RUN_ID.json", dirs: []string{"real-results"},
+			links: map[string]string{"alias-results": "real-results"}},
+		"symlink below prefix": {path: "per-run/$STAGEHAND_RUN_ID/data", dirs: []string{"per-run", "real-results"},
+			links: map[string]string{"per-run/7": "real-results"}},
+		"symlinked ancestor of a missing prefix": {path: "alias/results/d-$STAGEHAND_RUN_ID.json", dirs: []string{"real"},
+			links: map[string]string{"alias": "real"}},
+		// Lexically alias/../results is <root>/results, which exists and
+		// holds no symlink; the kernel writes to actual-parent/results.
+		"dot-dot after a symlink": {path: "alias/../results/decisions-$STAGEHAND_RUN_ID.json", dirs: []string{"actual-parent/child", "results"},
+			links: map[string]string{"alias": "actual-parent/child"}},
+		// The same through a leading ~, a variable's value, and a "."
+		// component: each is cleaned away before the path is checked.
+		"tilde, dot-dot after a symlink": {cmd: "cmd: /bin/cp a ~/inventory/alias/../results/decisions-$STAGEHAND_RUN_ID.json\n",
+			dirs: []string{"actual-parent/child", "results"}, links: map[string]string{"alias": "actual-parent/child"}},
+		"variable value with dot-dot": {cmd: "cmd: D=@/alias/.. /bin/cp a \"$D/results/decisions-$STAGEHAND_RUN_ID.json\"\n",
+			dirs: []string{"actual-parent/child", "results"}, links: map[string]string{"alias": "actual-parent/child"}},
+		"tilde, dot component":       {cmd: "cmd: /bin/cp a ~/./inventory/results/decisions-$STAGEHAND_RUN_ID.json\n", dirs: []string{"results"}},
+		"walk past the entry budget": {path: "x/results/d-$STAGEHAND_RUN_ID.json", dirs: []string{"x/results/a", "x/results/b"}, limit: 1},
+		// Post-merge review of #223: the prefix is real, but the inventory
+		// spells it through alias, so a subtree reference on real/...
+		// would not match the entries it observes as alias/....
+		"inventory root through an alias": {path: "real/inventory/results/decisions-$STAGEHAND_RUN_ID.json",
+			dirs: []string{"real/inventory/results"}, links: map[string]string{"alias": "real"},
+			roots: func(root string) []string { return []string{root + "/alias/inventory"} }},
+		"scanned root through an alias": {path: "real/inventory/results/decisions-$STAGEHAND_RUN_ID.json",
+			dirs: []string{"real/inventory/results"}, links: map[string]string{"alias": "real"},
+			scanned: func(root string) []string { return []string{root + "/alias/inventory"} }},
+		"category root through an alias": {path: "real/inventory/results/decisions-$STAGEHAND_RUN_ID.json",
+			dirs: []string{"real/inventory/results"}, links: map[string]string{"alias": "real"},
+			observed: func(root string) []string { return []string{root + "/alias/inventory"} }},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := stagehandTree(t, tc.dirs, tc.links)
+			path := tc.path
+			if !strings.HasPrefix(path, "/") {
+				path = root + "/" + path
+			}
+			roots := []string{root}
+			if tc.roots != nil {
+				roots = tc.roots(root)
+			}
+			spec := "cmd: /bin/cp a \"" + path + "\"\n"
+			if tc.cmd != "" {
+				t.Setenv("HOME", filepath.Dir(root))
+				spec = strings.ReplaceAll(tc.cmd, "@", root)
+			}
+			opts := writeStagehandSpec(t, spec, roots)
+			if tc.limit > 0 {
+				opts.Limits.DeepSizeMaxEntries = tc.limit
+			}
+			if tc.scanned != nil {
+				for _, path := range tc.scanned(root) {
+					opts.Roots = append(opts.Roots, RootSpec{Path: path, MaxDepth: 1})
+				}
+			}
+			if tc.observed != nil {
+				opts.ServiceSources.ObservedRoots = tc.observed(root)
+			}
+			refs, report := gatherServiceReferences(context.Background(), opts)
+			if report.Status == core.CollectorRan || report.Unknowns == 0 {
+				t.Fatalf("unproven run-dependent prefix must leave services partial: %+v %+v", report, refs)
+			}
+		})
+	}
+}
+
 // Review of #170: the collector must not treat a relative state directory
 // as "no database" (policy validation also rejects one).
 func TestStagehandDatabaseRejectsRelativeStateDir(t *testing.T) {
 	opts := &Options{ServiceSources: ServiceSources{StagehandStateDir: "stagehand state"}}
 	report := &core.CollectorReport{Status: core.CollectorRan}
-	gatherStagehandDatabase(context.Background(), opts, report, nil, "")
+	gatherStagehandDatabase(context.Background(), opts, report, nil, "", nil)
 	if report.Status == core.CollectorRan || report.Unknowns == 0 {
 		t.Fatalf("relative state directory skipped silently: %+v", report)
 	}
@@ -258,7 +443,7 @@ func TestStagehandDatabaseRejectsRelativeStateDir(t *testing.T) {
 func TestStagehandFileFieldsAreLiteral(t *testing.T) {
 	report := &core.CollectorReport{Status: core.CollectorRan}
 	spec := "stages:\n  - prompt_file: ../data/f$HOME\n  - env_file: ~x/e`y\n  - prompt_file: /abs/p$X.md\n"
-	refs := stagehandSpecRefs(spec, "d", nil, "/runs", "/work/source", "spec", report)
+	refs := stagehandSpecRefs(spec, "d", nil, "/runs", "/work/source", "spec", nil, report)
 	want := map[string]bool{"/work/data/f$HOME": false, "/work/source/~x/e`y": false, "/abs/p$X.md": false}
 	for _, ref := range refs {
 		if _, ok := want[ref.Path]; ok {
@@ -278,7 +463,7 @@ func TestStagehandFileFieldsAreLiteral(t *testing.T) {
 func TestStagehandLiteralFileFieldsDoNotMarkPartial(t *testing.T) {
 	report := &core.CollectorReport{Status: core.CollectorRan}
 	spec := "stages:\n  - prompt_file: ../data/f$UNSET\n  - env_file: ../data/f`literal`\n"
-	refs := stagehandSpecRefs(spec, "d", nil, "/runs", "/work/source", "spec", report)
+	refs := stagehandSpecRefs(spec, "d", nil, "/runs", "/work/source", "spec", nil, report)
 	if report.Status != core.CollectorRan || report.Unknowns != 0 {
 		t.Fatalf("literal file fields marked the source partial: %+v", report)
 	}
