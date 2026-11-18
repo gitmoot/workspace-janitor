@@ -542,6 +542,10 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 		}
 	}
 	safetyPolicy := enginePolicy(paths, policy)
+	// Herdr configured but not answering leaves every OMP session unknown:
+	// each is a failure of this run, not a refusal (v0.1.20 split).
+	var failures []error
+	herdrGap := collect.HerdrGap(observed.Reports)
 	releaseOwners := releaseOwnerAttribution(ctx, policy, releases)
 	byPath := make(map[string]int, len(observed.Entries))
 	for i, entry := range observed.Entries {
@@ -644,6 +648,12 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 			continue
 		}
 		item.Category, item.Kind = category.Name, string(category.Kind)
+		if herdrGap != nil && policy.Collectors.Herdr.Covers(entry.Path) {
+			item.Status, item.Reasons = categoryFailed, []string{herdrGap.Error()}
+			failures = append(failures, fmt.Errorf("%s: %w", item.Path, herdrGap))
+			report.Items = append(report.Items, item)
+			continue
+		}
 		if category.Kind == config.CategoryVersionedWork {
 			if reason := versionedRetention(*category, entry.Path); reason != "" {
 				item.Reasons = []string{reason}
@@ -713,7 +723,6 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 		report.Items = append(report.Items, item)
 	}
 
-	var failures []error
 	// Every category rule (released report items included) searches every
 	// inventory root for dependents, so one snapshot walk of them serves every
 	// candidate of this run instead of one bounded walk per candidate. Built

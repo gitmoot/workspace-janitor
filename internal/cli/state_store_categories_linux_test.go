@@ -24,6 +24,9 @@ import (
 type stateStoreFixture struct {
 	*categoryFixture
 	sessions, gitmoot, jobs string
+	// collectors holds extra lines under collectors:, each indented two
+	// spaces.
+	collectors string
 }
 
 func newStateStoreFixture(t *testing.T) *stateStoreFixture {
@@ -75,7 +78,7 @@ collectors:
   systemd_dirs: [%s]
   cron_paths: []
   pm2_dumps: []
-retention:
+%sretention:
   default: none
   delete_enabled: true
 prevention:
@@ -87,7 +90,7 @@ prevention:
   home: %s
   database: %s
 %sworkspace_archive_categories:
-%s%s`, x.sessions, x.jobs, x.archive, x.proc, x.services, x.prevention, x.limits, x.gitmoot, filepath.Join(x.gitmoot, "gitmoot.db"), extra,
+%s%s`, x.sessions, x.jobs, x.archive, x.proc, x.services, x.collectors, x.prevention, x.limits, x.gitmoot, filepath.Join(x.gitmoot, "gitmoot.db"), extra,
 		category("sessions", "omp_sessions", x.sessions), category("job-logs", "gitmoot_job_logs", x.jobs)))
 }
 

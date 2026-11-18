@@ -737,3 +737,27 @@ workspace_archive_categories:
 		}
 	}
 }
+
+// collectors.herdr needs an absolute binary and exact OMP session stores;
+// "~" expands, and the parsed policy carries both.
+func TestParsePolicyValidatesHerdrCollector(t *testing.T) {
+	paths := fixturePaths(t)
+	policy, err := parse(t, paths, "roots:\n  - path: /repos\ncollectors:\n  herdr:\n    binary: /root/.local/bin/herdr\n    session_roots: [~/.omp/agent/sessions]\n")
+	if err != nil {
+		t.Fatalf("valid herdr collector refused: %v", err)
+	}
+	if h := policy.Collectors.Herdr; h == nil || h.Binary != "/root/.local/bin/herdr" || len(h.SessionRoots) != 1 || h.SessionRoots[0] != filepath.Join(paths.Home, ".omp", "agent", "sessions") {
+		t.Fatalf("herdr collector = %+v", policy.Collectors.Herdr)
+	}
+	for document, field := range map[string]string{
+		"    binary: herdr\n    session_roots: [/root/.omp/agent/sessions]\n":                                 "collectors.herdr.binary",
+		"    binary: /bin/herdr\n    session_roots: []\n":                                                     "collectors.herdr.session_roots",
+		"    binary: /bin/herdr\n    session_roots: [/root/.omp/agent]\n":                                     "collectors.herdr.session_roots[0]",
+		"    binary: /bin/herdr\n    session_roots: [/root/.omp/agent/sessions, /root/.omp/agent/sessions]\n": "collectors.herdr.session_roots[1]",
+	} {
+		_, err := parse(t, paths, "roots:\n  - path: /repos\ncollectors:\n  herdr:\n"+document)
+		if err == nil || !strings.Contains(err.Error(), field) {
+			t.Errorf("%q: want an error for %s, got %v", document, field, err)
+		}
+	}
+}

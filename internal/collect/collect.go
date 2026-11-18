@@ -37,6 +37,10 @@ const (
 	CollectorServices   = "services"
 	CollectorGitmoot    = "gitmoot"
 	CollectorExports    = "evidence_exports"
+	// CollectorHerdr asks herdr which OMP sessions live agents resume; it
+	// runs only when collectors.herdr is set and the collection reaches one
+	// of its session roots.
+	CollectorHerdr = "herdr"
 	// CollectorWorkspaceArchives binds released workspaces to their pinned
 	// archives; it runs only when the policy has workspace_archives.
 	CollectorWorkspaceArchives = "workspace_archives"
@@ -153,6 +157,9 @@ type Options struct {
 	ServiceSources ServiceSources
 	// AgentSources are the registered-agent adapters to consult.
 	AgentSources []AgentSource
+	// Herdr, when set, names the herdr binary and the OMP session roots its
+	// live agents' sessions protect (collectors.herdr).
+	Herdr *config.HerdrCollector
 	// GitBinary is the git executable to run. Empty means "git" on PATH.
 	GitBinary string
 	// ProjectMarkers are file names whose presence inside a directory
@@ -293,6 +300,19 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 		result.References = append(result.References, refs...)
 		result.Reports = append(result.Reports, report)
 	}
+	// Herdr runs once per collection that reaches a session root, after the
+	// filesystem pass decided whether one does. Unanswered, every entry
+	// under a session root is unknown.
+	needHerdr := herdrNeeded(&opts, entries)
+	herdrRefs, herdrReport := runBounded(ctx, &opts, CollectorHerdr, func(ctx context.Context, opts *Options) ([]Reference, core.CollectorReport) {
+		return gatherHerdrReferences(ctx, opts, needHerdr)
+	})
+	herdrReport.Recorded = attachReferences(entries, herdrRefs, now)
+	if needHerdr {
+		attachHerdrUnknowns(entries, &opts, &herdrReport, now)
+	}
+	result.References = append(result.References, herdrRefs...)
+	result.Reports = append(result.Reports, herdrReport)
 	// Gitmoot probes a separate snapshot: a timed-out collector may still be
 	// blocked in the kernel, so it must never mutate entries after Run returns.
 	gitmootSnapshot := make([]core.Entry, len(entries))

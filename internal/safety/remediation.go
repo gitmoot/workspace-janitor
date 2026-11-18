@@ -10,6 +10,7 @@ import "github.com/gitmoot/workspace-janitor/internal/core"
 var remediations = map[core.ProtectionKind]string{
 	core.ProtectActiveProcess:      "stop the process using this path, or exclude the path, then scan again",
 	core.ProtectRegisteredAgent:    "release or finish the registered agent holding this directory, then scan again",
+	core.ProtectLiveAgentSession:   "close the herdr agent that resumes this OMP session (see herdr agent list), then scan again",
 	core.ProtectOwningJob:          "wait for the owning job to finish, or cancel it, then scan again",
 	core.ProtectDirtyRepository:    "commit, stash, or discard the uncommitted changes, then scan again",
 	core.ProtectStashedWork:        "apply or drop the stash entries, then scan again",

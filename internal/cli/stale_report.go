@@ -40,7 +40,7 @@ const (
 
 // staleInUse are the protections that mean something is using the item now.
 var staleInUse = []core.ProtectionKind{
-	core.ProtectActiveProcess, core.ProtectRegisteredAgent, core.ProtectServiceReference,
+	core.ProtectActiveProcess, core.ProtectRegisteredAgent, core.ProtectLiveAgentSession, core.ProtectServiceReference,
 	core.ProtectLockHeld, core.ProtectLiveDatabase,
 }
 
