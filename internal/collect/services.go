@@ -818,12 +818,57 @@ type stagehandPrefixes struct {
 	ctx    context.Context
 	roots  []string
 	limits Limits
+	// observed are every root entries may be observed through in this
+	// run or by a policy category (see aliased).
+	observed []string
 	// seen caches each prefix's verdict: "" proven, else why not.
 	seen map[string]string
 }
 
 func newStagehandPrefixes(ctx context.Context, opts *Options) *stagehandPrefixes {
-	return &stagehandPrefixes{ctx: ctx, roots: opts.ServiceSources.InventoryRoots, limits: opts.Limits, seen: map[string]string{}}
+	observed := append(append([]string(nil), opts.ServiceSources.InventoryRoots...), opts.ServiceSources.ObservedRoots...)
+	for _, root := range opts.Roots {
+		observed = append(observed, root.Path)
+	}
+	return &stagehandPrefixes{ctx: ctx, roots: opts.ServiceSources.InventoryRoots, limits: opts.Limits, observed: observed, seen: map[string]string{}}
+}
+
+// aliased refuses a proven prefix (which is its own real path) when a
+// root related to it, one above or below it once resolved, is spelled
+// through a symlink. Entries under such a root spell the prefix's
+// directories differently, so a subtree reference on the prefix would not
+// match them.
+func (s *stagehandPrefixes) aliased(prefix string) string {
+	for _, root := range s.observed {
+		clean := filepath.Clean(root)
+		if !filepath.IsAbs(clean) {
+			return "root " + root + " is not absolute"
+		}
+		resolved, err := resolveExisting(clean)
+		if err != nil {
+			return fmt.Sprintf("could not resolve root %s: %v", root, err)
+		}
+		if resolved != clean && (core.PathWithin(resolved, prefix) || core.PathWithin(prefix, resolved)) {
+			return "root " + root + " reaches its static prefix through a symlink (it resolves to " + resolved + ")"
+		}
+	}
+	return ""
+}
+
+// resolveExisting resolves the symlinks of path's longest existing
+// ancestor and appends the components that do not exist yet.
+func resolveExisting(path string) (string, error) {
+	missing := ""
+	for p := path; ; p = filepath.Dir(p) {
+		resolved, err := filepath.EvalSymlinks(p)
+		if err == nil {
+			return filepath.Join(resolved, missing), nil
+		}
+		if !os.IsNotExist(err) || p == filepath.Dir(p) {
+			return "", err
+		}
+		missing = filepath.Join(filepath.Base(p), missing)
+	}
 }
 
 // check returns the static prefix of path, the directory above its first
@@ -841,7 +886,8 @@ func newStagehandPrefixes(ctx context.Context, opts *Options) *stagehandPrefixes
 // lexically. An existing prefix must resolve to itself and a
 // bounded walk must find no symlink below it. A prefix that does not exist
 // yet redirects nothing: its nearest existing ancestor must resolve to
-// itself and must not be an inventory root or an ancestor of one.
+// itself and must not be an inventory root or an ancestor of one. Finally
+// no root related to the prefix may be spelled through a symlink.
 func (s *stagehandPrefixes) check(unclean bool, path string) (string, string) {
 	if unclean {
 		// filepath.Clean folds "x/.." lexically, but the kernel follows x
@@ -870,6 +916,9 @@ func (s *stagehandPrefixes) check(unclean bool, path string) (string, string) {
 		return prefix, why
 	}
 	why := s.prove(prefix)
+	if why == "" {
+		why = s.aliased(prefix)
+	}
 	s.seen[prefix] = why
 	return prefix, why
 }
