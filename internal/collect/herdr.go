@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -109,6 +108,26 @@ func (h *HerdrSessions) Unit(path string) string {
 	return ""
 }
 
+// Holds is why a live agent keeps what moving path would move (path in any
+// spelling, resolved, and need not exist): a live transcript at or inside
+// it (a session unit, or a directory holding a store), or a live session
+// folder holding it. It is "" when no live session lies there.
+func (h *HerdrSessions) Holds(path string) string {
+	real := config.RealParent(path)
+	transcripts := make([]string, 0, len(h.sessions))
+	for transcript := range h.sessions {
+		transcripts = append(transcripts, transcript)
+	}
+	sort.Strings(transcripts)
+	for _, transcript := range transcripts {
+		stem := strings.TrimSuffix(transcript, herdrSessionLog)
+		if core.PathWithin(transcript, real) || stem != transcript && core.PathWithin(real, stem) {
+			return liveSessionDetail(transcript, h.sessions[transcript])
+		}
+	}
+	return ""
+}
+
 // herdrView is how one collection reaches the session stores: each
 // directory it observes through (its roots and the directories holding its
 // entries), by its spelling, resolved; the observed real directories that
@@ -139,13 +158,14 @@ func newHerdrView(opts *Options, entries []core.Entry) herdrView {
 	}
 	for _, entry := range entries {
 		real := filepath.Join(resolve(filepath.Dir(entry.Path)), filepath.Base(entry.Path))
-		view.needed = opts.Herdr.CoversReal(real) || view.needed
 		// A symlink entry moves only itself; a real directory moves the
-		// stores inside it.
-		if entry.Kind == core.EntryKindDirectory && slices.ContainsFunc(opts.Herdr.Stores(), func(store string) bool {
-			return store != real && core.PathWithin(store, real)
-		}) {
-			view.ancestors[entry.Path], view.needed = true, true
+		// stores inside it (config.HerdrCollector.Reaches).
+		dir := entry.Kind == core.EntryKindDirectory
+		if opts.Herdr.ReachesReal(real, dir) {
+			view.needed = true
+			if dir && !opts.Herdr.CoversReal(real) {
+				view.ancestors[entry.Path] = true
+			}
 		}
 	}
 	return view

@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"net"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"slices"
@@ -302,21 +303,55 @@ func (h *HerdrCollector) CoversReal(real string) bool {
 	return slices.ContainsFunc(h.Stores(), func(store string) bool { return core.PathWithin(real, store) })
 }
 
-// Covers reports whether moving path could move part of a session store:
-// path, with its directory's symlinks resolved (RealParent), lies in a
-// store. A nil collector covers nothing.
+// Covers reports whether path, with its directory's symlinks resolved
+// (RealParent), lies in a session store. A nil collector covers nothing.
 func (h *HerdrCollector) Covers(path string) bool {
 	return h != nil && h.CoversReal(RealParent(path))
 }
 
+// Reaches is the one rule for whether moving path could move a live
+// session, so herdr must answer first: path lies in a session store, or it
+// is a real directory (realDir; a symlink moves only itself) that holds
+// one. Path need not exist (an expired receipt's original pathname). A nil
+// collector reaches nothing.
+func (h *HerdrCollector) Reaches(path string, realDir bool) bool {
+	return h != nil && h.ReachesReal(RealParent(path), realDir)
+}
+
+// ReachesReal is Reaches for real, a path already resolved (RealParent).
+func (h *HerdrCollector) ReachesReal(real string, realDir bool) bool {
+	return h.CoversReal(real) || realDir && h.HoldsStoreReal(real)
+}
+
+// HoldsStoreReal reports whether real, a resolved directory, strictly
+// holds a session store.
+func (h *HerdrCollector) HoldsStoreReal(real string) bool {
+	return slices.ContainsFunc(h.Stores(), func(store string) bool { return store != real && core.PathWithin(store, real) })
+}
+
+// maxRealPathLinks bounds how many dangling symlinks RealPath follows.
+const maxRealPathLinks = 40
+
 // RealPath resolves every symlink of path; for a path that does not exist,
-// those of its deepest existing ancestor, the rest appended as spelled.
+// those of its deepest existing ancestor, the rest appended as spelled. A
+// dangling symlink on the way (a session store whose target was moved into
+// quarantine) is followed to where it points, so the store keeps its
+// identity while its target is absent.
 func RealPath(path string) string {
-	path = filepath.Clean(path)
+	return realPath(filepath.Clean(path), maxRealPathLinks)
+}
+
+func realPath(path string, links int) string {
 	var rest []string
 	for dir := path; ; dir = filepath.Dir(dir) {
 		if real, err := filepath.EvalSymlinks(dir); err == nil {
 			return filepath.Join(append([]string{real}, rest...)...)
+		}
+		if target, err := os.Readlink(dir); err == nil && links > 0 {
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(dir), target)
+			}
+			return realPath(filepath.Join(append([]string{target}, rest...)...), links-1)
 		}
 		if parent := filepath.Dir(dir); parent == dir {
 			return path
