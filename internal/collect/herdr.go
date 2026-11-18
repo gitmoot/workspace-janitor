@@ -94,20 +94,6 @@ func storeSession(cfg *config.HerdrCollector, value string) (string, bool) {
 // Len is the number of distinct live sessions.
 func (h *HerdrSessions) Len() int { return len(h.sessions) }
 
-// Unit is why a live agent keeps the OMP session unit at path (its session
-// folder "<stem>" or its transcript "<stem>.jsonl", in any spelling), or ""
-// when none does.
-func (h *HerdrSessions) Unit(path string) string {
-	transcript := config.RealParent(path)
-	if !strings.HasSuffix(transcript, herdrSessionLog) {
-		transcript += herdrSessionLog
-	}
-	if agents, ok := h.sessions[transcript]; ok {
-		return liveSessionDetail(transcript, agents)
-	}
-	return ""
-}
-
 // Holds is why a live agent keeps what moving path would move (path in any
 // spelling, resolved, and need not exist): a live transcript at or inside
 // it (a session unit, or a directory holding a store), or a live session
@@ -130,18 +116,18 @@ func (h *HerdrSessions) Holds(path string) string {
 
 // herdrView is how one collection reaches the session stores: each
 // directory it observes through (its roots and the directories holding its
-// entries), by its spelling, resolved; the observed real directories that
-// hold a store (moving one moves every session in it); and whether any
-// root or entry lies in a store or holds one. It is computed once, before
-// herdr runs.
+// entries), by its spelling, resolved; the observed entries moving which
+// could move a session (config.HerdrCollector.Reaches: in a store, or a
+// real directory holding one); and whether any root or entry does. It is
+// computed once, before herdr runs.
 type herdrView struct {
-	dirs      map[string]string
-	ancestors map[string]bool
-	needed    bool
+	dirs    map[string]string
+	reached map[string]bool
+	needed  bool
 }
 
 func newHerdrView(opts *Options, entries []core.Entry) herdrView {
-	view := herdrView{dirs: map[string]string{}, ancestors: map[string]bool{}}
+	view := herdrView{dirs: map[string]string{}, reached: map[string]bool{}}
 	if opts.Herdr == nil {
 		return view
 	}
@@ -154,27 +140,17 @@ func newHerdrView(opts *Options, entries []core.Entry) herdrView {
 		return real
 	}
 	for _, root := range opts.Roots {
-		view.needed = opts.Herdr.CoversReal(resolve(root.Path)) || view.needed
+		view.needed = opts.Herdr.ReachesReal(resolve(root.Path), false) || view.needed
 	}
 	for _, entry := range entries {
 		real := filepath.Join(resolve(filepath.Dir(entry.Path)), filepath.Base(entry.Path))
 		// A symlink entry moves only itself; a real directory moves the
-		// stores inside it (config.HerdrCollector.Reaches).
-		dir := entry.Kind == core.EntryKindDirectory
-		if opts.Herdr.ReachesReal(real, dir) {
-			view.needed = true
-			if dir && !opts.Herdr.CoversReal(real) {
-				view.ancestors[entry.Path] = true
-			}
+		// stores inside it.
+		if opts.Herdr.ReachesReal(real, entry.Kind == core.EntryKindDirectory) {
+			view.needed, view.reached[entry.Path] = true, true
 		}
 	}
 	return view
-}
-
-// covers reports whether entry path lies in a store, by identity.
-func (v herdrView) covers(opts *Options, path string) bool {
-	real, ok := v.dirs[filepath.Dir(path)]
-	return ok && opts.Herdr.CoversReal(filepath.Join(real, filepath.Base(path)))
 }
 
 // herdrReferences are the protections of every live session unit: its
@@ -417,7 +393,7 @@ func attachHerdrUnknowns(entries []core.Entry, opts *Options, view herdrView, re
 		return
 	}
 	for i := range entries {
-		if view.covers(opts, entries[i].Path) || view.ancestors[entries[i].Path] {
+		if view.reached[entries[i].Path] {
 			addUnknown(&entries[i], core.SourceJob, core.ProtectCollectorFailure, CollectorHerdr,
 				"herdr agent sessions are unknown: "+report.Detail, now)
 			report.Recorded++

@@ -425,9 +425,6 @@ func (e *Engine) eligibleLeftoverCompanion(ctx context.Context, item core.Cleanu
 	if suffix == "" || id.Zero() {
 		return nil
 	}
-	if err := e.liveSessionFootprint(ctx, item); err != nil {
-		return err
-	}
 	path, source := item.Destination+suffix, item.Source+suffix
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -438,6 +435,11 @@ func (e *Engine) eligibleLeftoverCompanion(ctx context.Context, item core.Cleanu
 	}
 	if !identityMatches(info, id) {
 		return nil
+	}
+	// Only a leftover that is still there is held to herdr: a deletion that
+	// already removed both settles without it.
+	if err := e.liveSessionFootprint(ctx, item); err != nil {
+		return err
 	}
 	if err := e.originalReferences(ctx, source); err != nil {
 		return err

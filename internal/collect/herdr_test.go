@@ -3,8 +3,11 @@
 package collect
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -473,5 +476,32 @@ func TestHerdrProtectsAnObservedAncestorOfAStore(t *testing.T) {
 				t.Errorf("sibling %s protected under a failing herdr: %+v", s.other, entry.Protections)
 			}
 		})
+	}
+}
+
+// Review round 2 of #226: proving a stagehand static prefix holds no
+// symlink reads its directories in batches bounded by the remaining entry
+// budget; a budget of 1 over a directory of many children stops at once
+// instead of reading (and sorting) them all first.
+func TestStagehandPrefixWalkReadsWithinItsBudget(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 30000; i++ {
+		f, err := os.Create(filepath.Join(dir, fmt.Sprintf("child-%05d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+	}
+	s := &stagehandPrefixes{ctx: context.Background(), limits: Limits{DeepSizeMaxEntries: 1, DeepSizeMaxDepth: 4}, seen: map[string]string{}}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	got := s.walk(dir)
+	runtime.ReadMemStats(&after)
+	if !strings.Contains(got, "entry budget") {
+		t.Fatalf("walk = %q, want the entry budget exhausted", got)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 256<<10 {
+		t.Fatalf("walk with a budget of 1 allocated %d bytes over 30000 children", allocated)
 	}
 }

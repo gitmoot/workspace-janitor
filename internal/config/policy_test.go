@@ -784,7 +784,7 @@ func TestParsePolicyResolvesHerdrSessionRootAliases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h := policy.Collectors.Herdr; !h.Covers(filepath.Join(resolved, "-proj", "s.jsonl")) || !h.Covers(filepath.Join(aliasRoot, "-proj")) {
+	if h := policy.Collectors.Herdr; !h.Reaches(filepath.Join(resolved, "-proj", "s.jsonl"), false) || !h.Reaches(filepath.Join(aliasRoot, "-proj"), false) {
 		t.Fatalf("aliased root does not cover both spellings: %+v", h.SessionRoots)
 	}
 	_, err = parse(t, paths, "roots:\n  - path: /repos\ncollectors:\n  herdr:\n    binary: /bin/herdr\n    session_roots: ["+aliasRoot+", "+resolved+"]\n")
@@ -813,5 +813,67 @@ func TestHerdrStoreThroughADanglingSymlinkKeepsItsIdentity(t *testing.T) {
 	}
 	if got, want := h.Stores()[0], filepath.Join(real, "build", "sessions"); got != want {
 		t.Fatalf("store of a dangling sessions link = %q, want %q", got, want)
+	}
+}
+
+// Review round 2 of #226, the reviewer's layout: home -> actual/home and
+// home/.omp/agent/sessions -> ../../../build/sessions. The kernel reads the
+// relative target against the resolved actual/home/.omp/agent, so the store
+// is actual/build/sessions. Once actual/build is moved into quarantine the
+// link dangles; the store must keep that identity, so the missing
+// actual/build stays a real ancestor of it.
+func TestHerdrRelativeDanglingTargetResolvesFromItsRealParent(t *testing.T) {
+	top := t.TempDir()
+	actual := filepath.Join(top, "actual")
+	for _, dir := range []string{filepath.Join(actual, "home", ".omp", "agent"), filepath.Join(actual, "build", "sessions")} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("actual/home", filepath.Join(top, "home")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../../build/sessions", filepath.Join(actual, "home", ".omp", "agent", "sessions")); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(top, "home", ".omp", "agent", "sessions")
+	real, err := filepath.EvalSymlinks(actual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(real, "build", "sessions")
+	if live := (&HerdrCollector{Binary: "/bin/herdr", SessionRoots: []string{root}}).Stores()[0]; live != want {
+		t.Fatalf("live store = %q, want %q", live, want)
+	}
+	if err := os.RemoveAll(filepath.Join(actual, "build")); err != nil {
+		t.Fatal(err)
+	}
+	h := &HerdrCollector{Binary: "/bin/herdr", SessionRoots: []string{root}}
+	if got := h.Stores()[0]; got != want {
+		t.Fatalf("store of the dangling link = %q, want %q", got, want)
+	}
+	if !h.Reaches(filepath.Join(real, "build"), true) {
+		t.Fatal("the quarantined actual/build is no longer an ancestor of the store")
+	}
+	if h.Reaches(filepath.Join(top, "unrelated"), true) {
+		t.Fatal("an unrelated directory reaches the store")
+	}
+}
+
+// A sessions root whose resolution cannot be read as the filesystem would
+// (here ".." after an absent component) has no known store: every path
+// reaches one, so herdr must answer before anything moves.
+func TestHerdrUnresolvableStoreFailsClosed(t *testing.T) {
+	top := t.TempDir()
+	agent := filepath.Join(top, "home", ".omp", "agent")
+	if err := os.MkdirAll(agent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../gone/../../build/sessions", filepath.Join(agent, "sessions")); err != nil {
+		t.Fatal(err)
+	}
+	h := &HerdrCollector{Binary: "/bin/herdr", SessionRoots: []string{filepath.Join(agent, "sessions")}}
+	if !h.Reaches(filepath.Join(top, "anything"), false) {
+		t.Fatal("a store of unknown identity does not make every path reach it")
 	}
 }

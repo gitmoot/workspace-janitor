@@ -411,3 +411,44 @@ func TestInterruptedExpiryFollowsTheCurrentLocalExpiryPolicy(t *testing.T) {
 		})
 	}
 }
+
+// Review of #226: an expiry that deleted both the primary and its companion
+// but stopped before journaling settles as deleted without herdr, which has
+// nothing left to guard. A leftover companion that is still there stays
+// held to herdr: herdr failing keeps it.
+func TestInterruptedExpirySettlesWithoutHerdrOnceNothingIsLeft(t *testing.T) {
+	failingHerdr := func(t *testing.T, e *Engine, item core.CleanupItem) {
+		t.Helper()
+		binary := filepath.Join(t.TempDir(), "herdr")
+		if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		e.Collect.Herdr = &config.HerdrCollector{Binary: binary, SessionRoots: []string{filepath.Dir(item.Source)}}
+	}
+	t.Run("both deleted", func(t *testing.T) {
+		e, item := interruptedCompanionExpiry(t)
+		if err := deleteAnchored(item.Destination+".jsonl", item.Entry.WorkspaceArchive.CompanionID); err != nil {
+			t.Fatal(err)
+		}
+		failingHerdr(t, e, item)
+		if err := e.ExpiryPreview(context.Background(), item); err != nil {
+			t.Fatalf("preview of a finished deletion asked herdr: %v", err)
+		}
+		item, err := e.Delete(context.Background(), item)
+		if err != nil || item.State != core.CleanupDeleted {
+			t.Fatalf("finished deletion under a failing herdr: %+v %q %v, want deleted", item.State, item.Reason, err)
+		}
+	})
+	t.Run("companion left", func(t *testing.T) {
+		e, item := interruptedCompanionExpiry(t)
+		failingHerdr(t, e, item)
+		companion := item.Destination + ".jsonl"
+		item, err := e.Delete(context.Background(), item)
+		if err == nil || item.State == core.CleanupDeleted || !strings.Contains(item.Reason, "herdr") {
+			t.Fatalf("leftover companion under a failing herdr: %+v %q %v, want it kept", item.State, item.Reason, err)
+		}
+		if _, err := os.Lstat(companion); err != nil {
+			t.Fatalf("leftover companion removed under a failing herdr: %v", err)
+		}
+	})
+}

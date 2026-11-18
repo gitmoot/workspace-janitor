@@ -993,17 +993,7 @@ func (s *stagehandPrefixes) walk(dir string) string {
 	for len(queue) > 0 {
 		next := queue[0]
 		queue = queue[1:]
-		if err := ctx.Err(); err != nil {
-			return fmt.Sprintf("could not finish checking %s for symlinks: %v", dir, err)
-		}
-		entries, err := os.ReadDir(next.path)
-		if err != nil {
-			return fmt.Sprintf("could not check %s for symlinks: %v", next.path, err)
-		}
-		for _, entry := range entries {
-			if budget--; budget < 0 {
-				return "checking " + dir + " for symlinks ran past the entry budget"
-			}
+		if problem := readDirBudgeted(ctx, next.path, &budget, func(entry os.DirEntry) string {
 			path := filepath.Join(next.path, entry.Name())
 			if entry.Type()&os.ModeSymlink != 0 {
 				return "the symlink " + path + " lies below its static prefix"
@@ -1014,9 +1004,54 @@ func (s *stagehandPrefixes) walk(dir string) string {
 				}
 				queue = append(queue, level{path, next.depth + 1})
 			}
+			return ""
+		}); problem != "" {
+			if problem == errBudgetSpent {
+				return "checking " + dir + " for symlinks ran past the entry budget"
+			}
+			return problem
 		}
 	}
 	return ""
+}
+
+// errBudgetSpent is readDirBudgeted's report of an exhausted entry budget.
+const errBudgetSpent = "entry budget spent"
+
+// maxDirBatch caps one directory read, so ctx is checked between batches.
+const maxDirBatch = 256
+
+// readDirBudgeted calls visit for the entries of dir, unsorted, reading
+// them in batches of at most the remaining *budget + 1 (and maxDirBatch),
+// so a huge directory is never read whole: it stops as soon as the budget
+// is spent (errBudgetSpent), visit reports a problem, ctx ends, or a read
+// fails. Each visited entry spends one unit of *budget.
+func readDirBudgeted(ctx context.Context, dir string, budget *int, visit func(os.DirEntry) string) string {
+	f, err := os.Open(dir)
+	if err != nil {
+		return fmt.Sprintf("could not check %s for symlinks: %v", dir, err)
+	}
+	defer f.Close()
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Sprintf("could not finish checking %s for symlinks: %v", dir, err)
+		}
+		batch, err := f.ReadDir(min(*budget+1, maxDirBatch))
+		for _, entry := range batch {
+			if *budget--; *budget < 0 {
+				return errBudgetSpent
+			}
+			if problem := visit(entry); problem != "" {
+				return problem
+			}
+		}
+		switch {
+		case errors.Is(err, io.EOF):
+			return ""
+		case err != nil:
+			return fmt.Sprintf("could not check %s for symlinks: %v", dir, err)
+		}
+	}
 }
 
 // specPathReferences parses a pipeline spec (YAML, every document) and

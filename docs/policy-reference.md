@@ -1328,7 +1328,11 @@ is gone once quarantined and no collection observes it: a receipt whose
 original lay in a session store, or was a real directory holding one, is
 refused while a session under it is live and fails while herdr cannot
 answer. A sessions root that is a symlink into a moved directory keeps its
-identity (the dangling link is followed). The same rule (in a store, or a
+identity: links are resolved component by component as the kernel does, a
+relative target against the already resolved directory holding the link,
+so a dangling link still names its store. A root that cannot be read that
+way (`..` after an absent component, a link loop) has no known store, and
+then every path needs herdr's answer. The same rule (in a store, or a
 real directory holding one) decides when a herdr failure fails a category
 item rather than refusing it. Restores
 never replace an existing path (`RENAME_NOREPLACE`), so a session folder or
