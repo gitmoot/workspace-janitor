@@ -205,7 +205,6 @@ func TestHerdrAliasedSessionRootIsOneIdentity(t *testing.T) {
 		mustSymlink(t, filepath.Dir(filepath.Dir(filepath.Dir(x.sessions))), alias)
 		opts := x.options(5 * time.Second)
 		opts.Herdr.SessionRoots = []string{filepath.Join(alias, ".omp", "agent", "sessions")}
-		opts.Herdr.ResolveRoots(nil)
 		return opts
 	}
 	for name, viaAlias := range map[string]bool{"named by real path": false, "named by alias": true} {

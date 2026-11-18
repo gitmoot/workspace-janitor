@@ -1303,9 +1303,9 @@ transcript and its session folder `<project>/<stem>` as a whole, as the
 blocking protection `live_agent_session` naming the agent and its pane. It
 refuses `omp_sessions` archiving, the quarantine move and expiry of the unit
 and of its transcript (a refusal, not a failure). The category run asks
-herdr again before each session's copy and before its archive is published
-(one answer serves for at most 2 seconds); a session that became live while
-it waited in the queue is refused, and herdr failing there fails the item.
+herdr again before each session's copy and before its archive is published;
+a session that became live while it waited in the queue is refused, and
+herdr failing there fails the item.
 Quarantine and expiry ask herdr afresh in each item's revalidation. Restores
 never replace an existing path (`RENAME_NOREPLACE`), so a session folder or
 transcript an agent recreated meanwhile is never overwritten; such a restore

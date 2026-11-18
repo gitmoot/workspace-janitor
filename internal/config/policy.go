@@ -271,7 +271,7 @@ type HerdrCollector struct {
 	// forms holds, per session root, every spelling of that store this
 	// policy uses (ResolveRoots): the root, its symlink-resolved path, and
 	// each OMP category root that resolves to the same store. Nil until
-	// resolved, when only the configured roots are known.
+	// resolved.
 	forms [][]string
 }
 
@@ -302,16 +302,16 @@ func (h *HerdrCollector) ResolveRoots(aliases []string) {
 }
 
 // RootForms returns every known spelling of each session root, in
-// SessionRoots order; the first spelling is the configured root.
+// SessionRoots order; the first spelling is the configured root. A
+// collector built outside policy loading (never resolved) resolves its
+// roots' symlinks here, on each call.
 func (h *HerdrCollector) RootForms() [][]string {
 	if h.forms != nil {
 		return h.forms
 	}
-	out := make([][]string, len(h.SessionRoots))
-	for i, root := range h.SessionRoots {
-		out[i] = []string{root}
-	}
-	return out
+	resolved := *h
+	resolved.ResolveRoots(nil)
+	return resolved.forms
 }
 
 // Covers reports whether path is, or lies in, any spelling of a session

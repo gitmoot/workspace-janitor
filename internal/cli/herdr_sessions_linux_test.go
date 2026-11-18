@@ -303,14 +303,10 @@ func TestHerdrAliasedSessionRootStillGuards(t *testing.T) {
 // archive is published. A session that became live meanwhile is refused
 // (not failed) and nothing is recorded for it.
 func TestHerdrIsAskedAgainBeforeCopyAndPublication(t *testing.T) {
-	// herdr call 1 is the run's observation; 2 the check before the copy;
-	// 3 Create's preflight before the copy; 4 its preflight before
-	// publication.
-	for name, liveFrom := range map[string]int{"before the copy": 2, "before publication": 4} {
+	// herdr call 1 is the run's observation; 2 the archive preflight before
+	// the copy; 3 the preflight before publication.
+	for name, liveFrom := range map[string]int{"before the copy": 2, "before publication": 3} {
 		t.Run(name, func(t *testing.T) {
-			reuse := herdrRecheckReuse
-			herdrRecheckReuse = 0
-			t.Cleanup(func() { herdrRecheckReuse = reuse })
 			x := newStateStoreFixture(t)
 			dir := t.TempDir()
 			session := x.session(t, "-proj", sessionA, categoryIdleAge)

@@ -785,7 +785,7 @@ func TestParsePolicyResolvesHerdrSessionRootAliases(t *testing.T) {
 		t.Fatal(err)
 	}
 	if h := policy.Collectors.Herdr; !h.Covers(filepath.Join(resolved, "-proj", "s.jsonl")) || !h.Covers(filepath.Join(aliasRoot, "-proj")) {
-		t.Fatalf("aliased root does not cover both spellings: %+v", h.RootForms())
+		t.Fatalf("aliased root does not cover both spellings: %+v", h.SessionRoots)
 	}
 	_, err = parse(t, paths, "roots:\n  - path: /repos\ncollectors:\n  herdr:\n    binary: /bin/herdr\n    session_roots: ["+aliasRoot+", "+resolved+"]\n")
 	if err == nil || !strings.Contains(err.Error(), "collectors.herdr.session_roots[1]") {

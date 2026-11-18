@@ -804,14 +804,7 @@ func archiveCategories(ctx context.Context, e *env, paths config.Paths, policy c
 				item.Status, item.Name = categoryWouldArchive, name
 				continue
 			}
-			binding, err := func() (*workspacearchive.Binding, error) {
-				if category.Kind == config.CategoryOMPSessions {
-					if err := herdr.check(ctx, path); err != nil {
-						return nil, err
-					}
-				}
-				return createCategoryArchive(ctx, db, paths, category, rule, scope, report.RunID, preflight)
-			}()
+			binding, err := createCategoryArchive(ctx, db, paths, category, rule, scope, report.RunID, preflight)
 			var live *liveSessionRefusal
 			switch {
 			case errors.As(err, &live):
@@ -891,18 +884,13 @@ func createCategoryArchive(ctx context.Context, db *store.Store, paths config.Pa
 	return binding, nil
 }
 
-// herdrRecheckReuse is how long one herdr answer serves the archive
-// preflights of a run; any older answer is replaced by a fresh one. Tests
-// set it to zero to ask herdr at every check.
-var herdrRecheckReuse = 2 * time.Second
-
-// herdrRecheck asks herdr afresh at an omp_sessions archive's preflights
-// (before the copy and before publication), reusing one answer for at most
-// herdrRecheckReuse. Nil (herdr not configured) checks nothing.
+// herdrRecheck asks herdr afresh at each omp_sessions archive preflight
+// (before the copy and before publication); one answer takes about 30 ms
+// and a run archives at most max_items_per_cycle sessions. Nil (herdr not
+// configured) checks nothing.
 type herdrRecheck struct {
 	cfg     *config.HerdrCollector
 	timeout time.Duration
-	last    *collect.HerdrSessions
 }
 
 func newHerdrRecheck(policy config.Policy) *herdrRecheck {
@@ -926,15 +914,11 @@ func (h *herdrRecheck) check(ctx context.Context, path string) error {
 	if h == nil || !h.cfg.Covers(path) {
 		return nil
 	}
-	if h.last == nil || time.Since(h.last.At) >= herdrRecheckReuse {
-		sessions, err := collect.ListHerdrSessions(ctx, h.cfg, h.timeout)
-		if err != nil {
-			h.last = nil
-			return fmt.Errorf("herdr agent sessions are unknown, so %s is not archived: %w", path, err)
-		}
-		h.last = sessions
+	sessions, err := collect.ListHerdrSessions(ctx, h.cfg, h.timeout)
+	if err != nil {
+		return fmt.Errorf("herdr agent sessions are unknown, so %s is not archived: %w", path, err)
 	}
-	if live := h.last.Unit(path); live != "" {
+	if live := sessions.Unit(path); live != "" {
 		return &liveSessionRefusal{reason: live}
 	}
 	return nil
