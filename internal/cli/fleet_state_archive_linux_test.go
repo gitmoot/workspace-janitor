@@ -759,6 +759,52 @@ func TestStagehandRunIDPathOutsideRunsKeepsItsDirectory(t *testing.T) {
 	}
 }
 
+// Review of #223: a static prefix is complete evidence only when it
+// provably contains every run's path. Through a symlink on the prefix, or
+// one below it that the run-dependent component may name, the real target
+// would get no protection, so services stay partial and nothing archives.
+func TestStagehandRunIDPathThroughSymlinkLeavesServicesPartial(t *testing.T) {
+	cases := map[string]struct{ link, target, path string }{
+		"symlinked prefix":     {"alias-results", "real-results", "alias-results/decisions-$STAGEHAND_RUN_ID.json"},
+		"symlink below prefix": {"per-run/7", "real-results", "per-run/$STAGEHAND_RUN_ID/data"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			x := newFleetStateFixture(t)
+			real := filepath.Join(x.state, tc.target)
+			x.folder(t, real, 20*24*time.Hour, map[string]string{"f": "x"})
+			link := filepath.Join(x.state, tc.link)
+			if err := os.MkdirAll(filepath.Dir(link), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, link); err != nil {
+				t.Fatal(err)
+			}
+			specs := filepath.Join(x.home, "stagehand", "pipelines")
+			if err := os.MkdirAll(specs, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			spec := fmt.Sprintf("stages:\n  - cmd: /bin/cp \"$STAGEHAND_WORK/decisions.json\" \"%s/%s\"\n", x.state, tc.path)
+			if err := os.WriteFile(filepath.Join(specs, "p.yaml"), []byte(spec), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			x.stagehandDirs, x.stagehandState = []string{specs}, filepath.Join(x.home, "stagehand-state")
+			x.policy(t)
+			report := x.categories(t, true)
+			if item := x.item(t, report, real); item.Status == "would_archive" {
+				t.Fatalf("%s is reached through a symlink by a stagehand spec but would archive: %+v", real, item)
+			}
+			var scan core.Scan
+			field(t, x.data(t, "scan"), "scan", &scan)
+			for _, collector := range scan.Collectors {
+				if collector.Name == "services" && collector.Status == core.CollectorRan {
+					t.Fatalf("a run-dependent path through a symlink left services complete: %+v", collector)
+				}
+			}
+		})
+	}
+}
+
 // Review of #167: a stagehand spec that writes to $STAGEHAND_WORK protects
 // every run under <state>/runs. A run already in quarantine when that spec
 // appears must not expire either: expiry's re-check of the original path
