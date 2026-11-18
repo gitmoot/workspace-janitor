@@ -19,6 +19,7 @@ func trimCargoTarget(_ context.Context, _ string, _ config.CacheTrim, _ core.Fil
 type cargoMatch struct {
 	path string
 	id   core.FilesystemID
+	err  error
 }
 
 func discoverCargoTargets(string, string, map[string]bool) ([]cargoMatch, error) {

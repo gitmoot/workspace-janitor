@@ -250,7 +250,10 @@ At most one trim per kind and path (or path_glob) is accepted.
   every guard below, and reported under its own `path` with the
   `path_glob` that found it. A directory a `cargo-target` trim names by
   `path` is left to that trim. New target directories (another
-  `herdr-*-target`) are covered without a policy change.
+  `herdr-*-target`) are covered without a policy change. A match that
+  cannot be opened is reported as `failed` on its own; its siblings are
+  still trimmed. Only a parent that cannot be opened or listed fails the
+  whole glob.
 
   The trim is postponed (`skipped_in_use`, naming the reason in
   `active_users`) when:
@@ -267,8 +270,11 @@ At most one trim per kind and path (or path_glob) is accepted.
   and locking and removal go only through those open directories. Holding
   the locks, before removing anything, the trim checks that `path` (opened
   again without following symlinks) and each profile name still are the
-  validated directories and that it is still a cargo target directory; a
-  directory replaced or moved meanwhile fails the trim and nothing is
+  validated directories, that each profile still holds a regular
+  `.cargo-lock` (a held lock does not stop an unlink), and that it is still
+  a cargo target directory; a
+  directory replaced or moved meanwhile, or one that lost its lock file,
+  fails the trim and nothing is
   removed. Removal never follows a symlink (a link is removed, never its
   target) and never crosses into another filesystem: an entry on another
   device, or a mount below one, is not removed and fails the trim, as does
@@ -399,10 +405,14 @@ changes admission; `target_free_bytes` and `reserve_free_bytes` keep that
 role. `notify_command` and `notify_below_bytes` require each other.
 
 It is edge-triggered: one run per transition below the threshold, not one
-per sample. `notify_cooldown` (default `6h`, accepted `1m` through `168h`)
-is the least time between two runs, so free space hovering at the
-threshold does not repeat the warning; a failed run is retried, while space
-stays below, once the cooldown has passed. The notifier runs beside the
+per sample. Every published sample updates the transition state at once,
+even while a run is in progress, so a recovery followed by a new fall below
+the threshold during a run is a new episode; only the runs themselves are
+coalesced. A successful run marks the episode it was for. `notify_cooldown`
+(default `6h`, accepted `1m` through `168h`, measured in sample time) is
+the least time between two runs, so free space hovering at the threshold
+does not repeat the warning; a failed run, or an episode that began during
+a run, is notified once the cooldown has passed. The notifier runs beside the
 capacity sampler and never delays publication. `notify_timeout` (default
 `30s`, accepted `1s` through `5m`) bounds a run: the command runs in its own
 process group, which is killed at the timeout and again once the command

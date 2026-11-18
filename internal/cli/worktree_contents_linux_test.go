@@ -146,9 +146,11 @@ func TestCycleWholeWorktreeContentsPolicy(t *testing.T) {
 				policy = strings.Replace(policy, "auto_expire: false", "auto_expire: true", 1)
 				policy = strings.Replace(policy, "  - name: explicitly-approved-fixture\n    path: "+cache+"\n    action: quarantine\n    retention: none\n", "", 1)
 				f.writePolicy(t, policy)
-				// The refusal is reported; on its own it does not fail the cycle.
+				// Its contents can no longer be proven reconstructible
+				// (collector_failure): an incomplete observation, which
+				// fails the cycle rather than counting as a refusal.
 				out, stderr, code = f.run(t, "cycle")
-				if code != ExitOK || !strings.Contains(out, `"refusals"`) || !strings.Contains(out, "deletion safety refused") {
+				if code == ExitOK || !strings.Contains(out+stderr, "deletion safety refused") {
 					t.Fatalf("revoked expiry was not refused: %d %s %s", code, out, stderr)
 				}
 				if _, err := os.Stat(retained); err != nil {

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
+	"github.com/gitmoot/workspace-janitor/internal/core"
 )
 
 // lineSink hands each JSON report line the watcher writes to lines. Tests
@@ -213,79 +214,6 @@ prevention:
 	}
 }
 
-// A capacity sample below prevention.notify_below_bytes runs notify_command
-// once with the warning as its last argument: on the transition below it,
-// not on every sample that stays below it. The threshold is informational:
-// a volume above its own warning target stays target_recovered, no hold.
-func TestCapacityWarningNotifiesOncePerTransition(t *testing.T) {
-	x := newTrimFixture(t)
-	log := filepath.Join(x.home, "notified.log")
-	notify := filepath.Join(x.home, "notify")
-	writeFile(t, notify, "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> "+log+"\n")
-	if err := os.Chmod(notify, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	x.writePolicy(t, fmt.Sprintf(`roots:
-  - path: %s
-collectors:
-  deep_size: false
-  git: false
-  processes: false
-  services: false
-prevention:
-  min_free_percent: 0
-  capacity_interval: 3s
-  targets:
-    - path: %[1]s
-      target_free_bytes: 1
-      reserve_free_bytes: 0
-  notify_command: [%s, jarvis]
-  notify_below_bytes: 9000000000000000000
-  notify_timeout: 1s
-`, x.root, notify))
-	lines, stop := startWatch(t, x)
-	samples := 0
-	deadline := time.After(45 * time.Second)
-	for samples < 4 {
-		select {
-		case line := <-lines:
-			var report struct {
-				Reason   string `json:"reason"`
-				Capacity *struct {
-					Volumes []struct {
-						State         string `json:"state"`
-						AdmissionHold bool   `json:"admission_hold"`
-					} `json:"volumes"`
-				} `json:"capacity"`
-			}
-			if err := json.Unmarshal(line, &report); err != nil {
-				t.Fatal(err)
-			}
-			if report.Reason != "capacity" || report.Capacity == nil {
-				continue
-			}
-			for _, volume := range report.Capacity.Volumes {
-				// An unmeasured sample is unknown whatever the policy says.
-				if volume.State != "measurement_unknown" && (volume.State != "target_recovered" || volume.AdmissionHold) {
-					t.Fatalf("the notify threshold changed capacity state: %s", line)
-				}
-			}
-			samples++
-		case <-deadline:
-			t.Fatalf("only %d capacity samples", samples)
-		}
-	}
-	stop()
-	raw, err := os.ReadFile(log)
-	if err != nil {
-		t.Fatalf("notify_command never ran: %v", err)
-	}
-	calls := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	if len(calls) != 1 || !strings.HasPrefix(calls[0], "jarvis|workspace-janitor on ") || !strings.Contains(calls[0], "below 9000000000.0 GB (warning target 0.0 GB") {
-		t.Fatalf("notify_command calls over %d samples below the threshold: %q", samples, calls)
-	}
-}
-
 // The notification settings are not part of the capacity contract Gitmoot
 // reads: the policy hash and every volume's state, hold, target, reserve,
 // recovery bytes and reason are identical with and without them.
@@ -329,76 +257,193 @@ func TestNotifyThresholdLeavesCapacityContractUnchanged(t *testing.T) {
 	}
 }
 
-// A notify command that exits while a child it forked keeps its output
-// open and sleeps holds neither the sampler nor the notifier: capacity
-// samples keep being published, the notify run ends within notify_timeout
-// plus the pipe drain bound, and the child is killed with its group.
-func TestCapacityNotifyCannotStallSampling(t *testing.T) {
+// notifierFixture drives the capacity notifier directly with synthetic
+// samples and sample times, so no test depends on the watcher's sampling
+// clock. Its command logs each call and, while hold exists, waits for it to
+// be removed.
+type notifierFixture struct {
+	x                       *trimFixture
+	log, hold, started, pid string
+	lines                   <-chan []byte
+	publish                 func(*core.CapacitySnapshot, time.Time)
+	stop                    func()
+	t0                      time.Time
+}
+
+func newNotifierFixture(t *testing.T, script string) *notifierFixture {
+	t.Helper()
 	x := newTrimFixture(t)
-	pidFile := filepath.Join(x.home, "child.pid")
+	n := &notifierFixture{x: x, log: filepath.Join(x.home, "notified.log"), hold: filepath.Join(x.home, "hold"),
+		started: filepath.Join(x.home, "started"), pid: filepath.Join(x.home, "child.pid"),
+		t0: time.Date(2026, 11, 18, 0, 0, 0, 0, time.UTC)}
+	if script != "" {
+		script = strings.ReplaceAll(script, "{pid}", n.pid)
+	} else {
+		script = "printf '%s\\n' \"$1\" >> " + n.log + "\ntouch " + n.started + "\ni=0\nwhile [ -e " + n.hold + " ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\n"
+	}
 	notify := filepath.Join(x.home, "notify")
-	started := filepath.Join(x.home, "started")
-	writeFile(t, notify, "#!/bin/sh\ntouch "+started+"\nsleep 60 &\necho $! > "+pidFile+"\necho sent\n")
+	writeFile(t, notify, "#!/bin/sh\n"+script)
 	if err := os.Chmod(notify, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	x.writePolicy(t, fmt.Sprintf(`roots:
-  - path: %s
-collectors:
-  deep_size: false
-  git: false
-  processes: false
-  services: false
-prevention:
-  min_free_percent: 0
-  capacity_interval: 3s
-  targets:
-    - path: %[1]s
-      target_free_bytes: 1
-      reserve_free_bytes: 0
-  notify_command: [%s]
-  notify_below_bytes: 9000000000000000000
-  notify_timeout: 1s
-`, x.root, notify))
-	lines, stop := startWatch(t, x)
-	samples := 0
-	var notified time.Duration
-	deadline := time.After(45 * time.Second)
-	for samples < 4 || notified == 0 {
-		select {
-		case line := <-lines:
-			var report struct {
-				Reason   string          `json:"reason"`
-				Capacity json.RawMessage `json:"capacity"`
-			}
-			if err := json.Unmarshal(line, &report); err != nil {
-				t.Fatal(err)
-			}
-			switch {
-			case report.Reason == "capacity" && len(report.Capacity) != 0:
-				samples++
-			case report.Reason == "capacity_notify" && notified == 0:
-				info, err := os.Stat(started)
-				if err != nil {
-					t.Fatal(err)
-				}
-				notified = time.Since(info.ModTime())
-			}
-		case <-deadline:
-			t.Fatalf("after 45s: %d capacity samples, notify ended after %s", samples, notified)
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n", x.root))
+	sink := &lineSink{lines: make(chan []byte, 4096)}
+	e := &env{opts: &globalOpts{format: "json"}, stdout: sink, stderr: io.Discard, lookup: config.MapLookup(x.env)}
+	paths, err := e.resolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := e.loadPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.Prevention.NotifyCommand = []string{notify}
+	policy.Prevention.NotifyBelowBytes = 40_000_000_000
+	policy.Prevention.NotifyCooldown = config.Duration(time.Hour)
+	policy.Prevention.NotifyTimeout = config.Duration(time.Minute)
+	n.lines = sink.lines
+	n.publish, _, n.stop = startCapacityNotifier(context.Background(), e, paths, policy)
+	t.Cleanup(n.stop)
+	return n
+}
+
+// sample publishes a sample with free bytes available, taken offset after
+// the fixture's start, and waits until the notifier has checked delivery
+// for it: its persisted state names that sample time.
+func (n *notifierFixture) sample(t *testing.T, free uint64, offset time.Duration) {
+	t.Helper()
+	at := n.t0.Add(offset)
+	total := uint64(1_000_000_000_000)
+	n.publish(&core.CapacitySnapshot{Volumes: []core.CapacityState{{Key: "root:/", Roots: []string{"/"},
+		AvailableBytes: &free, TotalBytes: &total, TargetBytes: 20_000_000_000, ReserveBytes: 10_000_000_000}}}, at)
+	n.processed(t, at)
+}
+
+func (n *notifierFixture) processed(t *testing.T, at time.Time) {
+	t.Helper()
+	path := filepath.Join(n.x.home, ".local", "state", "workspace-janitor", "capacity-notify.json")
+	deadline := time.Now().Add(time.Minute)
+	for {
+		var state struct {
+			SampledAt time.Time `json:"sampled_at"`
+		}
+		if raw, err := os.ReadFile(path); err == nil && json.Unmarshal(raw, &state) == nil && !state.SampledAt.Before(at) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the notifier never checked delivery for the sample at %s", at.Format(time.RFC3339))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (n *notifierFixture) calls(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(n.log)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Split(strings.TrimSpace(string(raw)), "\n")
+}
+
+func (n *notifierFixture) waitFor(t *testing.T, path string) {
+	t.Helper()
+	for deadline := time.Now().Add(time.Minute); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never appeared", path)
 		}
 	}
-	stop()
-	// notify_timeout, the pipe drain bound and scheduling slack.
-	if limit := time.Second + 2*time.Second + 2*time.Second; notified > limit {
-		t.Fatalf("notify run took %s, more than %s", notified, limit)
+}
+
+// A sample below notify_below_bytes runs notify_command once with the
+// warning as its last argument: on the transition below, not on every
+// sample that stays below, even long after the cooldown. A recovery and a
+// new fall below notify again.
+func TestCapacityWarningNotifiesOncePerTransition(t *testing.T) {
+	n := newNotifierFixture(t, "")
+	n.sample(t, 30_000_000_000, 0)
+	for i, offset := range []time.Duration{time.Minute, 3 * time.Hour, 5 * time.Hour} {
+		n.sample(t, 29_000_000_000-uint64(i), offset)
 	}
-	raw, err := os.ReadFile(pidFile)
+	calls := n.calls(t)
+	if len(calls) != 1 || !strings.HasPrefix(calls[0], "workspace-janitor on ") || !strings.Contains(calls[0], "/ has 30.0 GB free, below 40.0 GB (warning target 20.0 GB, blocking below 10.0 GB)") {
+		t.Fatalf("notify_command calls while staying below: %q", calls)
+	}
+	n.sample(t, 50_000_000_000, 6*time.Hour)
+	n.sample(t, 35_000_000_000, 7*time.Hour)
+	if calls := n.calls(t); len(calls) != 2 {
+		t.Fatalf("a new fall below the threshold was not notified: %q", calls)
+	}
+}
+
+// Samples published while the command runs still change the transition
+// state: below, then recovered, then below again during the first
+// notification is a new episode, notified once the cooldown has passed.
+func TestCapacityNotifyKeepsTransitionsDuringRun(t *testing.T) {
+	n := newNotifierFixture(t, "")
+	writeFile(t, n.hold, "")
+	total := uint64(1_000_000_000_000)
+	snapshot := func(free uint64) *core.CapacitySnapshot {
+		return &core.CapacitySnapshot{Volumes: []core.CapacityState{{Key: "root:/", Roots: []string{"/"},
+			AvailableBytes: &free, TotalBytes: &total, TargetBytes: 20_000_000_000, ReserveBytes: 10_000_000_000}}}
+	}
+	n.publish(snapshot(30_000_000_000), n.t0)
+	n.waitFor(t, n.started)
+	// While the first notification runs: recovered, then below again.
+	n.publish(snapshot(50_000_000_000), n.t0.Add(time.Minute))
+	n.publish(snapshot(30_000_000_000), n.t0.Add(2*time.Minute))
+	if err := os.Remove(n.hold); err != nil {
+		t.Fatal(err)
+	}
+	n.processed(t, n.t0.Add(2*time.Minute))
+	if calls := n.calls(t); len(calls) != 1 {
+		t.Fatalf("calls within the cooldown: %q", calls)
+	}
+	n.sample(t, 30_000_000_000, 2*time.Hour)
+	if calls := n.calls(t); len(calls) != 2 {
+		t.Fatalf("the fall below during the first run was never notified: %q", calls)
+	}
+}
+
+// A notify command that exits while a child it forked keeps its output
+// open and sleeps holds neither publication nor the notifier: publish
+// returns at once throughout, the run ends within notify_timeout and the
+// pipe drain bound, and the child is killed with its process group.
+func TestCapacityNotifyCannotStallSampling(t *testing.T) {
+	n := newNotifierFixture(t, "sleep 60 &\necho $! > {pid}\necho sent\n")
+	total, free := uint64(1_000_000_000_000), uint64(30_000_000_000)
+	snapshot := &core.CapacitySnapshot{Volumes: []core.CapacityState{{Key: "root:/", Roots: []string{"/"},
+		AvailableBytes: &free, TotalBytes: &total, TargetBytes: 20_000_000_000, ReserveBytes: 10_000_000_000}}}
+	start := time.Now()
+	published := make(chan struct{})
+	go func() {
+		defer close(published)
+		for i := range 50 {
+			n.publish(snapshot, n.t0.Add(time.Duration(i)*time.Second))
+		}
+	}()
+	select {
+	case <-published:
+	case <-time.After(30 * time.Second):
+		t.Fatal("publish blocked while the notify command ran")
+	}
+	n.processed(t, n.t0.Add(49*time.Second))
+	// The child sleeps 60s holding the output; the run must not wait for it.
+	if took := time.Since(start); took > 30*time.Second {
+		t.Fatalf("the notify run waited %s for the child holding its output", took)
+	}
+	raw, err := os.ReadFile(n.pid)
 	if err != nil {
 		t.Fatal(err)
 	}
 	stat := filepath.Join("/proc", strings.TrimSpace(string(raw)), "stat")
-	for wait := time.Now().Add(2 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+	for wait := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
 		data, err := os.ReadFile(stat)
 		// Gone, or a zombie awaiting its reaper: either way not running.
 		if err != nil || strings.Contains(string(data), ") Z ") {

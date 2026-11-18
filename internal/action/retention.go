@@ -249,7 +249,7 @@ func (e *Engine) eligible(ctx context.Context, item core.CleanupItem, original b
 		return observeErr
 	}
 	if !verdict.Allows(core.ActionDeleteCandidate) {
-		return verdictError(observeErr, "deletion safety refused: %s", verdict.Detail())
+		return verdictError(observeErr, verdict, "deletion safety refused: %s", verdict.Detail())
 	}
 	// Re-evaluate the *original* pathname as well. Names and protected-path
 	// rules can change after quarantine; evaluating only the receipt's generic
@@ -259,7 +259,7 @@ func (e *Engine) eligible(ctx context.Context, item core.CleanupItem, original b
 		mirror.Path, mirror.Root, mirror.CanonicalPath = item.Source, item.Entry.Root, item.Entry.CanonicalPath
 		verdict := safety.Evaluate(safety.Input{Entry: mirror, Policy: e.Policy, Now: e.now()})
 		if !verdict.Allows(core.ActionDeleteCandidate) {
-			return refused("original source safety refused: %s", verdict.Detail())
+			return verdictError(nil, verdict, "original source safety refused: %s", verdict.Detail())
 		}
 	}
 	// Inspect the full tree for mount boundaries before deleting any child.
@@ -442,11 +442,11 @@ func (e *Engine) eligibleLeftoverCompanion(ctx context.Context, item core.Cleanu
 	fresh.Root = item.Entry.Root
 	verdict := safety.Evaluate(safety.Input{Entry: fresh, Policy: e.receiptPolicy(), Now: e.now()})
 	if !verdict.Allows(core.ActionDeleteCandidate) {
-		return refused("deletion safety refused: %s", verdict.Detail())
+		return verdictError(nil, verdict, "deletion safety refused: %s", verdict.Detail())
 	}
 	fresh.Path = source
 	if original := safety.Evaluate(safety.Input{Entry: fresh, Policy: e.Policy, Now: e.now()}); !original.Allows(core.ActionDeleteCandidate) {
-		return refused("original source safety refused: %s", original.Detail())
+		return verdictError(nil, original, "original source safety refused: %s", original.Detail())
 	}
 	return nil
 }

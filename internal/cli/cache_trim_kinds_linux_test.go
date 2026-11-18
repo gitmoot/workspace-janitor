@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1081,4 +1083,69 @@ func symlinkDuringScan(fifo, dir, dest string) error {
 	}
 	_, err = unix.Write(fd, cmdline)
 	return err
+}
+
+// asNonRoot runs the calling test again in a child process inside a new user
+// namespace whose only user, 1000, is this host's root: files the test
+// creates belong to it, but it has no capability to bypass their modes, so
+// a mode-000 directory really cannot be opened. It returns false in that
+// child (or when already unprivileged), where the test goes on; in the
+// parent it returns true once the child has passed.
+func asNonRoot(t *testing.T) bool {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		return false
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1", "-test.v")
+	cmd.Env = os.Environ()
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags:  syscall.CLONE_NEWUSER,
+		UidMappings: []syscall.SysProcIDMap{{ContainerID: 1000, HostID: 0, Size: 1}},
+		GidMappings: []syscall.SysProcIDMap{{ContainerID: 1000, HostID: 0, Size: 1}},
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "--- PASS: "+t.Name()) {
+		t.Fatalf("as a non-root user: %v\n%s", err, out)
+	}
+	return true
+}
+
+// One directory a cargo-target path_glob matched that cannot be opened is
+// reported as failed on its own; its healthy sibling is still trimmed.
+func TestCargoTargetGlobKeepsHealthyMatchesWhenOneCannotBeOpened(t *testing.T) {
+	if asNonRoot(t) {
+		return
+	}
+	x := newTrimFixture(t)
+	cache := filepath.Join(x.home, "cache")
+	healthy, locked := filepath.Join(cache, "a-target"), filepath.Join(cache, "b-target")
+	for _, dir := range []string{healthy, locked} {
+		writeFile(t, filepath.Join(dir, "CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n")
+		writeFile(t, filepath.Join(dir, "release", ".cargo-lock"), "")
+		writeFile(t, filepath.Join(dir, "release", "deps", "libbig.rlib"), string(make([]byte, 1<<20)))
+		backdate(t, dir, 2*time.Hour)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(locked, 0o700)
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n    - kind: cargo-target\n      path_glob: %s\n      max_bytes: 65536\n",
+		x.root, x.proc, filepath.Join(cache, "*-target")))
+	out, stderr, code := x.run(t, "cycle")
+	var report struct {
+		CacheTrims []struct {
+			kindResult
+			Path string `json:"path"`
+		} `json:"cache_trims"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("cycle report: %v %s %s", err, out, stderr)
+	}
+	status := map[string]string{}
+	for _, trim := range report.CacheTrims {
+		status[trim.Path] = trim.Status
+	}
+	if code == ExitOK || status[healthy] != "trimmed" || status[locked] != "failed" {
+		t.Fatalf("one unopenable match changed its sibling's trim: exit %d %v %s", code, status, out)
+	}
 }

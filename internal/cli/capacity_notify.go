@@ -7,38 +7,101 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
 
-// notifySample is one published capacity sample for the notifier.
-type notifySample struct {
-	snapshot *core.CapacitySnapshot
-	at       time.Time
+// capacityNotifyReport is one prevention.notify_command run.
+type capacityNotifyReport struct {
+	Command []string `json:"command"`
+	Message string   `json:"message"`
+	Output  string   `json:"output,omitempty"`
+	Error   string   `json:"error,omitempty"`
+}
+
+// capacityNotifyVolume is the notifier's view of one volume.
+type capacityNotifyVolume struct {
+	// Below is whether the last measured sample was below the threshold.
+	Below bool `json:"below"`
+	// Episode counts the transitions below the threshold.
+	Episode int `json:"episode"`
+	// NotifiedEpisode is the episode the command last succeeded for.
+	NotifiedEpisode int       `json:"notified_episode"`
+	LastAttempt     time.Time `json:"last_attempt,omitzero"`
+}
+
+// capacityNotifyState is the notifier's persisted state.
+type capacityNotifyState struct {
+	// SampledAt is the time of the newest sample the state reflects.
+	SampledAt time.Time                       `json:"sampled_at,omitzero"`
+	Volumes   map[string]capacityNotifyVolume `json:"volumes"`
+}
+
+const capacityNotifyStateFile = "capacity-notify.json"
+
+// capacityNotifier runs prevention.notify_command once for each transition
+// of a volume below notify_below_bytes: edge-triggered, not on every
+// sample. It only reads the samples: the threshold is not a capacity target
+// and changes no capacity state or admission hold.
+//
+// Every published sample updates the transition state at once (publish),
+// whatever the command is doing, so a recovery and a new fall below the
+// threshold during a run start a new episode. Only delivery is coalesced:
+// the notifier goroutine runs the command for each volume below the
+// threshold whose current episode has not been notified, unless the last
+// attempt was within notify_cooldown (measured in sample time). A success
+// marks the episode the run was for, so an episode begun during the run is
+// still notified once the cooldown has passed; a failure is retried then
+// too. A volume that could not be measured changes nothing. The state
+// persists in the state directory after every delivery check, so a
+// restarted watcher does not warn again.
+type capacityNotifier struct {
+	e         *env
+	policy    config.Policy
+	statePath string
+	wake      chan struct{}
+
+	mu     sync.Mutex
+	state  capacityNotifyState
+	latest map[string]core.CapacityState // newest measurement of each volume
 }
 
 // startCapacityNotifier runs the notifier beside the sampler, so capacity
-// publication never waits on notify_command. publish hands it the newest
-// sample, replacing one it has not yet taken. failed delivers the error
-// that ended it (a report that could not be written). stop ends it and
-// waits for it; a command in flight is killed with its process group.
+// publication never waits on notify_command. publish applies a sample's
+// transitions and wakes the notifier; it never blocks. failed delivers the
+// error that ended it (a report that could not be written). stop ends it
+// and waits for it; a command in flight is killed with its process group.
 func startCapacityNotifier(ctx context.Context, e *env, paths config.Paths, policy config.Policy) (publish func(*core.CapacitySnapshot, time.Time), failed <-chan error, stop func()) {
+	n := &capacityNotifier{e: e, policy: policy, statePath: filepath.Join(paths.StateDir, capacityNotifyStateFile),
+		wake: make(chan struct{}, 1), latest: map[string]core.CapacityState{}}
+	loadErr := readStateJSON(n.statePath, &n.state)
+	if n.state.Volumes == nil {
+		n.state.Volumes = map[string]capacityNotifyVolume{}
+	}
 	ctx, cancel := context.WithCancel(ctx)
-	samples := make(chan notifySample, 1)
 	errs := make(chan error, 1)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
+		if loadErr != nil {
+			if err := writeWatchReport(e, watchReport{Reason: "capacity_notify", Error: loadErr.Error()}); err != nil {
+				errs <- fmt.Errorf("capacity notify report: %w", err)
+				return
+			}
+		}
 		for {
-			var sample notifySample
 			select {
 			case <-ctx.Done():
 				return
-			case sample = <-samples:
+			case <-n.wake:
 			}
-			notify, err := notifyCapacityWarning(ctx, paths, policy, sample.snapshot, sample.at)
+			notify, err := n.deliver(ctx)
+			if ctx.Err() != nil {
+				return
+			}
 			if notify == nil && err == nil {
 				continue
 			}
@@ -52,87 +115,79 @@ func startCapacityNotifier(ctx context.Context, e *env, paths config.Paths, poli
 			}
 		}
 	}()
-	publish = func(snapshot *core.CapacitySnapshot, at time.Time) {
-		// Only the sampler publishes, so after dropping a stale pending
-		// sample the buffer has room.
-		select {
-		case <-samples:
-		default:
-		}
-		samples <- notifySample{snapshot, at}
-	}
-	return publish, errs, func() { cancel(); <-finished }
+	return n.publish, errs, func() { cancel(); <-finished }
 }
 
-// capacityNotifyReport is one prevention.notify_command run.
-type capacityNotifyReport struct {
-	Command []string `json:"command"`
-	Message string   `json:"message"`
-	Output  string   `json:"output,omitempty"`
-	Error   string   `json:"error,omitempty"`
-}
-
-// capacityNotifyVolume is the notifier's persisted view of one volume.
-type capacityNotifyVolume struct {
-	// Warning is whether the last measured sample was below the target.
-	Warning bool `json:"warning"`
-	// Notified is whether the command succeeded for this warning episode.
-	Notified    bool      `json:"notified"`
-	LastAttempt time.Time `json:"last_attempt,omitzero"`
-}
-
-const capacityNotifyStateFile = "capacity-notify.json"
-
-// notifyCapacityWarning runs prevention.notify_command once when a volume
-// of snapshot is first measured with fewer than notify_below_bytes available
-// after having at least that much: edge-triggered, not on every sample. It
-// only reads the sample: the threshold is not a capacity target and changes
-// no capacity state or admission hold. Within notify_cooldown of the last
-// attempt it waits, so space hovering at the threshold cannot repeat the
-// warning; a failed attempt is retried, while space stays below, once the
-// cooldown has passed. A volume that could not be measured changes nothing.
-// The state persists in the state directory, so a restarted watcher does
-// not warn again. It returns nil when nothing ran.
-func notifyCapacityWarning(ctx context.Context, paths config.Paths, policy config.Policy, snapshot *core.CapacitySnapshot, now time.Time) (*capacityNotifyReport, error) {
-	statePath := filepath.Join(paths.StateDir, capacityNotifyStateFile)
-	state := map[string]capacityNotifyVolume{}
-	if err := readStateJSON(statePath, &state); err != nil {
-		return nil, err
-	}
-	changed := false
-	var due []core.CapacityState
-	cooldown := policy.Prevention.NotifyCooldown.Duration()
+// publish applies snapshot, sampled at at, to the transition state and
+// wakes the notifier.
+func (n *capacityNotifier) publish(snapshot *core.CapacitySnapshot, at time.Time) {
+	threshold := uint64(n.policy.Prevention.NotifyBelowBytes)
+	n.mu.Lock()
 	for _, volume := range snapshot.Volumes {
 		if volume.AvailableBytes == nil {
 			continue
 		}
-		previous := state[volume.Key]
-		current := previous
-		current.Warning = *volume.AvailableBytes < uint64(policy.Prevention.NotifyBelowBytes)
-		if !current.Warning {
-			current.Notified = false
-		} else if !current.Notified && !now.Before(current.LastAttempt.Add(cooldown)) {
-			due = append(due, volume)
+		current := n.state.Volumes[volume.Key]
+		below := *volume.AvailableBytes < threshold
+		if below && !current.Below {
+			current.Episode++
 		}
-		if current != previous {
-			state[volume.Key] = current
-			changed = true
+		current.Below = below
+		n.state.Volumes[volume.Key] = current
+		n.latest[volume.Key] = volume
+	}
+	if at.After(n.state.SampledAt) {
+		n.state.SampledAt = at
+	}
+	n.mu.Unlock()
+	select {
+	case n.wake <- struct{}{}:
+	default: // a wake is already pending; it will see this sample
+	}
+}
+
+// deliver runs the command for the volumes due, records the attempt and
+// persists the state. It returns nil when nothing ran.
+func (n *capacityNotifier) deliver(ctx context.Context) (*capacityNotifyReport, error) {
+	cooldown := n.policy.Prevention.NotifyCooldown.Duration()
+	n.mu.Lock()
+	now := n.state.SampledAt
+	var due []core.CapacityState
+	episodes := map[string]int{}
+	for key, volume := range n.state.Volumes {
+		// A volume known only from the persisted state waits for its first
+		// measurement in this run.
+		measured, ok := n.latest[key]
+		if ok && volume.Below && volume.NotifiedEpisode != volume.Episode && !now.Before(volume.LastAttempt.Add(cooldown)) {
+			due = append(due, measured)
+			episodes[key] = volume.Episode
 		}
 	}
+	n.mu.Unlock()
+	sort.Slice(due, func(i, j int) bool { return due[i].Key < due[j].Key })
 	var report *capacityNotifyReport
 	if len(due) != 0 {
-		report = runCapacityNotify(ctx, policy, due)
-		for _, volume := range due {
-			current := state[volume.Key]
-			current.LastAttempt, current.Notified = now, report.Error == ""
-			state[volume.Key] = current
-		}
-		changed = true
+		report = runCapacityNotify(ctx, n.policy, due)
 	}
-	if changed {
-		if err := writeStateJSON(statePath, state); err != nil {
-			return report, err
+	n.mu.Lock()
+	for key, episode := range episodes {
+		volume := n.state.Volumes[key]
+		volume.LastAttempt = now
+		if report.Error == "" {
+			volume.NotifiedEpisode = episode
 		}
+		n.state.Volumes[key] = volume
+	}
+	persisted := capacityNotifyState{SampledAt: n.state.SampledAt, Volumes: make(map[string]capacityNotifyVolume, len(n.state.Volumes))}
+	for key, volume := range n.state.Volumes {
+		persisted.Volumes[key] = volume
+	}
+	n.mu.Unlock()
+	if ctx.Err() != nil {
+		return report, nil
+	}
+	if err := writeStateJSON(n.statePath, persisted); err != nil {
+		return report, fmt.Errorf("capacity notify state: %w", err)
 	}
 	return report, nil
 }

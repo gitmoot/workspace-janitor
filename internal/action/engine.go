@@ -135,7 +135,7 @@ func (e *Engine) preflightEntry(ctx context.Context, entry core.Entry, action co
 		},
 	})
 	if !verdict.Allows(action.Kind) {
-		return verdictError(observeErr, "%s refused %s: %s", label, entry.Path, verdict.Detail())
+		return verdictError(observeErr, verdict, "%s refused %s: %s", label, entry.Path, verdict.Detail())
 	}
 	return nil
 }
@@ -161,7 +161,7 @@ func (e *Engine) Quarantine(ctx context.Context, item core.CleanupItem) (core.Cl
 		return e.deferPrepared(ctx, item, observeErr)
 	}
 	if !verdict.Allows(item.Action.Kind) {
-		return item, verdictError(observeErr, "revalidation refused %s: %s", item.Source, verdict.Detail())
+		return item, verdictError(observeErr, verdict, "revalidation refused %s: %s", item.Source, verdict.Detail())
 	}
 	if err := e.moveUnit(ctx, item, handle.Identity()); err != nil {
 		return item, err
@@ -297,7 +297,7 @@ func (e *Engine) revalidateCompanion(ctx context.Context, item core.CleanupItem,
 	target := safety.ResolveTarget(filepath.Dir(item.Destination))
 	verdict := safety.Evaluate(safety.Input{Entry: unitCompanion(fresh, item.Source), Policy: e.Policy, Target: &target, Now: e.now()})
 	if !verdict.Allows(item.Action.Kind) {
-		return refused("companion revalidation refused %s: %s", path, verdict.Detail())
+		return verdictError(nil, verdict, "companion revalidation refused %s: %s", path, verdict.Detail())
 	}
 	return nil
 }

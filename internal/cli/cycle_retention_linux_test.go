@@ -384,3 +384,41 @@ func TestCycleFailsWhenRevalidationCannotObserve(t *testing.T) {
 		t.Fatalf("unobserved item was moved: %q %v", raw, err)
 	}
 }
+
+// A Git timeout during revalidation leaves only a partial Git report, which
+// the evidence check accepts, and a collector_failure protection on the
+// fresh entry. That observation is incomplete, not a safety decision: the
+// item stays and the cycle fails instead of reporting a refusal.
+func TestCycleFailsWhenRevalidationGitTimesOut(t *testing.T) {
+	f := newFixture(t)
+	root := filepath.Join(f.home, "workspace")
+	cache := filepath.Join(root, "build-cache")
+	proc := filepath.Join(f.home, "empty-proc")
+	units := filepath.Join(f.home, "systemd")
+	bin := filepath.Join(f.home, "bin")
+	for _, path := range []string{filepath.Join(cache, ".git"), proc, units, bin} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(cache, "payload"), []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// The scan runs no Git collector; apply's revalidation always does,
+	// with this git, which outlasts limits.git_timeout.
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexec sleep 30\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: true\n  proc_root: "+proc+"\n  systemd_dirs:\n    - "+units+"\n  cron_paths: []\n  pm2_dumps: []\n"+
+		"limits:\n  git_timeout: 200ms\n"+
+		"caches:\n  - name: build\n    path: "+cache+"\n    action: quarantine\n    retention: none\n"+
+		"retention:\n  delete_enabled: true\nprevention:\n  auto_quarantine: true\n  auto_expire: true\n  min_free_percent: 0\n")
+	out, stderr, code := f.run(t, "cycle")
+	if code == ExitOK {
+		t.Fatalf("a revalidation whose Git collector timed out passed as a refusal: %s %s", out, stderr)
+	}
+	if raw, err := os.ReadFile(filepath.Join(cache, "payload")); err != nil || string(raw) != "fixture" {
+		t.Fatalf("unobserved item was moved: %q %v", raw, err)
+	}
+}

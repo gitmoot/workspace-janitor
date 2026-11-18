@@ -178,6 +178,13 @@ func runCacheTrims(ctx context.Context, policy config.Policy, trims []config.Cac
 			continue
 		}
 		for _, match := range matches {
+			if match.err != nil {
+				// This match only; its healthy siblings are still trimmed.
+				reports = append(reports, cacheTrimReport{Kind: trim.Kind, Path: match.path, PathGlob: trim.PathGlob, MaxBytes: trim.MaxBytes,
+					Status: cacheTrimFailed, Error: match.err.Error()})
+				errs = append(errs, fmt.Errorf("cache trim %s %s: %w", trim.Kind, match.path, match.err))
+				continue
+			}
 			found := trim
 			found.Path = match.path
 			run(found, match.id)

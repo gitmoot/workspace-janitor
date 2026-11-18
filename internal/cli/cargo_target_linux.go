@@ -98,6 +98,9 @@ func trimCargoTarget(ctx context.Context, procRoot string, trim config.CacheTrim
 		report.Status, report.ActiveUsers = cacheInUse, held
 		return report
 	}
+	if cargoBeforeVerify != nil {
+		cargoBeforeVerify(trim.Path)
+	}
 	if err := target.verify(); err != nil {
 		return fail(err)
 	}
@@ -333,9 +336,14 @@ func (t *cargoTarget) lock() (release func(), held []string) {
 	return release, held
 }
 
+// cargoBeforeVerify, when set (tests only), runs after the trim holds every
+// cargo lock and before its final verification.
+var cargoBeforeVerify func(path string)
+
 // verify checks, just before removal, that the path still names the
-// validated target, each profile name still the validated profile, and that
-// the target is still a cargo target directory.
+// validated target, each profile name still the validated profile, each
+// profile still holds its regular .cargo-lock (a held flock does not stop
+// an unlink), and that the target is still a cargo target directory.
 func (t *cargoTarget) verify() error {
 	changed := fmt.Errorf("%s changed since it was validated; nothing removed", t.path)
 	fd, err := action.OpenDirNoSymlinks(t.path)
@@ -419,17 +427,20 @@ func fdIdentity(fd int) (core.FilesystemID, error) {
 }
 
 // cargoMatch is one directory a cargo-target path_glob matched, with the
-// identity it had when discovered.
+// identity it had when discovered, or err when it could not be opened.
 type cargoMatch struct {
 	path string
 	id   core.FilesystemID
+	err  error
 }
 
 // discoverCargoTargets opens parent without following symlinks and lists,
 // in name order, its real directories whose name matches pattern, leaving
 // out the paths in skip. Each is opened through parent's descriptor with
 // O_NOFOLLOW and its identity bound, so a match later replaced (by a
-// symlink or another directory) is refused when its trim opens it.
+// symlink or another directory) is refused when its trim opens it. A match
+// that cannot be opened is listed with its error, beside every healthy
+// one; only a parent that cannot be opened or listed is an error.
 func discoverCargoTargets(parent, pattern string, skip map[string]bool) ([]cargoMatch, error) {
 	dir, err := action.OpenDirNoSymlinks(parent)
 	if err != nil {
@@ -452,12 +463,14 @@ func discoverCargoTargets(parent, pattern string, skip map[string]bool) ([]cargo
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("open %s: %w", path, err)
+			matches = append(matches, cargoMatch{path: path, err: fmt.Errorf("open %s: %w", path, err)})
+			continue
 		}
 		id, err := fdIdentity(fd)
 		unix.Close(fd)
 		if err != nil {
-			return nil, err
+			matches = append(matches, cargoMatch{path: path, err: fmt.Errorf("stat %s: %w", path, err)})
+			continue
 		}
 		matches = append(matches, cargoMatch{path: path, id: id})
 	}
