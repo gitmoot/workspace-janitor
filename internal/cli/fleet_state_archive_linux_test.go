@@ -688,13 +688,8 @@ func TestStagehandSpecKeepsItsFoldersLocal(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(specs, "radar.yaml"), []byte(spec), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	x.stagehandDirs = []string{specs}
 	x.policy(t)
-	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
-	raw, err := os.ReadFile(policyFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  stagehand_dirs: ["+specs+"]\n", 1))
 	report := x.categories(t, true)
 	for _, path := range []string{script, work, envs, prompts} {
 		if item := x.item(t, report, path); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
@@ -713,6 +708,107 @@ func TestStagehandSpecKeepsItsFoldersLocal(t *testing.T) {
 		if collector.Name == "services" && collector.Status == core.CollectorRan {
 			t.Fatalf("an unparseable stagehand spec left services complete: %+v", collector)
 		}
+	}
+}
+
+// A stagehand stage that copies its result out of the run directory into a
+// file named by the run id (docs-reference's collect stage) keeps the
+// directory it writes into and leaves services complete, so unrelated
+// folders still archive. A run-dependent path whose static prefix is an
+// inventory root still blocks every removal.
+func TestStagehandRunIDPathOutsideRunsKeepsItsDirectory(t *testing.T) {
+	x := newFleetStateFixture(t)
+	results := filepath.Join(x.state, "results")
+	free := filepath.Join(x.state, "unrelated")
+	for _, path := range []string{results, free} {
+		x.folder(t, path, 20*24*time.Hour, map[string]string{"f": "x"})
+	}
+	specs := filepath.Join(x.home, "stagehand", "pipelines")
+	if err := os.MkdirAll(specs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	spec := fmt.Sprintf("stages:\n  - id: collect\n    needs: [research]\n    cmd: >-\n      /bin/cp \"$STAGEHAND_WORK/decisions.json\"\n      \"%s/decisions-$STAGEHAND_RUN_ID.json\"\n    timeout: 1m\n", results)
+	if err := os.WriteFile(filepath.Join(specs, "docs-reference.yaml"), []byte(spec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	x.stagehandDirs, x.stagehandState = []string{specs}, filepath.Join(x.home, "stagehand-state")
+	x.policy(t)
+	report := x.categories(t, true)
+	if item := x.item(t, report, results); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
+		t.Fatalf("%s receives stagehand results but was not kept: %+v", results, item)
+	}
+	if item := x.item(t, report, free); item.Status != "would_archive" {
+		t.Fatalf("an unreferenced folder was blocked: %+v", item)
+	}
+	var scan core.Scan
+	field(t, x.data(t, "scan"), "scan", &scan)
+	for _, collector := range scan.Collectors {
+		if collector.Name == "services" && collector.Status != core.CollectorRan {
+			t.Fatalf("services not complete: %+v", collector)
+		}
+	}
+	broad := fmt.Sprintf("stages:\n  - cmd: /bin/cp a \"%s/decisions-$STAGEHAND_RUN_ID.json\"\n", x.state)
+	if err := os.WriteFile(filepath.Join(specs, "broad.yaml"), []byte(broad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	field(t, x.data(t, "scan"), "scan", &scan)
+	for _, collector := range scan.Collectors {
+		if collector.Name == "services" && collector.Status == core.CollectorRan {
+			t.Fatalf("a run-dependent path directly in an inventory root left services complete: %+v", collector)
+		}
+	}
+}
+
+// Review of #223: a static prefix is complete evidence only when it
+// provably contains every run's path. Through a symlink on the prefix, or
+// one below it that the run-dependent component may name, the real target
+// would get no protection, so services stay partial and nothing archives.
+func TestStagehandRunIDPathThroughSymlinkLeavesServicesPartial(t *testing.T) {
+	// lexical is a real directory where the path points once cleaned.
+	cases := map[string]struct{ link, target, path, lexical string }{
+		"symlinked prefix":     {"alias-results", "real-results", "alias-results/decisions-$STAGEHAND_RUN_ID.json", ""},
+		"symlink below prefix": {"per-run/7", "real-results", "per-run/$STAGEHAND_RUN_ID/data", ""},
+		// The kernel writes to actual-parent/results, not to results.
+		"dot-dot after a symlink": {"alias", "actual-parent/child", "alias/../results/decisions-$STAGEHAND_RUN_ID.json", "results"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			x := newFleetStateFixture(t)
+			real := filepath.Join(x.state, tc.target)
+			x.folder(t, real, 20*24*time.Hour, map[string]string{"f": "x"})
+			if tc.lexical != "" {
+				x.folder(t, filepath.Join(x.state, tc.lexical), 20*24*time.Hour, map[string]string{"f": "x"})
+			}
+			link := filepath.Join(x.state, tc.link)
+			if err := os.MkdirAll(filepath.Dir(link), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, link); err != nil {
+				t.Fatal(err)
+			}
+			specs := filepath.Join(x.home, "stagehand", "pipelines")
+			if err := os.MkdirAll(specs, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			spec := fmt.Sprintf("stages:\n  - cmd: /bin/cp \"$STAGEHAND_WORK/decisions.json\" \"%s/%s\"\n", x.state, tc.path)
+			if err := os.WriteFile(filepath.Join(specs, "p.yaml"), []byte(spec), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			x.stagehandDirs, x.stagehandState = []string{specs}, filepath.Join(x.home, "stagehand-state")
+			x.policy(t)
+			report := x.categories(t, true)
+			top := filepath.Join(x.state, strings.SplitN(tc.target, "/", 2)[0])
+			if item := x.item(t, report, top); item.Status == "would_archive" {
+				t.Fatalf("%s is reached through a symlink by a stagehand spec but would archive: %+v", top, item)
+			}
+			var scan core.Scan
+			field(t, x.data(t, "scan"), "scan", &scan)
+			for _, collector := range scan.Collectors {
+				if collector.Name == "services" && collector.Status == core.CollectorRan {
+					t.Fatalf("a run-dependent path through a symlink left services complete: %+v", collector)
+				}
+			}
+		})
 	}
 }
 
@@ -819,13 +915,8 @@ func TestStagehandDatabasePipelineKeepsItsFoldersLocal(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	x.stagehandDirs, x.stagehandState = []string{}, state
 	x.policy(t)
-	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
-	raw, err := os.ReadFile(policyFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  stagehand_dirs: []\n  stagehand_state_dir: "+state+"\n", 1))
 	report := x.categories(t, true)
 	for _, path := range []string{source, used, prompts} {
 		if item := x.item(t, report, path); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
@@ -847,13 +938,8 @@ func TestStagehandDatabasePipelineKeepsItsFoldersLocal(t *testing.T) {
 // Review of #170: policy validation rejects a relative stagehand_state_dir.
 func TestRelativeStagehandStateDirIsRejected(t *testing.T) {
 	x := newFleetStateFixture(t)
+	x.stagehandState = "stagehand state"
 	x.policy(t)
-	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
-	raw, err := os.ReadFile(policyFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	x.writePolicy(t, strings.Replace(string(raw), "  pm2_dumps: []\n", "  pm2_dumps: []\n  stagehand_state_dir: stagehand state\n", 1))
 	_, stderr, code := x.run(t, "scan")
 	if code == ExitOK || !strings.Contains(stderr, "stagehand_state_dir") {
 		t.Fatalf("relative stagehand_state_dir accepted: exit=%d %s", code, stderr)

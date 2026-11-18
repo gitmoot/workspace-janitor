@@ -641,8 +641,9 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 	// Stagehand sets $STAGEHAND_WORK to <state>/runs/<run id>/work and
 	// $STAGEHAND_RUN_ID to that run id, an integer it assigns. A placeholder
 	// stands for it;
-	// references through it are folded into <state>/runs, unless the spec
-	// itself climbs out of that directory with a literal "..".
+	// references through it are folded into <state>/runs. One outside that
+	// directory protects its static prefix when that provably contains it.
+	prefixes := newStagehandPrefixes(ctx, opts)
 	var runtime map[string]string
 	var runsDir string
 	if state := opts.ServiceSources.StagehandStateDir; filepath.IsAbs(state) {
@@ -676,10 +677,10 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 				continue
 			}
 			report.Visited++
-			refs = append(refs, stagehandSpecRefs(content, "used by stagehand pipeline "+file, runtime, runsDir, dir, file, report)...)
+			refs = append(refs, stagehandSpecRefs(content, "used by stagehand pipeline "+file, runtime, runsDir, dir, file, prefixes, report)...)
 		}
 	}
-	refs = append(refs, gatherStagehandDatabase(ctx, opts, report, runtime, runsDir)...)
+	refs = append(refs, gatherStagehandDatabase(ctx, opts, report, runtime, runsDir, prefixes)...)
 	return refs
 }
 
@@ -688,7 +689,7 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 // directory it was added from). Pipelines can be added from anywhere, so the
 // spec directory alone does not list them all. A missing database is
 // skipped; one that cannot be read leaves this source unknown.
-func gatherStagehandDatabase(ctx context.Context, opts *Options, report *core.CollectorReport, runtime map[string]string, runsDir string) []Reference {
+func gatherStagehandDatabase(ctx context.Context, opts *Options, report *core.CollectorReport, runtime map[string]string, runsDir string, prefixes *stagehandPrefixes) []Reference {
 	state := opts.ServiceSources.StagehandStateDir
 	if state == "" {
 		return nil
@@ -732,7 +733,7 @@ func gatherStagehandDatabase(ctx context.Context, opts *Options, report *core.Co
 		} else if source != "" {
 			noteUnreadable(report, fmt.Sprintf("stagehand pipeline %s has a relative source_dir %q", name, source))
 		}
-		refs = append(refs, stagehandSpecRefs(spec, detail, runtime, runsDir, source, "stagehand pipeline "+name, report)...)
+		refs = append(refs, stagehandSpecRefs(spec, detail, runtime, runsDir, source, "stagehand pipeline "+name, prefixes, report)...)
 	}
 	if err := rows.Err(); err != nil {
 		noteUnreadable(report, fmt.Sprintf("could not read stagehand pipelines: %v", err))
@@ -749,7 +750,7 @@ var stagehandFileKeys = map[string]bool{"prompt_file": true, "env_file": true, "
 // file field (prompt_file, env_file, ...) is resolved against source, the
 // directory stagehand resolves it against; without an absolute source it is
 // unresolved. label names the spec in unreadable notes.
-func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, source, label string, report *core.CollectorReport) []Reference {
+func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, source, label string, prefixes *stagehandPrefixes, report *core.CollectorReport) []Reference {
 	var refs []Reference
 	var docs []any
 	decoder := yaml.NewDecoder(strings.NewReader(spec))
@@ -790,15 +791,183 @@ func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, 
 			continue
 		}
 		// filepath.Clean has already applied any literal "..": a path
-		// that left <state>/runs is reported, not folded.
+		// that left <state>/runs is protected by its static prefix, the
+		// directory above its first run-dependent component, only when
+		// that prefix provably contains it (see stagehandPrefixes.check).
 		if !core.PathWithin(ref.Path, runsDir) {
-			noteUnreadable(report, fmt.Sprintf("%s builds a path outside its run directory: %s", label, ref.Path))
+			prefix, why := prefixes.check(ref.unclean, ref.Path)
+			if why != "" {
+				noteUnreadable(report, fmt.Sprintf("%s builds a path outside its run directory: %s (%s)", label, ref.Path, why))
+				continue
+			}
+			ref.Detail += fmt.Sprintf(" (%s writes run-dependent %s)", ref.specKey, ref.Path)
+			ref.Path, ref.Subtree = prefix, true
+			refs = append(refs, ref)
 			continue
 		}
 		ref.Path, ref.Subtree = runsDir, true
 		refs = append(refs, ref)
 	}
 	return refs
+}
+
+// stagehandPrefixes decides, once per prefix in one collection, whether a
+// run-dependent stagehand path outside <state>/runs is bounded by its
+// static prefix (see check).
+type stagehandPrefixes struct {
+	ctx    context.Context
+	roots  []string
+	limits Limits
+	// seen caches each prefix's verdict: "" proven, else why not.
+	seen map[string]string
+}
+
+func newStagehandPrefixes(ctx context.Context, opts *Options) *stagehandPrefixes {
+	return &stagehandPrefixes{ctx: ctx, roots: opts.ServiceSources.InventoryRoots, limits: opts.Limits, seen: map[string]string{}}
+}
+
+// check returns the static prefix of path, the directory above its first
+// run-dependent component, when protecting that prefix as a subtree is
+// complete evidence for every run's path. Otherwise it returns why not.
+//
+// The prefix must be absolute, clean, not a filesystem root, and neither
+// an inventory root nor an ancestor of one (protecting it would freeze
+// everything the janitor manages). Containment must also be proven on
+// disk: the run-dependent component may name any entry below the prefix,
+// so a symlink on the prefix path or anywhere below it could send the
+// real target elsewhere. A path that is unclean (spelled with a "." or ".."
+// component before or during expansion, or not clean once expanded) fails:
+// a ".." after a symlink resolves through the symlink's target, not
+// lexically. An existing prefix must resolve to itself and a
+// bounded walk must find no symlink below it. A prefix that does not exist
+// yet redirects nothing: its nearest existing ancestor must resolve to
+// itself and must not be an inventory root or an ancestor of one.
+func (s *stagehandPrefixes) check(unclean bool, path string) (string, string) {
+	if unclean {
+		// filepath.Clean folds "x/.." lexically, but the kernel follows x
+		// first: a symlink at x sends the real path elsewhere.
+		return "", "it is not spelled as a clean path"
+	}
+	if s == nil {
+		return "", "its containment cannot be checked"
+	}
+	parts := strings.Split(path, "/")
+	cut := -1
+	for i, part := range parts {
+		if strings.Contains(part, stagehandRunPlaceholder) || strings.ContainsAny(part, "$`") {
+			cut = i
+			break
+		}
+	}
+	prefix := ""
+	if filepath.IsAbs(path) && cut >= 1 {
+		prefix = strings.Join(parts[:cut], "/")
+	}
+	if prefix == "" || prefix != filepath.Clean(prefix) || prefix == "/" {
+		return "", "it has no static prefix below the filesystem root"
+	}
+	if why, ok := s.seen[prefix]; ok {
+		return prefix, why
+	}
+	why := s.prove(prefix)
+	s.seen[prefix] = why
+	return prefix, why
+}
+
+// broad reports whether protecting dir would protect an inventory root.
+func (s *stagehandPrefixes) broad(dir string) bool {
+	if len(s.roots) == 0 {
+		return true
+	}
+	for _, root := range s.roots {
+		if !filepath.IsAbs(root) || core.PathWithin(filepath.Clean(root), dir) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *stagehandPrefixes) prove(prefix string) string {
+	if s.broad(prefix) {
+		return "its static prefix " + prefix + " is an inventory root or an ancestor of one"
+	}
+	info, err := os.Lstat(prefix)
+	if os.IsNotExist(err) {
+		existing := filepath.Dir(prefix)
+		for {
+			if _, err := os.Lstat(existing); err == nil {
+				break
+			} else if !os.IsNotExist(err) {
+				return fmt.Sprintf("could not stat %s: %v", existing, err)
+			}
+			existing = filepath.Dir(existing)
+		}
+		if resolved, err := filepath.EvalSymlinks(existing); err != nil || resolved != existing {
+			return "the nearest existing ancestor " + existing + " of its static prefix is reached through a symlink"
+		}
+		if s.broad(existing) {
+			return "its static prefix " + prefix + " does not exist and its nearest existing ancestor " + existing + " is an inventory root or an ancestor of one"
+		}
+		return ""
+	}
+	if err != nil {
+		return fmt.Sprintf("could not stat %s: %v", prefix, err)
+	}
+	if !info.IsDir() {
+		return "its static prefix " + prefix + " is not a directory"
+	}
+	if resolved, err := filepath.EvalSymlinks(prefix); err != nil || resolved != prefix {
+		return "its static prefix " + prefix + " is reached through a symlink"
+	}
+	return s.walk(prefix)
+}
+
+// walk proves that no symlink lies below dir, within the deep-size entry
+// and depth budgets and the command timeout. Running out of any budget, or
+// any read error, is not proof.
+func (s *stagehandPrefixes) walk(dir string) string {
+	budget, maxDepth := s.limits.DeepSizeMaxEntries, s.limits.DeepSizeMaxDepth
+	if budget <= 0 || maxDepth <= 0 {
+		return "no walk budget is configured to prove " + dir + " holds no symlink"
+	}
+	ctx := s.ctx
+	if s.limits.CommandTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.limits.CommandTimeout)
+		defer cancel()
+	}
+	type level struct {
+		path  string
+		depth int
+	}
+	queue := []level{{dir, 0}}
+	for len(queue) > 0 {
+		next := queue[0]
+		queue = queue[1:]
+		if err := ctx.Err(); err != nil {
+			return fmt.Sprintf("could not finish checking %s for symlinks: %v", dir, err)
+		}
+		entries, err := os.ReadDir(next.path)
+		if err != nil {
+			return fmt.Sprintf("could not check %s for symlinks: %v", next.path, err)
+		}
+		for _, entry := range entries {
+			if budget--; budget < 0 {
+				return "checking " + dir + " for symlinks ran past the entry budget"
+			}
+			path := filepath.Join(next.path, entry.Name())
+			if entry.Type()&os.ModeSymlink != 0 {
+				return "the symlink " + path + " lies below its static prefix"
+			}
+			if entry.IsDir() {
+				if next.depth+1 >= maxDepth {
+					return "checking " + dir + " for symlinks ran past the depth budget"
+				}
+				queue = append(queue, level{path, next.depth + 1})
+			}
+		}
+	}
+	return ""
 }
 
 // specPathReferences parses a pipeline spec (YAML, every document) and
@@ -871,9 +1040,15 @@ func specPathReferences(spec, signal, detail string, runtime map[string]string, 
 	})
 	var refs []Reference
 	var unresolved []string
+	var currentKey string
+	// currentDotted marks every path of the word being considered whose
+	// spelling, before any expansion or in a substituted value, has a "."
+	// or ".." component.
+	var currentDotted bool
 	addOne := func(path string) {
 		if p := filepath.Clean(path); filepath.IsAbs(p) && p != "/" {
-			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail})
+			refs = append(refs, Reference{Path: p, Source: core.SourceService, Protection: core.ProtectServiceReference, Signal: signal, Detail: detail, specKey: currentKey,
+				unclean: currentDotted || path != p})
 		}
 	}
 	// add applies the shell's pathname expansions to one candidate: braces,
@@ -890,7 +1065,9 @@ func specPathReferences(spec, signal, detail string, runtime map[string]string, 
 		}
 	}
 	consider := func(word string) {
-		for _, expanded := range expandWord(word, vars) {
+		expansions, dotted := expandWord(word, vars)
+		currentDotted = dotted || hasDotComponent(word)
+		for _, expanded := range expansions {
 			// An expansion still present may hold any value, including "..",
 			// so no part of the word bounds where it points: unresolved.
 			if unresolvedExpansion.MatchString(expanded) {
@@ -918,6 +1095,7 @@ func specPathReferences(spec, signal, detail string, runtime map[string]string, 
 	// (cwd: /a b). A command field is shell text: only its words count, or a
 	// whole command line would be read as one long path.
 	walkConfigKeyedStrings(docs, "", func(key, value string) {
+		currentKey = key
 		if literal[strings.ToLower(key)] {
 			return
 		}
@@ -993,7 +1171,12 @@ func expandPathname(word string) ([]string, bool) {
 			if !filepath.IsAbs(home) {
 				return nil, false
 			}
-			w = filepath.Join(home, rest)
+			// Concatenated, not joined: filepath.Join would clean away a
+			// ".." that the containment check must see.
+			w = home
+			if rest != "" {
+				w += "/" + rest
+			}
 		}
 		if !filepath.IsAbs(w) {
 			continue
@@ -1071,9 +1254,12 @@ func expandBraces(word string, limit int) ([]string, bool) {
 // candidates, set or not. An unknown expansion, a variable recorded with too
 // many values (nil in vars), or a word whose expansions would exceed 16 is
 // returned unexpanded, for the caller to treat as unresolved: candidates are
-// never silently dropped.
-func expandWord(word string, vars map[string][]string) []string {
+// never silently dropped. Values are substituted by plain concatenation;
+// dotted reports whether any substituted value has a "." or ".."
+// component.
+func expandWord(word string, vars map[string][]string) ([]string, bool) {
 	const maxResults = 16
+	dotted := false
 	results := []string{word}
 	for round := 0; round < 4; round++ {
 		changed := false
@@ -1092,7 +1278,7 @@ func expandWord(word string, vars map[string][]string) []string {
 			}
 			known, recorded := vars[name]
 			if recorded && known == nil {
-				return []string{word}
+				return []string{word}, dotted
 			}
 			// A written fallback is always a candidate as well: POSIX uses it
 			// when NAME is unset and, for :- and :=, when NAME is empty, and
@@ -1108,10 +1294,11 @@ func expandWord(word string, vars map[string][]string) []string {
 				continue
 			}
 			if len(next)+len(values) > maxResults {
-				return []string{word}
+				return []string{word}, dotted
 			}
 			changed = true
 			for _, value := range values {
+				dotted = dotted || hasDotComponent(value)
 				next = append(next, current[:loc[0]]+value+current[loc[1]:])
 			}
 		}
@@ -1120,7 +1307,20 @@ func expandWord(word string, vars map[string][]string) []string {
 			break
 		}
 	}
-	return results
+	return results, dotted
+}
+
+// hasDotComponent reports whether s, split on "/", has a "." or ".."
+// component. filepath.Clean folds those lexically, but the kernel resolves
+// ".." through a symlink's target, so a cleaned path no longer says where
+// such a path points.
+func hasDotComponent(s string) bool {
+	for _, part := range strings.Split(s, "/") {
+		if part == "." || part == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // commandKeys name spec fields whose values are shell commands.

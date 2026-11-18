@@ -165,7 +165,7 @@ func runScan(ctx context.Context, e *env, args []string, opts scanOptions) error
 			SystemdDirs: policy.Collectors.SystemdDirs,
 			CronPaths:   policy.Collectors.CronPaths,
 			PM2Dumps:    policy.Collectors.PM2Dumps,
-			ConfigFiles: policy.Collectors.ConfigFiles, GitmootPipelines: policy.Gitmoot.Database, StagehandDirs: policy.Collectors.StagehandDirs, StagehandStateDir: policy.Collectors.StagehandStateDir,
+			ConfigFiles: policy.Collectors.ConfigFiles, GitmootPipelines: policy.Gitmoot.Database, StagehandDirs: policy.Collectors.StagehandDirs, StagehandStateDir: policy.Collectors.StagehandStateDir, InventoryRoots: inventoryRootPaths(policy),
 		},
 		AgentSources: e.agentSources,
 		Herdr:        policy.Collectors.Herdr,
@@ -274,6 +274,16 @@ func scanRoots(policy config.Policy, args []string, opts scanOptions) ([]collect
 		specs = append(specs, spec)
 	}
 	return specs, nil
+}
+
+// inventoryRootPaths lists every policy root, whatever this command scans:
+// the services collector refuses to protect any of them or their ancestors.
+func inventoryRootPaths(policy config.Policy) []string {
+	paths := make([]string, 0, len(policy.Roots))
+	for _, root := range policy.Roots {
+		paths = append(paths, root.Path)
+	}
+	return paths
 }
 
 func rootSpec(root config.Root, opts scanOptions) collect.RootSpec {

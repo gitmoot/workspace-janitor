@@ -93,6 +93,10 @@ type ServiceSources struct {
 	// StagehandStateDir is stagehand's state directory, which holds each
 	// run's work directory ($STAGEHAND_WORK).
 	StagehandStateDir string
+	// InventoryRoots are the policy's inventory roots. A run-dependent
+	// stagehand path is protected by its static prefix only when that
+	// prefix is neither one of them nor an ancestor of one.
+	InventoryRoots []string
 }
 
 // AgentRef is one directory a registered agent is using.
@@ -394,10 +398,16 @@ type Reference struct {
 	Detail     string
 	// Subtree also protects every entry inside Path. It is used only where
 	// the unknown part of a path is bounded by construction (a stagehand
-	// run id is an integer, so a run's work stays inside <state>/runs).
+	// run id is an integer, so a run's work stays inside <state>/runs, and
+	// a path built from it stays inside the directory above it).
 	Subtree          bool
 	ExportArchive    *core.ExportArchiveBinding    `json:"export_archive,omitempty"`
 	WorkspaceArchive *core.WorkspaceArchiveBinding `json:"workspace_archive,omitempty"`
+	// specKey is the pipeline spec field the path came from. unclean marks
+	// a path spelled with a "." or ".." component (in the spec or in a
+	// substituted value) or not clean once expanded.
+	specKey string
+	unclean bool
 }
 
 // attachReferences records each reference on every entry that contains it,
