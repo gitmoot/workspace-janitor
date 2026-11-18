@@ -33,12 +33,12 @@ type planOptions struct {
 	// quarantineRules, when set, limits approveQuarantine to the actions
 	// one of these rules decided (the low-disk trigger's cache rules).
 	quarantineRules []string
-	approver          string
-	note              string
-	noPersist         bool
-	noJev             bool
-	jevDryRun         bool
-	jevDebug          bool
+	approver        string
+	note            string
+	noPersist       bool
+	noJev           bool
+	jevDryRun       bool
+	jevDebug        bool
 }
 
 // planReport is the `plan` result contract.

@@ -35,8 +35,8 @@ type cycleReport struct {
 	// Refusals lists the quarantine and expiry items a safety guard
 	// declined. They stay where they were (or are recorded for
 	// investigation) and do not fail the cycle; failures still do.
-	Refusals []string `json:"refusals,omitempty"`
-	Inventory          *inventoryReport       `json:"inventory_report"`
+	Refusals  []string         `json:"refusals,omitempty"`
+	Inventory *inventoryReport `json:"inventory_report"`
 	// History is the end-of-cycle scan history trim and guarded VACUUM.
 	History *historyMaintenance `json:"history,omitempty"`
 }
