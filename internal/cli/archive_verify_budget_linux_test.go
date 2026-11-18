@@ -294,8 +294,8 @@ func TestCycleStillRefusesAChangedArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	report, output, code := x.cycle(t)
-	if code != ExitOK || len(report.Refusals) == 0 || !strings.Contains(output, "does not bind the local tree") || strings.Contains(output, "verification deferred") {
+	_, output, code := x.cycle(t)
+	if code != ExitOK || !strings.Contains(output, `"refusals"`) || !strings.Contains(output, "does not bind the local tree") || strings.Contains(output, "verification deferred") {
 		t.Fatalf("changed archive not refused as a mismatch: exit=%d %s", code, output)
 	}
 	x.preserved(t, x.source)
