@@ -688,13 +688,8 @@ func TestStagehandSpecKeepsItsFoldersLocal(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(specs, "radar.yaml"), []byte(spec), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	x.stagehandDirs = []string{specs}
 	x.policy(t)
-	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
-	raw, err := os.ReadFile(policyFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	x.writePolicy(t, x.setStagehand(string(raw), "["+specs+"]", ""))
 	report := x.categories(t, true)
 	for _, path := range []string{script, work, envs, prompts} {
 		if item := x.item(t, report, path); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
@@ -736,13 +731,8 @@ func TestStagehandRunIDPathOutsideRunsKeepsItsDirectory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(specs, "docs-reference.yaml"), []byte(spec), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	x.stagehandDirs, x.stagehandState = []string{specs}, filepath.Join(x.home, "stagehand-state")
 	x.policy(t)
-	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
-	raw, err := os.ReadFile(policyFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	x.writePolicy(t, x.setStagehand(string(raw), "["+specs+"]", filepath.Join(x.home, "stagehand-state")))
 	report := x.categories(t, true)
 	if item := x.item(t, report, results); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
 		t.Fatalf("%s receives stagehand results but was not kept: %+v", results, item)
@@ -872,13 +862,8 @@ func TestStagehandDatabasePipelineKeepsItsFoldersLocal(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	x.stagehandDirs, x.stagehandState = []string{}, state
 	x.policy(t)
-	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
-	raw, err := os.ReadFile(policyFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	x.writePolicy(t, x.setStagehand(string(raw), "[]", state))
 	report := x.categories(t, true)
 	for _, path := range []string{source, used, prompts} {
 		if item := x.item(t, report, path); !strings.Contains(strings.Join(item.Reasons, " "), "service_reference") {
@@ -900,13 +885,8 @@ func TestStagehandDatabasePipelineKeepsItsFoldersLocal(t *testing.T) {
 // Review of #170: policy validation rejects a relative stagehand_state_dir.
 func TestRelativeStagehandStateDirIsRejected(t *testing.T) {
 	x := newFleetStateFixture(t)
+	x.stagehandState = "stagehand state"
 	x.policy(t)
-	policyFile := filepath.Join(x.home, ".config", "workspace-janitor", "policy.yaml")
-	raw, err := os.ReadFile(policyFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	x.writePolicy(t, x.setStagehand(string(raw), "", "stagehand state"))
 	_, stderr, code := x.run(t, "scan")
 	if code == ExitOK || !strings.Contains(stderr, "stagehand_state_dir") {
 		t.Fatalf("relative stagehand_state_dir accepted: exit=%d %s", code, stderr)

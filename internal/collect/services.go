@@ -642,7 +642,8 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 	// $STAGEHAND_RUN_ID to that run id, an integer it assigns. A placeholder
 	// stands for it;
 	// references through it are folded into <state>/runs. One outside that
-	// directory protects its static prefix (see stagehandStaticPrefix).
+	// directory protects its static prefix when that provably contains it.
+	prefixes := newStagehandPrefixes(ctx, opts)
 	var runtime map[string]string
 	var runsDir string
 	if state := opts.ServiceSources.StagehandStateDir; filepath.IsAbs(state) {
@@ -676,10 +677,10 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 				continue
 			}
 			report.Visited++
-			refs = append(refs, stagehandSpecRefs(content, "used by stagehand pipeline "+file, runtime, runsDir, dir, file, opts.ServiceSources.InventoryRoots, report)...)
+			refs = append(refs, stagehandSpecRefs(content, "used by stagehand pipeline "+file, runtime, runsDir, dir, file, prefixes, report)...)
 		}
 	}
-	refs = append(refs, gatherStagehandDatabase(ctx, opts, report, runtime, runsDir)...)
+	refs = append(refs, gatherStagehandDatabase(ctx, opts, report, runtime, runsDir, prefixes)...)
 	return refs
 }
 
@@ -688,7 +689,7 @@ func gatherStagehand(ctx context.Context, opts *Options, report *core.CollectorR
 // directory it was added from). Pipelines can be added from anywhere, so the
 // spec directory alone does not list them all. A missing database is
 // skipped; one that cannot be read leaves this source unknown.
-func gatherStagehandDatabase(ctx context.Context, opts *Options, report *core.CollectorReport, runtime map[string]string, runsDir string) []Reference {
+func gatherStagehandDatabase(ctx context.Context, opts *Options, report *core.CollectorReport, runtime map[string]string, runsDir string, prefixes *stagehandPrefixes) []Reference {
 	state := opts.ServiceSources.StagehandStateDir
 	if state == "" {
 		return nil
@@ -732,7 +733,7 @@ func gatherStagehandDatabase(ctx context.Context, opts *Options, report *core.Co
 		} else if source != "" {
 			noteUnreadable(report, fmt.Sprintf("stagehand pipeline %s has a relative source_dir %q", name, source))
 		}
-		refs = append(refs, stagehandSpecRefs(spec, detail, runtime, runsDir, source, "stagehand pipeline "+name, opts.ServiceSources.InventoryRoots, report)...)
+		refs = append(refs, stagehandSpecRefs(spec, detail, runtime, runsDir, source, "stagehand pipeline "+name, prefixes, report)...)
 	}
 	if err := rows.Err(); err != nil {
 		noteUnreadable(report, fmt.Sprintf("could not read stagehand pipelines: %v", err))
@@ -749,7 +750,7 @@ var stagehandFileKeys = map[string]bool{"prompt_file": true, "env_file": true, "
 // file field (prompt_file, env_file, ...) is resolved against source, the
 // directory stagehand resolves it against; without an absolute source it is
 // unresolved. label names the spec in unreadable notes.
-func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, source, label string, inventoryRoots []string, report *core.CollectorReport) []Reference {
+func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, source, label string, prefixes *stagehandPrefixes, report *core.CollectorReport) []Reference {
 	var refs []Reference
 	var docs []any
 	decoder := yaml.NewDecoder(strings.NewReader(spec))
@@ -791,12 +792,12 @@ func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, 
 		}
 		// filepath.Clean has already applied any literal "..": a path
 		// that left <state>/runs is protected by its static prefix, the
-		// directory above its first run-dependent component, unless that
-		// prefix is too broad to protect safely.
+		// directory above its first run-dependent component, only when
+		// that prefix provably contains it (see stagehandPrefixes.check).
 		if !core.PathWithin(ref.Path, runsDir) {
-			prefix, ok := stagehandStaticPrefix(ref.Path, inventoryRoots)
-			if !ok {
-				noteUnreadable(report, fmt.Sprintf("%s builds a path outside its run directory: %s", label, ref.Path))
+			prefix, why := prefixes.check(ref.Path)
+			if why != "" {
+				noteUnreadable(report, fmt.Sprintf("%s builds a path outside its run directory: %s (%s)", label, ref.Path, why))
 				continue
 			}
 			ref.Detail += fmt.Sprintf(" (%s writes run-dependent %s)", ref.specKey, ref.Path)
@@ -810,14 +811,37 @@ func stagehandSpecRefs(spec, detail string, runtime map[string]string, runsDir, 
 	return refs
 }
 
-// stagehandStaticPrefix returns the directory above the first component of
-// path that holds the run placeholder. It refuses (false) a prefix that is
-// not absolute and clean, is a filesystem root, or is an inventory root or
-// an ancestor of one (or when no roots are known): protecting it would
-// protect, and so freeze, every entry the janitor manages.
-func stagehandStaticPrefix(path string, inventoryRoots []string) (string, bool) {
-	if !filepath.IsAbs(path) {
-		return "", false
+// stagehandPrefixes decides, once per prefix in one collection, whether a
+// run-dependent stagehand path outside <state>/runs is bounded by its
+// static prefix (see check).
+type stagehandPrefixes struct {
+	ctx    context.Context
+	roots  []string
+	limits Limits
+	// seen caches each prefix's verdict: "" proven, else why not.
+	seen map[string]string
+}
+
+func newStagehandPrefixes(ctx context.Context, opts *Options) *stagehandPrefixes {
+	return &stagehandPrefixes{ctx: ctx, roots: opts.ServiceSources.InventoryRoots, limits: opts.Limits, seen: map[string]string{}}
+}
+
+// check returns the static prefix of path, the directory above its first
+// run-dependent component, when protecting that prefix as a subtree is
+// complete evidence for every run's path. Otherwise it returns why not.
+//
+// The prefix must be absolute, clean, not a filesystem root, and neither
+// an inventory root nor an ancestor of one (protecting it would freeze
+// everything the janitor manages). Containment must also be proven on
+// disk: the run-dependent component may name any entry below the prefix,
+// so a symlink on the prefix path or anywhere below it could send the
+// real target elsewhere. An existing prefix must resolve to itself and a
+// bounded walk must find no symlink below it. A prefix that does not exist
+// yet redirects nothing: its nearest existing ancestor must resolve to
+// itself and must not be an inventory root or an ancestor of one.
+func (s *stagehandPrefixes) check(path string) (string, string) {
+	if s == nil {
+		return "", "its containment cannot be checked"
 	}
 	parts := strings.Split(path, "/")
 	cut := -1
@@ -827,19 +851,115 @@ func stagehandStaticPrefix(path string, inventoryRoots []string) (string, bool) 
 			break
 		}
 	}
-	if cut < 1 {
-		return "", false
+	prefix := ""
+	if filepath.IsAbs(path) && cut >= 1 {
+		prefix = strings.Join(parts[:cut], "/")
 	}
-	prefix := strings.Join(parts[:cut], "/")
-	if prefix == "" || prefix != filepath.Clean(prefix) || prefix == "/" || len(inventoryRoots) == 0 {
-		return "", false
+	if prefix == "" || prefix != filepath.Clean(prefix) || prefix == "/" {
+		return "", "it has no static prefix below the filesystem root"
 	}
-	for _, root := range inventoryRoots {
-		if !filepath.IsAbs(root) || core.PathWithin(filepath.Clean(root), prefix) {
-			return "", false
+	if why, ok := s.seen[prefix]; ok {
+		return prefix, why
+	}
+	why := s.prove(prefix)
+	s.seen[prefix] = why
+	return prefix, why
+}
+
+// broad reports whether protecting dir would protect an inventory root.
+func (s *stagehandPrefixes) broad(dir string) bool {
+	if len(s.roots) == 0 {
+		return true
+	}
+	for _, root := range s.roots {
+		if !filepath.IsAbs(root) || core.PathWithin(filepath.Clean(root), dir) {
+			return true
 		}
 	}
-	return prefix, true
+	return false
+}
+
+func (s *stagehandPrefixes) prove(prefix string) string {
+	if s.broad(prefix) {
+		return "its static prefix " + prefix + " is an inventory root or an ancestor of one"
+	}
+	info, err := os.Lstat(prefix)
+	if os.IsNotExist(err) {
+		existing := filepath.Dir(prefix)
+		for {
+			if _, err := os.Lstat(existing); err == nil {
+				break
+			} else if !os.IsNotExist(err) {
+				return fmt.Sprintf("could not stat %s: %v", existing, err)
+			}
+			existing = filepath.Dir(existing)
+		}
+		if resolved, err := filepath.EvalSymlinks(existing); err != nil || resolved != existing {
+			return "the nearest existing ancestor " + existing + " of its static prefix is reached through a symlink"
+		}
+		if s.broad(existing) {
+			return "its static prefix " + prefix + " does not exist and its nearest existing ancestor " + existing + " is an inventory root or an ancestor of one"
+		}
+		return ""
+	}
+	if err != nil {
+		return fmt.Sprintf("could not stat %s: %v", prefix, err)
+	}
+	if !info.IsDir() {
+		return "its static prefix " + prefix + " is not a directory"
+	}
+	if resolved, err := filepath.EvalSymlinks(prefix); err != nil || resolved != prefix {
+		return "its static prefix " + prefix + " is reached through a symlink"
+	}
+	return s.walk(prefix)
+}
+
+// walk proves that no symlink lies below dir, within the deep-size entry
+// and depth budgets and the command timeout. Running out of any budget, or
+// any read error, is not proof.
+func (s *stagehandPrefixes) walk(dir string) string {
+	budget, maxDepth := s.limits.DeepSizeMaxEntries, s.limits.DeepSizeMaxDepth
+	if budget <= 0 || maxDepth <= 0 {
+		return "no walk budget is configured to prove " + dir + " holds no symlink"
+	}
+	ctx := s.ctx
+	if s.limits.CommandTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.limits.CommandTimeout)
+		defer cancel()
+	}
+	type level struct {
+		path  string
+		depth int
+	}
+	queue := []level{{dir, 0}}
+	for len(queue) > 0 {
+		next := queue[0]
+		queue = queue[1:]
+		if err := ctx.Err(); err != nil {
+			return fmt.Sprintf("could not finish checking %s for symlinks: %v", dir, err)
+		}
+		entries, err := os.ReadDir(next.path)
+		if err != nil {
+			return fmt.Sprintf("could not check %s for symlinks: %v", next.path, err)
+		}
+		for _, entry := range entries {
+			if budget--; budget < 0 {
+				return "checking " + dir + " for symlinks ran past the entry budget"
+			}
+			path := filepath.Join(next.path, entry.Name())
+			if entry.Type()&os.ModeSymlink != 0 {
+				return "the symlink " + path + " lies below its static prefix"
+			}
+			if entry.IsDir() {
+				if next.depth+1 >= maxDepth {
+					return "checking " + dir + " for symlinks ran past the depth budget"
+				}
+				queue = append(queue, level{path, next.depth + 1})
+			}
+		}
+	}
+	return ""
 }
 
 // specPathReferences parses a pipeline spec (YAML, every document) and
