@@ -32,6 +32,10 @@ type cycleReport struct {
 	CategoryArchives   *categoryArchiveReport `json:"category_archives,omitempty"`
 	ScratchCleanup     []scratchRunReport     `json:"scratch_cleanup,omitempty"`
 	CacheTrims         []cacheTrimReport      `json:"cache_trims,omitempty"`
+	// Refusals lists the quarantine and expiry items a safety guard
+	// declined. They stay where they were (or are recorded for
+	// investigation) and do not fail the cycle; failures still do.
+	Refusals []string `json:"refusals,omitempty"`
 	Inventory          *inventoryReport       `json:"inventory_report"`
 	// History is the end-of-cycle scan history trim and guarded VACUUM.
 	History *historyMaintenance `json:"history,omitempty"`
@@ -155,7 +159,11 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	}
 	var quarantineErr error
 	if policy.Prevention.AutoQuarantine {
-		report.Quarantine, report.QuarantineReport, quarantineErr = autoQuarantine(ctx, e, scanID)
+		report.Quarantine, report.QuarantineReport, _, quarantineErr = autoQuarantine(ctx, e, scanID,
+			planOptions{approver: "janitor cycle", note: "prevention.auto_quarantine"})
+		if items, ok := onlyRefusals(quarantineErr); ok {
+			report.Refusals, quarantineErr = append(report.Refusals, items...), nil
+		}
 	}
 	// Expiry does not depend on the latest scan; the watcher may resume.
 	releaseScan()
@@ -175,7 +183,7 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 	// checks for live users at the moment it runs. A failed trim does not
 	// stop expiry; it is reported and fails the cycle at the end.
 	var trimErr error
-	report.CacheTrims, trimErr = runCacheTrims(ctx, policy, paths.StateDir)
+	report.CacheTrims, trimErr = runCacheTrims(ctx, policy, policy.Prevention.CacheTrims, paths.StateDir)
 	categoryErr = errors.Join(categoryErr, trimErr)
 	if policy.Prevention.AutoExpire {
 		// Reuse the interactive path and retain its item-level outcome.
@@ -185,8 +193,10 @@ func runCycle(ctx context.Context, e *env, args []string) error {
 		err := runApply(ctx, &applyEnv, nil, applyOptions{expire: true, confirm: true, dryRun: false})
 		report.Expiry = "checked"
 		report.ExpiryReport = strings.TrimSpace(expiryOutput.String())
-		if err != nil {
-			// A refusal fails the cycle without discarding what it did.
+		if items, ok := onlyRefusals(err); ok {
+			report.Refusals = append(report.Refusals, items...)
+		} else if err != nil {
+			// A failure fails the cycle without discarding what it did.
 			return errors.Join(quarantineErr, categoryErr, fmt.Errorf("scheduled expiry: %w; %s", err, report.ExpiryReport), writeCycleReport(e.stdout, report))
 		}
 	}
@@ -248,50 +258,53 @@ func writeCycleReport(out io.Writer, report cycleReport) error {
 	return err
 }
 
-// autoQuarantine plans the cycle's scan from rules alone, approves the
-// quarantine actions, and moves them. Apply still revalidates every target
-// against a fresh observation before moving it, so anything that became
-// referenced, dirty, or changed since the scan stays where it is.
-func autoQuarantine(ctx context.Context, e *env, scanID string) (string, string, error) {
+// autoQuarantine plans scanID from rules alone, approves its quarantine
+// actions (only those approval.quarantineRules decided, when set) under
+// approval's approver and note, and moves them. Apply still revalidates
+// every target against a fresh observation before moving it, so anything
+// that became referenced, dirty, or changed since the scan stays where it
+// is. It returns the outcome, the apply report and the plan ID.
+func autoQuarantine(ctx context.Context, e *env, scanID string, approval planOptions) (string, string, string, error) {
 	planEnv := *e
 	var planned bytes.Buffer
 	planEnv.stdout = &planned
 	opts := *e.opts
 	opts.format = string(output.FormatJSON)
 	planEnv.opts = &opts
-	if err := runPlan(ctx, &planEnv, nil, planOptions{scanID: scanID, noJev: true, approveQuarantine: true,
-		approver: "janitor cycle", note: "prevention.auto_quarantine"}); err != nil {
-		return "failed", "", fmt.Errorf("scheduled quarantine plan: %w", err)
+	approval.scanID, approval.noJev, approval.approveQuarantine = scanID, true, true
+	if err := runPlan(ctx, &planEnv, nil, approval); err != nil {
+		return "failed", "", "", fmt.Errorf("scheduled quarantine plan: %w", err)
 	}
 	var result struct {
 		Data planReport `json:"data"`
 	}
 	if err := json.Unmarshal(planned.Bytes(), &result); err != nil {
-		return "failed", "", fmt.Errorf("scheduled quarantine plan output: %w", err)
+		return "failed", "", "", fmt.Errorf("scheduled quarantine plan output: %w", err)
 	}
+	planID := result.Data.Plan.ID
 	var skipped string
 	if len(result.Data.Skipped) > 0 {
 		data, err := json.Marshal(result.Data.Skipped)
 		if err != nil {
-			return "failed", "", err
+			return "failed", "", planID, err
 		}
 		skipped = "skipped active receipts: " + string(data)
 	}
 	if len(result.Data.Approvals) == 0 {
-		return "none", skipped, nil
+		return "none", skipped, planID, nil
 	}
 	var applied bytes.Buffer
 	applyEnv := *e
 	applyEnv.stdout = &applied
-	err := runApply(ctx, &applyEnv, nil, applyOptions{planID: result.Data.Plan.ID, quarantine: true, confirm: true, dryRun: false})
+	err := runApply(ctx, &applyEnv, nil, applyOptions{planID: planID, quarantine: true, confirm: true, dryRun: false})
 	out := strings.TrimSpace(applied.String())
 	if skipped != "" {
 		out = skipped + "\n" + out
 	}
 	if err != nil {
-		return "applied", out, fmt.Errorf("scheduled quarantine: %w; %s", err, out)
+		return "applied", out, planID, fmt.Errorf("scheduled quarantine: %w; %s", err, out)
 	}
-	return "applied", out, nil
+	return "applied", out, planID, nil
 }
 
 func deepScanDue(ctx context.Context, database string, interval time.Duration, now time.Time) (bool, error) {

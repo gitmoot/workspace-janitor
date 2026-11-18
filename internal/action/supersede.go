@@ -55,7 +55,7 @@ func (e *Engine) copyInUse(ctx context.Context, item core.CleanupItem) error {
 		return fmt.Errorf("live process check of the quarantined copy: %w", err)
 	}
 	if use, ok := used[filepath.Base(item.Destination)]; ok {
-		return fmt.Errorf("quarantined copy is in use (%s)", use)
+		return refused("quarantined copy is in use (%s)", use)
 	}
 	return nil
 }

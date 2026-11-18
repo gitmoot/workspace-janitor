@@ -830,15 +830,18 @@ func TestCargoTargetTrimWaitsForBuilds(t *testing.T) {
 	}
 }
 
-// A directory without cargo's CACHEDIR.TAG is not a cargo target directory:
-// the trim fails and removes nothing.
+// A directory with neither cargo's CACHEDIR.TAG nor cargo's layout, or with
+// another tool's CACHEDIR.TAG, is not a cargo target directory: the trim
+// fails and removes nothing.
 func TestCargoTargetTrimRefusesUntaggedDirectory(t *testing.T) {
 	for name, tag := range map[string]string{"missing": "", "foreign": "# not a cache directory tag\n"} {
 		t.Run(name, func(t *testing.T) {
 			x, target, trim := cargoTargetFixture(t)
 			if tag == "" {
-				if err := os.Remove(filepath.Join(target, "CACHEDIR.TAG")); err != nil {
-					t.Fatal(err)
+				for _, proof := range []string{"CACHEDIR.TAG", "release/.cargo-lock"} {
+					if err := os.Remove(filepath.Join(target, proof)); err != nil {
+						t.Fatal(err)
+					}
 				}
 			} else {
 				writeFile(t, filepath.Join(target, "CACHEDIR.TAG"), tag)
@@ -852,6 +855,65 @@ func TestCargoTargetTrimRefusesUntaggedDirectory(t *testing.T) {
 				t.Fatal("untagged directory trimmed")
 			}
 		})
+	}
+}
+
+// A cargo-target path_glob bounds every cargo target directly in its parent
+// without listing each (owner 2026-11-18): a new herdr-*-target, tagged or
+// with only cargo's layout (cargo writes no tag into a pre-created
+// CARGO_TARGET_DIR), is trimmed; one a live process builds into is skipped;
+// a matching directory that is not a cargo target is left alone.
+func TestCargoTargetGlobTrimsDiscoveredTargets(t *testing.T) {
+	x := newTrimFixture(t)
+	cache := filepath.Join(x.home, "cache")
+	makeTarget := func(name string, tagged bool) string {
+		target := filepath.Join(cache, name)
+		if tagged {
+			writeFile(t, filepath.Join(target, "CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n")
+		}
+		writeFile(t, filepath.Join(target, "release", ".cargo-lock"), "")
+		writeFile(t, filepath.Join(target, "release", "deps", "libbig.rlib"), string(make([]byte, 1<<20)))
+		return target
+	}
+	tagged := makeTarget("herdr-new-target", true)
+	untagged := makeTarget("herdr-untagged-target", false)
+	busy := makeTarget("herdr-busy-target", true)
+	notes := filepath.Join(cache, "notes-target")
+	writeFile(t, filepath.Join(notes, "keep.bin"), string(make([]byte, 1<<20)))
+	backdate(t, cache, 2*time.Hour)
+	x.processEnv(t, "100", []string{"HOME=" + x.home, "CARGO_TARGET_DIR=" + busy}, "/bin/bash")
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n    - kind: cargo-target\n      path_glob: %s\n      max_bytes: 65536\n",
+		x.root, x.proc, filepath.Join(cache, "*-target")))
+	out, stderr, code := x.run(t, "cycle")
+	var report struct {
+		CacheTrims []struct {
+			kindResult
+			Path string `json:"path"`
+		} `json:"cache_trims"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil || code != ExitOK {
+		t.Fatalf("cycle: exit %d %s %s", code, out, stderr)
+	}
+	status := map[string]string{}
+	for _, trim := range report.CacheTrims {
+		status[trim.Path] = trim.Status
+	}
+	want := map[string]string{tagged: "trimmed", untagged: "trimmed", busy: "skipped_in_use", notes: "not_cargo_target"}
+	if len(status) != len(want) {
+		t.Fatalf("glob trims = %v, want %v", status, want)
+	}
+	for path, wantStatus := range want {
+		if status[path] != wantStatus {
+			t.Errorf("%s: status %q, want %q", path, status[path], wantStatus)
+		}
+	}
+	for _, trimmed := range []string{tagged, untagged} {
+		if exists(t, filepath.Join(trimmed, "release", "deps")) || !exists(t, filepath.Join(trimmed, "release", ".cargo-lock")) {
+			t.Errorf("%s not trimmed as cargo clean would", trimmed)
+		}
+	}
+	if !exists(t, filepath.Join(busy, "release", "deps", "libbig.rlib")) || !exists(t, filepath.Join(notes, "keep.bin")) {
+		t.Fatal("a target in use or a non-cargo directory lost content")
 	}
 }
 

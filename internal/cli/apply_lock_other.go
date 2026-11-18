@@ -24,4 +24,6 @@ func lockRestore(string) (func(), error) { return func() {}, nil }
 // Watching is Linux-only; elsewhere there is no concurrent scanner to wait for.
 func lockScan(context.Context, string) (func(), error) { return func() {}, nil }
 
+func tryLockScan(string) (func(), bool, error) { return func() {}, true, nil }
+
 func tryLockTrim(string) (func(), bool, error) { return func() {}, true, nil }

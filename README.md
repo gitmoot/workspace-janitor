@@ -428,6 +428,11 @@ is not permission. All confirmed apply and restore operations share one
 cross-process lock on Linux; a second process fails closed instead of racing.
 On other platforms confirmed apply remains unsupported, while confirmed
 restore retains its prior behavior without this Linux-only lock.
+An item a safety guard refuses (new protected references, a changed
+identity, a refusing verdict) stays where it is, is listed in the cycle
+report's `refusals`, and does not fail the cycle; a real failure (an I/O,
+store or verification error, a failed trim command) still exits `1`. An
+interactive `janitor apply` still exits `1` on a refusal.
 
 Expiry checks references at or under the original path, not its siblings: a
 home directory's parent always has live processes. A directory recreated at

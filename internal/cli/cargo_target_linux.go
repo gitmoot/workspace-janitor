@@ -34,7 +34,8 @@ var cargoLockFiles = []string{".cargo-lock", ".cargo-build-lock", ".cargo-artifa
 // profile directory (a top-level directory holding .cargo-lock) and of tmp,
 // and .rustc_info.json. It keeps the directory itself, its CACHEDIR.TAG and
 // cargo's lock files. It runs no command (cargo clean needs the source
-// tree). A target directory without cargo's CACHEDIR.TAG is refused. The
+// tree). A directory that is not a cargo target (identify) is refused; one
+// a path_glob matched is reported as not_cargo_target instead. The
 // trim is skipped as in use while anything in the top two levels changed
 // within min_idle, while a process may use the directory (cargoTargetUser),
 // or while any cargo lock is held; it holds every lock while removing.
@@ -42,7 +43,7 @@ var cargoLockFiles = []string{".cargo-lock", ".cargo-build-lock", ".cargo-artifa
 // The target and its profile directories are opened once, when validated;
 // locking and removal go through those descriptors only. Under the locks,
 // before removing anything, the path must still name the validated target
-// and profiles and the tag must still be cargo's, else the trim fails and
+// and profiles and still be a cargo target, else the trim fails and
 // removes nothing. Removal never follows a symlink and never crosses into
 // another filesystem.
 func trimCargoTarget(ctx context.Context, procRoot string, trim config.CacheTrim, report cacheTrimReport) cacheTrimReport {
@@ -53,6 +54,10 @@ func trimCargoTarget(ctx context.Context, procRoot string, trim config.CacheTrim
 	target, err := openCargoTarget(trim.Path)
 	if errors.Is(err, unix.ENOENT) {
 		report.Status = cacheTrimNotFound
+		return report
+	}
+	if errors.Is(err, errNotCargoTarget) && trim.PathGlob != "" {
+		report.Status, report.Error = cacheTrimNotCargo, err.Error()
 		return report
 	}
 	if err != nil {
@@ -122,7 +127,7 @@ type cargoProfile struct {
 }
 
 // openCargoTarget opens path, refusing a symlink in any component, and
-// checks it holds cargo's CACHEDIR.TAG.
+// checks it is a cargo target directory (identify).
 func openCargoTarget(path string) (*cargoTarget, error) {
 	fd, err := action.OpenDirNoSymlinks(path)
 	if err != nil {
@@ -135,7 +140,7 @@ func openCargoTarget(path string) (*cargoTarget, error) {
 		return nil, err
 	}
 	target.id = id
-	if err := target.tagged(); err != nil {
+	if err := target.identify(); err != nil {
 		target.close()
 		return nil, err
 	}
@@ -149,13 +154,34 @@ func (t *cargoTarget) close() {
 	unix.Close(t.fd)
 }
 
-// tagged checks that the target holds the CACHEDIR.TAG cargo writes, a
-// regular file starting with the cache directory tag signature.
-func (t *cargoTarget) tagged() error {
-	refuse := fmt.Errorf("%s has no cargo CACHEDIR.TAG; not a cargo target directory, refused", t.path)
+// errNotCargoTarget marks a directory that is neither tagged nor laid out
+// as a cargo target directory.
+var errNotCargoTarget = errors.New("not a cargo target directory")
+
+// cargoProfileProof names the profile directories whose .cargo-lock proves
+// an untagged directory is a cargo target.
+var cargoProfileProof = []string{"debug", "release"}
+
+// identify checks that the target is a cargo target directory: it holds
+// the CACHEDIR.TAG cargo writes (a regular file starting with cargo's
+// cache directory tag signature), or it holds no CACHEDIR.TAG at all and a
+// real debug or release directory in it holds a regular .cargo-lock, the
+// layout cargo builds into (cargo writes the tag only into a target
+// directory it creates, so a pre-created CARGO_TARGET_DIR has none). Any
+// other CACHEDIR.TAG belongs to another tool and is refused.
+func (t *cargoTarget) identify() error {
+	refuse := func(why string) error {
+		return fmt.Errorf("%s %s; %w, refused", t.path, why, errNotCargoTarget)
+	}
 	fd, err := unix.Openat(t.fd, "CACHEDIR.TAG", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ELOOP) {
-		return refuse
+	if errors.Is(err, unix.ENOENT) {
+		if t.cargoLayout() {
+			return nil
+		}
+		return refuse("has neither cargo's CACHEDIR.TAG nor a debug or release directory holding .cargo-lock")
+	}
+	if errors.Is(err, unix.ELOOP) {
+		return refuse("has a CACHEDIR.TAG symlink, not cargo's CACHEDIR.TAG")
 	}
 	if err != nil {
 		return err
@@ -163,13 +189,31 @@ func (t *cargoTarget) tagged() error {
 	file := os.NewFile(uintptr(fd), "CACHEDIR.TAG")
 	defer file.Close()
 	if info, err := file.Stat(); err != nil || !info.Mode().IsRegular() {
-		return refuse
+		return refuse("has a CACHEDIR.TAG that is not a regular file, not cargo's CACHEDIR.TAG")
 	}
 	head := make([]byte, len(cargoTagSignature))
 	if _, err := io.ReadFull(file, head); err != nil || !bytes.Equal(head, []byte(cargoTagSignature)) {
-		return refuse
+		return refuse("has a CACHEDIR.TAG without cargo's signature, not cargo's CACHEDIR.TAG")
 	}
 	return nil
+}
+
+// cargoLayout reports whether a real debug or release directory of the
+// target holds a regular .cargo-lock.
+func (t *cargoTarget) cargoLayout() bool {
+	for _, name := range cargoProfileProof {
+		fd, err := unix.Openat(t.fd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			continue
+		}
+		var lock unix.Stat_t
+		err = unix.Fstatat(fd, ".cargo-lock", &lock, unix.AT_SYMLINK_NOFOLLOW)
+		unix.Close(fd)
+		if err == nil && lock.Mode&unix.S_IFMT == unix.S_IFREG {
+			return true
+		}
+	}
+	return false
 }
 
 // findProfiles opens the profile directories: top-level real directories
@@ -293,7 +337,7 @@ func (t *cargoTarget) lock() (release func(), held []string) {
 
 // verify checks, just before removal, that the path still names the
 // validated target, each profile name still the validated profile, and that
-// the target still holds cargo's tag.
+// the target is still a cargo target directory.
 func (t *cargoTarget) verify() error {
 	changed := fmt.Errorf("%s changed since it was validated; nothing removed", t.path)
 	fd, err := action.OpenDirNoSymlinks(t.path)
@@ -311,7 +355,7 @@ func (t *cargoTarget) verify() error {
 			return changed
 		}
 	}
-	if err := t.tagged(); err != nil {
+	if err := t.identify(); err != nil {
 		return fmt.Errorf("%w: %v", changed, err)
 	}
 	return nil

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,6 +30,9 @@ type planOptions struct {
 	// approveQuarantine approves every quarantine action that overlaps no
 	// other quarantine action; the scheduled cycle uses it.
 	approveQuarantine bool
+	// quarantineRules, when set, limits approveQuarantine to the actions
+	// one of these rules decided (the low-disk trigger's cache rules).
+	quarantineRules []string
 	approver          string
 	note              string
 	noPersist         bool
@@ -331,7 +335,7 @@ func applyApprovals(ctx context.Context, db *store.Store, built core.Plan, opts 
 // approving a "keep" would mean nothing.
 func selectedActions(built core.Plan, opts planOptions) ([]core.Action, error) {
 	if opts.approveQuarantine {
-		return quarantineActions(built), nil
+		return quarantineActions(built, opts.quarantineRules), nil
 	}
 	if !opts.approveAll && strings.TrimSpace(opts.approve) == "" {
 		return nil, nil
@@ -380,7 +384,8 @@ func selectedActions(built core.Plan, opts planOptions) ([]core.Action, error) {
 // quarantineActions selects the plan's quarantine actions, leaving out any
 // that overlaps another: apply refuses an overlapping batch as a whole, and
 // which of two nested paths should move is not a decision to make silently.
-func quarantineActions(built core.Plan) []core.Action {
+// With rules set, it keeps only the actions one of those rules decided.
+func quarantineActions(built core.Plan, rules []string) []core.Action {
 	var candidates []core.Action
 	for _, action := range built.Actions {
 		if action.Kind == core.ActionQuarantine {
@@ -396,9 +401,10 @@ func quarantineActions(built core.Plan) []core.Action {
 				break
 			}
 		}
-		if !overlaps {
-			out = append(out, a)
+		if overlaps || (rules != nil && !slices.ContainsFunc(rules, func(rule string) bool { return slices.Contains(a.Rules, rule) })) {
+			continue
 		}
+		out = append(out, a)
 	}
 	return out
 }

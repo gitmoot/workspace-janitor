@@ -94,12 +94,12 @@ func TestScheduledExpiryRechecksOriginalReferences(t *testing.T) {
 	if err := os.WriteFile(unit, []byte("[Service]\nWorkingDirectory="+cache+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	refusedOut, _, code := f.run(t, "cycle")
-	if code == ExitOK {
-		t.Fatal("scheduled expiry bypassed a newly protected original path")
+	refusedOut, stderr, code := f.run(t, "cycle")
+	if code != ExitOK {
+		t.Fatalf("a refused expiry alone failed the cycle: %s", stderr)
 	}
-	// A refused expiry still fails the cycle, but must not discard the rest of
-	// its report (live 2026-11-04: a nightly refusal hid every cache trim).
+	// The refusal is reported with the rest of the cycle report (live
+	// 2026-11-04: a nightly refusal hid every cache trim).
 	var refused cycleReport
 	if err := json.Unmarshal([]byte(refusedOut), &refused); err != nil || refused.Expiry != "checked" || refused.ScanID == "" || !strings.Contains(refused.ExpiryReport, "refused") {
 		t.Fatalf("refused cycle lost its report: %+v %v %q", refused, err, refusedOut)
@@ -120,6 +120,64 @@ func TestScheduledExpiryRechecksOriginalReferences(t *testing.T) {
 	}
 	if _, err := os.Lstat(receipt.Destination); !os.IsNotExist(err) {
 		t.Fatalf("expired receipt remains: %v", err)
+	}
+}
+
+// A refused item is not a failure (live 2026-11-18: /root/efm-text-cache,
+// now used by a stagehand pipeline, failed every nightly cycle): a cycle
+// whose only problem is a refusal reports it and exits 0, while a real
+// failure in a cycle with the same refusal still exits non-zero.
+func TestCycleRefusalAloneSucceedsButFailureStillFails(t *testing.T) {
+	f := newFixture(t)
+	cache, units, receipt := quarantinedCache(t, f)
+	if err := os.WriteFile(filepath.Join(units, "active.service"), []byte("[Service]\nWorkingDirectory="+cache+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	decode := func(out string) []string {
+		t.Helper()
+		var report struct {
+			Refusals []string `json:"refusals"`
+		}
+		if err := json.Unmarshal([]byte(out), &report); err != nil {
+			t.Fatalf("cycle report: %v %q", err, out)
+		}
+		return report.Refusals
+	}
+	out, stderr, code := f.run(t, "cycle")
+	if code != ExitOK {
+		t.Fatalf("refusal-only cycle exited %d: %s", code, stderr)
+	}
+	if refusals := decode(out); len(refusals) != 1 || !strings.Contains(refusals[0], "new protected references") {
+		t.Fatalf("refusal not reported: %q", refusals)
+	}
+	if _, err := os.Stat(receipt.Destination); err != nil {
+		t.Fatalf("refused receipt was deleted: %v", err)
+	}
+
+	// The same refusal next to a failed trim command: the failure counts.
+	policy := filepath.Join(f.home, ".config", config.AppName, "policy.yaml")
+	document, err := os.ReadFile(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goCache := filepath.Join(f.home, "go-build")
+	failing := filepath.Join(f.home, "go")
+	if err := os.WriteFile(filepath.Join(f.home, "go"), []byte("#!/bin/sh\nexit 3\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(goCache, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(goCache, "obj"), make([]byte, 1<<20), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.writePolicy(t, string(document)+"  cache_trims:\n    - kind: go-build\n      path: "+goCache+"\n      binary: "+failing+"\n      max_bytes: 65536\n")
+	out, _, code = f.run(t, "cycle")
+	if code == ExitOK {
+		t.Fatalf("a failed trim command no longer fails the cycle: %s", out)
+	}
+	if refusals := decode(out); len(refusals) != 1 {
+		t.Fatalf("refusal not reported next to the failure: %q", refusals)
 	}
 }
 

@@ -44,7 +44,11 @@ type cleanupReport struct {
 	Official      []officialCommandHint   `json:"official_commands,omitempty"`
 	Estimate      *action.ReclaimEstimate `json:"expected_reclaim,omitempty"`
 	EstimateError string                  `json:"estimate_unavailable,omitempty"`
-	Errors        []string                `json:"errors"`
+	// Errors lists items that failed: an I/O, store or verification error.
+	Errors []string `json:"errors"`
+	// Refused lists items a safety guard declined (action.Refusal). They
+	// stay where they were, or are recorded for investigation.
+	Refused []string `json:"refused,omitempty"`
 	// Deferred lists items whose archive verification ran out of
 	// limits.archive_verify_timeout. They are left as they were, still
 	// protected, and retried by a later run; they are not refusals.
@@ -56,14 +60,63 @@ type cleanupReport struct {
 	ArchivedDue []archivedRetentionDue `json:"archived_retention_due,omitempty"`
 }
 
-// refuse records err for the item at path: a deferred archive verification
-// under Deferred, anything else under Errors.
-func (r *cleanupReport) refuse(path string, err error) {
-	if errors.Is(err, collect.ErrArchiveVerifyDeferred) {
-		r.Deferred = append(r.Deferred, fmt.Sprintf("%s: %v", path, err))
-		return
+// record files err for the item at path: a deferred archive verification
+// under Deferred, a safety refusal under Refused, anything else under Errors.
+func (r *cleanupReport) record(path string, err error) {
+	line := fmt.Sprintf("%s: %v", path, err)
+	switch {
+	case errors.Is(err, collect.ErrArchiveVerifyDeferred):
+		r.Deferred = append(r.Deferred, line)
+	case action.IsRefusal(err):
+		r.Refused = append(r.Refused, line)
+	default:
+		r.Errors = append(r.Errors, line)
 	}
-	r.Errors = append(r.Errors, fmt.Sprintf("%s: %v", path, err))
+}
+
+// outcome is the error an apply or expiry returns for its items: any
+// failure first; otherwise, when a guard refused an item, refusedItems.
+// failed names the failure for the mode.
+func (r *cleanupReport) outcome(failed string) error {
+	if len(r.Errors) != 0 {
+		return fmt.Errorf("%d %s", len(r.Errors), failed)
+	}
+	if len(r.Refused) != 0 {
+		return &refusedItems{Items: r.Refused}
+	}
+	return nil
+}
+
+// operationError summarizes the problems of a confirmed run for its
+// capacity activity record, or nil.
+func (r *cleanupReport) operationError(noun string) error {
+	problems := append(append([]string(nil), r.Errors...), r.Refused...)
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%d %s; first: %s", len(problems), noun, problems[0])
+}
+
+// refusedItems is an apply or expiry whose only problems were safety
+// refusals: nothing failed, and each refused item stayed where it was or was
+// recorded for investigation. An interactive apply still exits non-zero on
+// it; the scheduled cycle reports the items and succeeds.
+type refusedItems struct {
+	Items []string
+}
+
+func (r *refusedItems) Error() string {
+	return fmt.Sprintf("%d item(s) refused by a safety guard; first: %s", len(r.Items), r.Items[0])
+}
+
+// onlyRefusals returns the refused items when err is a refusedItems, the
+// outcome of a run in which nothing failed.
+func onlyRefusals(err error) ([]string, bool) {
+	var refused *refusedItems
+	if errors.As(err, &refused) {
+		return refused.Items, true
+	}
+	return nil, false
 }
 
 // archivedRetentionDue is one receipt that retention.archived made due.
@@ -301,7 +354,7 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 		if !exists {
 			item, err = engine.Prepare(ctx, item)
 			if err != nil {
-				report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", a.Path, err))
+				report.record(a.Path, err)
 				continue
 			}
 		}
@@ -315,7 +368,7 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 			monitor.activity.Replayed++
 		}
 		if errors.Is(err, collect.ErrArchiveVerifyDeferred) {
-			report.refuse(a.Path, err)
+			report.record(a.Path, err)
 			report.Items = append(report.Items, item)
 			continue
 		}
@@ -323,7 +376,7 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 			err = fmt.Errorf("cleanup remains %s; inspect receipt %s before retrying", item.State, item.CleanupID)
 		}
 		if err != nil {
-			report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", a.Path, err))
+			report.record(a.Path, err)
 		}
 		report.Items = append(report.Items, item)
 	}
@@ -338,11 +391,7 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	}
 	var activityErr error
 	if monitor != nil {
-		var operationErr error
-		if len(report.Errors) > 0 {
-			operationErr = fmt.Errorf("%d cleanup refusals; first: %s", len(report.Errors), report.Errors[0])
-		}
-		activityErr = monitor.finish(ctx, operationErr)
+		activityErr = monitor.record(ctx, report.operationError("cleanup refusals"))
 	}
 	if err := writeCleanup(e.stdout, format, report); err != nil {
 		return err
@@ -350,10 +399,7 @@ func runApply(ctx context.Context, e *env, args []string, opts applyOptions) err
 	if activityErr != nil {
 		return activityErr
 	}
-	if len(report.Errors) != 0 {
-		return fmt.Errorf("%d cleanup action(s) need investigation", len(report.Errors))
-	}
-	return nil
+	return report.outcome("cleanup action(s) need investigation")
 }
 
 func runRestore(ctx context.Context, e *env, args []string, confirm bool) error {
@@ -466,14 +512,14 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 				// Mirror the confirmed path: Reconcile's guard, then retention.
 				err = engine.RetryPreview(ctx, item)
 				if err != nil {
-					report.refuse(item.Source, err)
+					report.record(item.Source, err)
 				}
 				report.Items = append(report.Items, item)
 				continue
 			}
 			item, err = engine.Reconcile(ctx, item)
 			if err != nil {
-				report.refuse(item.Source, err)
+				report.record(item.Source, err)
 				report.Items = append(report.Items, item)
 				continue
 			}
@@ -501,7 +547,7 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 			}
 		}
 		if err != nil {
-			report.refuse(item.Source, err)
+			report.record(item.Source, err)
 		}
 		if opts.dryRun && err == nil {
 			entry := item.Entry
@@ -515,11 +561,7 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 	}
 	var activityErr error
 	if monitor != nil {
-		var operationErr error
-		if len(report.Errors) > 0 {
-			operationErr = fmt.Errorf("%d expiry refusals; first: %s", len(report.Errors), report.Errors[0])
-		}
-		activityErr = monitor.finish(ctx, operationErr)
+		activityErr = monitor.record(ctx, report.operationError("expiry refusals"))
 	}
 	if err := writeCleanup(out, format, report); err != nil {
 		return err
@@ -527,10 +569,7 @@ func runExpiry(ctx context.Context, out io.Writer, format output.Format, engine 
 	if activityErr != nil {
 		return activityErr
 	}
-	if len(report.Errors) != 0 {
-		return fmt.Errorf("%d expired item(s) refused revalidation", len(report.Errors))
-	}
-	return nil
+	return report.outcome("expired item(s) failed")
 }
 
 func pathContains(parent, child string) bool {
@@ -580,8 +619,13 @@ func writeCleanup(out io.Writer, format output.Format, report cleanupReport) err
 			return err
 		}
 	}
-	for _, reason := range report.Errors {
+	for _, reason := range report.Refused {
 		if _, err := fmt.Fprintf(out, "  refused: %s\n", reason); err != nil {
+			return err
+		}
+	}
+	for _, reason := range report.Errors {
+		if _, err := fmt.Fprintf(out, "  failed: %s\n", reason); err != nil {
 			return err
 		}
 	}

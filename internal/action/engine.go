@@ -132,7 +132,7 @@ func (e *Engine) preflightEntry(ctx context.Context, entry core.Entry, action co
 		},
 	})
 	if !verdict.Allows(action.Kind) {
-		return fmt.Errorf("%s refused %s: %s", label, entry.Path, verdict.Detail())
+		return refused("%s refused %s: %s", label, entry.Path, verdict.Detail())
 	}
 	return nil
 }
@@ -158,7 +158,7 @@ func (e *Engine) Quarantine(ctx context.Context, item core.CleanupItem) (core.Cl
 		return e.deferPrepared(ctx, item, deferred)
 	}
 	if !verdict.Allows(item.Action.Kind) {
-		return item, fmt.Errorf("revalidation refused %s: %s", item.Source, verdict.Detail())
+		return item, refused("revalidation refused %s: %s", item.Source, verdict.Detail())
 	}
 	if err := e.moveUnit(ctx, item, handle.Identity()); err != nil {
 		return item, err
@@ -290,12 +290,12 @@ func (e *Engine) revalidateCompanion(ctx context.Context, item core.CleanupItem,
 		return fmt.Errorf("companion revalidation refused %s: %w", path, err)
 	}
 	if fresh.Kind != core.EntryKindFile || fresh.FilesystemID != id {
-		return fmt.Errorf("companion revalidation refused %s: it is no longer the bound regular file", path)
+		return refused("companion revalidation refused %s: it is no longer the bound regular file", path)
 	}
 	target := safety.ResolveTarget(filepath.Dir(item.Destination))
 	verdict := safety.Evaluate(safety.Input{Entry: unitCompanion(fresh, item.Source), Policy: e.Policy, Target: &target, Now: e.now()})
 	if !verdict.Allows(item.Action.Kind) {
-		return fmt.Errorf("companion revalidation refused %s: %s", path, verdict.Detail())
+		return refused("companion revalidation refused %s: %s", path, verdict.Detail())
 	}
 	return nil
 }
@@ -431,12 +431,18 @@ func (e *Engine) Reconcile(ctx context.Context, item core.CleanupItem) (core.Cle
 }
 
 func (e *Engine) investigate(ctx context.Context, item core.CleanupItem, reason string) (core.CleanupItem, error) {
+	return e.investigateCause(ctx, item, errors.New(reason))
+}
+
+// investigateCause records item for investigation with cause as its reason.
+// The returned error wraps cause, so a Refusal stays one.
+func (e *Engine) investigateCause(ctx context.Context, item core.CleanupItem, cause error) (core.CleanupItem, error) {
 	before := item.State
-	item.State, item.UpdatedAt, item.Reason = core.CleanupInvestigate, e.now(), reason
+	item.State, item.UpdatedAt, item.Reason = core.CleanupInvestigate, e.now(), cause.Error()
 	if err := e.update(ctx, item, before); err != nil {
 		return item, err
 	}
-	return item, fmt.Errorf("%s: %s", item.ActionID, reason)
+	return item, fmt.Errorf("%s: %w", item.ActionID, cause)
 }
 
 // Restore never overwrites an occupied original path, including a symlink.
