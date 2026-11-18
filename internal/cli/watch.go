@@ -424,10 +424,20 @@ func sampleCapacityLoop(ctx context.Context, e *env, paths config.Paths, policy 
 		capacity *core.CapacitySnapshot
 		err      error
 	}
+	// The notifier runs beside the sampler: publication never waits on it.
+	publish := func(*core.CapacitySnapshot, time.Time) {}
+	var notifyFailed <-chan error
+	if len(policy.Prevention.NotifyCommand) != 0 {
+		var stopNotify func()
+		publish, notifyFailed, stopNotify = startCapacityNotifier(ctx, e, paths, policy)
+		defer stopNotify()
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case err := <-notifyFailed:
+			return err
 		case <-timer.C:
 		}
 		now := time.Now().UTC()
@@ -455,21 +465,14 @@ func sampleCapacityLoop(ctx context.Context, e *env, paths config.Paths, policy 
 				return err
 			}
 			if result.capacity != nil {
-				validUntil = result.capacity.ValidUntil
-			}
-			if len(policy.Prevention.NotifyCommand) != 0 && result.capacity != nil {
-				// Validation bounds notify_timeout by capacity_interval, so
-				// a slow command cannot let the sample go stale.
-				notify, err := notifyCapacityWarning(ctx, paths, policy, result.capacity, now)
-				if notify != nil || err != nil {
-					report := watchReport{Reason: "capacity_notify", Notify: notify}
-					if err != nil {
-						report.Error = err.Error()
-					}
-					if err := writeWatchReport(e, report); err != nil {
-						return err
-					}
+				// An unknown sample (this attempt's time preceded a sample
+				// another writer, such as the startup scan, stored first)
+				// has no validity window; keep the current one rather than
+				// declaring the published sample stale at once.
+				if result.capacity.ValidUntil.After(validUntil) {
+					validUntil = result.capacity.ValidUntil
 				}
+				publish(result.capacity, now)
 			}
 		} else if !time.Now().Before(validUntil) {
 			staleErr := fmt.Errorf("capacity sample stale since %s: %w", validUntil.UTC().Format(time.RFC3339), result.err)

@@ -229,12 +229,10 @@ func (e *Engine) eligible(ctx context.Context, item core.CleanupItem, original b
 		observer = e.withoutArchiveRulesAt(item.Source)
 	}
 	var observed core.Entry
-	var deferred error
+	var observeErr error
 	probe := func(ctx context.Context, path string) (core.Entry, error) {
 		fresh, err := observer.recollectReceipt(ctx, path, item.Source)
-		if errors.Is(err, collect.ErrArchiveVerifyDeferred) {
-			deferred = err
-		}
+		observeErr = err
 		fresh.Root = item.Entry.Root
 		if !original {
 			fresh.WorkspaceArchive = nil
@@ -247,11 +245,11 @@ func (e *Engine) eligible(ctx context.Context, item core.CleanupItem, original b
 	verdict := safety.Revalidate(ctx, safety.RevalidateInput{
 		Planned: planned, Action: action, Policy: policy, Now: e.now(), Handle: handle, Recollect: probe,
 	})
-	if deferred != nil {
-		return deferred
+	if errors.Is(observeErr, collect.ErrArchiveVerifyDeferred) {
+		return observeErr
 	}
 	if !verdict.Allows(core.ActionDeleteCandidate) {
-		return refused("deletion safety refused: %s", verdict.Detail())
+		return verdictError(observeErr, "deletion safety refused: %s", verdict.Detail())
 	}
 	// Re-evaluate the *original* pathname as well. Names and protected-path
 	// rules can change after quarantine; evaluating only the receipt's generic

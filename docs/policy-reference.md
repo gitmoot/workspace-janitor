@@ -230,16 +230,22 @@ At most one trim per kind and path (or path_glob) is accepted.
   (`doc`, per-target-triple directories) are not touched. The directory
   must be a cargo target directory: it holds cargo's `CACHEDIR.TAG` (a
   regular file starting `Signature: 8a477f597d28d172789f06886806bc55`),
-  or, with no `CACHEDIR.TAG` at all, a real `debug` or `release` directory
-  holding a regular `.cargo-lock`. Cargo writes the tag only into a target
+  or, with no `CACHEDIR.TAG` at all, at least one profile directory (any
+  real top-level directory holding a regular `.cargo-lock`, so custom
+  profiles count as well as `debug` and `release`). Cargo writes the tag only into a target
   directory it creates itself, so a `CARGO_TARGET_DIR` that existed before
   the first build has none; the profile lock is the layout cargo always
   builds. A `CACHEDIR.TAG` of another tool, or a directory with neither, is
   refused and reported as `failed`.
 
-  With `path_glob`, each directory directly in the glob's parent whose name
-  matches (symlinks are not followed) is checked when its trim opens it:
-  one that is not a cargo target is left alone and reported as
+  With `path_glob`, the glob's parent directory is opened once (only its
+  own configured path is resolved) and each real directory directly in it
+  whose name matches is opened through that descriptor without following
+  symlinks and its identity recorded. Its trim opens the path again without
+  following symlinks and refuses it (`failed`) when it is no longer that
+  directory: a match replaced by a symlink or by another directory is never
+  followed or trimmed. Whether a match is a cargo target is checked when its
+  trim opens it: one that is not is left alone and reported as
   `not_cargo_target`, not as a failure; every other one is trimmed with
   every guard below, and reported under its own `path` with the
   `path_glob` that found it. A directory a `cargo-target` trim names by
@@ -396,9 +402,12 @@ It is edge-triggered: one run per transition below the threshold, not one
 per sample. `notify_cooldown` (default `6h`, accepted `1m` through `168h`)
 is the least time between two runs, so free space hovering at the
 threshold does not repeat the warning; a failed run is retried, while space
-stays below, once the cooldown has passed. `notify_timeout` (default `30s`)
-bounds a run and may not exceed `capacity_interval`, since the sampler runs
-it between samples. The command's first element must be an absolute path;
+stays below, once the cooldown has passed. The notifier runs beside the
+capacity sampler and never delays publication. `notify_timeout` (default
+`30s`, accepted `1s` through `5m`) bounds a run: the command runs in its own
+process group, which is killed at the timeout and again once the command
+exits, and its output is drained for at most 2 seconds after that, so a
+child that keeps the output open cannot hold the notifier. The command's first element must be an absolute path;
 it runs with the watcher's environment in `/`. It requires
 `prevention.targets`, whose capacity sample it reads. Its state is kept in
 `capacity-notify.json` in the state directory, so a restarted watcher does

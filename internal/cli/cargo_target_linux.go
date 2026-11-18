@@ -46,12 +46,16 @@ var cargoLockFiles = []string{".cargo-lock", ".cargo-build-lock", ".cargo-artifa
 // and profiles and still be a cargo target, else the trim fails and
 // removes nothing. Removal never follows a symlink and never crosses into
 // another filesystem.
-func trimCargoTarget(ctx context.Context, procRoot string, trim config.CacheTrim, report cacheTrimReport) cacheTrimReport {
+//
+// A target a path_glob discovered is passed with bound, the identity it had
+// when discovered (discoverCargoTargets); one that is no longer that
+// directory is refused before anything else is read from it.
+func trimCargoTarget(ctx context.Context, procRoot string, trim config.CacheTrim, bound core.FilesystemID, report cacheTrimReport) cacheTrimReport {
 	fail := func(err error) cacheTrimReport {
 		report.Status, report.Error = cacheTrimFailed, err.Error()
 		return report
 	}
-	target, err := openCargoTarget(trim.Path)
+	target, err := openCargoTarget(trim.Path, bound)
 	if errors.Is(err, unix.ENOENT) {
 		report.Status = cacheTrimNotFound
 		return report
@@ -118,6 +122,8 @@ type cargoTarget struct {
 	fd       int
 	id       core.FilesystemID
 	profiles []cargoProfile
+	// profilesFound records that findProfiles has run.
+	profilesFound bool
 }
 
 type cargoProfile struct {
@@ -126,9 +132,10 @@ type cargoProfile struct {
 	id   core.FilesystemID
 }
 
-// openCargoTarget opens path, refusing a symlink in any component, and
-// checks it is a cargo target directory (identify).
-func openCargoTarget(path string) (*cargoTarget, error) {
+// openCargoTarget opens path, refusing a symlink in any component, checks
+// that it is still bound (when set) and that it is a cargo target directory
+// (identify).
+func openCargoTarget(path string, bound core.FilesystemID) (*cargoTarget, error) {
 	fd, err := action.OpenDirNoSymlinks(path)
 	if err != nil {
 		return nil, err
@@ -140,6 +147,10 @@ func openCargoTarget(path string) (*cargoTarget, error) {
 		return nil, err
 	}
 	target.id = id
+	if !bound.Zero() && id != bound {
+		target.close()
+		return nil, fmt.Errorf("%s is not the directory discovered there (%s, now %s); refused", path, bound, id)
+	}
 	if err := target.identify(); err != nil {
 		target.close()
 		return nil, err
@@ -158,27 +169,27 @@ func (t *cargoTarget) close() {
 // as a cargo target directory.
 var errNotCargoTarget = errors.New("not a cargo target directory")
 
-// cargoProfileProof names the profile directories whose .cargo-lock proves
-// an untagged directory is a cargo target.
-var cargoProfileProof = []string{"debug", "release"}
-
 // identify checks that the target is a cargo target directory: it holds
 // the CACHEDIR.TAG cargo writes (a regular file starting with cargo's
-// cache directory tag signature), or it holds no CACHEDIR.TAG at all and a
-// real debug or release directory in it holds a regular .cargo-lock, the
-// layout cargo builds into (cargo writes the tag only into a target
-// directory it creates, so a pre-created CARGO_TARGET_DIR has none). Any
-// other CACHEDIR.TAG belongs to another tool and is refused.
+// cache directory tag signature), or it holds no CACHEDIR.TAG at all and at
+// least one profile directory (findProfiles: a top-level real directory
+// holding a regular .cargo-lock), the layout cargo builds into (cargo
+// writes the tag only into a target directory it creates, so a pre-created
+// CARGO_TARGET_DIR has none). Any other CACHEDIR.TAG belongs to another
+// tool and is refused.
 func (t *cargoTarget) identify() error {
 	refuse := func(why string) error {
 		return fmt.Errorf("%s %s; %w, refused", t.path, why, errNotCargoTarget)
 	}
 	fd, err := unix.Openat(t.fd, "CACHEDIR.TAG", unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if errors.Is(err, unix.ENOENT) {
-		if t.cargoLayout() {
+		if err := t.findProfiles(); err != nil {
+			return err
+		}
+		if len(t.profiles) != 0 {
 			return nil
 		}
-		return refuse("has neither cargo's CACHEDIR.TAG nor a debug or release directory holding .cargo-lock")
+		return refuse("has neither cargo's CACHEDIR.TAG nor a profile directory holding .cargo-lock")
 	}
 	if errors.Is(err, unix.ELOOP) {
 		return refuse("has a CACHEDIR.TAG symlink, not cargo's CACHEDIR.TAG")
@@ -198,27 +209,14 @@ func (t *cargoTarget) identify() error {
 	return nil
 }
 
-// cargoLayout reports whether a real debug or release directory of the
-// target holds a regular .cargo-lock.
-func (t *cargoTarget) cargoLayout() bool {
-	for _, name := range cargoProfileProof {
-		fd, err := unix.Openat(t.fd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if err != nil {
-			continue
-		}
-		var lock unix.Stat_t
-		err = unix.Fstatat(fd, ".cargo-lock", &lock, unix.AT_SYMLINK_NOFOLLOW)
-		unix.Close(fd)
-		if err == nil && lock.Mode&unix.S_IFMT == unix.S_IFREG {
-			return true
-		}
-	}
-	return false
-}
-
-// findProfiles opens the profile directories: top-level real directories
-// holding a regular .cargo-lock. One on another filesystem is an error.
+// findProfiles opens, once, the profile directories: top-level real
+// directories holding a regular .cargo-lock. One on another filesystem is
+// an error.
 func (t *cargoTarget) findProfiles() error {
+	if t.profilesFound {
+		return nil
+	}
+	t.profilesFound = true
 	names, err := dirNames(t.fd)
 	if err != nil {
 		return err
@@ -418,4 +416,50 @@ func fdIdentity(fd int) (core.FilesystemID, error) {
 		return core.FilesystemID{}, err
 	}
 	return core.FilesystemID{Device: uint64(st.Dev), Inode: st.Ino}, nil
+}
+
+// cargoMatch is one directory a cargo-target path_glob matched, with the
+// identity it had when discovered.
+type cargoMatch struct {
+	path string
+	id   core.FilesystemID
+}
+
+// discoverCargoTargets opens parent without following symlinks and lists,
+// in name order, its real directories whose name matches pattern, leaving
+// out the paths in skip. Each is opened through parent's descriptor with
+// O_NOFOLLOW and its identity bound, so a match later replaced (by a
+// symlink or another directory) is refused when its trim opens it.
+func discoverCargoTargets(parent, pattern string, skip map[string]bool) ([]cargoMatch, error) {
+	dir, err := action.OpenDirNoSymlinks(parent)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(dir)
+	names, err := dirNames(dir)
+	if err != nil {
+		return nil, err
+	}
+	slices.Sort(names)
+	var matches []cargoMatch
+	for _, name := range names {
+		path := filepath.Join(parent, name)
+		if matched, _ := filepath.Match(pattern, name); !matched || skip[path] {
+			continue
+		}
+		fd, err := unix.Openat(dir, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOENT) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("open %s: %w", path, err)
+		}
+		id, err := fdIdentity(fd)
+		unix.Close(fd)
+		if err != nil {
+			return nil, err
+		}
+		matches = append(matches, cargoMatch{path: path, id: id})
+	}
+	return matches, nil
 }

@@ -993,3 +993,92 @@ func replaceDuringScan(fifo, dir, fresh string) error {
 	_, err = unix.Write(fd, []byte("/usr/bin/sleep\x0060\x00"))
 	return err
 }
+
+// A directory a cargo-target path_glob discovered, then replaced by a
+// symlink before its turn, is never followed: its trim fails, and the
+// symlink's destination (a cargo target outside the glob's directory) and
+// the moved-aside directory keep their data.
+func TestCargoTargetGlobRefusesMatchReplacedBySymlink(t *testing.T) {
+	x := newTrimFixture(t)
+	cache := filepath.Join(x.home, "cache")
+	first, second := filepath.Join(cache, "a-target"), filepath.Join(cache, "b-target")
+	outside := filepath.Join(x.home, "outside-target")
+	for _, dir := range []string{first, second, outside} {
+		writeFile(t, filepath.Join(dir, "CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n")
+		writeFile(t, filepath.Join(dir, "release", ".cargo-lock"), "")
+		writeFile(t, filepath.Join(dir, "release", "deps", "libbig.rlib"), string(make([]byte, 1<<20)))
+		backdate(t, dir, 2*time.Hour)
+	}
+	// The first target's process scan blocks reading this cmdline until the
+	// test has replaced the second, already discovered, target.
+	proc := filepath.Join(x.proc, "100")
+	writeFile(t, filepath.Join(proc, "environ"), "HOME=/nonexistent\x00")
+	if err := unix.Mkfifo(filepath.Join(proc, "cmdline"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for link, dest := range map[string]string{"cwd": "/", "exe": "/usr/bin/sleep"} {
+		if err := os.Symlink(dest, filepath.Join(proc, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- symlinkDuringScan(filepath.Join(proc, "cmdline"), second, outside) }()
+	x.writePolicy(t, fmt.Sprintf("roots:\n  - path: %s\ncollectors:\n  deep_size: false\n  git: false\n  processes: false\n  services: false\n  proc_root: %s\nprevention:\n  min_free_percent: 0\n  cache_trims:\n    - kind: cargo-target\n      path_glob: %s\n      max_bytes: 65536\n",
+		x.root, x.proc, filepath.Join(cache, "*-target")))
+	out, stderr, code := x.run(t, "cycle")
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	var report struct {
+		CacheTrims []struct {
+			kindResult
+			Path string `json:"path"`
+		} `json:"cache_trims"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("cycle report: %v %s %s", err, out, stderr)
+	}
+	status := map[string]string{}
+	for _, trim := range report.CacheTrims {
+		status[trim.Path] = trim.Status
+	}
+	if code == ExitOK || status[first] != "trimmed" || status[second] != "failed" {
+		t.Fatalf("replaced glob match not refused: exit %d %v", code, status)
+	}
+	for _, kept := range []string{filepath.Join(outside, "release", "deps", "libbig.rlib"), filepath.Join(second+".discovered", "release", "deps", "libbig.rlib")} {
+		if !exists(t, kept) {
+			t.Fatalf("%s was removed through the replaced match", kept)
+		}
+	}
+}
+
+// symlinkDuringScan waits for a process scan to read fifo, then moves dir
+// aside and puts a symlink to dest in its place, gives later scans a
+// regular cmdline, and releases the waiting scan.
+func symlinkDuringScan(fifo, dir, dest string) error {
+	deadline := time.Now().Add(time.Minute)
+	fd, err := unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	for errors.Is(err, unix.ENXIO) && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		fd, err = unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	}
+	if err != nil {
+		return fmt.Errorf("process scan never read %s: %w", fifo, err)
+	}
+	defer unix.Close(fd)
+	if err := os.Rename(dir, dir+".discovered"); err != nil {
+		return err
+	}
+	if err := os.Symlink(dest, dir); err != nil {
+		return err
+	}
+	cmdline := []byte("/usr/bin/sleep\x0060\x00")
+	if err := os.WriteFile(fifo+".next", cmdline, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(fifo+".next", fifo); err != nil {
+		return err
+	}
+	_, err = unix.Write(fd, cmdline)
+	return err
+}

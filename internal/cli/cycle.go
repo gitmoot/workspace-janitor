@@ -259,7 +259,7 @@ func writeCycleReport(out io.Writer, report cycleReport) error {
 }
 
 // autoQuarantine plans scanID from rules alone, approves its quarantine
-// actions (only those approval.quarantineRules decided, when set) under
+// actions (only those approval.quarantineCacheRules decided, when set) under
 // approval's approver and note, and moves them. Apply still revalidates
 // every target against a fresh observation before moving it, so anything
 // that became referenced, dirty, or changed since the scan stays where it

@@ -234,7 +234,7 @@ collectors:
   services: false
 prevention:
   min_free_percent: 0
-  capacity_interval: 1s
+  capacity_interval: 3s
   targets:
     - path: %[1]s
       target_free_bytes: 1
@@ -245,7 +245,7 @@ prevention:
 `, x.root, notify))
 	lines, stop := startWatch(t, x)
 	samples := 0
-	deadline := time.After(30 * time.Second)
+	deadline := time.After(45 * time.Second)
 	for samples < 4 {
 		select {
 		case line := <-lines:
@@ -326,5 +326,86 @@ func TestNotifyThresholdLeavesCapacityContractUnchanged(t *testing.T) {
 	notifyHash, notifyVolumes := sample(base + "  notify_command: [" + notify + ", jarvis]\n  notify_below_bytes: 40000000000\n  notify_cooldown: 1h\n  notify_timeout: 30s\n")
 	if hash != notifyHash || volumes != notifyVolumes {
 		t.Fatalf("notify settings changed the capacity contract:\nwithout %s %s\nwith    %s %s", hash, volumes, notifyHash, notifyVolumes)
+	}
+}
+
+// A notify command that exits while a child it forked keeps its output
+// open and sleeps holds neither the sampler nor the notifier: capacity
+// samples keep being published, the notify run ends within notify_timeout
+// plus the pipe drain bound, and the child is killed with its group.
+func TestCapacityNotifyCannotStallSampling(t *testing.T) {
+	x := newTrimFixture(t)
+	pidFile := filepath.Join(x.home, "child.pid")
+	notify := filepath.Join(x.home, "notify")
+	started := filepath.Join(x.home, "started")
+	writeFile(t, notify, "#!/bin/sh\ntouch "+started+"\nsleep 60 &\necho $! > "+pidFile+"\necho sent\n")
+	if err := os.Chmod(notify, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	x.writePolicy(t, fmt.Sprintf(`roots:
+  - path: %s
+collectors:
+  deep_size: false
+  git: false
+  processes: false
+  services: false
+prevention:
+  min_free_percent: 0
+  capacity_interval: 3s
+  targets:
+    - path: %[1]s
+      target_free_bytes: 1
+      reserve_free_bytes: 0
+  notify_command: [%s]
+  notify_below_bytes: 9000000000000000000
+  notify_timeout: 1s
+`, x.root, notify))
+	lines, stop := startWatch(t, x)
+	samples := 0
+	var notified time.Duration
+	deadline := time.After(45 * time.Second)
+	for samples < 4 || notified == 0 {
+		select {
+		case line := <-lines:
+			var report struct {
+				Reason   string          `json:"reason"`
+				Capacity json.RawMessage `json:"capacity"`
+			}
+			if err := json.Unmarshal(line, &report); err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case report.Reason == "capacity" && len(report.Capacity) != 0:
+				samples++
+			case report.Reason == "capacity_notify" && notified == 0:
+				info, err := os.Stat(started)
+				if err != nil {
+					t.Fatal(err)
+				}
+				notified = time.Since(info.ModTime())
+			}
+		case <-deadline:
+			t.Fatalf("after 45s: %d capacity samples, notify ended after %s", samples, notified)
+		}
+	}
+	stop()
+	// notify_timeout, the pipe drain bound and scheduling slack.
+	if limit := time.Second + 2*time.Second + 2*time.Second; notified > limit {
+		t.Fatalf("notify run took %s, more than %s", notified, limit)
+	}
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := filepath.Join("/proc", strings.TrimSpace(string(raw)), "stat")
+	for wait := time.Now().Add(2 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		data, err := os.ReadFile(stat)
+		// Gone, or a zombie awaiting its reaper: either way not running.
+		if err != nil || strings.Contains(string(data), ") Z ") {
+			break
+		}
+		if time.Now().After(wait) {
+			t.Fatalf("the notify command's child outlived it: %s", data)
+		}
 	}
 }

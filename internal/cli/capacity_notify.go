@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -13,6 +12,57 @@ import (
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
+
+// notifySample is one published capacity sample for the notifier.
+type notifySample struct {
+	snapshot *core.CapacitySnapshot
+	at       time.Time
+}
+
+// startCapacityNotifier runs the notifier beside the sampler, so capacity
+// publication never waits on notify_command. publish hands it the newest
+// sample, replacing one it has not yet taken. failed delivers the error
+// that ended it (a report that could not be written). stop ends it and
+// waits for it; a command in flight is killed with its process group.
+func startCapacityNotifier(ctx context.Context, e *env, paths config.Paths, policy config.Policy) (publish func(*core.CapacitySnapshot, time.Time), failed <-chan error, stop func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	samples := make(chan notifySample, 1)
+	errs := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for {
+			var sample notifySample
+			select {
+			case <-ctx.Done():
+				return
+			case sample = <-samples:
+			}
+			notify, err := notifyCapacityWarning(ctx, paths, policy, sample.snapshot, sample.at)
+			if notify == nil && err == nil {
+				continue
+			}
+			report := watchReport{Reason: "capacity_notify", Notify: notify}
+			if err != nil {
+				report.Error = err.Error()
+			}
+			if err := writeWatchReport(e, report); err != nil {
+				errs <- fmt.Errorf("capacity notify report: %w", err)
+				return
+			}
+		}
+	}()
+	publish = func(snapshot *core.CapacitySnapshot, at time.Time) {
+		// Only the sampler publishes, so after dropping a stale pending
+		// sample the buffer has room.
+		select {
+		case <-samples:
+		default:
+		}
+		samples <- notifySample{snapshot, at}
+	}
+	return publish, errs, func() { cancel(); <-finished }
+}
 
 // capacityNotifyReport is one prevention.notify_command run.
 type capacityNotifyReport struct {
@@ -87,17 +137,15 @@ func notifyCapacityWarning(ctx context.Context, paths config.Paths, policy confi
 	return report, nil
 }
 
-// runCapacityNotify runs the notify command, bounded by notify_timeout,
-// with the warning message as its last argument.
+// runCapacityNotify runs the notify command, bounded by notify_timeout and
+// killed with its whole process group (runNotifyCommand), with the warning
+// message as its last argument.
 func runCapacityNotify(ctx context.Context, policy config.Policy, volumes []core.CapacityState) *capacityNotifyReport {
 	message := capacityWarningMessage(uint64(policy.Prevention.NotifyBelowBytes), volumes)
 	command := policy.Prevention.NotifyCommand
 	report := &capacityNotifyReport{Command: command, Message: message}
-	runCtx, cancel := context.WithTimeout(ctx, policy.Prevention.NotifyTimeout.Duration())
-	defer cancel()
-	cmd := exec.CommandContext(runCtx, command[0], append(append([]string(nil), command[1:]...), message)...)
-	cmd.Dir = "/"
-	out, err := cmd.CombinedOutput()
+	argv := append(append([]string(nil), command...), message)
+	out, err := runNotifyCommand(ctx, argv, policy.Prevention.NotifyTimeout.Duration())
 	report.Output = boundedOutput(out)
 	if err != nil {
 		report.Error = err.Error()

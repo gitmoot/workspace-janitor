@@ -131,15 +131,15 @@ func lowDiskTrims(policy config.Policy) []config.CacheTrim {
 	return trims
 }
 
-// lowDiskRules are the plan rules of the size-bounded cache rules.
-func lowDiskRules(policy config.Policy) (names, rules []string) {
+// lowDiskRules names the size-bounded cache rules.
+func lowDiskRules(policy config.Policy) []string {
+	var names []string
 	for _, rule := range policy.Caches {
 		if rule.SizeBounded() {
 			names = append(names, rule.Name)
-			rules = append(rules, "policy.cache:"+rule.Name)
 		}
 	}
-	return names, rules
+	return names
 }
 
 // runLowDisk runs, unless a cycle or an apply holds its lock, the low-disk
@@ -173,8 +173,8 @@ func runLowDisk(ctx context.Context, e *env, paths config.Paths, policy config.P
 	unlockApply()
 	report.Status = lowDiskRan
 	trims, trimErr := runCacheTrims(ctx, policy, lowDiskTrims(policy), paths.StateDir)
-	names, rules := lowDiskRules(policy)
-	if len(rules) == 0 || ctx.Err() != nil {
+	names := lowDiskRules(policy)
+	if len(names) == 0 || ctx.Err() != nil {
 		return report, trims, trimErr
 	}
 	report.CacheRules = names
@@ -191,7 +191,7 @@ func runLowDisk(ctx context.Context, e *env, paths config.Paths, policy config.P
 	}
 	var planID string
 	report.Quarantine, report.QuarantineReport, planID, err = autoQuarantine(ctx, quiet, report.ScanID,
-		planOptions{approver: "janitor low-disk", note: "prevention.low_disk", quarantineRules: rules})
+		planOptions{approver: "janitor low-disk", note: "prevention.low_disk", quarantineCacheRules: names})
 	if items, ok := onlyRefusals(err); ok {
 		report.Refusals, err = append(report.Refusals, items...), nil
 	}

@@ -554,8 +554,8 @@ const MaxDockerImageKeep = 64
 // (each profile directory's contents, tmp's contents, .rustc_info.json) but
 // keeps the directory, its CACHEDIR.TAG and cargo's lock files. A directory
 // is a cargo target when it holds cargo's CACHEDIR.TAG or, without any
-// CACHEDIR.TAG, cargo's layout: a debug or release directory holding a
-// .cargo-lock. Instead of Path, a cargo-target trim may name PathGlob: every
+// CACHEDIR.TAG, cargo's layout: a profile directory (any top-level directory)
+// holding a .cargo-lock. Instead of Path, a cargo-target trim may name PathGlob: every
 // direct child of its parent directory matching its last element that is a
 // cargo target is trimmed as if listed with Path, each under MaxBytes.
 type CacheTrim struct {
@@ -1158,10 +1158,8 @@ func (p *Policy) Validate() core.FieldErrors {
 		if p.Prevention.NotifyBelowBytes <= 0 {
 			errs.Add("prevention.notify_below_bytes", "must be positive with notify_command")
 		}
-		if timeout := p.Prevention.NotifyTimeout.Duration(); timeout < time.Second || timeout > p.Prevention.CapacityInterval.Duration() {
-			// The sampler runs the command between samples; a longer run
-			// could let the published sample go stale.
-			errs.Add("prevention.notify_timeout", "must be between 1s and prevention.capacity_interval")
+		if timeout := p.Prevention.NotifyTimeout.Duration(); timeout < time.Second || timeout > 5*time.Minute {
+			errs.Add("prevention.notify_timeout", "must be between 1s and 5m")
 		}
 		if p.Prevention.NotifyCooldown.Duration() < time.Minute || p.Prevention.NotifyCooldown.Duration() > 7*24*time.Hour {
 			errs.Add("prevention.notify_cooldown", "must be between 1m and 168h")

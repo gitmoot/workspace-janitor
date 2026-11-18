@@ -102,7 +102,7 @@ prevention:
   # notify_command: [/usr/bin/env, GITMOOT_ORG_ROLE=workspace-janitor, /root/.local/bin/gitmoot, message, send, jarvis]
   # notify_below_bytes: 40000000000
   # notify_cooldown: 6h
-  # notify_timeout: 30s          # at most capacity_interval
+  # notify_timeout: 30s          # kills its process group after this
   # Below min_free_bytes on path's filesystem the watcher runs, at most once
   # per min_interval and never during a cycle or apply, the cache_trims (not
   # docker-images) and the caches rules with action quarantine, max_bytes and
@@ -160,7 +160,7 @@ prevention:
   #     max_bytes: 4294967296      # 4 GiB
   #     min_idle: 1h               # default: untouched for this long
   #   - kind: cargo-target         # every cargo target matching, each bounded
-  #     path_glob: /root/.cache/*-target  # tagged, or debug|release/.cargo-lock
+  #     path_glob: /root/.cache/*-target  # tagged, or a profile dir with .cargo-lock
   #     max_bytes: 4294967296
   # cache_trim_interval: 15m
 

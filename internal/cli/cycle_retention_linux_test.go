@@ -352,3 +352,35 @@ func TestScheduledCycleSkipsSourceWithActiveReceipt(t *testing.T) {
 		t.Fatalf("recreated source was touched: %q %v", raw, err)
 	}
 }
+
+// A revalidation whose fresh observation fails (here the process collector
+// cannot read its proc root) made no safety decision: the item stays, and
+// the cycle fails instead of reporting a refusal. A refusal by a guard
+// alone still exits 0 (TestCycleRefusalAloneSucceedsButFailureStillFails).
+func TestCycleFailsWhenRevalidationCannotObserve(t *testing.T) {
+	f := newFixture(t)
+	root := filepath.Join(f.home, "workspace")
+	cache := filepath.Join(root, "build-cache")
+	units := filepath.Join(f.home, "systemd")
+	for _, path := range []string{cache, units} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(cache, "payload"), []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// The scan does not collect processes; apply's revalidation always
+	// does, from this proc root, which does not exist.
+	missing := filepath.Join(f.home, "no-proc")
+	f.writePolicy(t, "roots:\n  - path: "+root+"\ncollectors:\n  git: false\n  processes: false\n  services: true\n  proc_root: "+missing+"\n  systemd_dirs:\n    - "+units+"\n  cron_paths: []\n  pm2_dumps: []\n"+
+		"caches:\n  - name: build\n    path: "+cache+"\n    action: quarantine\n    retention: none\n"+
+		"retention:\n  delete_enabled: true\nprevention:\n  auto_quarantine: true\n  auto_expire: true\n  min_free_percent: 0\n")
+	out, stderr, code := f.run(t, "cycle")
+	if code == ExitOK {
+		t.Fatalf("a revalidation that could not observe the item passed as a refusal: %s %s", out, stderr)
+	}
+	if raw, err := os.ReadFile(filepath.Join(cache, "payload")); err != nil || string(raw) != "fixture" {
+		t.Fatalf("unobserved item was moved: %q %v", raw, err)
+	}
+}
