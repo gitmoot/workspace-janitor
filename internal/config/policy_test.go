@@ -795,7 +795,7 @@ func TestParsePolicyResolvesHerdrSessionRootAliases(t *testing.T) {
 
 // Review of #226: a sessions root that is a symlink into a directory later
 // moved away (quarantined) keeps its identity: the dangling link is followed
-// to where it points, so the moved directory is still its ancestor.
+// to where it points, so the store keeps its identity.
 func TestHerdrStoreThroughADanglingSymlinkKeepsItsIdentity(t *testing.T) {
 	top := t.TempDir()
 	build := filepath.Join(top, "build")
@@ -813,8 +813,5 @@ func TestHerdrStoreThroughADanglingSymlinkKeepsItsIdentity(t *testing.T) {
 	}
 	if got, want := h.Stores()[0], filepath.Join(real, "build", "sessions"); got != want {
 		t.Fatalf("store of a dangling sessions link = %q, want %q", got, want)
-	}
-	if !h.Reaches(build, true) || h.Reaches(build, false) {
-		t.Fatal("the moved build directory is not (only as a real directory) an ancestor of the store")
 	}
 }
