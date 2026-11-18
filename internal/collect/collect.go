@@ -97,6 +97,11 @@ type ServiceSources struct {
 	// stagehand path is protected by its static prefix only when that
 	// prefix is neither one of them nor an ancestor of one.
 	InventoryRoots []string
+	// ObservedRoots are the other roots policy categories observe entries
+	// through (archive category and stale-report roots). A static prefix
+	// is refused when one of them, an inventory root or a scanned root
+	// related to it is spelled through a symlink.
+	ObservedRoots []string
 }
 
 // AgentRef is one directory a registered agent is using.

@@ -349,7 +349,11 @@ func TestStagehandRunPathOutsideRunsFailsClosedWithoutContainment(t *testing.T) 
 		// inventory root, and ~ for its parent (HOME).
 		cmd   string
 		roots func(root string) []string
-		limit int
+		// scanned, when set, are this run's collection roots, and
+		// observed the policy's category roots.
+		scanned  func(root string) []string
+		observed func(root string) []string
+		limit    int
 	}{
 		"prefix is a root":              {path: "d-$STAGEHAND_RUN_ID.json", dirs: []string{"results"}},
 		"prefix is an ancestor":         {path: "x/d-$STAGEHAND_RUN_ID.json", dirs: []string{"x/results"}, roots: func(root string) []string { return []string{root + "/x/results"} }},
@@ -374,6 +378,18 @@ func TestStagehandRunPathOutsideRunsFailsClosedWithoutContainment(t *testing.T) 
 			dirs: []string{"actual-parent/child", "results"}, links: map[string]string{"alias": "actual-parent/child"}},
 		"tilde, dot component":       {cmd: "cmd: /bin/cp a ~/./inventory/results/decisions-$STAGEHAND_RUN_ID.json\n", dirs: []string{"results"}},
 		"walk past the entry budget": {path: "x/results/d-$STAGEHAND_RUN_ID.json", dirs: []string{"x/results/a", "x/results/b"}, limit: 1},
+		// Post-merge review of #223: the prefix is real, but the inventory
+		// spells it through alias, so a subtree reference on real/...
+		// would not match the entries it observes as alias/....
+		"inventory root through an alias": {path: "real/inventory/results/decisions-$STAGEHAND_RUN_ID.json",
+			dirs: []string{"real/inventory/results"}, links: map[string]string{"alias": "real"},
+			roots: func(root string) []string { return []string{root + "/alias/inventory"} }},
+		"scanned root through an alias": {path: "real/inventory/results/decisions-$STAGEHAND_RUN_ID.json",
+			dirs: []string{"real/inventory/results"}, links: map[string]string{"alias": "real"},
+			scanned: func(root string) []string { return []string{root + "/alias/inventory"} }},
+		"category root through an alias": {path: "real/inventory/results/decisions-$STAGEHAND_RUN_ID.json",
+			dirs: []string{"real/inventory/results"}, links: map[string]string{"alias": "real"},
+			observed: func(root string) []string { return []string{root + "/alias/inventory"} }},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -394,6 +410,14 @@ func TestStagehandRunPathOutsideRunsFailsClosedWithoutContainment(t *testing.T) 
 			opts := writeStagehandSpec(t, spec, roots)
 			if tc.limit > 0 {
 				opts.Limits.DeepSizeMaxEntries = tc.limit
+			}
+			if tc.scanned != nil {
+				for _, path := range tc.scanned(root) {
+					opts.Roots = append(opts.Roots, RootSpec{Path: path, MaxDepth: 1})
+				}
+			}
+			if tc.observed != nil {
+				opts.ServiceSources.ObservedRoots = tc.observed(root)
 			}
 			refs, report := gatherServiceReferences(context.Background(), opts)
 			if report.Status == core.CollectorRan || report.Unknowns == 0 {
