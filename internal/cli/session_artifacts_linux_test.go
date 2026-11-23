@@ -786,25 +786,17 @@ func TestSessionArtifactsChangeDuringQuarantineStaysLocal(t *testing.T) {
 	x := newArtifactFixture(t)
 	session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"racy.log": oldArtifact, "calm.log": oldArtifact})
 	categoryItem(t, x.categories(t, false), session)
-	// The procfs pass reads this maps FIFO after every file was verified;
-	// the writer changes racy.log while the reader waits on it.
-	maps := filepath.Join(x.proc, "4242", "maps")
-	if err := syscall.Mkfifo(maps, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		w, err := os.OpenFile(maps, os.O_WRONLY, 0)
-		if err == nil {
-			f, openErr := os.OpenFile(filepath.Join(session, "racy.log"), os.O_APPEND|os.O_WRONLY, 0)
-			if err = openErr; err == nil {
-				_, err = f.WriteString("late write\n")
-				f.Close()
-			}
-			w.Close()
+	// The first procfs pass blocks after every file was verified; racy.log
+	// changes while it waits.
+	done := x.pauseScan(t, "4242", func() error {
+		f, err := os.OpenFile(filepath.Join(session, "racy.log"), os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			return err
 		}
-		done <- err
-	}()
+		defer f.Close()
+		_, err = f.WriteString("late write\n")
+		return err
+	})
 	report := x.quarantineArtifacts(t)
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -857,6 +849,8 @@ func TestSessionArtifactsNeedTheirCategory(t *testing.T) {
 
 // pauseScan makes pid's maps a FIFO, so the next procfs pass blocks on it
 // until change has run: a write that lands while a live-process scan runs.
+// The FIFO is removed before that pass resumes, so later passes (the
+// quarantine's second one after herdr) see pid without maps and never block.
 func (x *artifactFixture) pauseScan(t *testing.T, pid string, change func() error) <-chan error {
 	t.Helper()
 	maps := filepath.Join(x.proc, pid, "maps")
@@ -867,7 +861,7 @@ func (x *artifactFixture) pauseScan(t *testing.T, pid string, change func() erro
 	go func() {
 		w, err := os.OpenFile(maps, os.O_WRONLY, 0)
 		if err == nil {
-			err = change()
+			err = errors.Join(change(), os.Remove(maps))
 			w.Close()
 		}
 		done <- err

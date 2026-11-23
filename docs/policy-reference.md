@@ -1391,7 +1391,8 @@ entry must be an exact `.../.omp/agent/sessions` store. Without
 
 With `collectors.herdr`, `omp_session_artifacts` asks herdr once per archive
 run, and again for each batch at its move boundary (after the files are
-hashed and `/proc` is scanned, right before the renames). It keeps a file
+hashed and `/proc` is scanned; a second `/proc` pass follows the answer,
+right before the renames). It keeps a file
 out of the batch (or in place at quarantine, while its eligible siblings
 still move) when
 
@@ -1462,9 +1463,11 @@ tar is verified first; a batch whose archive does not verify moves nothing.
 Then each file must still be the archived file (inode, size, mtime, mode,
 ownership and contents, with no extended attributes), not covered by policy
 or by a current protected name (`protect.name_patterns` and the built-in
-screen, on every name below the session folder), unused (one `/proc`
-pass per batch), and, right after that pass, not kept by herdr
-([herdr rule for session artifacts](#herdr-rule-for-session-artifacts)).
+screen, on every name below the session folder), unused (a `/proc` pass
+per batch), then not kept by herdr
+([herdr rule for session artifacts](#herdr-rule-for-session-artifacts)),
+then still unused by a second `/proc` pass over the remaining files, since
+the herdr query can block for up to `limits.command_timeout`.
 Immediately before its rename, its full verified state
 (ctime included) is compared again, so a write after the hash keeps it. Each moved file is
 its own cleanup item and audit row under the batch's cleanup id. A file that

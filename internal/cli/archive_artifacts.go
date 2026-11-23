@@ -502,11 +502,11 @@ type artifactQuarantineReport struct {
 // batch whose local retention has elapsed into the batch's cleanup receipt,
 // one journaled cleanup item per file. Each batch archive is fully verified
 // first; then each file must still be exactly the archived file (identity,
-// size, mtime and contents), unprotected, unused (one procfs pass per
-// batch) and, by herdr asked afresh right after that pass, not kept
-// (artifactHerdr.keeps), and is re-checked immediately before its rename.
-// A file that fails
-// any of that stays in place and is reported; the batch is then settled. A
+// size, mtime and contents), unprotected, unused (a procfs pass per
+// batch), not kept by herdr asked afresh after that pass
+// (artifactHerdr.keeps), and still unused by a second procfs pass after the
+// herdr query; it is re-checked immediately before its rename. A file that
+// fails any of that stays in place and is reported; the batch is then settled. A
 // batch whose archive does not verify, or whose live-process check cannot
 // complete, moves nothing and is retried.
 func quarantineArtifacts(ctx context.Context, engine *action.Engine, policy config.Policy, dryRun bool) (artifactQuarantineReport, error) {
@@ -630,30 +630,50 @@ func quarantineArtifactBatch(ctx context.Context, engine *action.Engine, policy 
 		}
 		ready = append(ready, verified{file, member, state})
 	}
-	candidates := make([]string, len(ready))
-	for i, r := range ready {
-		candidates[i] = r.file.Path
-	}
-	used := map[string]string{}
-	if len(candidates) != 0 {
-		if used, err = workspacearchive.OpenFiles(ctx, policy.Collectors.ProcRoot, candidates); err != nil {
-			return fmt.Errorf("live process check: %w; nothing moved", err)
+	// unused keeps the files of ready no process holds, after one procfs
+	// pass over them, and notes the rest.
+	unused := func(ready []verified) ([]verified, error) {
+		if len(ready) == 0 {
+			return ready, nil
 		}
+		candidates := make([]string, len(ready))
+		for i, r := range ready {
+			candidates[i] = r.file.Path
+		}
+		used, err := workspacearchive.OpenFiles(ctx, policy.Collectors.ProcRoot, candidates)
+		if err != nil {
+			return nil, err
+		}
+		return slices.DeleteFunc(ready, func(r verified) bool {
+			use, open := used[r.file.Path]
+			if open {
+				notes.add("open in a process ("+use+")", r.file.Path, false)
+			}
+			return open
+		}), nil
 	}
-	// Fresh herdr evidence for this batch, taken at the move boundary after
-	// hashing and the procfs pass: a topic that became live, or that herdr
-	// now lists, or any topic while herdr does not answer, stays.
+	if ready, err = unused(ready); err != nil {
+		return fmt.Errorf("live process check: %w; nothing moved", err)
+	}
+	// Fresh herdr evidence for this batch, taken after hashing and the
+	// procfs pass: a topic that became live, or that herdr now lists, or any
+	// topic while herdr does not answer, stays.
 	herdr := askArtifactHerdr(ctx, policy)
+	ready = slices.DeleteFunc(ready, func(r verified) bool {
+		reason := herdr.keeps(r.file.Path)
+		if reason != "" {
+			notes.add(reason, r.file.Path, false)
+		}
+		return reason != ""
+	})
+	// The herdr query blocks for up to command_timeout: process use is
+	// checked again after it, so herdr and then open files are the last
+	// checks before the renames.
+	if ready, err = unused(ready); err != nil {
+		return fmt.Errorf("live process check after herdr: %w; nothing moved", err)
+	}
 	var failures []error
 	for _, r := range ready {
-		if use, open := used[r.file.Path]; open {
-			notes.add("open in a process ("+use+")", r.file.Path, false)
-			continue
-		}
-		if reason := herdr.keeps(r.file.Path); reason != "" {
-			notes.add(reason, r.file.Path, false)
-			continue
-		}
 		if dryRun {
 			out.Moved++
 			out.MovedBytes += r.file.Size

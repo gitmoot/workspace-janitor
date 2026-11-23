@@ -400,6 +400,41 @@ func TestHerdrArtifactQuarantineAsksHerdrAfterTheProcessScan(t *testing.T) {
 	}
 }
 
+// Review of #249: the quarantine's herdr query blocks, so process use is
+// checked again after it. A file a process already holds, or opens while
+// herdr is answering, stays in place; its sibling still moves.
+func TestHerdrArtifactQuarantineRechecksOpenFilesAfterHerdr(t *testing.T) {
+	for name, duringHerdr := range map[string]bool{"already open": false, "opened during herdr": true} {
+		t.Run(name, func(t *testing.T) {
+			x := newArtifactFixture(t)
+			answer := fakeHerdr(t, x.stateStoreFixture)
+			x.prevention = "  auto_quarantine: true\n"
+			x.writeArtifacts(t)
+			session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"held.log": oldArtifact, "calm.log": oldArtifact})
+			if item := categoryItem(t, x.categories(t, false), session); item.Status != categoryArchived || item.Files != 2 {
+				t.Fatalf("batch = %+v", item)
+			}
+			held := filepath.Join(session, "held.log")
+			if duringHerdr {
+				// herdr itself publishes the descriptor before it answers.
+				script := "#!/bin/sh\n[ \"$*\" = 'agent list --json' ] || exit 64\n/bin/ln -sfn " + held + " " + filepath.Join(x.proc, "4242", "fd", "9") + " || exit 1\nexec /bin/cat " + answer + "\n"
+				if err := os.WriteFile(filepath.Join(filepath.Dir(answer), "herdr"), []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				x.open(t, "4242", "9", held)
+			}
+			report := x.quarantineArtifacts(t)
+			if len(report.Batches) != 1 || report.Batches[0].Moved != 1 || report.Batches[0].Kept != 1 || !strings.Contains(strings.Join(report.Batches[0].Reasons, "\n"), "open in a process") {
+				t.Fatalf("quarantine = %+v", report)
+			}
+			if got := contents(t, session, "held.log", "calm.log"); got["held.log"] == "<absent>" || got["calm.log"] != "<absent>" {
+				t.Fatalf("after quarantine: %v", got)
+			}
+		})
+	}
+}
+
 // herdrScript installs a herdr stand-in running body and configures
 // collectors.herdr with it over root.
 func herdrScript(t *testing.T, x *stateStoreFixture, root, body string) {
