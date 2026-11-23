@@ -128,22 +128,14 @@ func (h *HerdrSessions) Holds(path string) string {
 	return ""
 }
 
-// KeepsFile is why a live agent keeps the single file at path (any
-// spelling, resolved): herdr lists it (an agent_session or a topic
-// transcript), or it is a ".jsonl" directly inside the session folder of a
-// listed transcript, where OMP keeps that session's topic transcripts. It
-// is "" otherwise. omp_session_artifacts never moves such a file.
-func (h *HerdrSessions) KeepsFile(path string) string {
+// Lists is why a live agent keeps the transcript at path (any spelling,
+// resolved): herdr lists exactly that file, as an agent_session or a topic
+// transcript. It is "" otherwise; what lies inside a listed session's
+// folder is the caller's to classify.
+func (h *HerdrSessions) Lists(path string) string {
 	real := config.RealParent(path)
 	if agents, ok := h.sessions[real]; ok {
 		return liveSessionDetail(real, agents)
-	}
-	if !strings.HasSuffix(real, herdrSessionLog) {
-		return ""
-	}
-	transcript := filepath.Dir(real) + herdrSessionLog
-	if agents, ok := h.sessions[transcript]; ok {
-		return liveSessionDetail(transcript, agents) + ", whose session folder holds its topic transcripts"
 	}
 	return ""
 }
@@ -195,7 +187,7 @@ func newHerdrView(opts *Options, entries []core.Entry) herdrView {
 // meet them in whatever spelling they use. They bind collected entries
 // only; omp_session_artifacts, which moves old single files out of live
 // seats by an earlier owner decision (2026-11-09), selects and moves files
-// under its own guards and asks only HerdrSessions.KeepsFile.
+// under its own guards and asks only HerdrSessions.Lists.
 func herdrReferences(sessions *HerdrSessions, view herdrView) []Reference {
 	transcripts := make([]string, 0, len(sessions.sessions))
 	for transcript := range sessions.sessions {

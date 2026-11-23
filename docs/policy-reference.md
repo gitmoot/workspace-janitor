@@ -1365,7 +1365,24 @@ The boundary is the unit, not the files inside it (decided with this guard,
 session folder, under its own guards (open files, process use, per-file
 `idle`, verified batches), as the earlier owner decision for exactly these
 seats requires. It never selects the transcript itself, which lies beside
-the folder, nor the folder as a whole, and it does not run or depend on herdr.
+the folder, nor the folder as a whole. With `collectors.herdr` it also asks
+herdr, once per archive run and again for each batch right before its
+quarantine, and keeps a file out of the batch (or in place at quarantine,
+while its eligible siblings still move) when
+
+- herdr lists that file itself (an `agent_session` or a `topic_sessions`
+  path), at any depth, or
+- the file is a topic transcript, a `*.jsonl` directly inside a session
+  folder `<project>/<stem>/`, and herdr lists that session's
+  `<project>/<stem>.jsonl`.
+
+Its herdr scope is `session_roots` plus every `omp_session_artifacts` root,
+so a file herdr lists under an artifact root that `session_roots` does not
+name is still kept. When herdr does not answer (including an answer the
+decoder rejects), a listed topic could be any `*.jsonl` the walk reaches, so
+every `*.jsonl` at any depth inside any session folder stays (reported, not
+a failure); every other file (logs and the rest) stays eligible under the
+guards above. Without `collectors.herdr` none of this applies.
 
 Herdr configured but failing, timing out, printing more than the bound or
 printing anything but a well-formed agent list (its error document, any `id`
@@ -1415,6 +1432,11 @@ Each file is its own unit. A file is selected when all of these hold:
   from the archive) with the size and mtime it was archived with
 - `omp_sessions` does not archive its session folder whole in the same run
   (`would_archive`, `archived`, `deferred` or `already_archived` there)
+- with `collectors.herdr`, herdr does not keep it: it is not a path herdr
+  lists, nor a topic transcript (`*.jsonl` directly in the session folder) of
+  a session herdr lists, nor, while herdr does not answer, any `*.jsonl` in
+  a session folder at any depth; herdr is asked again at quarantine (see
+  [live herdr agent sessions](#live-herdr-agent-sessions))
 
 Every cycle archives, per session folder, one batch: one tar holding that
 folder's selected files (at most `max_files_per_batch` files and
