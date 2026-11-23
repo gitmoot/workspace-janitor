@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"slices"
 	"sort"
 	"strings"
@@ -98,12 +99,14 @@ func wholeSessionUnits(report *categoryArchiveReport) map[string]string {
 // its eligible files. A file is eligible when it is a single-link regular
 // file below "<project>/<session>/" idle for the category's idle by its own
 // mtime, no policy fact refuses it, it is not already archived unchanged,
-// and no process holds it. A session folder that omp_sessions archives
-// whole in this run is left to it. Per-batch failures are reported on the
-// batch and returned; the run continues with the next batch.
+// herdr does not keep it (artifactHerdr), and no process holds it. A
+// session folder that omp_sessions archives whole in this run is left to
+// it. Per-batch failures are reported on the batch and returned; the run
+// continues with the next batch.
 func archiveSessionArtifacts(ctx context.Context, db *store.Store, paths config.Paths, policy config.Policy, report *categoryArchiveReport, now time.Time, dryRun bool) []error {
 	var failures []error
 	var archived map[string]store.ArchivedArtifact
+	var herdr *artifactHerdr
 	whole := wholeSessionUnits(report)
 	for _, category := range policy.WorkspaceArchiveCategories {
 		if category.Kind != config.CategoryOMPSessionArtifacts {
@@ -114,8 +117,9 @@ func archiveSessionArtifacts(ctx context.Context, db *store.Store, paths config.
 			if archived, err = store.ReadArchivedArtifacts(ctx, paths.DatabaseFile); err != nil {
 				return append(failures, fmt.Errorf("session artifact receipts: %w", err))
 			}
+			herdr = askArtifactHerdr(ctx, policy)
 		}
-		plans, roots, err := observeArtifacts(ctx, policy, category, whole, archived, report, now)
+		plans, roots, err := observeArtifacts(ctx, policy, category, whole, archived, herdr, report, now)
 		if err != nil {
 			failures = append(failures, err)
 		}
@@ -127,13 +131,49 @@ func archiveSessionArtifacts(ctx context.Context, db *store.Store, paths config.
 	return failures
 }
 
+// artifactHerdr is one herdr answer for omp_session_artifacts, asked once
+// per run; nil when herdr is not configured.
+type artifactHerdr struct {
+	sessions *collect.HerdrSessions
+	err      error
+}
+
+func askArtifactHerdr(ctx context.Context, policy config.Policy) *artifactHerdr {
+	if policy.Collectors.Herdr == nil {
+		return nil
+	}
+	sessions, err := collect.ListHerdrSessions(ctx, policy.Collectors.Herdr, policy.Limits.CommandTimeout.Duration())
+	return &artifactHerdr{sessions: sessions, err: err}
+}
+
+// keeps is why herdr keeps the file rel (relative to rootPath, in session
+// folder session) out of a batch: a transcript herdr lists, or a ".jsonl"
+// directly inside a listed session's folder (its topic transcripts). When
+// herdr gave no answer, every ".jsonl" directly inside any session folder
+// stays; other files are not herdr's to keep.
+func (h *artifactHerdr) keeps(rootPath, session, rel string) string {
+	if h == nil {
+		return ""
+	}
+	if h.err != nil {
+		if path.Dir(rel) == session && strings.HasSuffix(rel, ".jsonl") {
+			return "herdr agent sessions are unknown, so a possible topic transcript stays: " + h.err.Error()
+		}
+		return ""
+	}
+	if live := h.sessions.KeepsFile(rootPath + "/" + rel); live != "" {
+		return string(core.ProtectLiveAgentSession) + ": " + live
+	}
+	return ""
+}
+
 // observeArtifacts walks every session folder of category's roots and keeps
 // the eligible files of each, after one live-process pass over all of them.
 // An unreadable root or procfs, or any process that cannot be inspected,
 // refuses every batch of the category. The caller closes the returned roots,
 // which the plans share.
 func observeArtifacts(ctx context.Context, policy config.Policy, category config.WorkspaceArchiveCategory, whole map[string]string,
-	archived map[string]store.ArchivedArtifact, report *categoryArchiveReport, now time.Time) ([]*artifactPlan, []*workspacearchive.ArtifactRoot, error) {
+	archived map[string]store.ArchivedArtifact, herdr *artifactHerdr, report *categoryArchiveReport, now time.Time) ([]*artifactPlan, []*workspacearchive.ArtifactRoot, error) {
 	var plans []*artifactPlan
 	var roots []*workspacearchive.ArtifactRoot
 	var failures []error
@@ -181,6 +221,10 @@ func observeArtifacts(ctx context.Context, policy config.Policy, category config
 				}
 				if refusals := artifactRefusals(policy, category, path); len(refusals) != 0 {
 					plan.notes.add(refusals[0], file.Path, false)
+					continue
+				}
+				if reason := herdr.keeps(rootPath, session, file.Path); reason != "" {
+					plan.notes.add(reason, file.Path, false)
 					continue
 				}
 				plan.files = append(plan.files, file)
