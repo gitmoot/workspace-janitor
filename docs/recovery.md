@@ -40,14 +40,21 @@ They are identical when the trees have the same shape and entry names, and
 every entry has the same type, permission bits, owner and group, every
 symlink the same target, and every regular file the same size and bytes.
 Modification times, extended attributes and ACLs are not compared; symlinks
-are never followed, mounts never crossed, and a tree with more than
+are never followed, mounts never crossed (by mount identity, so a bind mount
+of the same filesystem is a crossing, and a kernel that reports no mount
+identity proves nothing), and a tree with more than
 `limits.deep_size_max_entries` entries is not compared. An original that is
 not identical but contains the copy also qualifies: every entry of the copy
 has its counterpart at the same relative path in the original, identical as
 above, except that a directory of the copy need only be a directory there,
-of any permissions and owner, while the original may hold more. Only the copy's
-directories are listed, so `limits.deep_size_max_entries` bounds the copy's
-entries alone. An identical or containing original makes the copy redundant:
+of any permissions and owner, while the original may hold more. The copy is
+walked once; only its directories are listed, so
+`limits.deep_size_max_entries` bounds the copy's entries alone, and the
+original's directories are only searched, so a search-only (`--x`) directory
+there does not stop the proof. No entry of the original may be an entry of
+the copy (the same inode anywhere in either tree, as a bind mount or hard
+link would make it), since removing the copy would then remove what the
+original was proven to hold. An identical or containing original makes the copy redundant:
 expiry removes only the copy, never touching the original, and records the
 receipt `superseded_by_original` rather than `deleted`, with a reason saying
 whether the original was identical or contained the copy. References to and

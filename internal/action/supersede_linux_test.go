@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/workspace-janitor/internal/core"
+	"golang.org/x/sys/unix"
 )
 
 // writeSupersedeTree writes a small tree with every entry type a comparison
@@ -393,4 +394,140 @@ func TestIdenticalTreeProofFailsClosed(t *testing.T) {
 			t.Fatal("a rewrite of a compared original file after the comparison kept the proof")
 		}
 	})
+	// The original's directories are looked up, not listed: a search-only
+	// one does not stop a containment proof. Root reads it regardless, so
+	// this runs only unprivileged.
+	t.Run("contained: search-only original directory", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads a search-only directory anyway; run unprivileged")
+		}
+		original, copy, id := setup(t)
+		sub := filepath.Join(original, "sub")
+		if err := os.Chmod(sub, 0o111); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(sub, 0o755) })
+		proof, err := compareTrees(ctx, original, copy, id, 100)
+		if err != nil {
+			t.Fatalf("original with a search-only directory: %v", err)
+		}
+		if err := proof.unchanged(ctx); err != nil {
+			t.Fatalf("unchanged trees: %v", err)
+		}
+	})
+}
+
+// privateMounts skips unless the test runs as root in a mount namespace of
+// its own (the suite runs under unshare -m), and keeps its mounts from
+// propagating out of it.
+func privateMounts(t *testing.T) {
+	t.Helper()
+	self, err := os.Readlink("/proc/self/ns/mnt")
+	if err != nil {
+		t.Skipf("no mount namespace: %v", err)
+	}
+	if init, err := os.Readlink("/proc/1/ns/mnt"); err != nil || init == self || os.Geteuid() != 0 {
+		t.Skip("needs root in a private mount namespace (unshare -m)")
+	}
+	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+		t.Skipf("cannot make mounts private: %v", err)
+	}
+}
+
+func bindMount(t *testing.T, from, to string) {
+	t.Helper()
+	if err := unix.Mount(from, to, "", unix.MS_BIND, ""); err != nil {
+		t.Fatalf("bind %s at %s: %v", from, to, err)
+	}
+	t.Cleanup(func() { unix.Unmount(to, unix.MNT_DETACH) })
+}
+
+// writeTwins writes a tree whose directories a and b hold the same bytes,
+// so either can stand in for the other.
+func writeTwins(t *testing.T, dir string) {
+	t.Helper()
+	for _, path := range []string{dir, filepath.Join(dir, "a"), filepath.Join(dir, "b")} {
+		if err := os.Mkdir(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{filepath.Join(dir, "a", "data"), filepath.Join(dir, "b", "data")} {
+		if err := os.WriteFile(path, []byte("payload\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// An original that shows the quarantined copy's own directories (bind
+// mounts of the same filesystem, so device numbers match) proves nothing:
+// removing the copy would remove what the original was compared to. Both
+// the crossed binds (copy a at original b and copy b at original a, which
+// match byte for byte) and a bind of a copy directory at its own path keep
+// the copy and today's refusal, identical or containing.
+func TestExpiryRefusesAnOriginalShowingTheCopy(t *testing.T) {
+	privateMounts(t)
+	crossed := func(t *testing.T, source, copy string) {
+		bindMount(t, filepath.Join(copy, "a"), filepath.Join(source, "b"))
+		bindMount(t, filepath.Join(copy, "b"), filepath.Join(source, "a"))
+	}
+	samePath := func(t *testing.T, source, copy string) {
+		bindMount(t, filepath.Join(copy, "a"), filepath.Join(source, "a"))
+	}
+	cases := []struct {
+		name string
+		grow bool
+		bind func(t *testing.T, source, copy string)
+	}{
+		{"crossed binds, otherwise identical", false, crossed},
+		{"crossed binds, original grown", true, crossed},
+		{"copy directory bound at its own path", true, samePath},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e, root, clock := fixtureEngine(t)
+			ctx := context.Background()
+			source := filepath.Join(root, "cache")
+			writeTwins(t, source)
+			item := prepareFixture(t, e, source, core.Retention30Days)
+			item, err := e.Quarantine(ctx, item)
+			if err != nil {
+				t.Fatal(err)
+			}
+			*clock = clock.Add(31 * 24 * time.Hour)
+			writeTwins(t, source)
+			if tc.grow {
+				if err := os.WriteFile(filepath.Join(source, "extra"), []byte("new\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tc.bind(t, source, item.Destination)
+			unit := "[Service]\nWorkingDirectory=" + source + "\nExecStart=/bin/true\n"
+			if err := os.WriteFile(filepath.Join(e.Collect.ServiceSources.SystemdDirs[0], "user.service"), []byte(unit), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			copyBefore := treeState(t, item.Destination)
+
+			item, err = e.Delete(ctx, item)
+
+			if err == nil || item.State != core.CleanupInvestigate || !strings.Contains(item.Reason, "original source has new protected references") {
+				t.Fatalf("expiry: %s %q %v, want the original-reference refusal", item.State, item.Reason, err)
+			}
+			if got := treeState(t, item.Destination); got != copyBefore {
+				t.Fatalf("refused copy changed:\n%s\nwas\n%s", got, copyBefore)
+			}
+			for _, path := range []string{source, item.Destination} {
+				for _, dir := range []string{"a", "b"} {
+					if _, err := os.Lstat(filepath.Join(path, dir, "data")); err != nil {
+						t.Fatalf("payload lost: %v", err)
+					}
+				}
+			}
+		})
+	}
 }
