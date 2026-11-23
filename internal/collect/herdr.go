@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -58,6 +59,9 @@ func ListHerdrSessions(ctx context.Context, cfg *config.HerdrCollector, timeout 
 		var resumed string
 		if session := agent.session; session != nil && session.Kind == "path" {
 			// An "id" session (Claude) names no file.
+			if lossyHerdrPath(session.Value) {
+				return nil, fmt.Errorf("herdr agent %s names a session path %q holding a NUL or an undecodable character", agent.label(), session.Value)
+			}
 			if !filepath.IsAbs(session.Value) {
 				return nil, fmt.Errorf("herdr agent %s names a non-absolute session path %q", agent.label(), session.Value)
 			}
@@ -261,17 +265,17 @@ const (
 
 // herdrSession is a well-formed agent_session: a kind and a value.
 type herdrSession struct {
-	Kind  string `json:"kind"`
-	Value string `json:"value"`
+	Kind  string
+	Value string
 }
 
 // herdrAgent is the part of one "herdr agent list" entry the guard reads.
 type herdrAgent struct {
-	Agent   string          `json:"agent"`
-	Name    string          `json:"name"`
-	PaneID  string          `json:"pane_id"`
-	Session json.RawMessage `json:"agent_session"`
-	Topics  json.RawMessage `json:"topic_sessions"`
+	Agent   string
+	Name    string
+	PaneID  string
+	Session json.RawMessage
+	Topics  json.RawMessage
 	session *herdrSession
 	topics  []string
 }
@@ -282,9 +286,10 @@ const maxHerdrTopics = 1000
 
 // parseHerdrTopics decodes an agent's topic_sessions: absent or null is
 // none; otherwise an array of at most maxHerdrTopics entries, each an
-// absolute, clean ".jsonl" path or an object whose string "path" is one
-// (herdr 0.9.5 emits {path, topic_id, title, created_unix_ms}; other keys
-// are ignored).
+// absolute, clean ".jsonl" path, decoded losslessly (lossyHerdrPath), or
+// an object (read with herdrMembers) whose "path" member is one (herdr
+// 0.9.5 emits {path, topic_id, title, created_unix_ms}; other keys are
+// ignored).
 func parseHerdrTopics(agent herdrAgent) ([]string, error) {
 	trimmed := bytes.TrimSpace(agent.Topics)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -309,6 +314,8 @@ func parseHerdrTopics(agent herdrAgent) ([]string, error) {
 		switch {
 		case topic == "":
 			return nil, fmt.Errorf("herdr agent %s names an empty topic session path", agent.label())
+		case lossyHerdrPath(topic):
+			return nil, fmt.Errorf("herdr agent %s names a topic session path %q holding a NUL or an undecodable character", agent.label(), topic)
 		case !filepath.IsAbs(topic):
 			return nil, fmt.Errorf("herdr agent %s names a non-absolute topic session path %q", agent.label(), topic)
 		case topic != filepath.Clean(topic):
@@ -322,7 +329,8 @@ func parseHerdrTopics(agent herdrAgent) ([]string, error) {
 }
 
 // herdrTopicPath reads one topic_sessions entry: a JSON string, or an
-// object carrying a string "path".
+// object (read with herdrMembers, so a second member of any name or a
+// "Path" is malformed) carrying a string "path" member.
 func herdrTopicPath(raw json.RawMessage) (string, error) {
 	r := bytes.TrimSpace(raw)
 	if len(r) == 0 {
@@ -336,11 +344,11 @@ func herdrTopicPath(raw json.RawMessage) (string, error) {
 		}
 		return topic, nil
 	case '{':
-		var entry map[string]json.RawMessage
-		if err := json.Unmarshal(r, &entry); err != nil {
+		members, err := herdrMembers(r, "path")
+		if err != nil {
 			return "", err
 		}
-		path, ok := entry["path"]
+		path, ok := members["path"]
 		if !ok {
 			return "", fmt.Errorf("object has no path")
 		}
@@ -352,6 +360,16 @@ func herdrTopicPath(raw json.RawMessage) (string, error) {
 		return topic, nil
 	}
 	return "", fmt.Errorf("neither a string nor an object")
+}
+
+// lossyHerdrPath reports whether a decoded herdr path is no evidence of a
+// file: it holds a NUL, which no file name does, or U+FFFD. encoding/json
+// decodes every invalid UTF-8 byte and every unpaired surrogate escape
+// ("\ud800") to U+FFFD without an error, so such a path may not be the one
+// herdr meant; a session path holding a genuine U+FFFD is rejected with
+// them.
+func lossyHerdrPath(value string) bool {
+	return strings.ContainsRune(value, 0) || strings.ContainsRune(value, utf8.RuneError)
 }
 
 func (a herdrAgent) label() string {
@@ -369,63 +387,155 @@ func isObject(raw json.RawMessage) bool {
 	return len(trimmed) != 0 && trimmed[0] == '{'
 }
 
+// isNull reports whether raw is absent or JSON null.
+func isNull(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
+}
+
+// herdrMembers reads the members of the well-formed JSON object raw, key
+// names compared after decoding escapes, and returns those named in read.
+// A member name that appears twice, in any spelling, or a case variant of a
+// name in read ("Value" beside or instead of "value"), is malformed:
+// encoding/json keeps the last of duplicate members and matches struct
+// fields case-insensitively, so which member herdr meant is unknown. Other
+// members are ignored.
+func herdrMembers(raw []byte, read ...string) (map[string]json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, errors.New("not an object")
+	}
+	seen := map[string]bool{}
+	members := map[string]json.RawMessage{}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, _ := tok.(string)
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, err
+		}
+		if seen[key] {
+			return nil, fmt.Errorf("member %q appears twice", key)
+		}
+		seen[key] = true
+		for _, name := range read {
+			if key == name {
+				members[name] = value
+			} else if strings.EqualFold(key, name) {
+				return nil, fmt.Errorf("member %q is a case variant of %q", key, name)
+			}
+		}
+	}
+	return members, nil
+}
+
+// herdrString decodes member name into dst: a JSON string, or "" when it
+// is absent or null.
+func herdrString(members map[string]json.RawMessage, name string, dst *string) error {
+	if raw, ok := members[name]; ok {
+		if err := json.Unmarshal(raw, dst); err != nil {
+			return fmt.Errorf("member %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
 // parseHerdrAgents decodes exactly one agent-list document: id
 // cli:agent:list, result.type agent_list, result.agents an array of agent
 // objects, each with an agent name and, when it has a session, an
 // agent_session object with a kind and a value, and optionally a
-// topic_sessions array of absolute, clean ".jsonl" paths. An error
-// document, any other id or result type, a null or ill-typed record, a
-// malformed session or topic list, or trailing data is no answer.
+// topic_sessions array of absolute, clean ".jsonl" paths. Every object is
+// read with herdrMembers. A duplicate or case-variant member, a topic path
+// holding a NUL or a lossily decoded character, an error document, any
+// other id or result type, a null or ill-typed record, a malformed session
+// or topic list, or trailing data is no answer.
 func parseHerdrAgents(data []byte) ([]herdrAgent, error) {
-	var doc struct {
-		ID     string `json:"id"`
-		Result *struct {
-			Type   string             `json:"type"`
-			Agents *[]json.RawMessage `json:"agents"`
-		} `json:"result"`
-		Error *struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
 	dec := json.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&doc); err != nil {
+	var root json.RawMessage
+	if err := dec.Decode(&root); err != nil {
 		return nil, fmt.Errorf("herdr agent list is not a well-formed JSON document: %w", err)
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return nil, errors.New("herdr agent list has trailing data after its JSON document")
 	}
-	if doc.Error != nil {
-		return nil, fmt.Errorf("herdr agent list failed: %s: %s", doc.Error.Code, doc.Error.Message)
+	if !isObject(root) {
+		return nil, errors.New("herdr agent list is not a JSON object")
 	}
-	switch {
-	case doc.ID != herdrAgentListID:
-		return nil, fmt.Errorf("herdr answered %q, not %s", doc.ID, herdrAgentListID)
-	case doc.Result == nil || doc.Result.Agents == nil:
+	doc, err := herdrMembers(root, "id", "result", "error")
+	if err != nil {
+		return nil, fmt.Errorf("herdr agent list is malformed: %w", err)
+	}
+	if !isNull(doc["error"]) {
+		// Any error document is a failure; its fields only describe it.
+		var failure struct{ Code, Message string }
+		_ = json.Unmarshal(doc["error"], &failure)
+		return nil, fmt.Errorf("herdr agent list failed: %s: %s", failure.Code, failure.Message)
+	}
+	var id string
+	if err := herdrString(doc, "id", &id); err != nil {
+		return nil, fmt.Errorf("herdr agent list is malformed: %w", err)
+	}
+	if id != herdrAgentListID {
+		return nil, fmt.Errorf("herdr answered %q, not %s", id, herdrAgentListID)
+	}
+	if !isObject(doc["result"]) {
 		return nil, errors.New("herdr agent list has no result.agents")
-	case doc.Result.Type != herdrAgentListType:
-		return nil, fmt.Errorf("herdr agent list result type is %q, not %s", doc.Result.Type, herdrAgentListType)
 	}
-	agents := make([]herdrAgent, 0, len(*doc.Result.Agents))
-	for i, raw := range *doc.Result.Agents {
-		var agent herdrAgent
+	result, err := herdrMembers(doc["result"], "type", "agents")
+	if err != nil {
+		return nil, fmt.Errorf("herdr agent list result is malformed: %w", err)
+	}
+	if isNull(result["agents"]) {
+		return nil, errors.New("herdr agent list has no result.agents")
+	}
+	var resultType string
+	if err := herdrString(result, "type", &resultType); err != nil {
+		return nil, fmt.Errorf("herdr agent list result is malformed: %w", err)
+	}
+	if resultType != herdrAgentListType {
+		return nil, fmt.Errorf("herdr agent list result type is %q, not %s", resultType, herdrAgentListType)
+	}
+	var raws []json.RawMessage
+	if err := json.Unmarshal(result["agents"], &raws); err != nil {
+		return nil, fmt.Errorf("herdr agent list result.agents is malformed: %w", err)
+	}
+	agents := make([]herdrAgent, 0, len(raws))
+	for i, raw := range raws {
 		if !isObject(raw) {
 			return nil, fmt.Errorf("herdr agent list entry %d is not an agent object: %s", i, bytes.TrimSpace(raw))
 		}
-		if err := json.Unmarshal(raw, &agent); err != nil {
+		members, err := herdrMembers(raw, "agent", "name", "pane_id", "agent_session", "topic_sessions")
+		if err != nil {
 			return nil, fmt.Errorf("herdr agent list entry %d is malformed: %w", i, err)
 		}
+		var agent herdrAgent
+		for name, dst := range map[string]*string{"agent": &agent.Agent, "name": &agent.Name, "pane_id": &agent.PaneID} {
+			if err := herdrString(members, name, dst); err != nil {
+				return nil, fmt.Errorf("herdr agent list entry %d is malformed: %w", i, err)
+			}
+		}
+		agent.Session, agent.Topics = members["agent_session"], members["topic_sessions"]
 		if agent.Agent == "" {
 			return nil, fmt.Errorf("herdr agent list entry %d names no agent", i)
 		}
 		// An absent or null agent_session is an agent with no session.
-		if trimmed := bytes.TrimSpace(agent.Session); len(trimmed) != 0 && !bytes.Equal(trimmed, []byte("null")) {
-			var session herdrSession
+		if !isNull(agent.Session) {
+			trimmed := bytes.TrimSpace(agent.Session)
 			if !isObject(trimmed) {
 				return nil, fmt.Errorf("herdr agent %s has a malformed agent_session: %s", agent.label(), trimmed)
 			}
-			if err := json.Unmarshal(trimmed, &session); err != nil {
+			members, err := herdrMembers(trimmed, "kind", "value")
+			if err != nil {
 				return nil, fmt.Errorf("herdr agent %s has a malformed agent_session: %w", agent.label(), err)
+			}
+			var session herdrSession
+			for name, dst := range map[string]*string{"kind": &session.Kind, "value": &session.Value} {
+				if err := herdrString(members, name, dst); err != nil {
+					return nil, fmt.Errorf("herdr agent %s has a malformed agent_session: %w", agent.label(), err)
+				}
 			}
 			if session.Kind == "" || session.Value == "" {
 				return nil, fmt.Errorf("herdr agent %s has an agent_session without kind or value", agent.label())

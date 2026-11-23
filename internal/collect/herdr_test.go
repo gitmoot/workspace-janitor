@@ -410,6 +410,82 @@ func TestHerdrUncleanSessionPathFailsClosed(t *testing.T) {
 	}
 }
 
+// Review of #237: encoding/json decodes an escaped NUL as is, and an
+// invalid UTF-8 byte or an unpaired surrogate to U+FFFD, without an error.
+// An agent_session path holding one is malformed evidence: herdr fails,
+// naming the agent, and every session entry is unknown.
+func TestHerdrLossySessionPathFailsClosed(t *testing.T) {
+	for name, inner := range map[string]string{"NUL": `\u0000`, "invalid UTF-8": "\xff", "unpaired surrogate": `\ud800`} {
+		t.Run(name, func(t *testing.T) {
+			x := newHerdrFixture(t, "")
+			writeHerdrScript(t, x, answerScript(t, filepath.Join(x.project, herdrStemA+inner+".jsonl")))
+			result := run(t, x.options(5*time.Second))
+			report := reportFor(t, result, CollectorHerdr)
+			if report.Status != core.CollectorFailed || !strings.Contains(report.Detail, `"keephair" (omp, pane w65:p72)`) || report.Recorded != 4 {
+				t.Fatalf("herdr report for a session path holding %s = %+v", name, report)
+			}
+			for _, entry := range result.Entries {
+				if protectionReason(entry, core.ProtectCollectorFailure) == "" {
+					t.Errorf("%s not unknown after a lossy herdr session path", entry.Path)
+				}
+			}
+		})
+	}
+}
+
+// Review of #237: encoding/json keeps the last of duplicate members and
+// matches struct fields case-insensitively, so a second or case-variant
+// member silently replaced the one herdr meant. Every herdr object (the
+// document, its result, an agent, its agent_session) with a member name
+// twice, in any spelling, or a case variant of a member the guard reads is
+// malformed: herdr fails, naming where, and every session entry is unknown.
+func TestHerdrDuplicateOrCaseVariantMembersFailClosed(t *testing.T) {
+	const (
+		good  = `{"agent":"omp","name":"keephair","pane_id":"w65:p72","agent_session":{"kind":"path","value":"$S"}}`
+		label = `"keephair" (omp, pane w65:p72)`
+	)
+	doc := func(agents string) string {
+		return `{"id":"cli:agent:list","result":{"type":"agent_list","agents":[` + agents + `]}}`
+	}
+	agent := func(members string) string {
+		return doc(`{"agent":"omp","name":"keephair","pane_id":"w65:p72",` + members + `}`)
+	}
+	session := func(object string) string { return agent(`"agent_session":` + object) }
+	for name, c := range map[string]struct{ doc, want string }{
+		"duplicate value":         {session(`{"kind":"path","value":"$S","value":"$S"}`), label},
+		"Value beside value":      {session(`{"kind":"path","value":"$S","Value":"$S"}`), label},
+		"escaped duplicate value": {session(`{"kind":"path","value":"$S","v\u0061lue":"$S"}`), label},
+		"duplicate kind":          {session(`{"kind":"id","kind":"path","value":"$S"}`), label},
+		"KIND":                    {session(`{"KIND":"path","value":"$S"}`), label},
+		"two agent_session":       {agent(`"agent_session":{"kind":"path","value":"$S"},"agent_session":null`), "entry 0"},
+		"AGENT_SESSION":           {agent(`"AGENT_SESSION":{"kind":"path","value":"$S"}`), "entry 0"},
+		"two topic_sessions":      {agent(`"agent_session":{"kind":"path","value":"$S"},"topic_sessions":["$T"],"topic_sessions":[]`), "entry 0"},
+		"Agent beside agent":      {doc(`{"agent":"omp","Agent":"claude","agent_session":{"kind":"path","value":"$S"}}`), "entry 0"},
+		"PANE_ID":                 {doc(`{"agent":"omp","PANE_ID":"w1:p1","agent_session":{"kind":"path","value":"$S"}}`), "entry 0"},
+		"two agents arrays":       {`{"id":"cli:agent:list","result":{"type":"agent_list","agents":[` + good + `],"agents":[]}}`, "agent list"},
+		"two ids":                 {`{"id":"cli:pane:list","id":"cli:agent:list","result":{"type":"agent_list","agents":[` + good + `]}}`, "agent list"},
+		"RESULT":                  {`{"id":"cli:agent:list","RESULT":{"type":"agent_list","agents":[` + good + `]}}`, "agent list"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			x := newHerdrFixture(t, "")
+			answer := filepath.Join(t.TempDir(), "answer.json")
+			mustWrite(t, answer, strings.NewReplacer("$S", filepath.Join(x.project, herdrStemA+".jsonl"),
+				"$T", filepath.Join(x.project, herdrStemB+".jsonl")).Replace(c.doc))
+			writeHerdrScript(t, x, "exec /bin/cat "+answer)
+			result := run(t, x.options(5*time.Second))
+			report := reportFor(t, result, CollectorHerdr)
+			if report.Status != core.CollectorFailed || !strings.Contains(report.Detail, c.want) || report.Recorded != 4 {
+				t.Fatalf("herdr report for %s = %+v, want a failure naming %s", name, report, c.want)
+			}
+			for _, entry := range result.Entries {
+				if protectionReason(entry, core.ProtectCollectorFailure) == "" {
+					t.Errorf("%s not unknown under %s", entry.Path, name)
+				}
+			}
+		})
+	}
+}
+
 // Review of #223: moving a real directory that holds a session store moves
 // every live session in it. A shallow collection that observes such a
 // directory runs herdr, protects it while a session is live, and leaves it

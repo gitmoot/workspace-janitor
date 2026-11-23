@@ -90,35 +90,35 @@ func TestHerdrTopicSessionsProtectEveryListedTopic(t *testing.T) {
 
 // herdr 0.9.5 emits topic_sessions entries as objects; their string
 // "path" is validated like the bare-string form and other keys are
-// ignored. A topic in the session's companion folder is protected by
-// name (and by the folder already protecting it).
+// ignored. Review of #237: the resumed session, the object topic and the
+// string topic are three distinct sessions, so each topic is held by its
+// own protection, not by the resumed session's.
 func TestHerdrTopicSessionObjectsProtectTheirPath(t *testing.T) {
 	x := newHerdrFixture(t, "")
-	topic := filepath.Join(x.project, herdrStemA, "Topicscheck.jsonl")
-	mustWrite(t, topic, `{"type":"session"}`+"\n")
-	session := filepath.Join(x.project, herdrStemA+".jsonl")
-	writeHerdrScript(t, x, topicScript(t, session,
-		`[{"created_unix_ms":1795328166859,"path":"`+topic+`","title":"Topics check","topic_id":"Topicscheck","future":{"x":[1]}},"`+session+`"]`))
+	addHerdrSession(t, x, herdrStemC)
+	transcript := func(stem string) string { return filepath.Join(x.project, stem+".jsonl") }
+	writeHerdrScript(t, x, topicScript(t, transcript(herdrStemA),
+		`[{"created_unix_ms":1795328166859,"path":"`+transcript(herdrStemB)+`","title":"Topics check","topic_id":"Topicscheck","future":{"x":[1]}},"`+transcript(herdrStemC)+`"]`))
 	result := run(t, x.options(5*time.Second))
-	if report := reportFor(t, result, CollectorHerdr); report.Status != core.CollectorRan {
+	if report := reportFor(t, result, CollectorHerdr); report.Status != core.CollectorRan || report.Visited != 3 {
 		t.Fatalf("herdr report = %+v", report)
 	}
-	var reason string
-	for _, ref := range result.References {
-		if ref.Path == topic && ref.Protection == core.ProtectLiveAgentSession {
-			reason = ref.Detail
+	for _, stem := range []string{herdrStemB, herdrStemC} {
+		for _, path := range []string{filepath.Join(x.project, stem), transcript(stem)} {
+			reason := protectionReason(entryFor(t, result, path), core.ProtectLiveAgentSession)
+			if !strings.Contains(reason, `"keephair" (omp, pane w65:p72) keeps topic`) || !strings.Contains(reason, stem+".jsonl") {
+				t.Errorf("%s: blocking live_agent_session reason = %q", filepath.Base(path), reason)
+			}
 		}
-	}
-	if !strings.Contains(reason, "Topicscheck.jsonl") || !strings.Contains(reason, `"keephair" (omp, pane w65:p72) keeps topic`) {
-		t.Errorf("topic live_agent_session reference = %q; references %+v", reason, result.References)
-	}
-	if reason := protectionReason(entryFor(t, result, filepath.Join(x.project, herdrStemA)), core.ProtectLiveAgentSession); reason == "" {
-		t.Error("session folder not protected")
 	}
 }
 
-// A malformed topic_sessions is no answer: herdr fails and every session
-// entry is unknown. Absent and null mean no topics.
+// A malformed topic_sessions is no answer: herdr fails, naming the agent,
+// and every session entry is unknown. Absent and null mean no topics.
+// Review of #237: an object with a member name twice (a second "path" in
+// any spelling or after a null one, or any other key), or a case variant
+// of "path", is malformed, and so is a path holding a NUL or a character
+// encoding/json decoded lossily to U+FFFD.
 func TestHerdrMalformedTopicSessionsFailClosed(t *testing.T) {
 	tooMany := make([]string, 1001) // past the 1000-per-agent cap
 	for i := range tooMany {
@@ -144,13 +144,25 @@ func TestHerdrMalformedTopicSessionsFailClosed(t *testing.T) {
 		"object path unclean":   `[{"path":"/s/alias/../t.jsonl"}]`,
 		"object path no suffix": `[{"path":"/s/-proj/t"}]`,
 		"nested array":          `[["/s/-proj/t.jsonl"]]`,
+		"object dup path":       `[{"path":"/s/-proj/a.jsonl","path":"/s/-proj/b.jsonl"}]`,
+		"object escaped dup":    `[{"path":"/s/-proj/a.jsonl","p\u0061th":"/s/-proj/b.jsonl"}]`,
+		"object null then path": `[{"path":null,"path":"/s/-proj/t.jsonl"}]`,
+		"NUL":                   `["/s/-proj/t\u0000.jsonl"]`,
+		"object path NUL":       `[{"path":"/s/-proj/t\u0000.jsonl"}]`,
+		"invalid UTF-8":         "[\"/s/-proj/t\xff.jsonl\"]",
+		"object path bad UTF-8": "[{\"path\":\"/s/-proj/t\xff.jsonl\"}]",
+		"lone surrogate":        `["/s/-proj/t\ud800.jsonl"]`,
+		"object lone surrogate": `[{"path":"/s/-proj/t\ud800.jsonl"}]`,
+		"object title twice":    `[{"path":"/s/-proj/t.jsonl","title":"a","title":"b"}]`,
+		"object Path and path":  `[{"path":"/s/-proj/t.jsonl","Path":"/s/-proj/u.jsonl"}]`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			x := newHerdrFixture(t, "")
 			writeHerdrScript(t, x, topicScript(t, filepath.Join(x.project, herdrStemA+".jsonl"), topics))
 			result := run(t, x.options(5*time.Second))
 			report := reportFor(t, result, CollectorHerdr)
-			if report.Status != core.CollectorFailed || !strings.Contains(report.Detail, "topic") || report.Recorded != 4 {
+			if report.Status != core.CollectorFailed || !strings.Contains(report.Detail, "topic") ||
+				!strings.Contains(report.Detail, `"keephair" (omp, pane w65:p72)`) || report.Recorded != 4 {
 				t.Fatalf("herdr report for topic_sessions %s = %+v", name, report)
 			}
 			for _, entry := range result.Entries {
