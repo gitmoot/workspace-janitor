@@ -206,6 +206,9 @@ func TestHerdrFailureFailsEverySessionUnit(t *testing.T) {
 // folder (owner decision 2026-11-09, boundary set 2026-11-18): a herdr
 // reference to the session, or a herdr that does not answer, changes
 // nothing for them, and the referenced transcript itself is never selected.
+// Issue #235: neither is a topic transcript (a .jsonl directly inside the
+// referenced session's folder), nor, while herdr does not answer, any .jsonl
+// directly inside a session folder.
 func TestHerdrSessionArtifactsStillMoveButNeverTheTranscript(t *testing.T) {
 	for name, live := range map[string]bool{"referenced": true, "herdr failing": false} {
 		t.Run(name, func(t *testing.T) {
@@ -213,7 +216,7 @@ func TestHerdrSessionArtifactsStillMoveButNeverTheTranscript(t *testing.T) {
 			answer := fakeHerdr(t, x.stateStoreFixture)
 			x.prevention = "  auto_quarantine: true\n"
 			x.writeArtifacts(t)
-			session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"old.log": oldArtifact})
+			session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"old.log": 15 * 24 * time.Hour, "Topic.jsonl": 15 * 24 * time.Hour})
 			transcript, err := os.ReadFile(session + ".jsonl")
 			if err != nil {
 				t.Fatal(err)
@@ -237,6 +240,9 @@ func TestHerdrSessionArtifactsStillMoveButNeverTheTranscript(t *testing.T) {
 			}
 			if got := contents(t, session, "old.log"); got["old.log"] != "<absent>" {
 				t.Fatalf("artifact still in place: %v", got)
+			}
+			if got := contents(t, session, "Topic.jsonl"); got["Topic.jsonl"] == "<absent>" {
+				t.Fatalf("topic transcript of a herdr session moved: %v", got)
 			}
 			if got, err := os.ReadFile(session + ".jsonl"); err != nil || !bytes.Equal(got, transcript) {
 				t.Fatalf("session transcript changed or moved: %v %q", err, got)
