@@ -11,9 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -849,46 +847,26 @@ func TestSessionArtifactsNeedTheirCategory(t *testing.T) {
 	}
 }
 
-// countScans makes pid's maps a FIFO that ends every procfs pass's read at
-// once and counts the passes; the returned func, called once no pass runs,
-// stops counting and returns how many passes read it. A pass's open blocks
-// until a writer appears; the counter polls with non-blocking writer opens
-// (ENXIO while no reader is there), counts a reader when one succeeds, and
-// then waits for ENXIO again, so each pass counts once.
-func (x *artifactFixture) countScans(t *testing.T, pid string) func() int {
+// scanOnce lets exactly one procfs pass inspect pid: its maps becomes a
+// FIFO, and before the first reader is released (it reads EOF) maps is
+// replaced by a directory, which no later pass can read, so a second pass
+// finds pid uninspectable and fails. The channel reports the swap.
+func (x *artifactFixture) scanOnce(t *testing.T, pid string) <-chan error {
 	t.Helper()
 	maps := filepath.Join(x.proc, pid, "maps")
 	if err := syscall.Mkfifo(maps, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var passes atomic.Int32
-	var stopped atomic.Bool
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
-		reading := false
-		for {
-			w, err := os.OpenFile(maps, os.O_WRONLY|syscall.O_NONBLOCK, 0)
-			if err != nil { // no reader
-				if stopped.Load() {
-					return
-				}
-				reading = false
-			} else {
-				w.Close() // the pass reads EOF
-				if !reading {
-					passes.Add(1)
-					reading = true
-				}
-			}
-			runtime.Gosched()
+		w, err := os.OpenFile(maps, os.O_WRONLY, 0) // waits for the first pass
+		if err == nil {
+			err = errors.Join(os.Remove(maps), os.Mkdir(maps, 0o700))
+			w.Close()
 		}
+		done <- err
 	}()
-	return func() int {
-		stopped.Store(true)
-		<-done
-		return int(passes.Load())
-	}
+	return done
 }
 
 // pauseScan makes pid's maps a FIFO, so the next procfs pass blocks on it

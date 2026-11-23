@@ -668,14 +668,18 @@ func quarantineArtifactBatch(ctx context.Context, engine *action.Engine, policy 
 	})
 	// The herdr query blocks for up to command_timeout, so process use is
 	// checked again after it, over only the files still to move: herdr and
-	// then open files are the last checks before the renames. Guarantee:
-	// every herdr listing and every open descriptor that exists when this
-	// final pass starts is honoured; one that appears after it starts and
-	// before a rename is not seen. A file moved in that window sits in
-	// quarantine, restorable with `janitor restore`, and in the verified
-	// batch archive (manifest and SHA-256 pinned by its receipt), so expiry
-	// deleting the local copy still leaves the archive. Without herdr there
-	// is no query to wait out, so the first pass is the last.
+	// then open files are the last checks before the renames. Both are
+	// best-effort samples, not a shared cutoff: herdr evidence is as of
+	// herdr's own snapshot, taken inside the query; open-file evidence is as
+	// of each process's inspection during the final pass. A listing herdr
+	// publishes after its snapshot, or a descriptor a process opens after it
+	// was inspected, is not seen before the rename. This order minimises
+	// that window but cannot close it without an exclusion herdr and the
+	// file openers would both have to honour. A file moved in the window
+	// sits in quarantine, restorable with `janitor restore`, and in the
+	// verified batch archive (manifest and SHA-256 pinned by its receipt),
+	// so expiry deleting the local copy still leaves the archive. Without
+	// herdr there is no query to wait out, so the first pass is the last.
 	if herdr != nil {
 		if ready, err = unused(ready); err != nil {
 			return fmt.Errorf("live process check after herdr: %w; nothing moved", err)

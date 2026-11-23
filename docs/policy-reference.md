@@ -1411,13 +1411,18 @@ a failure); every other file (logs and the rest) stays eligible under the
 guards above. Without `collectors.herdr` none of this applies, and
 quarantine makes no second `/proc` pass.
 
-At quarantine, every herdr listing and every open file that exists when the
-final `/proc` pass starts is honoured; that pass reads each process once and
-looks only for the batch's files still to move. A listing or open that
-starts after that pass starts and before the rename is not seen. A file
-moved in that window sits in quarantine, restorable with `janitor restore`,
-and in the verified artifact batch archive (manifest and SHA-256 pinned by
-its receipt), so expiry deleting the local copy still leaves the archive.
+At quarantine both checks are best-effort samples, not a shared cutoff.
+Herdr evidence is as of herdr's own snapshot, taken inside the query;
+open-file evidence is as of each process's inspection during the final
+`/proc` pass, which reads each process once and looks only for the batch's
+files still to move. A listing herdr publishes after its snapshot, or a
+file a process opens after that process was inspected, is not seen before
+the rename. The order (hash, first `/proc` pass, herdr, final `/proc` pass,
+rename) minimises that window but cannot close it without an exclusion
+that herdr and the file openers would both have to honour. A file moved in
+the window sits in quarantine, restorable with `janitor restore`, and in
+the verified artifact batch archive (manifest and SHA-256 pinned by its
+receipt), so expiry deleting the local copy still leaves the archive.
 
 ##### OMP session artifacts
 
