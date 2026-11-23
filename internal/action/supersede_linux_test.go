@@ -415,6 +415,51 @@ func TestIdenticalTreeProofFailsClosed(t *testing.T) {
 			t.Fatalf("unchanged trees: %v", err)
 		}
 	})
+	t.Run("search-only parent of the original", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads a search-only directory anyway; run unprivileged")
+		}
+		original, copy, id := setup(t)
+		parent := filepath.Dir(original)
+		if err := os.Chmod(parent, 0o111); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(parent, 0o700) })
+		proof, err := compareTrees(ctx, original, copy, id, 100)
+		if err != nil {
+			t.Fatalf("original below a search-only parent: %v", err)
+		}
+		if err := proof.unchanged(ctx); err != nil {
+			t.Fatalf("unchanged trees: %v", err)
+		}
+	})
+	// A readable directory that cannot be searched can still be listed: an
+	// empty one on both sides leaves the trees identical, so the proof stays
+	// an identical one, which an entry added to the original voids.
+	t.Run("identical: readable, non-searchable empty directory", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root searches any directory anyway; run unprivileged")
+		}
+		original, copy, id := setup(t)
+		for _, dir := range []string{filepath.Join(original, "empty"), filepath.Join(copy, "empty")} {
+			if err := os.Mkdir(dir, 0o400); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(dir, 0o400); err != nil {
+				t.Fatal(err)
+			}
+		}
+		proof, err := compareTrees(ctx, original, copy, id, 100)
+		if err != nil {
+			t.Fatalf("identical trees with a 0400 empty directory: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(original, "later"), []byte("later\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := proof.unchanged(ctx); err == nil {
+			t.Fatal("an entry added to an original proven identical kept the proof: it was taken as containing the copy")
+		}
+	})
 }
 
 // privateMounts skips unless the test runs as root in a mount namespace of

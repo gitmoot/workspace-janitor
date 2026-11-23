@@ -55,16 +55,19 @@ const compareChunk = 1 << 20
 // when, besides, every directory has the same permission bits, owner, group
 // and entry names. Otherwise it contains the copy: it may hold more
 // entries, and its directories any permissions and owner. A containing
-// original's directories are looked up through search-only descriptors and
-// never need to be readable; only the copy's directories are listed, so
-// maxEntries bounds the copy's entries alone.
+// original's directories, and its parent, are looked up through
+// search-only descriptors and never need to be readable; only the copy's
+// directories are listed, so maxEntries bounds the copy's entries alone.
 //
 // Anything else is not proof: another entry type, an unreadable file, an
 // entry on another mount (by mount identity, so a bind mount of the same
 // filesystem counts) or with no mount identity, more than maxEntries
-// entries in the copy, or an entry of the original that is an entry of the
-// copy (the same inode, anywhere in either tree), since removing the copy
-// would then remove what the original was proven to hold.
+// entries in the copy, or a compared counterpart in the original that is
+// an entry of the copy (the same inode as any of them, at any path), since
+// removing the copy would then remove what the original was proven to
+// hold. Entries only the original has are never visited: one that
+// bind-mounts or hard-links into the copy loses that view when the copy is
+// removed, while the data stays at the proven, separate counterparts.
 func compareTrees(ctx context.Context, original, copy string, copyID core.FilesystemID, maxEntries int) (*supersedeProof, error) {
 	proof := &supersedeProof{original: original, copy: copy, copyID: copyID, maxEntries: maxEntries}
 	w, err := proof.walk(ctx, true)
@@ -106,12 +109,14 @@ func (p *supersedeProof) walk(ctx context.Context, content bool) (*treeWalk, err
 	if p.maxEntries <= 0 {
 		return nil, errors.New("no comparison entry budget (limits.deep_size_max_entries)")
 	}
-	originalParent, err := openExistingDirNoSymlinks(filepath.Dir(p.original))
+	// The walk only looks up and reads; neither parent needs to be
+	// readable, the original's in particular may be search-only.
+	originalParent, err := openSearchDirNoSymlinks(filepath.Dir(p.original))
 	if err != nil {
 		return nil, fmt.Errorf("original: %w", err)
 	}
 	defer unix.Close(originalParent)
-	copyParent, err := openExistingDirNoSymlinks(filepath.Dir(p.copy))
+	copyParent, err := openSearchDirNoSymlinks(filepath.Dir(p.copy))
 	if err != nil {
 		return nil, fmt.Errorf("quarantined copy: %w", err)
 	}
@@ -301,7 +306,7 @@ func (w *treeWalk) dirs(originalParent, copyParent int, originalName, copyName s
 		return err
 	}
 	if w.exact {
-		if err := w.sameNames(od, o, copyName, cn); err != nil {
+		if err := w.sameNames(originalParent, originalName, o, copyName, cn); err != nil {
 			return err
 		}
 	}
@@ -324,11 +329,14 @@ func (w *treeWalk) dirs(originalParent, copyParent int, originalName, copyName s
 	return nil
 }
 
-// sameNames lists the original directory od, reading at most one name more
-// than the copy's, and records a difference unless it has exactly the
-// copy's names. One that cannot be listed is not proven identical.
-func (w *treeWalk) sameNames(od int, o *entryStat, copyName string, copyNames []string) error {
-	dir, err := openAt(od, ".", o, unix.O_DIRECTORY)
+// sameNames lists the original directory originalName in originalParent,
+// reading at most one name more than the copy's, and records a difference
+// unless it has exactly the copy's names. It is opened by name through its
+// parent (a listing needs read, not search, permission on it) and must be
+// the inode that was stat'ed. One that cannot be listed is not proven
+// identical.
+func (w *treeWalk) sameNames(originalParent int, originalName string, o *entryStat, copyName string, copyNames []string) error {
+	dir, err := openAt(originalParent, originalName, o, unix.O_DIRECTORY)
 	if err != nil {
 		return w.differs("%s cannot be listed at the original path: %v", copyName, err)
 	}

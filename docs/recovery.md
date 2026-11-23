@@ -49,12 +49,16 @@ has its counterpart at the same relative path in the original, identical as
 above, except that a directory of the copy need only be a directory there,
 of any permissions and owner, while the original may hold more. The copy is
 walked once; only its directories are listed, so
-`limits.deep_size_max_entries` bounds the copy's entries alone, and the
-original's directories are only searched, so a search-only (`--x`) directory
-there does not stop the proof. No entry of the original may be an entry of
-the copy (the same inode anywhere in either tree, as a bind mount or hard
-link would make it), since removing the copy would then remove what the
-original was proven to hold. An identical or containing original makes the copy redundant:
+`limits.deep_size_max_entries` bounds the copy's entries alone, and a
+containing original's directories (and the original's parent) need only be
+searchable, so a search-only (`--x`) directory there does not stop the proof. Every original
+counterpart the proof compares is checked against every entry of the copy:
+it may not be the same inode as any of them (as a bind mount or hard link
+would make it) and may not be on another mount. Entries only the original
+has are never visited, so they are not inspected: an original-only branch
+that bind-mounts or hard-links into the copy loses that view when the copy
+is removed, while the data stays at the proven, separate counterparts. An
+identical or containing original makes the copy redundant:
 expiry removes only the copy, never touching the original, and records the
 receipt `superseded_by_original` rather than `deleted`, with a reason saying
 whether the original was identical or contained the copy. References to and

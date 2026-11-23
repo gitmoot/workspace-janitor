@@ -44,6 +44,20 @@ jobs:
       - name: go test
         run: go test -v ./...
 
+      # The bind-mount supersede regression needs root in a private mount
+      # namespace; under plain go test it skips, so run it here and fail
+      # unless it actually ran and passed.
+      - name: supersede bind-mount regression (root, private mount namespace)
+        run: |
+          go test -c -o "$RUNNER_TEMP/action.test" ./internal/action
+          cd "$RUNNER_TEMP"
+          sudo unshare -m ./action.test -test.run '^TestExpiryRefusesAnOriginalShowingTheCopy$' -test.v -test.count=1 | tee bind-mount.log
+          if grep -q -- '--- SKIP' bind-mount.log; then
+            echo "the bind-mount regression was skipped"
+            exit 1
+          fi
+          grep -q -- '^--- PASS: TestExpiryRefusesAnOriginalShowingTheCopy' bind-mount.log
+
       - name: go test -race (watcher goroutines)
         env:
           CGO_ENABLED: "1"
