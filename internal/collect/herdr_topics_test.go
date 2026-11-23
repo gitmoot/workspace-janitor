@@ -115,9 +115,10 @@ func TestHerdrTopicSessionObjectsProtectTheirPath(t *testing.T) {
 
 // A malformed topic_sessions is no answer: herdr fails, naming the agent,
 // and every session entry is unknown. Absent and null mean no topics.
-// Review of #237: an object with a second "path" member (in any spelling,
-// or after a null one) is malformed, and so is a path holding a NUL or a
-// character encoding/json decoded lossily to U+FFFD.
+// Review of #237: an object with a member name twice (a second "path" in
+// any spelling or after a null one, or any other key), or a case variant
+// of "path", is malformed, and so is a path holding a NUL or a character
+// encoding/json decoded lossily to U+FFFD.
 func TestHerdrMalformedTopicSessionsFailClosed(t *testing.T) {
 	tooMany := make([]string, 1001) // past the 1000-per-agent cap
 	for i := range tooMany {
@@ -152,6 +153,8 @@ func TestHerdrMalformedTopicSessionsFailClosed(t *testing.T) {
 		"object path bad UTF-8": "[{\"path\":\"/s/-proj/t\xff.jsonl\"}]",
 		"lone surrogate":        `["/s/-proj/t\ud800.jsonl"]`,
 		"object lone surrogate": `[{"path":"/s/-proj/t\ud800.jsonl"}]`,
+		"object title twice":    `[{"path":"/s/-proj/t.jsonl","title":"a","title":"b"}]`,
+		"object Path and path":  `[{"path":"/s/-proj/t.jsonl","Path":"/s/-proj/u.jsonl"}]`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			x := newHerdrFixture(t, "")
