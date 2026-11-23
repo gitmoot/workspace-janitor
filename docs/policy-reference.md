@@ -1408,7 +1408,16 @@ name is still kept. When herdr does not answer (including an answer the
 decoder rejects), a listed topic could be any `*.jsonl` the walk reaches, so
 every `*.jsonl` at any depth inside any session folder stays (reported, not
 a failure); every other file (logs and the rest) stays eligible under the
-guards above. Without `collectors.herdr` none of this applies.
+guards above. Without `collectors.herdr` none of this applies, and
+quarantine makes no second `/proc` pass.
+
+At quarantine, every herdr listing and every open file that exists when the
+final `/proc` pass starts is honoured; that pass reads each process once and
+looks only for the batch's files still to move. A listing or open that
+starts after that pass starts and before the rename is not seen. A file
+moved in that window sits in quarantine, restorable with `janitor restore`,
+and in the verified artifact batch archive (manifest and SHA-256 pinned by
+its receipt), so expiry deleting the local copy still leaves the archive.
 
 ##### OMP session artifacts
 
@@ -1464,9 +1473,9 @@ Then each file must still be the archived file (inode, size, mtime, mode,
 ownership and contents, with no extended attributes), not covered by policy
 or by a current protected name (`protect.name_patterns` and the built-in
 screen, on every name below the session folder), unused (a `/proc` pass
-per batch), then not kept by herdr
-([herdr rule for session artifacts](#herdr-rule-for-session-artifacts)),
-then still unused by a second `/proc` pass over the remaining files, since
+per batch), and, with `collectors.herdr`, not kept by herdr
+([herdr rule for session artifacts](#herdr-rule-for-session-artifacts))
+and still unused by a second `/proc` pass over the remaining files, since
 the herdr query can block for up to `limits.command_timeout`.
 Immediately before its rename, its full verified state
 (ctime included) is compared again, so a write after the hash keeps it. Each moved file is

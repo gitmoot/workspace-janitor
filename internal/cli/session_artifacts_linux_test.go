@@ -11,7 +11,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -844,6 +846,48 @@ func TestSessionArtifactsNeedTheirCategory(t *testing.T) {
 	}
 	if _, err := os.Lstat(receipts["a.log"]); err != nil {
 		t.Fatalf("quarantined file deleted without category authority: %v", err)
+	}
+}
+
+// countScans makes pid's maps a FIFO that ends every procfs pass's read at
+// once and counts the passes; the returned func, called once no pass runs,
+// stops counting and returns how many passes read it. A pass's open blocks
+// until a writer appears; the counter polls with non-blocking writer opens
+// (ENXIO while no reader is there), counts a reader when one succeeds, and
+// then waits for ENXIO again, so each pass counts once.
+func (x *artifactFixture) countScans(t *testing.T, pid string) func() int {
+	t.Helper()
+	maps := filepath.Join(x.proc, pid, "maps")
+	if err := syscall.Mkfifo(maps, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var passes atomic.Int32
+	var stopped atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reading := false
+		for {
+			w, err := os.OpenFile(maps, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+			if err != nil { // no reader
+				if stopped.Load() {
+					return
+				}
+				reading = false
+			} else {
+				w.Close() // the pass reads EOF
+				if !reading {
+					passes.Add(1)
+					reading = true
+				}
+			}
+			runtime.Gosched()
+		}
+	}()
+	return func() int {
+		stopped.Store(true)
+		<-done
+		return int(passes.Load())
 	}
 }
 

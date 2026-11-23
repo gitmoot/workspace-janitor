@@ -435,6 +435,42 @@ func TestHerdrArtifactQuarantineRechecksOpenFilesAfterHerdr(t *testing.T) {
 	}
 }
 
+// Review of #249: the quarantine's second procfs pass only waits out the
+// herdr query, so without collectors.herdr a batch gets one pass, with it
+// two. A preview runs the same checks without the moves, whose own
+// revalidation would add passes of its own.
+func TestHerdrArtifactQuarantineSecondPassOnlyWithHerdr(t *testing.T) {
+	for name, withHerdr := range map[string]bool{"without herdr": false, "with herdr": true} {
+		t.Run(name, func(t *testing.T) {
+			x := newArtifactFixture(t)
+			if withHerdr {
+				fakeHerdr(t, x.stateStoreFixture)
+				x.writeArtifacts(t)
+			}
+			session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"a.log": oldArtifact})
+			if item := categoryItem(t, x.categories(t, false), session); item.Status != categoryArchived || item.Files != 1 {
+				t.Fatalf("batch = %+v", item)
+			}
+			stop := x.countScans(t, "4242")
+			out, stderr, code := x.run(t, "--format", "json", "apply", "--quarantine", "--artifacts")
+			passes := stop()
+			var doc struct {
+				Data artifactQuarantineReport `json:"data"`
+			}
+			if code != ExitOK || json.Unmarshal([]byte(out), &doc) != nil || len(doc.Data.Batches) != 1 || doc.Data.Batches[0].Moved != 1 {
+				t.Fatalf("quarantine preview: exit=%d stderr=%s stdout=%s", code, stderr, out)
+			}
+			want := 1
+			if withHerdr {
+				want = 2
+			}
+			if passes != want {
+				t.Fatalf("quarantine made %d procfs passes, want %d", passes, want)
+			}
+		})
+	}
+}
+
 // herdrScript installs a herdr stand-in running body and configures
 // collectors.herdr with it over root.
 func herdrScript(t *testing.T, x *stateStoreFixture, root, body string) {

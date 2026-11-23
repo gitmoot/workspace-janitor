@@ -503,9 +503,9 @@ type artifactQuarantineReport struct {
 // one journaled cleanup item per file. Each batch archive is fully verified
 // first; then each file must still be exactly the archived file (identity,
 // size, mtime and contents), unprotected, unused (a procfs pass per
-// batch), not kept by herdr asked afresh after that pass
-// (artifactHerdr.keeps), and still unused by a second procfs pass after the
-// herdr query; it is re-checked immediately before its rename. A file that
+// batch), and, with collectors.herdr, not kept by herdr asked afresh after
+// that pass (artifactHerdr.keeps) and still unused by a second procfs pass
+// after the herdr query; it is re-checked immediately before its rename. A file that
 // fails any of that stays in place and is reported; the batch is then settled. A
 // batch whose archive does not verify, or whose live-process check cannot
 // complete, moves nothing and is retried.
@@ -666,11 +666,20 @@ func quarantineArtifactBatch(ctx context.Context, engine *action.Engine, policy 
 		}
 		return reason != ""
 	})
-	// The herdr query blocks for up to command_timeout: process use is
-	// checked again after it, so herdr and then open files are the last
-	// checks before the renames.
-	if ready, err = unused(ready); err != nil {
-		return fmt.Errorf("live process check after herdr: %w; nothing moved", err)
+	// The herdr query blocks for up to command_timeout, so process use is
+	// checked again after it, over only the files still to move: herdr and
+	// then open files are the last checks before the renames. Guarantee:
+	// every herdr listing and every open descriptor that exists when this
+	// final pass starts is honoured; one that appears after it starts and
+	// before a rename is not seen. A file moved in that window sits in
+	// quarantine, restorable with `janitor restore`, and in the verified
+	// batch archive (manifest and SHA-256 pinned by its receipt), so expiry
+	// deleting the local copy still leaves the archive. Without herdr there
+	// is no query to wait out, so the first pass is the last.
+	if herdr != nil {
+		if ready, err = unused(ready); err != nil {
+			return fmt.Errorf("live process check after herdr: %w; nothing moved", err)
+		}
 	}
 	var failures []error
 	for _, r := range ready {
