@@ -411,11 +411,12 @@ func TestHerdrUncleanSessionPathFailsClosed(t *testing.T) {
 }
 
 // Review of #237: encoding/json decodes an escaped NUL as is, and an
-// invalid UTF-8 byte or an unpaired surrogate to U+FFFD, without an error.
-// An agent_session path holding one is malformed evidence: herdr fails,
-// naming the agent, and every session entry is unknown.
+// invalid UTF-8 byte or an unpaired surrogate escape (#247: high or low)
+// to U+FFFD, without an error. An agent_session path holding one is
+// malformed evidence: herdr fails, naming the agent, and every session
+// entry is unknown.
 func TestHerdrLossySessionPathFailsClosed(t *testing.T) {
-	for name, inner := range map[string]string{"NUL": `\u0000`, "invalid UTF-8": "\xff", "unpaired surrogate": `\ud800`} {
+	for name, inner := range map[string]string{"NUL": `\u0000`, "invalid UTF-8": "\xff", "unpaired surrogate": `\ud800`, "lone low surrogate": `\udc00`} {
 		t.Run(name, func(t *testing.T) {
 			x := newHerdrFixture(t, "")
 			writeHerdrScript(t, x, answerScript(t, filepath.Join(x.project, herdrStemA+inner+".jsonl")))
@@ -465,6 +466,11 @@ func TestHerdrDuplicateOrCaseVariantMembersFailClosed(t *testing.T) {
 		"two agents arrays":       {`{"id":"cli:agent:list","result":{"type":"agent_list","agents":[` + good + `],"agents":[]}}`, "agent list"},
 		"two ids":                 {`{"id":"cli:pane:list","id":"cli:agent:list","result":{"type":"agent_list","agents":[` + good + `]}}`, "agent list"},
 		"RESULT":                  {`{"id":"cli:agent:list","RESULT":{"type":"agent_list","agents":[` + good + `]}}`, "agent list"},
+		// #247: a malformed error document still fails, reported as
+		// malformed rather than by a shadowed or partial value.
+		"error code and Code":  {`{"id":"cli:agent:list","error":{"code":"first","Code":"last","message":5}}`, "malformed error"},
+		"error code twice":     {`{"id":"cli:agent:list","error":{"code":"first","code":"last","message":"m"}}`, "malformed error"},
+		"error message number": {`{"id":"cli:agent:list","error":{"code":"c","message":5}}`, "malformed error"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			x := newHerdrFixture(t, "")

@@ -1303,14 +1303,17 @@ topics. Anything else must be an array of at most 1000 entries, each a path
 string or an object (herdr 0.9.5: `{path, topic_id, title,
 created_unix_ms}`) whose `path` member is a path string; other members are
 ignored. Each path must be absolute, clean and end in `.jsonl`. A session
-or topic path must also decode losslessly: one holding a NUL, or U+FFFD
-(what an invalid UTF-8 byte or an unpaired surrogate escape such as
-`\ud800` decodes to), is malformed. Every object in the answer (the
-document, its result, each agent, its `agent_session`, each topic object)
-is read member by member, key names compared exactly after decoding
-escapes: a member name that appears twice (`"p\u0061th"` beside `"path"`,
-a second `agent_session`, a duplicate `title`), or a case variant of a
-member the guard reads (`"Value"`, `"AGENT_SESSION"`, `"Path"`), is
+or topic path must also decode losslessly, checked on the JSON string
+before decoding: one with an invalid UTF-8 byte, an unpaired surrogate
+escape (`\ud800` without a low surrogate after it, or a lone `\udc00`;
+the decoder would turn either into U+FFFD) or a NUL is malformed. A U+FFFD
+herdr sends, as UTF-8 or as `\ufffd`, and a surrogate pair are characters
+of a valid file name. Every object in the answer (the document, its error
+and result, each agent, its `agent_session`, each topic object) is read
+member by member, key names compared exactly after decoding escapes: a
+member name that appears twice (`"p\u0061th"` beside `"path"`, a second
+`agent_session`, a duplicate `title`), or a case variant of a member the
+guard reads (`"Value"`, `"AGENT_SESSION"`, `"Path"`, `"Code"`), is
 malformed; unknown members are ignored. Any other value is malformed
 evidence and herdr fails closed.
 
