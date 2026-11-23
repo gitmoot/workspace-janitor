@@ -9,12 +9,16 @@ import (
 	"github.com/gitmoot/workspace-janitor/internal/core"
 )
 
-type identicalTrees struct{}
+type supersedeProof struct{}
 
-func compareTrees(context.Context, string, string, core.FilesystemID, int) (*identicalTrees, error) {
+func compareTrees(context.Context, string, string, core.FilesystemID, int) (*supersedeProof, error) {
 	return nil, errors.New("comparing a quarantined copy with its original is supported on Linux only")
 }
 
-func (*identicalTrees) unchanged(context.Context) error {
+func (*supersedeProof) reason() string {
+	return supersededReason
+}
+
+func (*supersedeProof) unchanged(context.Context) error {
 	return errors.New("comparing a quarantined copy with its original is supported on Linux only")
 }

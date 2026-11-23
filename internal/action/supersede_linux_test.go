@@ -75,17 +75,38 @@ func treeState(t *testing.T, path string) string {
 	return out.String()
 }
 
+// growOriginal adds entries the quarantined copy lacks to the tree at
+// source, at its top and inside a directory the copy shares, and changes
+// the shared directories' permissions, as a rebuilt original does.
+func growOriginal(t *testing.T, source string) {
+	t.Helper()
+	for _, step := range []func() error{
+		func() error { return os.WriteFile(filepath.Join(source, "extra"), []byte("new\n"), 0o644) },
+		func() error { return os.WriteFile(filepath.Join(source, "sub", "more"), []byte("more\n"), 0o644) },
+		func() error { return os.Mkdir(filepath.Join(source, "added"), 0o755) },
+		func() error { return os.Chmod(source, 0o700) },
+		func() error { return os.Chmod(filepath.Join(source, "sub"), 0o755) },
+	} {
+		if err := step(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // Expiry of a receipt whose original path was recreated after quarantine
-// (sandboxd-*-omp, admin-v*-work: restored from archives, then referenced).
-// Only an original identical to the quarantined copy makes the copy
-// redundant; it alone is removed and recorded superseded_by_original, while
-// anything else at the original path keeps today's refusal, and a guard on
-// the copy itself still keeps it.
+// (sandboxd-*-omp, admin-v*-work: restored from archives, then referenced;
+// efm-text-cache: rebuilt and grown past the copy). Only an original
+// identical to the quarantined copy, or one containing every entry of it
+// identical at the same relative path, makes the copy redundant; it alone
+// is removed and recorded superseded_by_original, while anything else at
+// the original path keeps today's refusal, and a guard on the copy itself
+// still keeps it.
 func TestExpiryOfRecreatedOriginal(t *testing.T) {
 	type outcome int
 	const (
 		deleted outcome = iota
 		superseded
+		contained        // superseded by an original holding more than the copy
 		refusedReference // today's refusal: the original path is referenced
 		refusedCopy      // a guard on the quarantined copy refuses
 	)
@@ -103,6 +124,51 @@ func TestExpiryOfRecreatedOriginal(t *testing.T) {
 		}, superseded},
 		{"one byte different", func(t *testing.T, _ *Engine, _, source string, _ core.CleanupItem) bool {
 			writeSupersedeTree(t, source, "notez\n")
+			return true
+		}, refusedReference},
+		{"contained and referenced", func(t *testing.T, _ *Engine, _, source string, _ core.CleanupItem) bool {
+			writeSupersedeTree(t, source, "notes\n")
+			growOriginal(t, source)
+			return true
+		}, contained},
+		{"grown, one file different", func(t *testing.T, _ *Engine, _, source string, _ core.CleanupItem) bool {
+			writeSupersedeTree(t, source, "notez\n")
+			growOriginal(t, source)
+			return true
+		}, refusedReference},
+		{"grown, one file missing", func(t *testing.T, _ *Engine, _, source string, _ core.CleanupItem) bool {
+			writeSupersedeTree(t, source, "notes\n")
+			growOriginal(t, source)
+			if err := os.Remove(filepath.Join(source, "sub", "notes")); err != nil {
+				t.Fatal(err)
+			}
+			return true
+		}, refusedReference},
+		{"grown, symlink retargeted", func(t *testing.T, _ *Engine, _, source string, _ core.CleanupItem) bool {
+			writeSupersedeTree(t, source, "notes\n")
+			growOriginal(t, source)
+			link := filepath.Join(source, "link")
+			if err := os.Remove(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("sub/notez", link); err != nil {
+				t.Fatal(err)
+			}
+			return true
+		}, refusedReference},
+		{"grown, directory where the copy has a file", func(t *testing.T, _ *Engine, _, source string, _ core.CleanupItem) bool {
+			writeSupersedeTree(t, source, "notes\n")
+			growOriginal(t, source)
+			tool := filepath.Join(source, "tool")
+			if err := os.Remove(tool); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(tool, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(tool, "inner"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
 			return true
 		}, refusedReference},
 		{"symlink to an identical tree", func(t *testing.T, _ *Engine, root, source string, _ core.CleanupItem) bool {
@@ -164,13 +230,16 @@ func TestExpiryOfRecreatedOriginal(t *testing.T) {
 			item, err = e.Delete(ctx, item)
 
 			switch tc.want {
-			case deleted, superseded:
-				want := map[outcome]core.CleanupState{deleted: core.CleanupDeleted, superseded: core.CleanupSuperseded}[tc.want]
+			case deleted, superseded, contained:
+				want := map[outcome]core.CleanupState{deleted: core.CleanupDeleted, superseded: core.CleanupSuperseded, contained: core.CleanupSuperseded}[tc.want]
 				if err != nil || item.State != want {
 					t.Fatalf("expiry: %s %q %v, want %s", item.State, item.Reason, err, want)
 				}
 				if _, err := os.Lstat(item.Destination); !os.IsNotExist(err) {
 					t.Fatalf("quarantined copy still exists: %v", err)
+				}
+				if wantContained := tc.want == contained; tc.want != deleted && strings.Contains(item.Reason, "contained") != wantContained {
+					t.Fatalf("superseded reason %q, want a contained reason=%t", item.Reason, wantContained)
 				}
 			default:
 				if err == nil || item.State != core.CleanupInvestigate {
@@ -226,9 +295,12 @@ func TestExpiryRecordsAnInterruptedSupersededRemoval(t *testing.T) {
 
 // The identity proof fails closed. Permission bits are compared (a restore
 // brings them back, and they decide who may use the tree); modification
-// times are not (copying a tree resets them). A tree over the entry budget
+// times are not (copying a tree resets them). A copy over the entry budget
 // is not compared, and a change to either tree after the comparison, even
-// one that leaves the bytes equal, voids the proof before removal.
+// one that leaves the bytes equal, voids the proof before removal. An
+// original containing the copy is bounded by the copy's entries alone, and
+// may keep gaining entries beside the compared ones, but a change to a
+// compared original file voids the proof.
 func TestIdenticalTreeProofFailsClosed(t *testing.T) {
 	setup := func(t *testing.T) (original, copy string, id core.FilesystemID) {
 		t.Helper()
@@ -290,6 +362,35 @@ func TestIdenticalTreeProofFailsClosed(t *testing.T) {
 		}
 		if err := proof.unchanged(ctx); err == nil {
 			t.Fatal("a rewrite after the comparison kept the proof")
+		}
+	})
+	t.Run("contained: budget bounds the copy alone", func(t *testing.T) {
+		original, copy, id := setup(t)
+		growOriginal(t, original)
+		if _, err := compareTrees(ctx, original, copy, id, 5); err != nil {
+			t.Fatalf("a five-entry copy inside an eight-entry original, budget five: %v", err)
+		}
+	})
+	t.Run("contained: changed after comparison", func(t *testing.T) {
+		original, copy, id := setup(t)
+		growOriginal(t, original)
+		proof, err := compareTrees(ctx, original, copy, id, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A live original gains entries beside the compared ones: the
+		// counterparts still hold what was compared.
+		if err := os.WriteFile(filepath.Join(original, "sub", "later"), []byte("later\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := proof.unchanged(ctx); err != nil {
+			t.Fatalf("original grown beside the compared entries: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(original, "sub", "notes"), []byte("notes\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := proof.unchanged(ctx); err == nil {
+			t.Fatal("a rewrite of a compared original file after the comparison kept the proof")
 		}
 	})
 }

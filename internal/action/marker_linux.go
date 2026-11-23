@@ -16,7 +16,7 @@ const deletionMarkerName = "deleting"
 
 // markerContent binds a marker to one receipt: its action, the receipt
 // directory's own identity, and the object's identity. A removal that an
-// identical original supersedes also names that outcome; a deletion keeps
+// identical or containing original supersedes also names that outcome; a deletion keeps
 // the format earlier releases wrote, so their markers still settle.
 func markerContent(item core.CleanupItem, dir unix.Stat_t, outcome core.CleanupState) []byte {
 	obj := item.Entry.FilesystemID

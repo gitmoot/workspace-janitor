@@ -17,15 +17,20 @@ import (
 // identical original was back at its source.
 const supersededReason = "an object identical to the quarantined copy is back at the original path; only the redundant copy was removed and the original was not touched"
 
-// expiryEligible applies the guards a confirmed expiry of item would. When an
-// object identical to the quarantined copy is back at the original path, it
-// returns proof of that and applies only the guards on the copy itself: the
-// copy is redundant, and its removal never touches the original, so
-// references to and protections of the original pathname do not hold it.
-// Otherwise (no object there, or one that is not provably identical) it
-// returns nil proof and every expiry guard (Eligible) applies, as it always
-// has.
-func (e *Engine) expiryEligible(ctx context.Context, item core.CleanupItem) (*identicalTrees, error) {
+// containedReason is the receipt reason of a copy removed because the
+// original back at its source held every entry of it.
+const containedReason = "every file of the quarantined copy is contained byte-identical at the original path; only the redundant copy was removed and the original was not touched"
+
+// expiryEligible applies the guards a confirmed expiry of item would. When
+// the object back at the original path is identical to the quarantined copy
+// or contains it (every entry of the copy present, identical, at the same
+// relative path), it returns proof of that and applies only the guards on
+// the copy itself: the copy is redundant, and its removal never touches the
+// original, so references to and protections of the original pathname do
+// not hold it. Otherwise (no object there, or one that provably neither
+// matches nor contains the copy) it returns nil proof and every expiry
+// guard (Eligible) applies, as it always has.
+func (e *Engine) expiryEligible(ctx context.Context, item core.CleanupItem) (*supersedeProof, error) {
 	if err := e.expiryReady(item); err != nil {
 		return nil, err
 	}
@@ -35,7 +40,7 @@ func (e *Engine) expiryEligible(ctx context.Context, item core.CleanupItem) (*id
 	if err := e.liveSessionFootprint(ctx, item); err != nil {
 		return nil, err
 	}
-	proof := e.identicalOriginal(ctx, item)
+	proof := e.supersedingOriginal(ctx, item)
 	if proof == nil {
 		return nil, e.Eligible(ctx, item)
 	}
@@ -50,7 +55,7 @@ func (e *Engine) expiryEligible(ctx context.Context, item core.CleanupItem) (*id
 
 // copyInUse refuses a quarantined copy that any process uses through its
 // working directory, root, executable, an open descriptor or a mapped file,
-// or when any process cannot be inspected. With the original identical, a
+// or when any process cannot be inspected. With the original standing in, a
 // process still holding the copy may be in the middle of reading it.
 func (e *Engine) copyInUse(ctx context.Context, item core.CleanupItem) error {
 	used, err := workspacearchive.ScratchReferences(ctx, e.Collect.ProcRoot, filepath.Dir(item.Destination))
@@ -81,7 +86,7 @@ func (e *Engine) archiveRulesAt(source string) []config.WorkspaceArchiveRule {
 // withoutArchiveRulesAt is e observing without the workspace archive rules
 // for exactly source. Binding the quarantined copy to such a rule asks
 // whether the archive may stand in for it, and checks live use of the
-// original names as well as the copy's; with an identical original standing
+// original names as well as the copy's; with a superseding original standing
 // in, that question is moot, and a process using only the original must not
 // hold the redundant copy. Every other rule still applies, including a
 // rule's protection of the trees that contain it, and copyArchiveReferences
@@ -119,11 +124,12 @@ func (e *Engine) copyArchiveReferences(ctx context.Context, item core.CleanupIte
 	return nil
 }
 
-// identicalOriginal compares the object at item.Source, if there is one, with
-// the quarantined copy, and returns proof only when they are identical. A
-// unit with a companion (bound, or named by a rule for its source) never
-// qualifies: its two parts expire together under every guard.
-func (e *Engine) identicalOriginal(ctx context.Context, item core.CleanupItem) *identicalTrees {
+// supersedingOriginal compares the object at item.Source, if there is one,
+// with the quarantined copy, and returns proof only when it is identical to
+// the copy or, failing that, contains it. A unit with a companion (bound, or
+// named by a rule for its source) never qualifies: its two parts expire
+// together under every guard.
+func (e *Engine) supersedingOriginal(ctx context.Context, item core.CleanupItem) *supersedeProof {
 	if suffix, _ := companionOf(item); suffix != "" {
 		return nil
 	}
@@ -144,16 +150,17 @@ func (e *Engine) identicalOriginal(ctx context.Context, item core.CleanupItem) *
 
 // supersede removes a quarantined copy that expiryEligible found redundant
 // and records it superseded_by_original. Both trees must still carry every
-// stamp the comparison saw, so a change to either after it was compared
-// keeps the copy. The removal is the anchored deletion expiry always uses:
+// stamp the comparison saw (for a containing original, every counterpart of
+// a copy entry), so a change to either after it was compared keeps the
+// copy. The removal is the anchored deletion expiry always uses:
 // it starts from the copy's recorded identity, never follows a symlink and
 // never leaves the copy's filesystem, so it cannot reach the original.
-func (e *Engine) supersede(ctx context.Context, item core.CleanupItem, proof *identicalTrees) (core.CleanupItem, error) {
+func (e *Engine) supersede(ctx context.Context, item core.CleanupItem, proof *supersedeProof) (core.CleanupItem, error) {
 	if err := proof.unchanged(ctx); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return item, err
 		}
-		return e.investigate(ctx, item, "identical original no longer proven: "+err.Error())
+		return e.investigate(ctx, item, "superseding original no longer proven: "+err.Error())
 	}
 	if err := writeRemovalMarker(item, core.CleanupSuperseded); err != nil {
 		return item, fmt.Errorf("record removal intent: %w", err)
@@ -161,7 +168,7 @@ func (e *Engine) supersede(ctx context.Context, item core.CleanupItem, proof *id
 	if err := deleteAnchored(item.Destination, item.Entry.FilesystemID); err != nil {
 		return item, err
 	}
-	item.State, item.UpdatedAt, item.Reason = core.CleanupSuperseded, e.now(), supersededReason
+	item.State, item.UpdatedAt, item.Reason = core.CleanupSuperseded, e.now(), proof.reason()
 	if err := e.update(ctx, item, core.CleanupQuarantined); err != nil {
 		return item, err
 	}

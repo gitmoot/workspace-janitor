@@ -26,12 +26,14 @@ type entryStamp struct {
 	size     int64
 }
 
-// identicalTrees proves that the object at the original path was, entry by
-// entry, the quarantined copy: stamps of both trees in walk order.
-type identicalTrees struct {
+// supersedeProof proves that the object at the original path was, entry by
+// entry, the quarantined copy (identical), or held every entry of it
+// (contained): stamps of both trees in walk order.
+type supersedeProof struct {
 	original, copy string
 	copyID         core.FilesystemID
 	maxEntries     int
+	contained      bool
 	stamps         []entryStamp
 }
 
@@ -40,27 +42,51 @@ const compareChunk = 1 << 20
 
 // compareTrees compares the object at original with the quarantined copy
 // without following a symlink anywhere, crossing a mount, or changing
-// either side (files are read with O_NOATIME where permitted). Identical
-// means the same tree shape and entry names, and for every entry the same
-// type, permission bits, owner and group; the same target for a symlink;
-// and the same size and bytes for a regular file. Modification times are
-// not compared: copying or extracting a tree commonly resets them, and they
-// do not change what a restore would bring back. Anything else (another
-// entry type, a mount, an unreadable entry, more than maxEntries entries
-// on a side, the original's directory being the copy's) is not proof.
-func compareTrees(ctx context.Context, original, copy string, copyID core.FilesystemID, maxEntries int) (*identicalTrees, error) {
-	proof := &identicalTrees{original: original, copy: copy, copyID: copyID, maxEntries: maxEntries}
+// either side (files are read with O_NOATIME where permitted), and proves
+// the original identical to the copy or, failing that, containing it.
+//
+// Identical means the same tree shape and entry names, and for every entry
+// the same type, permission bits, owner and group; the same target for a
+// symlink; and the same size and bytes for a regular file. Modification
+// times are not compared: copying or extracting a tree commonly resets
+// them, and they do not change what a restore would bring back. Anything
+// else (another entry type, a mount, an unreadable entry, more than
+// maxEntries entries on a side, the original's directory being the copy's)
+// is not proof of identity.
+//
+// Containing allows the original to hold entries the copy lacks: every
+// entry of the copy must have its counterpart at the same relative path in
+// the original, identical as above, except that a directory of the copy
+// need only be a directory there, of any permissions and owner. Only the
+// copy's directories are listed, so maxEntries bounds the copy's entries
+// alone. The original's directories are stamped by identity only, so
+// entries added to or removed from them beside the counterparts (a live
+// original keeps changing) do not void the proof; every counterpart is
+// stamped, and looked up again by name when the proof is re-checked.
+func compareTrees(ctx context.Context, original, copy string, copyID core.FilesystemID, maxEntries int) (*supersedeProof, error) {
+	proof := &supersedeProof{original: original, copy: copy, copyID: copyID, maxEntries: maxEntries}
 	stamps, err := proof.walk(ctx, true)
 	if err != nil {
-		return nil, err
+		proof.contained = true
+		if stamps, err = proof.walk(ctx, true); err != nil {
+			return nil, err
+		}
 	}
 	proof.stamps = stamps
 	return proof, nil
 }
 
+// reason is the receipt reason of a copy this proof superseded.
+func (p *supersedeProof) reason() string {
+	if p.contained {
+		return containedReason
+	}
+	return supersededReason
+}
+
 // unchanged re-walks both trees' metadata, without reading content, and
 // refuses unless every entry still has the stamp the comparison saw.
-func (p *identicalTrees) unchanged(ctx context.Context) error {
+func (p *supersedeProof) unchanged(ctx context.Context) error {
 	stamps, err := p.walk(ctx, false)
 	if err != nil {
 		return err
@@ -71,7 +97,7 @@ func (p *identicalTrees) unchanged(ctx context.Context) error {
 	return nil
 }
 
-func (p *identicalTrees) walk(ctx context.Context, content bool) ([]entryStamp, error) {
+func (p *supersedeProof) walk(ctx context.Context, content bool) ([]entryStamp, error) {
 	if p.maxEntries <= 0 {
 		return nil, errors.New("no comparison entry budget (limits.deep_size_max_entries)")
 	}
@@ -85,7 +111,7 @@ func (p *identicalTrees) walk(ctx context.Context, content bool) ([]entryStamp, 
 		return nil, fmt.Errorf("quarantined copy: %w", err)
 	}
 	defer unix.Close(copyParent)
-	w := &treeWalk{ctx: ctx, content: content, budget: p.maxEntries}
+	w := &treeWalk{ctx: ctx, content: content, contained: p.contained, budget: p.maxEntries}
 	if content {
 		w.a, w.b = make([]byte, compareChunk), make([]byte, compareChunk)
 	}
@@ -98,9 +124,11 @@ func (p *identicalTrees) walk(ctx context.Context, content bool) ([]entryStamp, 
 type treeWalk struct {
 	ctx     context.Context
 	content bool
-	budget  int
-	a, b    []byte
-	stamps  []entryStamp
+	// contained: the original may hold entries the copy lacks.
+	contained bool
+	budget    int
+	a, b      []byte
+	stamps    []entryStamp
 	// devices of the two roots; every entry must stay on its root's.
 	originalDev, copyDev uint64
 }
@@ -129,15 +157,24 @@ func (w *treeWalk) pair(originalParent, copyParent int, originalName, copyName s
 	if w.budget--; w.budget < 0 {
 		return errors.New("tree has more entries than limits.deep_size_max_entries")
 	}
+	// A containing original need only hold a directory where the copy has
+	// one: its permissions and owner are the live original's own, and it
+	// changes beside the compared entries, so only its identity is stamped.
+	dirInOriginal := w.contained && o.Mode&unix.S_IFMT == unix.S_IFDIR && c.Mode&unix.S_IFMT == unix.S_IFDIR
 	switch {
 	case uint64(o.Dev) != w.originalDev || uint64(c.Dev) != w.copyDev:
 		return fmt.Errorf("%s crosses a mount", copyName)
+	case dirInOriginal:
 	case o.Mode != c.Mode:
 		return fmt.Errorf("%s differs in type or permissions", copyName)
 	case o.Uid != c.Uid || o.Gid != c.Gid:
 		return fmt.Errorf("%s differs in owner or group", copyName)
 	}
-	w.stamps = append(w.stamps, stampOf(o), stampOf(c))
+	originalStamp := stampOf(o)
+	if dirInOriginal {
+		originalStamp = entryStamp{dev: originalStamp.dev, ino: originalStamp.ino}
+	}
+	w.stamps = append(w.stamps, originalStamp, stampOf(c))
 	switch c.Mode & unix.S_IFMT {
 	case unix.S_IFREG:
 		if o.Size != c.Size {
@@ -184,20 +221,25 @@ func (w *treeWalk) dirs(originalParent, copyParent int, originalName, copyName s
 		return err
 	}
 	defer cd.Close()
-	on, err := w.names(od)
-	if err != nil {
-		return err
-	}
 	cn, err := w.names(cd)
 	if err != nil {
 		return err
 	}
-	if !slices.Equal(on, cn) {
-		return fmt.Errorf("%s differs in entry names", copyName)
+	if !w.contained {
+		on, err := w.names(od)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(on, cn) {
+			return fmt.Errorf("%s differs in entry names", copyName)
+		}
 	}
 	for _, name := range cn {
 		var oc, cc unix.Stat_t
 		if err := unix.Fstatat(int(od.Fd()), name, &oc, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			if w.contained && errors.Is(err, unix.ENOENT) {
+				return fmt.Errorf("%s is missing at the original path", name)
+			}
 			return err
 		}
 		if err := unix.Fstatat(int(cd.Fd()), name, &cc, unix.AT_SYMLINK_NOFOLLOW); err != nil {
