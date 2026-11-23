@@ -281,8 +281,10 @@ type herdrAgent struct {
 const maxHerdrTopics = 1000
 
 // parseHerdrTopics decodes an agent's topic_sessions: absent or null is
-// none; otherwise an array of at most maxHerdrTopics absolute, clean
-// ".jsonl" paths.
+// none; otherwise an array of at most maxHerdrTopics entries, each an
+// absolute, clean ".jsonl" path or an object whose string "path" is one
+// (herdr 0.9.5 emits {path, topic_id, title, created_unix_ms}; other keys
+// are ignored).
 func parseHerdrTopics(agent herdrAgent) ([]string, error) {
 	trimmed := bytes.TrimSpace(agent.Topics)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -300,9 +302,9 @@ func parseHerdrTopics(agent herdrAgent) ([]string, error) {
 	}
 	topics := make([]string, 0, len(raws))
 	for _, raw := range raws {
-		var topic string
-		if r := bytes.TrimSpace(raw); len(r) == 0 || r[0] != '"' || json.Unmarshal(r, &topic) != nil {
-			return nil, fmt.Errorf("herdr agent %s has a non-string topic session: %s", agent.label(), bytes.TrimSpace(raw))
+		topic, err := herdrTopicPath(raw)
+		if err != nil {
+			return nil, fmt.Errorf("herdr agent %s has a malformed topic session %s: %w", agent.label(), bytes.TrimSpace(raw), err)
 		}
 		switch {
 		case topic == "":
@@ -317,6 +319,39 @@ func parseHerdrTopics(agent herdrAgent) ([]string, error) {
 		topics = append(topics, topic)
 	}
 	return topics, nil
+}
+
+// herdrTopicPath reads one topic_sessions entry: a JSON string, or an
+// object carrying a string "path".
+func herdrTopicPath(raw json.RawMessage) (string, error) {
+	r := bytes.TrimSpace(raw)
+	if len(r) == 0 {
+		return "", fmt.Errorf("empty entry")
+	}
+	switch r[0] {
+	case '"':
+		var topic string
+		if err := json.Unmarshal(r, &topic); err != nil {
+			return "", err
+		}
+		return topic, nil
+	case '{':
+		var entry map[string]json.RawMessage
+		if err := json.Unmarshal(r, &entry); err != nil {
+			return "", err
+		}
+		path, ok := entry["path"]
+		if !ok {
+			return "", fmt.Errorf("object has no path")
+		}
+		p := bytes.TrimSpace(path)
+		var topic string
+		if len(p) == 0 || p[0] != '"' || json.Unmarshal(p, &topic) != nil {
+			return "", fmt.Errorf("path is not a string")
+		}
+		return topic, nil
+	}
+	return "", fmt.Errorf("neither a string nor an object")
 }
 
 func (a herdrAgent) label() string {
