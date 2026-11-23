@@ -1368,7 +1368,9 @@ The boundary is the unit, not the files inside it (decided with this guard,
 session folder, under its own guards (open files, process use, per-file
 `idle`, verified batches), as the earlier owner decision for exactly these
 seats requires. It never selects the transcript itself, which lies beside
-the folder, nor the folder as a whole, and it does not run or depend on herdr.
+the folder, nor the folder as a whole, and with `collectors.herdr` it keeps
+what the [herdr rule for session artifacts](#herdr-rule-for-session-artifacts)
+keeps.
 
 Herdr configured but failing, timing out, printing more than the bound or
 printing anything but a well-formed agent list (its error document, any `id`
@@ -1384,6 +1386,43 @@ observes a directory holding one does not run herdr, and a herdr failure
 does not hold it. `binary` must be an absolute path; each `session_roots`
 entry must be an exact `.../.omp/agent/sessions` store. Without
 `collectors.herdr` nothing changes.
+
+###### Herdr rule for session artifacts
+
+With `collectors.herdr`, `omp_session_artifacts` asks herdr once per archive
+run, and again for each batch at its move boundary (after the files are
+hashed and `/proc` is scanned; a second `/proc` pass follows the answer,
+right before the renames). It keeps a file
+out of the batch (or in place at quarantine, while its eligible siblings
+still move) when
+
+- herdr lists that file itself (an `agent_session` or a `topic_sessions`
+  path), at any depth, or
+- the file is a topic transcript, a `*.jsonl` whose immediate parent
+  directory `<dir>` is a session folder herdr lists the transcript of
+  (`<dir>.jsonl`), at any depth (a nested session's topics included).
+
+Its herdr scope is `session_roots` plus every `omp_session_artifacts` root,
+so a file herdr lists under an artifact root that `session_roots` does not
+name is still kept. When herdr does not answer (including an answer the
+decoder rejects), a listed topic could be any `*.jsonl` the walk reaches, so
+every `*.jsonl` at any depth inside any session folder stays (reported, not
+a failure); every other file (logs and the rest) stays eligible under the
+guards above. Without `collectors.herdr` none of this applies, and
+quarantine makes no second `/proc` pass.
+
+At quarantine both checks are best-effort samples, not a shared cutoff.
+Herdr evidence is as of herdr's own snapshot, taken inside the query;
+open-file evidence is as of each process's inspection during the final
+`/proc` pass, which reads each process once and looks only for the batch's
+files still to move. A listing herdr publishes after its snapshot, or a
+file a process opens after that process was inspected, is not seen before
+the rename. The order (hash, first `/proc` pass, herdr, final `/proc` pass,
+rename) minimises that window but cannot close it without an exclusion
+that herdr and the file openers would both have to honour. A file moved in
+the window sits in quarantine, restorable with `janitor restore`, and in
+the verified artifact batch archive (manifest and SHA-256 pinned by its
+receipt), so expiry deleting the local copy still leaves the archive.
 
 ##### OMP session artifacts
 
@@ -1418,6 +1457,7 @@ Each file is its own unit. A file is selected when all of these hold:
   from the archive) with the size and mtime it was archived with
 - `omp_sessions` does not archive its session folder whole in the same run
   (`would_archive`, `archived`, `deferred` or `already_archived` there)
+- herdr does not keep it ([herdr rule for session artifacts](#herdr-rule-for-session-artifacts))
 
 Every cycle archives, per session folder, one batch: one tar holding that
 folder's selected files (at most `max_files_per_batch` files and
@@ -1437,8 +1477,12 @@ tar is verified first; a batch whose archive does not verify moves nothing.
 Then each file must still be the archived file (inode, size, mtime, mode,
 ownership and contents, with no extended attributes), not covered by policy
 or by a current protected name (`protect.name_patterns` and the built-in
-screen, on every name below the session folder), and unused (one `/proc`
-pass per batch). Immediately before its rename, its full verified state
+screen, on every name below the session folder), unused (a `/proc` pass
+per batch), and, with `collectors.herdr`, not kept by herdr
+([herdr rule for session artifacts](#herdr-rule-for-session-artifacts))
+and still unused by a second `/proc` pass over the remaining files, since
+the herdr query can block for up to `limits.command_timeout`.
+Immediately before its rename, its full verified state
 (ctime included) is compared again, so a write after the hash keeps it. Each moved file is
 its own cleanup item and audit row under the batch's cleanup id. A file that
 changed, was opened, was removed or became protected after archiving stays in

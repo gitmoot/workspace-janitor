@@ -291,6 +291,15 @@ func (h *HerdrCollector) ResolveRoots() {
 	}
 }
 
+// WithRoots is a copy of h whose session roots are h's followed by roots,
+// resolved together (ResolveRoots), so the added roots and the stores they
+// resolve to never disagree. h is unchanged.
+func (h *HerdrCollector) WithRoots(roots ...string) *HerdrCollector {
+	scope := &HerdrCollector{Binary: h.Binary, SessionRoots: append(slices.Clone(h.SessionRoots), roots...)}
+	scope.ResolveRoots()
+	return scope
+}
+
 // resolution returns the resolved stores and whether any is unknown. A
 // collector built outside policy loading resolves them on each call.
 func (h *HerdrCollector) resolution() ([]string, bool) {

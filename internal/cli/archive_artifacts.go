@@ -104,21 +104,23 @@ func wholeSessionUnits(report *categoryArchiveReport) map[string]string {
 // it. Per-batch failures are reported on the batch and returned; the run
 // continues with the next batch.
 func archiveSessionArtifacts(ctx context.Context, db *store.Store, paths config.Paths, policy config.Policy, report *categoryArchiveReport, now time.Time, dryRun bool) []error {
-	var failures []error
-	var archived map[string]store.ArchivedArtifact
-	var herdr *artifactHerdr
-	whole := wholeSessionUnits(report)
+	var categories []config.WorkspaceArchiveCategory
 	for _, category := range policy.WorkspaceArchiveCategories {
-		if category.Kind != config.CategoryOMPSessionArtifacts {
-			continue
+		if category.Kind == config.CategoryOMPSessionArtifacts {
+			categories = append(categories, category)
 		}
-		if archived == nil {
-			var err error
-			if archived, err = store.ReadArchivedArtifacts(ctx, paths.DatabaseFile); err != nil {
-				return append(failures, fmt.Errorf("session artifact receipts: %w", err))
-			}
-			herdr = askArtifactHerdr(ctx, policy)
-		}
+	}
+	if len(categories) == 0 {
+		return nil
+	}
+	archived, err := store.ReadArchivedArtifacts(ctx, paths.DatabaseFile)
+	if err != nil {
+		return []error{fmt.Errorf("session artifact receipts: %w", err)}
+	}
+	herdr := askArtifactHerdr(ctx, policy)
+	whole := wholeSessionUnits(report)
+	var failures []error
+	for _, category := range categories {
 		plans, roots, err := observeArtifacts(ctx, policy, category, whole, archived, herdr, report, now)
 		if err != nil {
 			failures = append(failures, err)
@@ -131,38 +133,56 @@ func archiveSessionArtifacts(ctx context.Context, db *store.Store, paths config.
 	return failures
 }
 
-// artifactHerdr is one herdr answer for omp_session_artifacts, asked once
-// per run; nil when herdr is not configured.
+// artifactHerdr is one herdr answer for omp_session_artifacts: asked once
+// per archive run and again for each batch at its move boundary; nil when
+// herdr is not configured.
 type artifactHerdr struct {
 	sessions *collect.HerdrSessions
 	err      error
 }
 
+// askArtifactHerdr asks herdr over collectors.herdr's session roots and
+// every omp_session_artifacts root: a transcript herdr lists under an
+// artifact root is kept even where session_roots do not name that root.
 func askArtifactHerdr(ctx context.Context, policy config.Policy) *artifactHerdr {
 	if policy.Collectors.Herdr == nil {
 		return nil
 	}
-	sessions, err := collect.ListHerdrSessions(ctx, policy.Collectors.Herdr, policy.Limits.CommandTimeout.Duration())
+	var roots []string
+	for _, category := range policy.WorkspaceArchiveCategories {
+		if category.Kind == config.CategoryOMPSessionArtifacts {
+			roots = append(roots, category.Roots...)
+		}
+	}
+	sessions, err := collect.ListHerdrSessions(ctx, policy.Collectors.Herdr.WithRoots(roots...), policy.Limits.CommandTimeout.Duration())
 	return &artifactHerdr{sessions: sessions, err: err}
 }
 
-// keeps is why herdr keeps the file rel (relative to rootPath, in session
-// folder session) out of a batch: a transcript herdr lists, or a ".jsonl"
-// directly inside a listed session's folder (its topic transcripts). When
-// herdr gave no answer, every ".jsonl" directly inside any session folder
-// stays; other files are not herdr's to keep.
-func (h *artifactHerdr) keeps(rootPath, session, rel string) string {
+// keeps is why herdr keeps file (absolute, inside a session folder) out of
+// a batch, or in place at its quarantine. With an answer: herdr lists the
+// file itself, or the file is a topic transcript (a ".jsonl") of the
+// session folder holding it, whose transcript "<folder>.jsonl" herdr lists;
+// both at any depth. Without one, any listed topic could be any ".jsonl"
+// the walk reaches, so every ".jsonl" stays. Other files are not herdr's
+// to keep.
+func (h *artifactHerdr) keeps(file string) string {
 	if h == nil {
 		return ""
 	}
+	jsonl := strings.HasSuffix(file, ".jsonl")
 	if h.err != nil {
-		if path.Dir(rel) == session && strings.HasSuffix(rel, ".jsonl") {
+		if jsonl {
 			return "herdr agent sessions are unknown, so a possible topic transcript stays: " + h.err.Error()
 		}
 		return ""
 	}
-	if live := h.sessions.KeepsFile(rootPath + "/" + rel); live != "" {
+	if live := h.sessions.Lists(file); live != "" {
 		return string(core.ProtectLiveAgentSession) + ": " + live
+	}
+	if jsonl {
+		if live := h.sessions.Lists(path.Dir(file) + ".jsonl"); live != "" {
+			return string(core.ProtectLiveAgentSession) + ": " + live + ", whose session folder holds its topic transcripts"
+		}
 	}
 	return ""
 }
@@ -223,7 +243,7 @@ func observeArtifacts(ctx context.Context, policy config.Policy, category config
 					plan.notes.add(refusals[0], file.Path, false)
 					continue
 				}
-				if reason := herdr.keeps(rootPath, session, file.Path); reason != "" {
+				if reason := herdr.keeps(path); reason != "" {
 					plan.notes.add(reason, file.Path, false)
 					continue
 				}
@@ -482,9 +502,11 @@ type artifactQuarantineReport struct {
 // batch whose local retention has elapsed into the batch's cleanup receipt,
 // one journaled cleanup item per file. Each batch archive is fully verified
 // first; then each file must still be exactly the archived file (identity,
-// size, mtime and contents), unprotected and unused (one procfs pass per
-// batch) and is re-checked immediately before its rename. A file that fails
-// any of that stays in place and is reported; the batch is then settled. A
+// size, mtime and contents), unprotected, unused (a procfs pass per
+// batch), and, with collectors.herdr, not kept by herdr asked afresh after
+// that pass (artifactHerdr.keeps) and still unused by a second procfs pass
+// after the herdr query; it is re-checked immediately before its rename. A file that
+// fails any of that stays in place and is reported; the batch is then settled. A
 // batch whose archive does not verify, or whose live-process check cannot
 // complete, moves nothing and is retried.
 func quarantineArtifacts(ctx context.Context, engine *action.Engine, policy config.Policy, dryRun bool) (artifactQuarantineReport, error) {
@@ -608,22 +630,63 @@ func quarantineArtifactBatch(ctx context.Context, engine *action.Engine, policy 
 		}
 		ready = append(ready, verified{file, member, state})
 	}
-	candidates := make([]string, len(ready))
-	for i, r := range ready {
-		candidates[i] = r.file.Path
+	// unused keeps the files of ready no process holds, after one procfs
+	// pass over them, and notes the rest.
+	unused := func(ready []verified) ([]verified, error) {
+		if len(ready) == 0 {
+			return ready, nil
+		}
+		candidates := make([]string, len(ready))
+		for i, r := range ready {
+			candidates[i] = r.file.Path
+		}
+		used, err := workspacearchive.OpenFiles(ctx, policy.Collectors.ProcRoot, candidates)
+		if err != nil {
+			return nil, err
+		}
+		return slices.DeleteFunc(ready, func(r verified) bool {
+			use, open := used[r.file.Path]
+			if open {
+				notes.add("open in a process ("+use+")", r.file.Path, false)
+			}
+			return open
+		}), nil
 	}
-	used := map[string]string{}
-	if len(candidates) != 0 {
-		if used, err = workspacearchive.OpenFiles(ctx, policy.Collectors.ProcRoot, candidates); err != nil {
-			return fmt.Errorf("live process check: %w; nothing moved", err)
+	if ready, err = unused(ready); err != nil {
+		return fmt.Errorf("live process check: %w; nothing moved", err)
+	}
+	// Fresh herdr evidence for this batch, taken after hashing and the
+	// procfs pass: a topic that became live, or that herdr now lists, or any
+	// topic while herdr does not answer, stays.
+	herdr := askArtifactHerdr(ctx, policy)
+	ready = slices.DeleteFunc(ready, func(r verified) bool {
+		reason := herdr.keeps(r.file.Path)
+		if reason != "" {
+			notes.add(reason, r.file.Path, false)
+		}
+		return reason != ""
+	})
+	// The herdr query blocks for up to command_timeout, so process use is
+	// checked again after it, over only the files still to move: herdr and
+	// then open files are the last checks before the renames. Both are
+	// best-effort samples, not a shared cutoff: herdr evidence is as of
+	// herdr's own snapshot, taken inside the query; open-file evidence is as
+	// of each process's inspection during the final pass. A listing herdr
+	// publishes after its snapshot, or a descriptor a process opens after it
+	// was inspected, is not seen before the rename. This order minimises
+	// that window but cannot close it without an exclusion herdr and the
+	// file openers would both have to honour. A file moved in the window
+	// sits in quarantine, restorable with `janitor restore`, and in the
+	// verified batch archive (manifest and SHA-256 pinned by its receipt),
+	// so expiry deleting the local copy still leaves the archive. Without
+	// herdr there is no query to wait out, so the first pass is the last.
+	if herdr != nil {
+		if ready, err = unused(ready); err != nil {
+			return fmt.Errorf("live process check after herdr: %w; nothing moved", err)
 		}
 	}
 	var failures []error
 	for _, r := range ready {
-		if use, open := used[r.file.Path]; open {
-			notes.add("open in a process ("+use+")", r.file.Path, false)
-			continue
-		}
 		if dryRun {
 			out.Moved++
 			out.MovedBytes += r.file.Size

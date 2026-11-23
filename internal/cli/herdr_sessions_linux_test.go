@@ -254,6 +254,226 @@ func TestHerdrSessionArtifactsStillMoveButNeverTheTranscript(t *testing.T) {
 	}
 }
 
+// Review of #238 (#244): herdr is asked afresh for each batch right before
+// its quarantine. A topic transcript batched while herdr kept nothing stays
+// in place when its session became live, when herdr now lists it, or when
+// herdr no longer answers; its eligible sibling still moves.
+func TestHerdrArtifactQuarantineRechecksTopics(t *testing.T) {
+	for name, answer := range map[string]func(session string) string{
+		"session became live": func(session string) string { return herdrAgentList(session + ".jsonl") },
+		"topic now listed":    func(session string) string { return herdrAgentList(session + "/Topic.jsonl") },
+		"herdr down":          func(string) string { return herdrNotRunning },
+	} {
+		t.Run(name, func(t *testing.T) {
+			x := newArtifactFixture(t)
+			herdr := fakeHerdr(t, x.stateStoreFixture)
+			x.prevention = "  auto_quarantine: true\n"
+			x.writeArtifacts(t)
+			session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"old.log": 15 * 24 * time.Hour, "Topic.jsonl": 15 * 24 * time.Hour})
+			item := categoryItem(t, x.categories(t, false), session)
+			if item.Status != categoryArchived || item.Files != 2 {
+				t.Fatalf("batch of an unreferenced session = %+v", item)
+			}
+			writeHerdrAnswer(t, herdr, answer(session))
+			report := x.quarantineArtifacts(t)
+			if len(report.Batches) != 1 || report.Batches[0].Moved != 1 || report.Batches[0].Kept != 1 {
+				t.Fatalf("quarantine = %+v", report)
+			}
+			if got := contents(t, session, "old.log", "Topic.jsonl"); got["old.log"] != "<absent>" || got["Topic.jsonl"] == "<absent>" {
+				t.Fatalf("after quarantine: %v", got)
+			}
+		})
+	}
+}
+
+// Review of #238 (#245): an omp_session_artifacts root that
+// collectors.herdr.session_roots does not name is still in herdr's scope
+// for artifacts: a topic herdr lists there is not selected, while an
+// ordinary log beside it still is.
+func TestHerdrArtifactRootOutsideSessionRootsKeepsListedTopic(t *testing.T) {
+	x := newArtifactFixture(t)
+	herdr := fakeHerdr(t, x.stateStoreFixture)
+	other := filepath.Join(t.TempDir(), ".omp", "agent", "sessions")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	x.collectors = strings.Replace(x.collectors, "["+x.sessions+"]", "["+other+"]", 1)
+	x.writeArtifacts(t)
+	session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"old.log": 15 * 24 * time.Hour, "Topic.jsonl": 15 * 24 * time.Hour})
+	writeHerdrAnswer(t, herdr, herdrAgentList(session+"/Topic.jsonl"))
+	item := categoryItem(t, x.categories(t, false), session)
+	if item.Status != categoryArchived || item.Files != 1 || !reasonsContain(item, string(core.ProtectLiveAgentSession)) {
+		t.Fatalf("artifacts under a root outside session_roots = %+v", item)
+	}
+	for member := range x.tarMembers(t, item.Name) {
+		if strings.HasSuffix(member, ".jsonl") {
+			t.Fatalf("listed topic archived as %s", member)
+		}
+	}
+}
+
+// Issue #246: a topic herdr lists below the top of its session folder is
+// kept by the listing itself while the answer is clean, and, once herdr's
+// answer is rejected (a duplicate title member), by the outage rule: every
+// .jsonl at any depth in a session folder stays. A nested log still moves.
+func TestHerdrArtifactNestedListedTopicStaysWhenTheAnswerIsRejected(t *testing.T) {
+	for name, rejected := range map[string]bool{"clean answer": false, "rejected answer": true} {
+		t.Run(name, func(t *testing.T) {
+			x := newArtifactFixture(t)
+			herdr := fakeHerdr(t, x.stateStoreFixture)
+			x.prevention = "  auto_quarantine: true\n"
+			x.writeArtifacts(t)
+			session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"sub/old.log": 15 * 24 * time.Hour, "sub/Topic.jsonl": 15 * 24 * time.Hour})
+			title, reason := `"title":"Topic"`, string(core.ProtectLiveAgentSession)
+			if rejected {
+				title, reason = `"title":"Topic","title":"Other"`, "herdr agent sessions are unknown"
+			}
+			writeHerdrAnswer(t, herdr, `{"id":"cli:agent:list","result":{"type":"agent_list","agents":[{"agent":"omp","name":"seat","pane_id":"w1:p1",`+
+				`"agent_session":{"agent":"omp","kind":"path","source":"herdr:omp","value":"`+session+`.jsonl"},`+
+				`"topic_sessions":[{"path":"`+session+`/sub/Topic.jsonl",`+title+`,"topic_id":"Topic"}]}]}}`)
+			item := categoryItem(t, x.categories(t, false), session)
+			if item.Status != categoryArchived || item.Files != 1 || !reasonsContain(item, reason) {
+				t.Fatalf("artifacts with a nested listed topic = %+v", item)
+			}
+			for member := range x.tarMembers(t, item.Name) {
+				if strings.HasSuffix(member, ".jsonl") {
+					t.Fatalf("nested listed topic archived as %s", member)
+				}
+			}
+			if report := x.quarantineArtifacts(t); len(report.Batches) != 1 || report.Batches[0].Moved != 1 {
+				t.Fatalf("quarantine = %+v", report)
+			}
+			if got := contents(t, session, "sub/old.log", "sub/Topic.jsonl"); got["sub/old.log"] != "<absent>" || got["sub/Topic.jsonl"] == "<absent>" {
+				t.Fatalf("after quarantine: %v", got)
+			}
+		})
+	}
+}
+
+// Review of #249: a session herdr lists below the top of a session folder
+// (sub/Nested.jsonl) keeps its own topics: a .jsonl directly in
+// sub/Nested/ is a topic of that listed transcript, wherever it lies. Its
+// sibling log still moves.
+func TestHerdrArtifactListedNestedSessionKeepsItsTopics(t *testing.T) {
+	x := newArtifactFixture(t)
+	herdr := fakeHerdr(t, x.stateStoreFixture)
+	x.prevention = "  auto_quarantine: true\n"
+	x.writeArtifacts(t)
+	session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"sub/Nested/out.log": 15 * 24 * time.Hour, "sub/Nested/Topic.jsonl": 15 * 24 * time.Hour})
+	writeHerdrAnswer(t, herdr, herdrAgentList(session+"/sub/Nested.jsonl"))
+	item := categoryItem(t, x.categories(t, false), session)
+	if item.Status != categoryArchived || item.Files != 1 || !reasonsContain(item, "whose session folder holds its topic transcripts") {
+		t.Fatalf("artifacts of a listed nested session = %+v", item)
+	}
+	if report := x.quarantineArtifacts(t); len(report.Batches) != 1 || report.Batches[0].Moved != 1 {
+		t.Fatalf("quarantine = %+v", report)
+	}
+	if got := contents(t, session, "sub/Nested/out.log", "sub/Nested/Topic.jsonl"); got["sub/Nested/out.log"] != "<absent>" || got["sub/Nested/Topic.jsonl"] == "<absent>" {
+		t.Fatalf("after quarantine: %v", got)
+	}
+}
+
+// Review of #249: herdr is asked at the quarantine's move boundary, after
+// the hashing and the procfs pass. A nested topic herdr starts listing
+// while the procfs pass runs stays; its sibling log moves.
+func TestHerdrArtifactQuarantineAsksHerdrAfterTheProcessScan(t *testing.T) {
+	x := newArtifactFixture(t)
+	herdr := fakeHerdr(t, x.stateStoreFixture)
+	x.prevention = "  auto_quarantine: true\n"
+	x.writeArtifacts(t)
+	session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"sub/old.log": 15 * 24 * time.Hour, "sub/Topic.jsonl": 15 * 24 * time.Hour})
+	if item := categoryItem(t, x.categories(t, false), session); item.Status != categoryArchived || item.Files != 2 {
+		t.Fatalf("batch of an unreferenced session = %+v", item)
+	}
+	done := x.pauseScan(t, "4242", func() error {
+		return os.WriteFile(herdr, []byte(herdrAgentList(session+"/sub/Topic.jsonl")), 0o644)
+	})
+	report := x.quarantineArtifacts(t)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Batches) != 1 || report.Batches[0].Moved != 1 || report.Batches[0].Kept != 1 {
+		t.Fatalf("quarantine = %+v", report)
+	}
+	if got := contents(t, session, "sub/old.log", "sub/Topic.jsonl"); got["sub/old.log"] != "<absent>" || got["sub/Topic.jsonl"] == "<absent>" {
+		t.Fatalf("after quarantine: %v", got)
+	}
+}
+
+// Review of #249: the quarantine's herdr query blocks, so process use is
+// checked again after it. A file a process already holds, or opens while
+// herdr is answering, stays in place; its sibling still moves.
+func TestHerdrArtifactQuarantineRechecksOpenFilesAfterHerdr(t *testing.T) {
+	for name, duringHerdr := range map[string]bool{"already open": false, "opened during herdr": true} {
+		t.Run(name, func(t *testing.T) {
+			x := newArtifactFixture(t)
+			answer := fakeHerdr(t, x.stateStoreFixture)
+			x.prevention = "  auto_quarantine: true\n"
+			x.writeArtifacts(t)
+			session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"held.log": oldArtifact, "calm.log": oldArtifact})
+			if item := categoryItem(t, x.categories(t, false), session); item.Status != categoryArchived || item.Files != 2 {
+				t.Fatalf("batch = %+v", item)
+			}
+			held := filepath.Join(session, "held.log")
+			if duringHerdr {
+				// herdr itself publishes the descriptor before it answers.
+				script := "#!/bin/sh\n[ \"$*\" = 'agent list --json' ] || exit 64\n/bin/ln -sfn " + held + " " + filepath.Join(x.proc, "4242", "fd", "9") + " || exit 1\nexec /bin/cat " + answer + "\n"
+				if err := os.WriteFile(filepath.Join(filepath.Dir(answer), "herdr"), []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				x.open(t, "4242", "9", held)
+			}
+			report := x.quarantineArtifacts(t)
+			if len(report.Batches) != 1 || report.Batches[0].Moved != 1 || report.Batches[0].Kept != 1 || !strings.Contains(strings.Join(report.Batches[0].Reasons, "\n"), "open in a process") {
+				t.Fatalf("quarantine = %+v", report)
+			}
+			if got := contents(t, session, "held.log", "calm.log"); got["held.log"] == "<absent>" || got["calm.log"] != "<absent>" {
+				t.Fatalf("after quarantine: %v", got)
+			}
+		})
+	}
+}
+
+// Review of #249: the quarantine's second procfs pass only waits out the
+// herdr query. Only one pass can inspect the seat (scanOnce), so without
+// collectors.herdr the batch would move, and with it the second pass fails
+// and nothing moves. A preview runs the same checks without the moves,
+// whose own revalidation inspects processes too.
+func TestHerdrArtifactQuarantineSecondPassOnlyWithHerdr(t *testing.T) {
+	for name, withHerdr := range map[string]bool{"without herdr": false, "with herdr": true} {
+		t.Run(name, func(t *testing.T) {
+			x := newArtifactFixture(t)
+			if withHerdr {
+				fakeHerdr(t, x.stateStoreFixture)
+				x.writeArtifacts(t)
+			}
+			session := x.liveSession(t, "-proj", sessionA, "4242", map[string]time.Duration{"a.log": oldArtifact})
+			if item := categoryItem(t, x.categories(t, false), session); item.Status != categoryArchived || item.Files != 1 {
+				t.Fatalf("batch = %+v", item)
+			}
+			swapped := x.scanOnce(t, "4242")
+			out, stderr, code := x.run(t, "--format", "json", "apply", "--quarantine", "--artifacts")
+			if err := <-swapped; err != nil {
+				t.Fatal(err)
+			}
+			var doc struct {
+				Data artifactQuarantineReport `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(out), &doc); err != nil || len(doc.Data.Batches) != 1 {
+				t.Fatalf("quarantine preview: exit=%d stderr=%s stdout=%s", code, stderr, out)
+			}
+			batch := doc.Data.Batches[0]
+			if !withHerdr && (code != ExitOK || batch.Moved != 1) {
+				t.Fatalf("one pass without herdr: exit=%d batch=%+v stderr=%s", code, batch, stderr)
+			}
+			if withHerdr && (code == ExitOK || batch.Moved != 0 || !strings.Contains(strings.Join(batch.Reasons, "\n"), "live process check after herdr")) {
+				t.Fatalf("second pass with herdr: exit=%d batch=%+v stderr=%s", code, batch, stderr)
+			}
+		})
+	}
+}
+
 // herdrScript installs a herdr stand-in running body and configures
 // collectors.herdr with it over root.
 func herdrScript(t *testing.T, x *stateStoreFixture, root, body string) {
