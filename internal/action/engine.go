@@ -358,7 +358,7 @@ func (e *Engine) Reconcile(ctx context.Context, item core.CleanupItem) (core.Cle
 		// An investigation is not a permanent tombstone. Recheck every expiry
 		// guard before allowing an explicitly retried deletion; an unchanged
 		// reason (new reference, changed bytes, unknown collector) stays put.
-		// A copy an identical original now supersedes is held to the guards
+		// A copy an identical or containing original now supersedes is held to the guards
 		// on the copy alone, as Delete holds it.
 		candidate := item
 		candidate.State = core.CleanupQuarantined

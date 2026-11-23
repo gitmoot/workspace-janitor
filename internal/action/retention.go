@@ -193,7 +193,7 @@ func (e *Engine) expiryReady(item core.CleanupItem) error {
 // Without original it also leaves the workspace archive binding out of the
 // copy's identity, and observes the copy without the archive rules for its
 // source (withoutArchiveRulesAt). That binding recorded that a verified
-// archive stood in for the copy; an identical original stands in for it
+// archive stood in for the copy; an identical or containing original stands in for it
 // now, and putting the original back (an archive restore, a KEEP record) is
 // what withdraws the archive's authority, so the fresh copy no longer binds.
 // The saved snapshot must still be one this build can verify, and every
@@ -301,7 +301,7 @@ func (e *Engine) Delete(ctx context.Context, item core.CleanupItem) (core.Cleanu
 		return item, nil
 	case absentSuperseded:
 		item.State, item.UpdatedAt = core.CleanupSuperseded, e.now()
-		item.Reason = "expiry had already removed the quarantined copy an identical original superseded but not journaled it; recorded as superseded"
+		item.Reason = "expiry had already removed the quarantined copy an identical or containing original superseded but not journaled it; recorded as superseded"
 		if err := e.update(ctx, item, core.CleanupQuarantined); err != nil {
 			return item, err
 		}

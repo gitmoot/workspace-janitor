@@ -442,9 +442,11 @@ home directory's parent always has live processes. A directory recreated at
 the original path, such as a cache a service regenerates, is a new object:
 expiry neither deletes it nor is blocked by it, unless something references a
 path inside it. A recreated original identical to the quarantined copy (same
-tree, types, modes, owners, symlink targets and file bytes) makes the copy
-redundant: expiry removes only the copy, under every guard on the copy, and
-records `superseded_by_original` even while the original is referenced. See
+tree, types, modes, owners, symlink targets and file bytes), or one that
+contains it (every entry of the copy present and identical at the same
+relative path, more entries allowed), makes the copy redundant: expiry
+removes only the copy, under every guard on the copy, and records
+`superseded_by_original` even while the original is referenced. See
 [recovery](docs/recovery.md#expiry-and-irreversible-paths).
 
 Automatic quarantine is also **off** by default. With

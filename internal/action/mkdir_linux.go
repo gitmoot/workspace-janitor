@@ -49,10 +49,21 @@ func createReceiptDir(path string) error {
 // the final component. Intermediate directories need search, not read,
 // permission; the returned parent descriptor is readable for mutations.
 func openExistingDirNoSymlinks(path string) (int, error) {
+	return openDirNoSymlinks(path, unix.O_RDONLY)
+}
+
+// openSearchDirNoSymlinks is openExistingDirNoSymlinks returning a
+// search-only (O_PATH) descriptor, for lookups that never read or change
+// the directory itself: it needs no read permission on any component.
+func openSearchDirNoSymlinks(path string) (int, error) {
+	return openDirNoSymlinks(path, unix.O_PATH)
+}
+
+func openDirNoSymlinks(path string, final int) (int, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return -1, fmt.Errorf("directory path must be absolute and canonical: %s", path)
 	}
-	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open("/", final|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return -1, err
 	}
@@ -63,7 +74,7 @@ func openExistingDirNoSymlinks(path string) (int, error) {
 		}
 		flags := unix.O_PATH | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
 		if i == len(parts)-1 {
-			flags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+			flags = final | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
 		}
 		next, err := unix.Openat(fd, part, flags, 0)
 		unix.Close(fd)

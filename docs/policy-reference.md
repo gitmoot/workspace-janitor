@@ -1207,7 +1207,8 @@ its expiry authority while any of these hold:
   cannot be told apart from one that never happened, so restoring it does not
   withdraw expiry either; the archive stays verified, so a later quarantine
   loses nothing. A quarantined copy that expiry removed as
-  `superseded_by_original`, because an identical original was put back at its
+  `superseded_by_original`, because an original identical to it, or containing
+  every file of it, was put back at its
   path ([recovery](recovery.md#expiry-and-irreversible-paths)), counts as the
   owner's undo too.
 

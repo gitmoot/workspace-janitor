@@ -40,11 +40,29 @@ They are identical when the trees have the same shape and entry names, and
 every entry has the same type, permission bits, owner and group, every
 symlink the same target, and every regular file the same size and bytes.
 Modification times, extended attributes and ACLs are not compared; symlinks
-are never followed, mounts never crossed, and a tree with more than
-`limits.deep_size_max_entries` entries is not compared. An identical original
-makes the copy redundant: expiry removes only the copy, never touching the
-original, and records the receipt `superseded_by_original` rather than
-`deleted`. References to and protections of the original path do not hold the
+are never followed, mounts never crossed (by mount identity, so a bind mount
+of the same filesystem is a crossing, and a kernel that reports no mount
+identity proves nothing), and a tree with more than
+`limits.deep_size_max_entries` entries is not compared. An original that is
+not identical but contains the copy also qualifies: every entry of the copy
+has its counterpart at the same relative path in the original, identical as
+above, except that a directory of the copy need only be a directory there,
+of any permissions and owner, while the original may hold more. The copy is
+walked once; only its directories are listed, so
+`limits.deep_size_max_entries` bounds the copy's entries alone, and a
+containing original's directories (and the original's parent) need only be
+searchable, so a search-only (`--x`) directory there does not stop the proof. Every original
+counterpart the proof compares is checked against every entry of the copy:
+it may not be the same inode as any of them (as a bind mount or hard link
+would make it) and may not be on another mount. Entries only the original
+has are never visited, so they are not inspected: an original-only branch
+that bind-mounts or hard-links into the copy loses that view when the copy
+is removed, while the data stays at the proven, separate counterparts. An
+identical or containing original makes the copy redundant:
+expiry removes only the copy, never touching the original, and records the
+receipt `superseded_by_original` rather than `deleted`, with a reason saying
+whether the original was identical or contained the copy. References to and
+protections of the original path do not hold the
 copy, since nothing happens there, but every guard on the copy itself still
 applies (open descriptors, processes, Git state, protected names, mounts and
 its identity, apart from a workspace archive binding that the restore
@@ -54,11 +72,15 @@ checks run against the copy's own names (a category rule through its shared
 dependent index, bounded by `limits.dependent_index_max_entries`, as when it
 binds), so a process using only the original does not hold the copy, while
 one using the copy, or one that cannot be inspected, does. Just before
-removal both trees must still show, for every entry,
-the inode, change time and size the comparison saw. A unit with a bound
+removal both trees must still show, for every compared entry, the inode,
+change time and size the comparison saw; for a containing original, its
+directories need only be the same inodes, so entries added beside the
+compared ones do not hold the copy, but a change to any compared file does.
+A unit with a bound
 companion is never superseded. Any other original (changed bytes, a symlink or
-file where a directory was, an unreadable entry, a tree changed meanwhile)
-gets the usual original-path checks, so a referenced one is still refused. A
+file where a directory was, a file of the copy missing from the original, an
+unreadable entry, a tree changed meanwhile) gets the usual original-path
+checks, so a referenced one is still refused. A
 copy removed before its receipt was updated is recorded from its removal
 marker on the next expiry. A `superseded_by_original` receipt, like
 `restored`, withdraws a category archive's local-expiry authority for that
