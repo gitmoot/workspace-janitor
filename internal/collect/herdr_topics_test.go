@@ -88,6 +88,35 @@ func TestHerdrTopicSessionsProtectEveryListedTopic(t *testing.T) {
 	}
 }
 
+// herdr 0.9.5 emits topic_sessions entries as objects; their string
+// "path" is validated like the bare-string form and other keys are
+// ignored. A topic in the session's companion folder is protected by
+// name (and by the folder already protecting it).
+func TestHerdrTopicSessionObjectsProtectTheirPath(t *testing.T) {
+	x := newHerdrFixture(t, "")
+	topic := filepath.Join(x.project, herdrStemA, "Topicscheck.jsonl")
+	mustWrite(t, topic, `{"type":"session"}`+"\n")
+	session := filepath.Join(x.project, herdrStemA+".jsonl")
+	writeHerdrScript(t, x, topicScript(t, session,
+		`[{"created_unix_ms":1795328166859,"path":"`+topic+`","title":"Topics check","topic_id":"Topicscheck","future":{"x":[1]}},"`+session+`"]`))
+	result := run(t, x.options(5*time.Second))
+	if report := reportFor(t, result, CollectorHerdr); report.Status != core.CollectorRan {
+		t.Fatalf("herdr report = %+v", report)
+	}
+	var reason string
+	for _, ref := range result.References {
+		if ref.Path == topic && ref.Protection == core.ProtectLiveAgentSession {
+			reason = ref.Detail
+		}
+	}
+	if !strings.Contains(reason, "Topicscheck.jsonl") || !strings.Contains(reason, `"keephair" (omp, pane w65:p72) keeps topic`) {
+		t.Errorf("topic live_agent_session reference = %q; references %+v", reason, result.References)
+	}
+	if reason := protectionReason(entryFor(t, result, filepath.Join(x.project, herdrStemA)), core.ProtectLiveAgentSession); reason == "" {
+		t.Error("session folder not protected")
+	}
+}
+
 // A malformed topic_sessions is no answer: herdr fails and every session
 // entry is unknown. Absent and null mean no topics.
 func TestHerdrMalformedTopicSessionsFailClosed(t *testing.T) {
@@ -96,18 +125,25 @@ func TestHerdrMalformedTopicSessionsFailClosed(t *testing.T) {
 		tooMany[i] = "/s/-proj/t.jsonl"
 	}
 	for name, topics := range map[string]string{
-		"not an array":  `"/s/-proj/t.jsonl"`,
-		"object":        `{"a":"/s/-proj/t.jsonl"}`,
-		"non-string":    `[5]`,
-		"null element":  `[null]`,
-		"empty string":  `[""]`,
-		"relative":      `["-proj/t.jsonl"]`,
-		"unclean":       `["/s/alias/../t.jsonl"]`,
-		"trailing /":    `["/s/-proj/t.jsonl/"]`,
-		"wrong suffix":  `["/s/-proj/t.json"]`,
-		"no suffix":     `["/s/-proj/t"]`,
-		"past the cap":  jsonPaths(tooMany...),
-		"ill-formed el": `[{"value":"/s/-proj/t.jsonl"}]`,
+		"not an array":          `"/s/-proj/t.jsonl"`,
+		"object":                `{"a":"/s/-proj/t.jsonl"}`,
+		"non-string":            `[5]`,
+		"null element":          `[null]`,
+		"empty string":          `[""]`,
+		"relative":              `["-proj/t.jsonl"]`,
+		"unclean":               `["/s/alias/../t.jsonl"]`,
+		"trailing /":            `["/s/-proj/t.jsonl/"]`,
+		"wrong suffix":          `["/s/-proj/t.json"]`,
+		"no suffix":             `["/s/-proj/t"]`,
+		"past the cap":          jsonPaths(tooMany...),
+		"ill-formed el":         `[{"value":"/s/-proj/t.jsonl"}]`,
+		"object no path":        `[{"topic_id":"T","title":"T"}]`,
+		"object path number":    `[{"path":5}]`,
+		"object path null":      `[{"path":null}]`,
+		"object path relative":  `[{"path":"-proj/t.jsonl"}]`,
+		"object path unclean":   `[{"path":"/s/alias/../t.jsonl"}]`,
+		"object path no suffix": `[{"path":"/s/-proj/t"}]`,
+		"nested array":          `[["/s/-proj/t.jsonl"]]`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			x := newHerdrFixture(t, "")
