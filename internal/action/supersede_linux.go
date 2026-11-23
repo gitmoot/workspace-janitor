@@ -66,8 +66,10 @@ const compareChunk = 1 << 20
 // an entry of the copy (the same inode as any of them, at any path), since
 // removing the copy would then remove what the original was proven to
 // hold. Entries only the original has are never visited: one that
-// bind-mounts or hard-links into the copy loses that view when the copy is
-// removed, while the data stays at the proven, separate counterparts.
+// bind-mounts into the copy loses that view when the copy is removed,
+// while the data stays at the proven, separate counterparts; one that
+// hard-links to a file of the copy keeps that inode, and its data, when
+// the copy's name is removed.
 func compareTrees(ctx context.Context, original, copy string, copyID core.FilesystemID, maxEntries int) (*supersedeProof, error) {
 	proof := &supersedeProof{original: original, copy: copy, copyID: copyID, maxEntries: maxEntries}
 	w, err := proof.walk(ctx, true)

@@ -56,8 +56,10 @@ counterpart the proof compares is checked against every entry of the copy:
 it may not be the same inode as any of them (as a bind mount or hard link
 would make it) and may not be on another mount. Entries only the original
 has are never visited, so they are not inspected: an original-only branch
-that bind-mounts or hard-links into the copy loses that view when the copy
-is removed, while the data stays at the proven, separate counterparts. An
+that bind-mounts into the copy loses that view when the copy is removed,
+while the data stays at the proven, separate counterparts; an original-only
+hard link to a file of the copy keeps the inode, so that file stays
+reachable through it after the copy's name is removed. An
 identical or containing original makes the copy redundant:
 expiry removes only the copy, never touching the original, and records the
 receipt `superseded_by_original` rather than `deleted`, with a reason saying
