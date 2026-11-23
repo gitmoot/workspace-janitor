@@ -410,6 +410,29 @@ func TestHerdrUncleanSessionPathFailsClosed(t *testing.T) {
 	}
 }
 
+// Review of #237: encoding/json decodes an escaped NUL as is, and an
+// invalid UTF-8 byte or an unpaired surrogate to U+FFFD, without an error.
+// An agent_session path holding one is malformed evidence: herdr fails,
+// naming the agent, and every session entry is unknown.
+func TestHerdrLossySessionPathFailsClosed(t *testing.T) {
+	for name, inner := range map[string]string{"NUL": `\u0000`, "invalid UTF-8": "\xff", "unpaired surrogate": `\ud800`} {
+		t.Run(name, func(t *testing.T) {
+			x := newHerdrFixture(t, "")
+			writeHerdrScript(t, x, answerScript(t, filepath.Join(x.project, herdrStemA+inner+".jsonl")))
+			result := run(t, x.options(5*time.Second))
+			report := reportFor(t, result, CollectorHerdr)
+			if report.Status != core.CollectorFailed || !strings.Contains(report.Detail, `"keephair" (omp, pane w65:p72)`) || report.Recorded != 4 {
+				t.Fatalf("herdr report for a session path holding %s = %+v", name, report)
+			}
+			for _, entry := range result.Entries {
+				if protectionReason(entry, core.ProtectCollectorFailure) == "" {
+					t.Errorf("%s not unknown after a lossy herdr session path", entry.Path)
+				}
+			}
+		})
+	}
+}
+
 // Review of #223: moving a real directory that holds a session store moves
 // every live session in it. A shallow collection that observes such a
 // directory runs herdr, protects it while a session is live, and leaves it

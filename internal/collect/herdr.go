@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gitmoot/workspace-janitor/internal/config"
 	"github.com/gitmoot/workspace-janitor/internal/core"
@@ -58,6 +59,9 @@ func ListHerdrSessions(ctx context.Context, cfg *config.HerdrCollector, timeout 
 		var resumed string
 		if session := agent.session; session != nil && session.Kind == "path" {
 			// An "id" session (Claude) names no file.
+			if lossyHerdrPath(session.Value) {
+				return nil, fmt.Errorf("herdr agent %s names a session path %q holding a NUL or an undecodable character", agent.label(), session.Value)
+			}
 			if !filepath.IsAbs(session.Value) {
 				return nil, fmt.Errorf("herdr agent %s names a non-absolute session path %q", agent.label(), session.Value)
 			}
@@ -262,9 +266,9 @@ const maxHerdrTopics = 1000
 
 // parseHerdrTopics decodes an agent's topic_sessions: absent or null is
 // none; otherwise an array of at most maxHerdrTopics entries, each an
-// absolute, clean ".jsonl" path or an object whose string "path" is one
-// (herdr 0.9.5 emits {path, topic_id, title, created_unix_ms}; other keys
-// are ignored).
+// absolute, clean ".jsonl" path, decoded losslessly (lossyHerdrPath), or
+// an object with exactly one "path" member that is one (herdr 0.9.5 emits
+// {path, topic_id, title, created_unix_ms}; other keys are ignored).
 func parseHerdrTopics(agent herdrAgent) ([]string, error) {
 	trimmed := bytes.TrimSpace(agent.Topics)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -289,6 +293,8 @@ func parseHerdrTopics(agent herdrAgent) ([]string, error) {
 		switch {
 		case topic == "":
 			return nil, fmt.Errorf("herdr agent %s names an empty topic session path", agent.label())
+		case lossyHerdrPath(topic):
+			return nil, fmt.Errorf("herdr agent %s names a topic session path %q holding a NUL or an undecodable character", agent.label(), topic)
 		case !filepath.IsAbs(topic):
 			return nil, fmt.Errorf("herdr agent %s names a non-absolute topic session path %q", agent.label(), topic)
 		case topic != filepath.Clean(topic):
@@ -302,7 +308,10 @@ func parseHerdrTopics(agent herdrAgent) ([]string, error) {
 }
 
 // herdrTopicPath reads one topic_sessions entry: a JSON string, or an
-// object carrying a string "path".
+// object carrying exactly one string "path" member, its key names compared
+// after decoding ("p\u0061th" is "path"). A second "path" member, in any
+// spelling or after a null one, is malformed: which one herdr meant is
+// unknown.
 func herdrTopicPath(raw json.RawMessage) (string, error) {
 	r := bytes.TrimSpace(raw)
 	if len(r) == 0 {
@@ -316,13 +325,31 @@ func herdrTopicPath(raw json.RawMessage) (string, error) {
 		}
 		return topic, nil
 	case '{':
-		var entry map[string]json.RawMessage
-		if err := json.Unmarshal(r, &entry); err != nil {
+		// A map keeps the last of duplicate members; walk them all.
+		dec := json.NewDecoder(bytes.NewReader(r))
+		if _, err := dec.Token(); err != nil {
 			return "", err
 		}
-		path, ok := entry["path"]
-		if !ok {
+		var path json.RawMessage
+		paths := 0
+		for dec.More() {
+			key, err := dec.Token()
+			if err != nil {
+				return "", err
+			}
+			var value json.RawMessage
+			if err := dec.Decode(&value); err != nil {
+				return "", err
+			}
+			if key == "path" {
+				path, paths = value, paths+1
+			}
+		}
+		if paths == 0 {
 			return "", fmt.Errorf("object has no path")
+		}
+		if paths > 1 {
+			return "", fmt.Errorf("object has %d path members", paths)
 		}
 		p := bytes.TrimSpace(path)
 		var topic string
@@ -332,6 +359,16 @@ func herdrTopicPath(raw json.RawMessage) (string, error) {
 		return topic, nil
 	}
 	return "", fmt.Errorf("neither a string nor an object")
+}
+
+// lossyHerdrPath reports whether a decoded herdr path is no evidence of a
+// file: it holds a NUL, which no file name does, or U+FFFD. encoding/json
+// decodes every invalid UTF-8 byte and every unpaired surrogate escape
+// ("\ud800") to U+FFFD without an error, so such a path may not be the one
+// herdr meant; a session path holding a genuine U+FFFD is rejected with
+// them.
+func lossyHerdrPath(value string) bool {
+	return strings.ContainsRune(value, 0) || strings.ContainsRune(value, utf8.RuneError)
 }
 
 func (a herdrAgent) label() string {
@@ -353,7 +390,8 @@ func isObject(raw json.RawMessage) bool {
 // cli:agent:list, result.type agent_list, result.agents an array of agent
 // objects, each with an agent name and, when it has a session, an
 // agent_session object with a kind and a value, and optionally a
-// topic_sessions array of absolute, clean ".jsonl" paths. An error
+// topic_sessions array of absolute, clean ".jsonl" paths. A topic path
+// holding a NUL or a lossily decoded character, an error
 // document, any other id or result type, a null or ill-typed record, a
 // malformed session or topic list, or trailing data is no answer.
 func parseHerdrAgents(data []byte) ([]herdrAgent, error) {

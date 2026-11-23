@@ -1299,8 +1299,14 @@ capability): every topic transcript the agent keeps, usually beside its
 `agent_session` is (same identity mapping, transcript and session folder,
 and a `live_agent_session` reason naming the agent and saying it keeps the
 topic); paths in no session store are ignored. Absent or `null` means no
-topics. Anything else must be an array of at most 1000 strings, each
-absolute, clean and ending in `.jsonl`; any other value is malformed
+topics. Anything else must be an array of at most 1000 entries, each a path
+string or an object (herdr 0.9.5: `{path, topic_id, title,
+created_unix_ms}`) with exactly one `path` member, key names compared after
+decoding escapes (`"p\u0061th"` is a second `path`), whose value is a path
+string; other members are ignored. Each path must be absolute, clean and end
+in `.jsonl`. A session or topic path must also decode losslessly: one holding
+a NUL, or U+FFFD (what an invalid UTF-8 byte or an unpaired surrogate escape
+such as `\ud800` decodes to), is malformed. Any other value is malformed
 evidence and herdr fails closed.
 
 Paths are compared by identity, not spelling. Each session root resolves at
