@@ -49,6 +49,9 @@ jobs:
       # unless it actually ran and passed.
       - name: supersede bind-mount regression (root, private mount namespace)
         run: |
+          # The default run shell has no pipefail: without it the test
+          # binary's exit status would be lost in the pipe to tee.
+          set -o pipefail
           go test -c -o "$RUNNER_TEMP/action.test" ./internal/action
           cd "$RUNNER_TEMP"
           sudo unshare -m ./action.test -test.run '^TestExpiryRefusesAnOriginalShowingTheCopy$' -test.v -test.count=1 | tee bind-mount.log
