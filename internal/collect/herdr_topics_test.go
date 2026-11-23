@@ -113,12 +113,46 @@ func TestHerdrTopicSessionObjectsProtectTheirPath(t *testing.T) {
 	}
 }
 
+// Review of #243 (#247): a path is checked before decoding, so a U+FFFD
+// herdr sent (as UTF-8 or as "\ufffd") and a surrogate pair are characters
+// of valid file names, not lossy decoding. Such a resumed session and such
+// topics are protected like any other.
+func TestHerdrLosslessPathsWithReplacementCharactersAreProtected(t *testing.T) {
+	x := newHerdrFixture(t, "")
+	stems := []string{"resumed-\uFFFD", "literal-\uFFFD", "escaped-\uFFFD", "pair-\U0001F600"}
+	for _, stem := range stems {
+		addHerdrSession(t, x, stem)
+	}
+	transcript := func(stem string) string { return filepath.Join(x.project, stem+".jsonl") }
+	escaped := func(stem string) string {
+		return strings.NewReplacer("\uFFFD", `\ufffd`, "\U0001F600", `\ud83d\ude00`).Replace(transcript(stem))
+	}
+	writeHerdrScript(t, x, topicScript(t, escaped(stems[0]),
+		`["`+transcript(stems[1])+`",{"path":"`+escaped(stems[2])+`"},"`+escaped(stems[3])+`"]`))
+	result := run(t, x.options(5*time.Second))
+	if report := reportFor(t, result, CollectorHerdr); report.Status != core.CollectorRan || report.Visited != 4 {
+		t.Fatalf("herdr report = %+v", report)
+	}
+	for i, stem := range stems {
+		clause := `"keephair" (omp, pane w65:p72) keeps topic`
+		if i == 0 {
+			clause = `"keephair" (omp, pane w65:p72) resumes`
+		}
+		for _, path := range []string{filepath.Join(x.project, stem), transcript(stem)} {
+			reason := protectionReason(entryFor(t, result, path), core.ProtectLiveAgentSession)
+			if !strings.Contains(reason, clause) || !strings.Contains(reason, stem+".jsonl") {
+				t.Errorf("%s: blocking live_agent_session reason = %q", filepath.Base(path), reason)
+			}
+		}
+	}
+}
+
 // A malformed topic_sessions is no answer: herdr fails, naming the agent,
 // and every session entry is unknown. Absent and null mean no topics.
 // Review of #237: an object with a member name twice (a second "path" in
 // any spelling or after a null one, or any other key), or a case variant
-// of "path", is malformed, and so is a path holding a NUL or a character
-// encoding/json decoded lossily to U+FFFD.
+// of "path", is malformed, and so is a path holding a NUL, an invalid
+// UTF-8 byte or an unpaired surrogate escape (#247: high or low).
 func TestHerdrMalformedTopicSessionsFailClosed(t *testing.T) {
 	tooMany := make([]string, 1001) // past the 1000-per-agent cap
 	for i := range tooMany {
@@ -155,6 +189,10 @@ func TestHerdrMalformedTopicSessionsFailClosed(t *testing.T) {
 		"object lone surrogate": `[{"path":"/s/-proj/t\ud800.jsonl"}]`,
 		"object title twice":    `[{"path":"/s/-proj/t.jsonl","title":"a","title":"b"}]`,
 		"object Path and path":  `[{"path":"/s/-proj/t.jsonl","Path":"/s/-proj/u.jsonl"}]`,
+		"lone low surrogate":    `["/s/-proj/t\udc00.jsonl"]`,
+		"object low surrogate":  `[{"path":"/s/-proj/t\udc00.jsonl"}]`,
+		"high then non-low":     `["/s/-proj/t\ud800\u0041.jsonl"]`,
+		"high then high":        `["/s/-proj/t\ud800\ud800.jsonl"]`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			x := newHerdrFixture(t, "")
