@@ -804,16 +804,19 @@ func TestCargoTargetTrimRemovesBuildOutputs(t *testing.T) {
 // by the process table's own "self" link, never by os.Getpid, whose number
 // can belong to another process when procfs comes from another PID
 // namespace (#254). Each entry is a neutral process with a handle open in
-// the target: it is skipped only when "self" names it.
+// the target: it is skipped only when "self" names it. The runner's own PID
+// is used wherever a fallback to os.Getpid would wrongly skip the entry, and
+// the other PID is derived from it so the two never coincide.
 func TestCargoTargetTrimSkipsOnlyTheProcessTableSelf(t *testing.T) {
 	getpid := strconv.Itoa(os.Getpid())
+	other := strconv.Itoa(os.Getpid() + 1)
 	for name, tc := range map[string]struct {
 		pid, self string // self is the target of the process table's "self" link, "" for none
 		skipped   bool
 	}{
-		"self link names it":                {pid: "4242", self: "4242", skipped: true},
-		"another process and no self link":  {pid: "4242"},
-		"janitor's os.Getpid in another ns": {pid: getpid, self: "4242"},
+		"self link names it":                {pid: other, self: other, skipped: true},
+		"janitor's os.Getpid and no self":   {pid: getpid},
+		"janitor's os.Getpid in another ns": {pid: getpid, self: other},
 	} {
 		t.Run(name, func(t *testing.T) {
 			x, target, trim := cargoTargetFixture(t)
