@@ -430,14 +430,12 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 }
 
 // procSelf is janitor's own PID as procRoot numbers it: the target of
-// procRoot's "self" link, or "" when that link is absent or not a PID (then
-// cacheUsers skips no process).
+// procRoot's "self" link, or "" when the link cannot be read (then
+// cacheUsers skips no process). cacheUsers compares it only with numeric
+// entries, so a target that is not a PID never matches one.
 func procSelf(procRoot string) string {
 	target, err := os.Readlink(filepath.Join(procRoot, "self"))
 	if err != nil {
-		return ""
-	}
-	if _, err := strconv.Atoi(target); err != nil {
 		return ""
 	}
 	return target
