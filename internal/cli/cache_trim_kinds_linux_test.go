@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -794,6 +795,23 @@ func TestCargoTargetTrimRemovesBuildOutputs(t *testing.T) {
 	}
 	if data, err := os.ReadFile(outside); err != nil || string(data) != "keep" {
 		t.Fatalf("symlink target outside the target directory touched: %q %v", data, err)
+	}
+}
+
+// Janitor holds an over-bound target open itself while it validates and
+// locks it, so its own process must not count as a user of the cache:
+// otherwise no target over its bound is ever trimmed (issue #252). Here
+// janitor's own process entry names the target the way a build would.
+func TestCargoTargetTrimIgnoresJanitorItself(t *testing.T) {
+	x, target, trim := cargoTargetFixture(t)
+	backdate(t, target, 2*time.Hour)
+	x.processEnv(t, strconv.Itoa(os.Getpid()), []string{"HOME=" + x.home, "CARGO_TARGET_DIR=" + target}, "/root/.local/bin/janitor", "cycle")
+	trims, code := x.cycleTrims(t, trim)
+	if code != ExitOK || trims[0].Status != "trimmed" {
+		t.Fatalf("janitor's own process blocked the trim: exit %d %+v", code, trims[0])
+	}
+	if exists(t, filepath.Join(target, "release", "deps", "libbig.rlib")) {
+		t.Fatal("build outputs survived the trim")
 	}
 }
 

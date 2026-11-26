@@ -326,16 +326,19 @@ func trimFilesystem(trim config.CacheTrim) string {
 // cargoTargetUser names for cargo-target; image builds for docker-builder,
 // and image builds or pulls for docker-images. It fails closed: a process
 // that cannot be inspected counts as a possible user. A false positive only
-// postpones the trim to the next cycle.
+// postpones the trim to the next cycle. Janitor's own process is never a
+// user: it holds the cache open itself while measuring, validating and
+// locking it, and it never builds into or reads from a cache it trims.
 func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
 		return []string{fmt.Sprintf("process list unavailable: %v", err)}
 	}
+	self := strconv.Itoa(os.Getpid())
 	var users []string
 	for _, entry := range entries {
 		pid := entry.Name()
-		if _, err := strconv.Atoi(pid); err != nil {
+		if _, err := strconv.Atoi(pid); err != nil || pid == self {
 			continue
 		}
 		raw, err := os.ReadFile(filepath.Join(procRoot, pid, "cmdline"))
