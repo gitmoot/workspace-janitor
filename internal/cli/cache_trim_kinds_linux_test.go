@@ -799,19 +799,55 @@ func TestCargoTargetTrimRemovesBuildOutputs(t *testing.T) {
 }
 
 // Janitor holds an over-bound target open itself while it validates and
-// locks it, so its own process must not count as a user of the cache:
-// otherwise no target over its bound is ever trimmed (issue #252). Here
-// janitor's own process entry names the target the way a build would.
-func TestCargoTargetTrimIgnoresJanitorItself(t *testing.T) {
-	x, target, trim := cargoTargetFixture(t)
-	backdate(t, target, 2*time.Hour)
-	x.processEnv(t, strconv.Itoa(os.Getpid()), []string{"HOME=" + x.home, "CARGO_TARGET_DIR=" + target}, "/root/.local/bin/janitor", "cycle")
-	trims, code := x.cycleTrims(t, trim)
-	if code != ExitOK || trims[0].Status != "trimmed" {
-		t.Fatalf("janitor's own process blocked the trim: exit %d %+v", code, trims[0])
-	}
-	if exists(t, filepath.Join(target, "release", "deps", "libbig.rlib")) {
-		t.Fatal("build outputs survived the trim")
+// locks it, so its own process must not count as a user of the cache, or no
+// target over its bound is ever trimmed (#252). Janitor is recognised only
+// by the process table's own "self" link, never by os.Getpid, whose number
+// can belong to another process when procfs comes from another PID
+// namespace (#254). Each entry is a neutral process with a handle open in
+// the target: it is skipped only when "self" names it.
+func TestCargoTargetTrimSkipsOnlyTheProcessTableSelf(t *testing.T) {
+	getpid := strconv.Itoa(os.Getpid())
+	for name, tc := range map[string]struct {
+		pid, self string // self is the target of the process table's "self" link, "" for none
+		skipped   bool
+	}{
+		"self link names it":                {pid: "4242", self: "4242", skipped: true},
+		"another process and no self link":  {pid: "4242"},
+		"janitor's os.Getpid in another ns": {pid: getpid, self: "4242"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			x, target, trim := cargoTargetFixture(t)
+			backdate(t, target, 2*time.Hour)
+			x.processEnv(t, tc.pid, []string{"HOME=" + x.home}, "/usr/local/bin/holder")
+			proc := filepath.Join(x.proc, tc.pid)
+			if err := os.MkdirAll(filepath.Join(proc, "fd"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for link, dest := range map[string]string{
+				"cwd":  x.home,
+				"fd/3": filepath.Join(target, "release", ".cargo-lock"),
+			} {
+				if err := os.Symlink(dest, filepath.Join(proc, link)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.self != "" {
+				if err := os.Symlink(tc.self, filepath.Join(x.proc, "self")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			trims, code := x.cycleTrims(t, trim)
+			deps := filepath.Join(target, "release", "deps", "libbig.rlib")
+			if tc.skipped {
+				if code != ExitOK || trims[0].Status != "trimmed" || exists(t, deps) {
+					t.Fatalf("the process table's self blocked the trim: exit %d %+v", code, trims[0])
+				}
+				return
+			}
+			if trims[0].Status != "skipped_in_use" || len(trims[0].ActiveUsers) == 0 || !strings.HasPrefix(trims[0].ActiveUsers[0], tc.pid+" ") || !exists(t, deps) {
+				t.Fatalf("a process holding the target open did not block the trim: exit %d %+v", code, trims[0])
+			}
+		})
 	}
 }
 

@@ -328,13 +328,16 @@ func trimFilesystem(trim config.CacheTrim) string {
 // that cannot be inspected counts as a possible user. A false positive only
 // postpones the trim to the next cycle. Janitor's own process is never a
 // user: it holds the cache open itself while measuring, validating and
-// locking it, and it never builds into or reads from a cache it trims.
+// locking it, and it never builds into or reads from a cache it trims. It is
+// recognised only through procRoot's own "self" link, whose number is in the
+// same PID namespace as procRoot's entries (os.Getpid is not, when procfs
+// comes from another namespace); without that link nothing is skipped.
 func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
 		return []string{fmt.Sprintf("process list unavailable: %v", err)}
 	}
-	self := strconv.Itoa(os.Getpid())
+	self := procSelf(procRoot)
 	var users []string
 	for _, entry := range entries {
 		pid := entry.Name()
@@ -424,6 +427,20 @@ func cacheUsers(procRoot string, trim config.CacheTrim) []string {
 	}
 	sort.Strings(users)
 	return users
+}
+
+// procSelf is janitor's own PID as procRoot numbers it: the target of
+// procRoot's "self" link, or "" when that link is absent or not a PID (then
+// cacheUsers skips no process).
+func procSelf(procRoot string) string {
+	target, err := os.Readlink(filepath.Join(procRoot, "self"))
+	if err != nil {
+		return ""
+	}
+	if _, err := strconv.Atoi(target); err != nil {
+		return ""
+	}
+	return target
 }
 
 // cargoTools are the executables that build into a target directory, by
